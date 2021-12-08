@@ -69,127 +69,6 @@
 #define LEON3_APB_PNP_OFFSET (0x800FF000)
 #define LEON3_AHB_PNP_OFFSET (0xFFFFF000)
 
-/*#define D(x)
-#define DNAND(x)
-
-struct nand_state_t
-{
-    DeviceState *nand;
-    MemoryRegion iomem;
-    unsigned int rdy:1;
-    unsigned int ale:1;
-    unsigned int cle:1;
-    unsigned int ce:1;
-};
-
-static struct nand_state_t nand_state;
-static uint64_t nand_read(void *opaque, hwaddr addr, unsigned size)
-{
-    struct nand_state_t *s = opaque;
-    uint32_t r;
-    int rdy;
-
-    r = nand_getio(s->nand);
-    nand_getpins(s->nand, &rdy);
-    s->rdy = rdy;
-
-    DNAND(printf("%s addr=%x r=%x\n", __func__, addr, r));
-    return r;
-}
-
-static void
-nand_write(void *opaque, hwaddr addr, uint64_t value,
-           unsigned size)
-{
-    struct nand_state_t *s = opaque;
-    int rdy;
-
-    DNAND(printf("%s addr=%x v=%x\n", __func__, addr, (unsigned)value));
-    nand_setpins(s->nand, s->cle, s->ale, s->ce, 1, 0);
-    nand_setio(s->nand, value);
-    nand_getpins(s->nand, &rdy);
-    s->rdy = rdy;
-}
-
-static const MemoryRegionOps nand_ops = {
-    .read = nand_read,
-    .write = nand_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-};
-
-#define RW_PA_DOUT    0x00
-#define R_PA_DIN      0x01
-#define RW_PA_OE      0x02
-#define RW_PD_DOUT    0x10
-#define R_PD_DIN      0x11
-#define RW_PD_OE      0x12
-
-static struct gpio_state_t
-{
-    MemoryRegion iomem;
-    struct nand_state_t *nand;
-    uint32_t regs[0x5c / 4];
-} gpio_state;
-
-static uint64_t gpio_read(void *opaque, hwaddr addr, unsigned size)
-{
-    struct gpio_state_t *s = opaque;
-    uint32_t r = 0;
-
-    addr >>= 2;
-    switch (addr)
-    {
-        case R_PA_DIN:
-            r = s->regs[RW_PA_DOUT] & s->regs[RW_PA_OE];
-
-            // Encode pins from the nand.
-            r |= s->nand->rdy << 7;
-            break;
-
-        default:
-            r = s->regs[addr];
-            break;
-    }
-    return r;
-    D(printf("%s %x=%x\n", __func__, addr, r));
-}
-
-static void gpio_write(void *opaque, hwaddr addr, uint64_t value,
-                       unsigned size)
-{
-    struct gpio_state_t *s = opaque;
-    D(printf("%s %x=%x\n", __func__, addr, (unsigned)value));
-
-    addr >>= 2;
-    switch (addr)
-    {
-        case RW_PA_DOUT:
-            // Decode nand pins.
-            s->nand->ale = !!(value & (1 << 6));
-            s->nand->cle = !!(value & (1 << 5));
-            s->nand->ce  = !!(value & (1 << 4));
-
-            s->regs[addr] = value;
-            break;
-
-        default:
-            s->regs[addr] = value;
-            break;
-    }
-}
-
-static const MemoryRegionOps gpio_ops = {
-    .read = gpio_read,
-    .write = gpio_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
-    .valid = {
-        .min_access_size = 4,
-        .max_access_size = 4,
-    },
-};*/
-
-#define INTMEM_SIZE (128 * KiB)
-
 typedef struct ResetData {
     SPARCCPU *cpu;
     uint32_t  entry;            /* save kernel entry in case of reset */
@@ -330,7 +209,6 @@ static void leon3_generic_hw_init(MachineState *machine)
     int i;
     AHBPnp *ahb_pnp;
     APBPnp *apb_pnp;
-    //DriveInfo *nand;
 
     /* Init CPU */
     cpu = SPARC_CPU(cpu_create(machine->cpu_type));
@@ -383,21 +261,6 @@ static void leon3_generic_hw_init(MachineState *machine)
 
     memory_region_add_subregion(address_space_mem, LEON3_RAM_OFFSET,
                                 machine->ram);
-
-    /* Allocate internal flash memory */
-    /*nand = drive_get(IF_MTD, 0, 0);
-    nand_state.nand = nand_init(nand ? blk_by_legacy_dinfo(nand) : NULL,
-                                NAND_MFR_SAMSUNG, 0x39);
-    memory_region_init_io(&nand_state.iomem, NULL, &nand_ops, &nand_state,
-                          "nand", 0x05000000);
-    memory_region_add_subregion(address_space_mem, 0x10000000,
-                                &nand_state.iomem);
-
-    gpio_state.nand = &nand_state;
-    memory_region_init_io(&gpio_state.iomem, NULL, &gpio_ops, &gpio_state,
-                          "gpio", 0x5c);
-    memory_region_add_subregion(address_space_mem, 0x80000800,
-                                &gpio_state.iomem);*/
 
     /* Allocate BIOS */
     prom_size = 8 * MiB;
@@ -495,7 +358,6 @@ static void leon3_generic_hw_init(MachineState *machine)
                             LEON3_UART_IRQ, GRLIB_APBIO_AREA);
 
     /* Allocate flash */
-
     dev = qdev_new(TYPE_GRLIB_STIXFLASH);
     //qdev_prop_set_chr(dev, "chrdev", serial_hd(0));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
