@@ -18,6 +18,8 @@ config SUN4M
 config LEON3
     bool
     select GRLIB
+    select PFLASH_CFI02
+    select NAND
 
 config GRLIB
     bool

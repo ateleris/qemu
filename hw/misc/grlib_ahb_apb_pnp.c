@@ -248,7 +248,10 @@ static uint64_t grlib_apb_pnp_read(void *opaque, hwaddr offset, unsigned size)
 
     val = apb_pnp->regs[offset >> 2];
     trace_grlib_apb_pnp_read(offset, val);
-
+    if (size == 1) {
+        val >>= (24 - (offset & 3) * 8);
+        val &= 0x0ff;
+    }
     return val;
 }
 
@@ -263,7 +266,7 @@ static const MemoryRegionOps grlib_apb_pnp_ops = {
     .write      = grlib_apb_pnp_write,
     .endianness = DEVICE_BIG_ENDIAN,
     .impl = {
-        .min_access_size = 4,
+        .min_access_size = 1,
         .max_access_size = 4,
     },
 };

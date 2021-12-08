@@ -46,4 +46,7 @@ void grlib_irqmp_ack(DeviceState *dev, int intno);
 /* APB UART */
 #define TYPE_GRLIB_APB_UART "grlib,apbuart"
 
+/* STIX FLASH */
+#define TYPE_GRLIB_STIXFLASH "grlib,stixflash"
+
 #endif /* GRLIB_H */
