@@ -5,6 +5,7 @@
 #include "hw/sysbus.h"
 #include "qemu/module.h"
 #include "chardev/char-fe.h"
+#include "qemu/qemu-print.h"
 
 #include "trace.h"
 #include "qom/object.h"
@@ -24,12 +25,22 @@ static uint64_t grlib_stixflash_read(void *opaque, hwaddr addr,
                                    unsigned size)
 {
     //trace_grlib_apbuart_readl_unknown(addr);
+    STIXFLASH *stixflash = opaque;
+    //qemu_irq_raise(stixflash->irq);
+    qemu_printf("READ: %lu - %u\n", addr, size);
+    qemu_set_irq(stixflash->irq, 1);
+    qemu_irq_lower(stixflash->irq);
+    for(uint32_t i = 0; i < 99999999; i++);
+    qemu_irq_raise(stixflash->irq);
+
+    qemu_printf("Connected: %u\n", qemu_irq_is_connected(stixflash->irq));
     return 0;
 }
 
 static void grlib_stixflash_write(void *opaque, hwaddr addr,
                                 uint64_t value, unsigned size)
 {
+    qemu_printf("WRITE: %lu - %lu - %u\n", addr, value, size);
     //trace_grlib_apbuart_readl_unknown(addr);
 }
 
