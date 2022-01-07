@@ -36,6 +36,7 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qom/object.h"
+#include "qemu/qemu-print.h"
 
 #define IRQMP_MAX_CPU 16
 #define IRQMP_REG_SIZE 256      /* Size of memory mapped registers */
@@ -226,6 +227,8 @@ static void grlib_irqmp_write(void *opaque, hwaddr addr,
     assert(irqmp != NULL);
     state = irqmp->state;
     assert(state != NULL);
+
+    //qemu_printf("irwmp_write: state = %u, addr = %lu\n", state->level, addr);
 
     addr &= 0xff;
 

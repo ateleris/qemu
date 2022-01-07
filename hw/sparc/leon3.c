@@ -41,6 +41,7 @@
 #include "trace.h"
 #include "exec/address-spaces.h"
 #include "hw/block/flash.h"
+#include "qemu/qemu-print.h"
 
 #include "hw/sparc/grlib.h"
 #include "hw/misc/grlib_ahb_apb_pnp.h"
@@ -360,11 +361,12 @@ static void leon3_generic_hw_init(MachineState *machine)
     /* Allocate flash */
     dev = qdev_new(TYPE_GRLIB_STIXFLASH);
     //qdev_prop_set_chr(dev, "chrdev", serial_hd(0));
+    //qdev_prop_set_uint32(dev, "irq-line", STIX_FLASH_IRQ);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIX_FLASH_OFFSET);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_FLASH_IRQ]);
     grlib_apb_pnp_add_entry(apb_pnp, STIX_FLASH_OFFSET, 0xFFF,
-                            GRLIB_VENDOR_GAISLER, GRLIB_APBMST_DEV, 1,
+                            GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL, 0,
                             STIX_FLASH_IRQ, GRLIB_APBIO_AREA);
 }
 

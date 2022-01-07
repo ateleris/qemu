@@ -10,3 +10,6 @@ TAGS
 *~
 *.ast_raw
 *.depend_raw
+flash.bin
+.vscode/c_cpp_properties.json
+.vscode/settings.json
