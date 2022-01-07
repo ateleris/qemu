@@ -14,9 +14,19 @@
 #define FLASH_FILE "flash.bin"
 
 /* DEFINES TAKEN FROM FilesystemDefinition.h */
-#define		FLASH_PAGE_DATA_SIZE		4096uLL // bytes
-#define		FLASH_PAGE_HEADER_SIZE		128uLL // bytes
+// all values are taken from the SAMSUNG K9F8G08X0M datasheet // STIX-DD-0814-ESC:
+#define		FLASH_PAGE_DATA_SIZE		4096uLL											// bytes
+#define		FLASH_PAGE_HEADER_SIZE		128uLL											// bytes
 #define		FLASH_PAGE_SIZE				(FLASH_PAGE_DATA_SIZE + FLASH_PAGE_HEADER_SIZE)	// 4'224 bytes
+#define		FLASH_PAGES_PER_BLOCK		64uLL											// quantity
+#define		FLASH_BLOCK_DATA_SIZE		(FLASH_PAGE_DATA_SIZE * FLASH_PAGES_PER_BLOCK)	// 262'144 bytes		= 256 KB
+#define		FLASH_BLOCK_SIZE			(FLASH_PAGE_SIZE * FLASH_PAGES_PER_BLOCK)		// 270'336 bytes		= 264 KB
+#define		FLASH_BLOCKS_PER_DEVICE		4096uLL											// quantity
+#define		FLASH_DEVICE_SIZE			(FLASH_BLOCK_SIZE * FLASH_BLOCKS_PER_DEVICE)	// 1'107'296'256 bytes	= 1'056 MB
+#define		FLASH_DEVICES_PER_MCM		8uLL											// quantity
+#define		FLASH_MCM_SIZE				(FLASH_DEVICE_SIZE * FLASH_DEVICES_PER_MCM)		// 8'858'370'048 bytes	= 8.25 GB
+#define		FLASH_NUM_MCMS				2uLL											// quantity
+#define		FLASH_TOTAL_STORAGE			(FLASH_MCM_SIZE * FLASH_NUM_MCMS)				// 17'716'740'096 bytes	= 16.5 GB	
 
 /* DEFINES TAKEN FROM stixidpu.h */
 #define FTNANDCTRL_PAGEADDRESS_CHIPADDRESS 20
@@ -255,15 +265,18 @@ static void init_and_load_flash_file(STIXFLASH *stixflash)
         memset(stixflash->page_data, 0xFF, FLASH_PAGE_SIZE);
 
         fseek(stixflash->f, 0, SEEK_SET);
-        for (uint32_t i = 0; i < 32 * 1024; i++)
+        for (uint32_t i = 0; i < FLASH_TOTAL_STORAGE / FLASH_PAGE_SIZE; i++)
         {
             fwrite(stixflash->page_data, sizeof(stixflash->page_data[0]), sizeof(stixflash->page_data) / sizeof(stixflash->page_data[0]), stixflash->f);
         }
+
         qemu_printf("file has been created");
+        
         if (0 != fclose(stixflash->f))
         {
             qemu_printf("problem closing file");
         }
+        
         stixflash->f = fopen(FLASH_FILE, "r+b");
     }
 
