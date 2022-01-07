@@ -68,12 +68,24 @@ struct STIXFLASH
     uint32_t memory_bit_type;
 };
 
+/*
+    Generally, a flash command is prepared by a setup step of the control block and executed with START_FLASH_OPERATION.
+    Executing the command will cause THREE WRITE function calls, often followed by ONE OR MANY READ calls (e.g., to check
+    the success or failure of the flash command).
+
+    FLASH RESET, which has command value zero (0), triggers THREE WRITE function calls and then ONE READ function
+    call, in which the status register is checked: if ((FLASH_REGISTERS->cmdSta & (1u << FTNANDCTRL_CMDSTA_BUSY)) == 0)
+
+
+
+*/
+
 static uint64_t grlib_stixflash_read(void *opaque, hwaddr addr,
                                      unsigned size)
 {
     STIXFLASH *stixflash = opaque;
 
-    qemu_printf("Read requested: addr = %lu, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = %u\n",
+    qemu_printf("Read requested: addr = %lu, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
                 addr, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
 
     if (addr == FLASH_CMD_STA_ADDRESS)
@@ -118,20 +130,38 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr,
     }
     else
     {
-        assert(0);
+        assert(false);
     }
 
     // Separating the last write command out on purpose for legibility
     if (addr == FLASH_CMD_STA_ADDRESS)
     {
+        // now we execute the flash command
+        switch (stixflash->command)
+        {
+        case COMMAND_RESET:
+            // with the following register update, we signal that the flash successfully reset
+            stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
+            
+            // make sure we tell the software that the read was good.
+            // NB: it also works without this, but I assume we should set it to ready
+            // let's see if we need it
+            // stixflash->cmd_sta |= (1u << ERROR_CODE_READY);
+            break;
+        
+        default:
+            assert(false);
+        }
+
+
         // make sure we are not busy anymore when we send out the ready read interrupt
-        stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
+        //stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
 
         // make sure we tell the software that the read was good.
-        stixflash->cmd_sta |= (1u << ERROR_CODE_READY);
+        //stixflash->cmd_sta |= (1u << ERROR_CODE_READY);
 
         // qemu_printf("Flash request fully configured\n");
-        qemu_printf("Write completed: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = %u\n",
+        qemu_printf("Write completed: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
                     stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
 
         if (stixflash->command == COMMAND_PAGE_READ)
