@@ -109,6 +109,7 @@ static void execute_flash_read(STIXFLASH *stixflash)
     int32_t ret = 0;
 
     fseek(stixflash->f, 0, SEEK_END);
+
     int64_t length = ftell(stixflash->f);
 
     // TODO: check if page_address is unique or if we do neet to include chip, page and mcm
@@ -120,8 +121,10 @@ static void execute_flash_read(STIXFLASH *stixflash)
     }
 
     fseek(stixflash->f, position_in_file, SEEK_SET);
+
     ret = fread(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
     assert(ret);
+
     fseek(stixflash->f, 0, SEEK_END);
 
     // update the flash register to be not busy anymore
@@ -129,6 +132,34 @@ static void execute_flash_read(STIXFLASH *stixflash)
 
     // the address space of QEMU is NOT FSW; must use wrapper function to translate the address and properly copy the data
     cpu_physical_memory_write(stixflash->ram_address, stixflash->page_data, FLASH_PAGE_SIZE);
+
+    // need to send out an interrupt that we're done
+    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number. 
+}
+
+static void execute_flash_write(STIXFLASH *stixflash)
+{
+    uint32_t ret = 0;
+
+    fseek(stixflash->f, 0, SEEK_END);
+
+    uint32_t length = ftell(stixflash->f);
+    uint32_t position_in_file = stixflash->page_address * FLASH_PAGE_SIZE;
+
+    if(length < (position_in_file + FLASH_PAGE_SIZE + 1)) //TODO: double check
+    {
+        assert(false);
+    }
+
+    fseek(stixflash->f, (position_in_file), SEEK_SET);
+    
+    // the address space of QEMU is NOT FSW; must use wrapper function to translate the address and properly copy the data
+    cpu_physical_memory_read(stixflash->ram_address, stixflash->page_data, FLASH_PAGE_SIZE);
+    
+    ret = fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
+    assert(ret);
+
+    fseek(stixflash->f, 0, SEEK_END);
 
     // need to send out an interrupt that we're done
     qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number. 
@@ -197,7 +228,11 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
         case COMMAND_PAGE_READ:
             execute_flash_read(stixflash);
             break;
-        
+
+        case COMMAND_PAGE_WRITE:
+            execute_flash_write(stixflash);
+            break;
+
         default:
             qemu_printf("UNKNOWN COMMAND %u\n", stixflash->command);
             assert(false);
