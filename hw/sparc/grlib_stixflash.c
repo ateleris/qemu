@@ -58,6 +58,9 @@
 #define FLASH_PAGE_ADDRESS 4
 #define FLASH_RAM_ADDRESS 8
 
+/* DEFINES TAKEN FROM stixIoConstants.h */
+#define FLASH_PAGENUM_IN_BLOCK 64
+
 OBJECT_DECLARE_SIMPLE_TYPE(STIXFLASH, GRLIB_STIXFLASH)
 
 struct STIXFLASH
@@ -104,15 +107,43 @@ static void execute_flash_reset(STIXFLASH *stixflash)
     stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
 }
 
+static void execute_flash_erase(STIXFLASH *stixflash)
+{
+    uint32_t ret = 0;
+    
+    for(uint32_t i = 0; i < FLASH_PAGE_SIZE; i++ )
+    {
+        stixflash->page_data[i] = 0xFF;
+    }
+
+    fseek(stixflash->f, 0, SEEK_END);
+
+    uint32_t length = ftell(stixflash->f);
+
+    // iterate through pages in block
+    for(uint32_t i = 0; i < FLASH_PAGENUM_IN_BLOCK; i++)
+    {
+        uint32_t position_in_file = (i + stixflash->page_address) * FLASH_PAGE_SIZE;
+
+        if(length < (position_in_file + FLASH_PAGE_SIZE + 1)) // TODO: double check
+        {
+            assert(false);
+        }
+
+        fseek(stixflash->f, position_in_file, SEEK_SET);
+        ret = fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
+        assert(ret);
+        fseek(stixflash->f, 0, SEEK_END);
+    }
+}
+
 static void execute_flash_read(STIXFLASH *stixflash)
 {
     int32_t ret = 0;
 
     fseek(stixflash->f, 0, SEEK_END);
 
-    int64_t length = ftell(stixflash->f);
-
-    // TODO: check if page_address is unique or if we do neet to include chip, page and mcm
+    uint32_t length = ftell(stixflash->f);
     uint32_t position_in_file = stixflash->page_address * FLASH_PAGE_SIZE;
 
     if(length < (position_in_file + FLASH_PAGE_SIZE + 1))
@@ -143,7 +174,7 @@ static void execute_flash_write(STIXFLASH *stixflash)
 
     fseek(stixflash->f, 0, SEEK_END);
 
-    uint32_t length = ftell(stixflash->f);
+    uint64_t length = ftell(stixflash->f);
     uint32_t position_in_file = stixflash->page_address * FLASH_PAGE_SIZE;
 
     if(length < (position_in_file + FLASH_PAGE_SIZE + 1)) //TODO: double check
@@ -151,7 +182,7 @@ static void execute_flash_write(STIXFLASH *stixflash)
         assert(false);
     }
 
-    fseek(stixflash->f, (position_in_file), SEEK_SET);
+    fseek(stixflash->f, position_in_file, SEEK_SET);
     
     // the address space of QEMU is NOT FSW; must use wrapper function to translate the address and properly copy the data
     cpu_physical_memory_read(stixflash->ram_address, stixflash->page_data, FLASH_PAGE_SIZE);
@@ -223,6 +254,10 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
         {
         case COMMAND_RESET:
             execute_flash_reset(stixflash);
+            break;
+
+        case COMMAND_BLOCK_ERASE:
+            execute_flash_erase(stixflash);
             break;
         
         case COMMAND_PAGE_READ:
