@@ -14,7 +14,7 @@
 #define FLASH_FILE "flash.bin"
 
 /* DEFINES TAKEN FROM FilesystemDefinition.h */
-// all values are taken from the SAMSUNG K9F8G08X0M datasheet // STIX-DD-0814-ESC:
+// all values are taken from the SAMSUNG K9F8G08X0M datasheet, STIX-DD-0814-ESC
 #define		FLASH_PAGE_DATA_SIZE		4096uLL											// bytes
 #define		FLASH_PAGE_HEADER_SIZE		128uLL											// bytes
 #define		FLASH_PAGE_SIZE				(FLASH_PAGE_DATA_SIZE + FLASH_PAGE_HEADER_SIZE)	// 4'224 bytes
@@ -70,7 +70,7 @@ struct STIXFLASH
     MemoryRegion iomem;
     qemu_irq irq;
 
-    uint32_t ram_address;
+    hwaddr ram_address;
     uint32_t page_address;
     uint32_t cmd_sta;
 
@@ -90,9 +90,6 @@ struct STIXFLASH
 
     FLASH RESET, which has command value zero (0), triggers THREE WRITE function calls and then ONE READ function
     call, in which the status register is checked: if ((FLASH_REGISTERS->cmdSta & (1u << FTNANDCTRL_CMDSTA_BUSY)) == 0)
-
-
-
 */
 
 /*
@@ -105,11 +102,6 @@ static void execute_flash_reset(STIXFLASH *stixflash)
 {
     // with the following register update, we signal that the flash successfully reset
     stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
-    
-    // make sure we tell the software that the read was good.
-    // NB: it also works without this, but I assume we should set it to ready
-    // let's see if we need it
-    // stixflash->cmd_sta |= (1u << ERROR_CODE_READY);
 }
 
 static void execute_flash_read(STIXFLASH *stixflash)
@@ -135,6 +127,9 @@ static void execute_flash_read(STIXFLASH *stixflash)
     // update the flash register to be not busy anymore
     stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
 
+    // the address space of QEMU is NOT FSW; must use wrapper function to translate the address and properly copy the data
+    cpu_physical_memory_write(stixflash->ram_address, stixflash->page_data, FLASH_PAGE_SIZE);
+
     // need to send out an interrupt that we're done
     qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number. 
 }
@@ -144,26 +139,13 @@ static uint64_t grlib_stixflash_read(void *opaque, hwaddr addr, unsigned size)
     STIXFLASH *stixflash = opaque;
 
     qemu_printf("Read requested: addr = %lu, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
-                addr, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
+                addr, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
 
     assert(stixflash->write_counter == 0);
 
-    if (addr == FLASH_CMD_STA_ADDRESS) // this is a read of the flash status register
-    {
-        return stixflash->cmd_sta;
-    }
-    else if (addr == FLASH_PAGE_ADDRESS)
-    {
-        assert(false);
-    }
-    else if (addr == FLASH_RAM_ADDRESS)
-    {
-        assert(false);
-    }
-    else
-    {
-        assert(false);
-    }
+    // it seems read is only used to get the status register
+    assert(addr == 0);
+    return stixflash->cmd_sta;
 }
 
 static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
@@ -226,7 +208,7 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
 
         // qemu_printf("Flash request fully configured\n");
         qemu_printf("Write completed: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
-                    stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
+                    stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
 
         // reset the write counter to 0
         stixflash->write_counter = 0;
@@ -290,16 +272,9 @@ static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
     STIXFLASH *stixflash = GRLIB_STIXFLASH(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
-    /*qemu_chr_fe_set_handlers(&uart->chr,
-                             grlib_apbuart_can_receive,
-                             grlib_apbuart_receive,
-                             grlib_apbuart_event,
-                             NULL, uart, NULL, true);*/
-
     sysbus_init_irq(sbd, &stixflash->irq);
 
-    memory_region_init_io(&stixflash->iomem, OBJECT(stixflash), &grlib_stixflash_ops, stixflash,
-                          "stixflash", STIXFLASH_REG_SIZE);
+    memory_region_init_io(&stixflash->iomem, OBJECT(stixflash), &grlib_stixflash_ops, stixflash, "stixflash", STIXFLASH_REG_SIZE);
 
     sysbus_init_mmio(sbd, &stixflash->iomem);
 
@@ -311,10 +286,6 @@ static void grlib_stixflash_reset(DeviceState *d)
     // STIXFLASH *stixflash = GRLIB_STIXFLASH(d);
 }
 
-/*static Property grlib_stixflash_properties[] = {
-    DEFINE_PROP_UINT32("irq-line",  STIXFLASH, irq_line,  8),
-    DEFINE_PROP_END_OF_LIST(),
-};*/
 
 static void grlib_stixflash_class_init(ObjectClass *klass, void *data)
 {
@@ -322,7 +293,6 @@ static void grlib_stixflash_class_init(ObjectClass *klass, void *data)
 
     dc->realize = grlib_stixflash_realize;
     dc->reset = grlib_stixflash_reset;
-    // device_class_set_props(dc, grlib_stixflash_properties);
 }
 
 static const TypeInfo grlib_stixflash_info = {
