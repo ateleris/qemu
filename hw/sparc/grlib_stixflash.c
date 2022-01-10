@@ -221,6 +221,10 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
     case FLASH_CMD_STA_ADDRESS: // update the status register
         assert(stixflash->write_counter == 2);
         stixflash->cmd_sta = (uint32_t)value;
+
+        // small workaround, this un-bysies the FLASH; should be updated once we want to have the flash busy
+        stixflash->cmd_sta |= (1u << ERROR_CODE_WRPROT);
+
         stixflash->command = (stixflash->cmd_sta >> FTNANDCTRL_CMDSTA_COMMAND) & FTNANDCTRL_CMDSTA_COMMAND_MASK;
         stixflash->mcm = (stixflash->cmd_sta >> FTNANDCTRL_CMDSTA_MCMADDRESS) & FTNANDCTRL_CMDSTA_MCMADDRESS_MASK;
         stixflash->memory_bit_type = (stixflash->cmd_sta >> FTNANDCTRL_CMDSTA_FLASHTYPE) & FTNANDCTRL_CMDSTA_FLASHTYPE_MASK;
@@ -259,7 +263,13 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
             break;
 
         case COMMAND_BLOCK_ERASE:
+            // fake a write protection to the cell we are working on
+            stixflash->cmd_sta &= ~(1u << ERROR_CODE_WRPROT);
+
             execute_flash_erase(stixflash);
+
+            // un-write-protect the cell
+            stixflash->cmd_sta |= (1u << ERROR_CODE_WRPROT);
             break;
         
         case COMMAND_PAGE_READ:
@@ -267,7 +277,13 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
             break;
 
         case COMMAND_PAGE_WRITE:
+            // fake a write protection to the cell we are working on
+            stixflash->cmd_sta &= ~(1u << ERROR_CODE_WRPROT);
+            
             execute_flash_write(stixflash);
+
+            // un-write-protect the cell
+            stixflash->cmd_sta |= (1u << ERROR_CODE_WRPROT);
             break;
 
         default:
@@ -275,8 +291,11 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
             assert(false);
         }
 
-        // make sure we tell the software that the read was good.
+        // make sure we tell the software that the command finished.
         stixflash->cmd_sta |= (1u << ERROR_CODE_READY);
+
+        // ensure we flag no error; could be used to inject errors
+        stixflash->cmd_sta &= ~(1u << ERROR_CODE_FAILED);
 
         // qemu_printf("Flash request fully configured\n");
         qemu_printf("Write completed: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
