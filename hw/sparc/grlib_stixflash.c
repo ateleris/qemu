@@ -135,6 +135,8 @@ static void execute_flash_erase(STIXFLASH *stixflash)
         assert(ret);
         fseek(stixflash->f, 0, SEEK_END);
     }
+
+    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number. 
 }
 
 static void execute_flash_read(STIXFLASH *stixflash)
