@@ -49,4 +49,7 @@ void grlib_irqmp_ack(DeviceState *dev, int intno);
 /* STIX FLASH */
 #define TYPE_GRLIB_STIXFLASH "grlib,stixflash"
 
+/* STIX SPW */
+#define TYPE_GRLIB_STIXSPW "grlib,stixspw"
+
 #endif /* GRLIB_H */

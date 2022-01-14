@@ -50,22 +50,25 @@
 #define CPU_CLK (20 * 1000 * 1000)
 
 #define LEON3_PROM_FILENAME "u-boot.bin"
-#define LEON3_PROM_OFFSET    (0x00000000)
-#define LEON3_RAM_OFFSET     (0x40000000)
+#define LEON3_PROM_OFFSET       (0x00000000)
+#define LEON3_RAM_OFFSET        (0x40000000)
 
 #define MAX_PILS 16
 
-#define LEON3_UART_OFFSET  (0x80000100)
-#define LEON3_UART_IRQ     (2)
+#define LEON3_UART_OFFSET       (0x80000100)
+#define LEON3_UART_IRQ          (2)
 
-#define STIX_FLASH_OFFSET  (0x80000800)
-#define STIX_FLASH_IRQ     (1)
+#define STIX_FLASH_OFFSET       (0x80000800)
+#define STIX_FLASH_IRQ          (1)
 
-#define LEON3_IRQMP_OFFSET (0x80000200)
+#define STIX_SPW_OFFSET         (0x80000A00)
+#define STIX_SPW_IRQ            (13)
 
-#define LEON3_TIMER_OFFSET (0x80000300)
-#define LEON3_TIMER_IRQ    (10)
-#define LEON3_TIMER_COUNT  (2)
+#define LEON3_IRQMP_OFFSET      (0x80000200)
+
+#define LEON3_TIMER_OFFSET      (0x80000300)
+#define LEON3_TIMER_IRQ         (10)
+#define LEON3_TIMER_COUNT       (2)
 
 #define LEON3_APB_PNP_OFFSET (0x800FF000)
 #define LEON3_AHB_PNP_OFFSET (0xFFFFF000)
@@ -360,14 +363,21 @@ static void leon3_generic_hw_init(MachineState *machine)
 
     /* Allocate flash */
     dev = qdev_new(TYPE_GRLIB_STIXFLASH);
-    //qdev_prop_set_chr(dev, "chrdev", serial_hd(0));
-    //qdev_prop_set_uint32(dev, "irq-line", STIX_FLASH_IRQ);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIX_FLASH_OFFSET);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_FLASH_IRQ]);
     grlib_apb_pnp_add_entry(apb_pnp, STIX_FLASH_OFFSET, 0xFFF,
                             GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL, 0,
                             STIX_FLASH_IRQ, GRLIB_APBIO_AREA);
+
+    /* Allocate SpW */
+    dev = qdev_new(TYPE_GRLIB_STIXSPW);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIX_SPW_OFFSET);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_SPW_IRQ]);
+    grlib_apb_pnp_add_entry(apb_pnp, STIX_SPW_OFFSET, 0xFFF,
+                            GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL, 0,
+                            STIX_SPW_IRQ, GRLIB_APBIO_AREA);
 }
 
 static void leon3_generic_machine_init(MachineClass *mc)

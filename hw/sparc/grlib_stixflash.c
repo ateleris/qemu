@@ -6,6 +6,7 @@
 #include "qemu/module.h"
 #include "chardev/char-fe.h"
 #include "qemu/qemu-print.h"
+#include "StixIdpu.h"
 
 #include "trace.h"
 #include "qom/object.h"
@@ -29,7 +30,7 @@
 #define		FLASH_TOTAL_STORAGE			(FLASH_MCM_SIZE * FLASH_NUM_MCMS)				// 17'716'740'096 bytes	= 16.5 GB	
 
 /* DEFINES TAKEN FROM stixidpu.h */
-#define FTNANDCTRL_PAGEADDRESS_CHIPADDRESS 20
+/*#define FTNANDCTRL_PAGEADDRESS_CHIPADDRESS 20
 #define FTNANDCTRL_PAGEADDRESS_CHIPADDRESS_MASK 0x7
 #define FTNANDCTRL_PAGEADDRESS_PAGEADDRESS 0
 #define FTNANDCTRL_PAGEADDRESS_PAGEADDRESS_MASK 0x3FFFF
@@ -40,7 +41,7 @@
 #define FTNANDCTRL_CMDSTA_FLASHTYPE 7
 #define FTNANDCTRL_CMDSTA_FLASHTYPE_MASK 0x1
 #define FTNANDCTRL_CMDSTA_BUSY 4
-#define FTNANDCTRL_CMDSTA_STATUS 24
+#define FTNANDCTRL_CMDSTA_STATUS 24*/
 
 /* DEFINES TAKEN FROM flash.c */
 #define COMMAND_RESET 0
@@ -202,8 +203,10 @@ static uint64_t grlib_stixflash_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXFLASH *stixflash = opaque;
 
-    qemu_printf("Read requested: addr = %lu, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
+    /*
+    qemu_printf("FLASH | Read requested: addr = %lu, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
                 addr, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
+    */
 
     assert(stixflash->write_counter == 0);
 
@@ -287,7 +290,7 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
             break;
 
         default:
-            qemu_printf("UNKNOWN COMMAND %u\n", stixflash->command);
+            qemu_printf("FLASH | UNKNOWN COMMAND %u\n", stixflash->command);
             assert(false);
         }
 
@@ -297,10 +300,11 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
         // ensure we flag no error; could be used to inject errors
         stixflash->cmd_sta &= ~(1u << ERROR_CODE_FAILED);
 
-        // qemu_printf("Flash request fully configured\n");
-        qemu_printf("Write completed: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
+        /*
+        qemu_printf("FLASH | Write completed: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
                     stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
-
+        */
+        
         // reset the write counter to 0
         stixflash->write_counter = 0;
     }
