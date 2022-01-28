@@ -13,7 +13,49 @@
 
 #define STIXSPW_REG_SIZE 256 /* Size of memory mapped registers */ // TODO: Set to right size
 
+/* Taken from SPW.c */
+#define RXDSC_TR 31       /**< (R) Truncated - Packet was truncated due to maximum length violation */
+#define RXDSC_DC 30       /**< (R) Data CRC - 1 if a CRC error was detected for the data. */
+#define RXDSC_HC 29       /**< (R) Header CRC - 1 if a CRC error was detected for the header */
+#define RXDSC_EP 28       /**< (R) EEP termination - This packet ended with an Error End of Packet character */
+#define RXDSC_IE 27       /**< Interrupt enable - If set, an interrupt will be generated when \
+                             a packet has been received if the receive interrupt enable bit   \
+                             in the DMA channel control register is set. */
+#define RXDSC_WR 26       /**< Wrap */
+#define RXDSC_EN 25       /**< Enable - Set to one to activate this descriptor. \
+                             Cleared by GRSPW on read completed. */
+#define RXDSC_PACKETLEN 0 /**< (R) 25 bits field */
+
+#define TXDSC_DC 17       /**< Append data CRC, don't use */
+#define TXDSC_HC 16       /**< Append header CRC, don't use */
+#define TXDSC_LE 15       /**< (R)A Link error occurred during the transmission of this packet. */
+#define TXDSC_IE 14       /**< Interrupt enable - If set, an interrupt will be generated when the packet \
+                             has been transmitted and the transmitter interrupt enable bit in            \
+                             the DMA control register is set. */
+#define TXDSC_WR 13       /**< Wrap */
+#define TXDSC_EN 12       /**< Enable transmit descriptor. \
+                             The GRSPW clears this bit when the transmission has finished. */
+#define TXDSC_NONCRCLEN 8 /**< 4 bits field = 0*/
+#define TXDSC_HEADERLEN 0 /**< 8 bits field = 0*/
+
 OBJECT_DECLARE_SIMPLE_TYPE(STIXSPW, GRLIB_STIXSPW)
+
+typedef struct
+{
+    volatile uint32_t ctrl;
+    volatile uint32_t haddr;
+    volatile uint32_t dlen;
+    volatile uint32_t daddr;
+
+} spwTXdsc_s;
+
+/** Definition of receive descriptor */
+typedef struct
+{
+    volatile uint32_t ctrl;
+    volatile uint32_t daddr;
+
+} spwRXdsc_s;
 
 struct STIXSPW
 {
@@ -25,14 +67,16 @@ struct STIXSPW
     qemu_irq irq;
 };
 
+static uint8_t buffer[8192];
+
 static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXSPW *stixspw = opaque;
 
-    uint32_t regval = *((uint32_t *)(&stixspw->reg + (uint32_t)addr));
+    uint32_t regval = ((uint8_t *)&stixspw->reg)[(uint32_t)addr];
 
     qemu_printf("SPW | Read requested: addr = %lu, regval = 0x%x\n", //, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
-                addr, regval); //, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
+                addr, regval);                                       //, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
 
     return regval;
 }
@@ -41,10 +85,97 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
 {
     STIXSPW *stixspw = opaque;
 
-    *((uint32_t *)(&stixspw->reg + (uint32_t)addr)) = (uint32_t)value;
-    
-    qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, (uint32_t)value);//: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
-        //stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
+    // update the register as per write request
+    ((uint8_t *)&stixspw->reg)[(uint32_t)addr] = (uint32_t)value;
+
+    qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, *((uint32_t *)(&stixspw->reg + (uint32_t)addr)));
+    qemu_printf("dma control %u\n", stixspw->reg.dmaControl);
+
+    // set the default link to a connected state
+    stixspw->reg.status = 0xA00000;
+
+    // clear the reset flag
+    stixspw->reg.control &= ~(1 << STIXSPW_CONTROL_RS);
+
+    // clear the DMA control register
+    if (stixspw->reg.dmaControl != 0)
+    {
+        qemu_printf("DMA control not zero\n");
+        // is transmit enabled?
+        if (stixspw->reg.dmaControl & (1 << STIXSPW_DMACONTROL_TE))
+        {
+            spwTXdsc_s txdsc;
+
+            // read TX descriptor from sparc
+            cpu_physical_memory_read(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
+
+            if (txdsc.dlen < sizeof(buffer))
+            {
+                cpu_physical_memory_read(txdsc.daddr, buffer, txdsc.dlen);
+
+                // TODO Check if needed
+                // swap buffer dwords
+                int ix;
+                uint32_t *buffer32 = (uint32_t *)buffer;
+                for (ix = 0; ix < txdsc.dlen / 4 + txdsc.dlen % 4; ix++)
+                {
+                    buffer32[ix] = bswap32(buffer32[ix]);
+                }
+
+                // sendPacket(buffer, txdsc.dlen);
+
+                qemu_printf("Send packet len: %d\n", txdsc.dlen);
+            }
+            else
+            {
+                qemu_printf("error: buffer overwflow\n");
+            }
+
+            // clear desc enabled flag
+            txdsc.ctrl &= ~(1 << TXDSC_EN);
+
+            // write TX decriptor to stix
+            cpu_physical_memory_write(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
+
+            // generate interrupt
+            qemu_irq_pulse(stixspw->irq);
+        }
+
+        // clear DMA control register
+        stixspw->reg.dmaControl = 0;
+    }
+
+    /*
+        switch (addr)
+        {
+        case 0: // control
+            if(value & (1 << STIXSPW_CONTROL_RS)) // request reset
+            {
+                // reset to zero to indicate correct reset, could also be faked to take a while if need be by letting it repeat a few times
+                *((uint32_t *)(&stixspw->reg + (uint32_t)addr)) &= ~(1 << STIXSPW_CONTROL_RS);
+            }
+            break;
+        case 8: // nodeAddress
+            // noop
+            break;
+        case 12: // clockDivisor
+            // noop
+            break;
+        case 24: // timerDisc
+            // noop
+            break;
+        case 32: // dmaControl
+            break;
+        case 36: // dmaMaxRxLength
+            // noop
+            break;
+        default:
+            qemu_printf("SPW | ADDRESS UNKNOWN = %lu\n", addr);
+            assert(0);
+        }*/
+
+    //qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, (uint32_t)value); //: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
+                                                                                                 // stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
 }
 
 static const MemoryRegionOps grlib_stixspw_ops = {
@@ -67,13 +198,16 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&STIXSPW->iomem, OBJECT(STIXSPW), &grlib_stixspw_ops, STIXSPW, "STIXSPW", STIXSPW_REG_SIZE);
 
     sysbus_init_mmio(sbd, &STIXSPW->iomem);
+
+    // set link to up from the start
+    // I know, it's a little cheating
+    STIXSPW->reg.status = 0xA00000;
 }
 
 static void grlib_stixspw_reset(DeviceState *d)
 {
     // STIXSPW *STIXSPW = grlib_stixspw(d);
 }
-
 
 static void grlib_stixspw_class_init(ObjectClass *klass, void *data)
 {
