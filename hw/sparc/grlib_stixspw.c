@@ -73,7 +73,7 @@ static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXSPW *stixspw = opaque;
 
-    uint32_t regval = ((uint8_t *)&stixspw->reg)[(uint32_t)addr];
+    uint32_t regval = ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr/sizeof(uint32_t)];
 
     qemu_printf("SPW | Read requested: addr = %lu, regval = 0x%x\n", //, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
                 addr, regval);                                       //, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
@@ -86,12 +86,12 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
     STIXSPW *stixspw = opaque;
 
     // update the register as per write request
-    ((uint8_t *)&stixspw->reg)[(uint32_t)addr] = (uint32_t)value;
+    ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr/sizeof(uint32_t)] = (uint32_t)value;
 
-    qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, *((uint32_t *)(&stixspw->reg + (uint32_t)addr)));
+    qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr/sizeof(uint32_t)]);
     qemu_printf("dma control %u\n", stixspw->reg.dmaControl);
 
-    // set the default link to a connected state
+    // shortcut for link running as per E_SPW_LINK_STATUS_RUN
     stixspw->reg.status = 0xA00000;
 
     // clear the reset flag
@@ -201,6 +201,7 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
 
     // set link to up from the start
     // I know, it's a little cheating
+    // shortcut for link running as per E_SPW_LINK_STATUS_RUN
     STIXSPW->reg.status = 0xA00000;
 }
 
