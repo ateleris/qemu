@@ -106,7 +106,6 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
         if (stixspw->reg.dmaControl & (1 << STIXSPW_DMACONTROL_TE))
         {
             spwTXdsc_s txdsc;
-            //uint32_t val[4];
 
             // read TX descriptor from STIX
             qemu_printf("stixspw->reg.dmaTxDescAddr = 0x%x\n", stixspw->reg.dmaTxDescAddr);
@@ -114,6 +113,7 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
             // endianness is incorrect for use in qemu; there may be a better way with address_space_read, but it's not working at the moment.
             // using a small workaround           
             cpu_physical_memory_read(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
+
             txdsc.ctrl = bswap32(txdsc.ctrl);
             txdsc.daddr = bswap32(txdsc.daddr);
             txdsc.dlen = bswap32(txdsc.dlen);
@@ -144,6 +144,12 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
 
             // clear desc enabled flag
             txdsc.ctrl &= ~(1 << TXDSC_EN);
+
+            // before using the exchange variable, correct for endienness
+            txdsc.ctrl = bswap32(txdsc.ctrl);
+            txdsc.daddr = bswap32(txdsc.daddr);
+            txdsc.dlen = bswap32(txdsc.dlen);
+            txdsc.haddr = bswap32(txdsc.haddr);
 
             // write TX decriptor to STIX
             cpu_physical_memory_write(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
