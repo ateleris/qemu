@@ -97,11 +97,14 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
     // clear the reset flag
     stixspw->reg.control &= ~(1 << STIXSPW_CONTROL_RS);
 
+    // used later e.g., to signal transmit OK
+    uint32_t dma_control_modifier_mask = 0;
+
     // clear the DMA control register
     if (stixspw->reg.dmaControl != 0)
     {
         qemu_printf("STIX SPW: Data exchange requested\n");
-        
+
         // is transmit enabled?
         if (stixspw->reg.dmaControl & (1 << STIXSPW_DMACONTROL_TE))
         {
@@ -154,12 +157,14 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
             // write TX decriptor to STIX
             cpu_physical_memory_write(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
 
+            dma_control_modifier_mask = (1 << STIXSPW_DMACONTROL_PS);
+
             // generate interrupt
             qemu_irq_pulse(stixspw->irq);
         }
 
         // clear DMA control register
-        stixspw->reg.dmaControl = 0;
+        stixspw->reg.dmaControl = dma_control_modifier_mask;
     }
 
     /*
