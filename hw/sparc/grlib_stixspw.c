@@ -71,91 +71,93 @@ struct STIXSPW
 static uint8_t buffer[8192];
 
 /**  Passes TC received by the TCP server to TSIM through memory read, signalized with IRQ */
-static void recv_packet_callback(uint8_t *data, int length)
+static void recv_packet_callback(uint8_t *data, int length, void *opaque)
 {
     qemu_printf("recv_packet_callback\n");
-  /*int ix;
-  spwRXdsc_s rxdsc;
-  uint32_t rxdsc_addr = spwRegs.dmaRxDescAddr + (sizeof(spwRXdsc_s) * rxIndex);
 
-  // Skip header
-  data += 8;
-  length -= 8;
+    /*STIXSPW *stixspw = opaque;
 
-  if (length <= 0)
-  {
-     fprintf(stderr, "%s: Not valid packet received\n", __FUNCTION__);
-     return;
-  }
+    int ix;
+    spwRXdsc_s rxdsc;
+    uint32_t rxdsc_addr = stixspw->reg.dmaRxDescAddr + (sizeof(spwRXdsc_s) * rxIndex);
 
-  if (length == 4 && data[0] == ((SPW_ESC_CHAR << 2) & SPW_TIME_CODE_PARITY_AND_CONTROL))
-  {
-    //
-    // Receive timecode
-    //  
-    spwRegs.time = swap32(*(uint32_t *)data) & SPW_TIME_CODE_TIME_MASK;
-    spwRegs.status |= (1 << STIXSPW_STATUS_TO);
-    PRINTF("RX timecode: %d  datalen: %d\n", spwRegs.time, length);
-  }
-  else
-  {
-    //
-    // Receive data
-    //   
+    // Skip header
+    data += 8;
+    length -= 8;
 
-    // Swap received dwords
-    uint32_t *data32 = (uint32_t *)data;
-    for (ix = 0; ix < length / 4 + length % 4; ix++)
+    if (length <= 0)
     {
-      data32[ix] = swap32(data32[ix]);
+        qemu_printf(stderr, "%s: Not valid packet received\n");
+        return;
     }
 
-    // Read RX descriptor   
-    tsim_read_cpu_mem(rxdsc_addr , &rxdsc, sizeof(rxdsc)); 
-
-    if (length > spwRegs.dmaMaxRxLength)
+    if (length == 4 && data[0] == ((SPW_ESC_CHAR << 2) & SPW_TIME_CODE_PARITY_AND_CONTROL))
     {
-       // Received packet was truncated 
-       length = 0;
-       rxdsc.ctrl |= RXDSC_TR;
-    }
-
-    PRINTF("Recv packet[%d] len: %d   rxdsc_addr: 0x%X   ctrl: 0x%X\n", rxIndex, length, rxdsc_addr,  rxdsc.ctrl);
-
-    // Write received data to RX buffer
-    tsim_write_cpu_mem(rxdsc.daddr, data, length);
-
-    // Increment RX index 
-    if (rxdsc.ctrl & (1 << RXDSC_WR))
-    {
-       rxIndex = 0;
+        //
+        // Receive timecode
+        //
+        stixspw->reg.time = swap32(*(uint32_t *)data) & SPW_TIME_CODE_TIME_MASK;
+        stixspw->reg.status |= (1 << STIXSPW_STATUS_TO);
+        qemu_printf("RX timecode: %d  datalen: %d\n", stixspw->reg.time, length);
     }
     else
     {
-      rxIndex++;
+        //
+        // Receive data
+        //
+
+        // Swap received dwords
+        uint32_t *data32 = (uint32_t *)data;
+        for (ix = 0; ix < length / 4 + length % 4; ix++)
+        {
+            data32[ix] = swap32(data32[ix]);
+        }
+
+        // Read RX descriptor
+        tsim_read_cpu_mem(rxdsc_addr, &rxdsc, sizeof(rxdsc));
+
+        if (length > stixspw->reg.dmaMaxRxLength)
+        {
+            // Received packet was truncated
+            length = 0;
+            rxdsc.ctrl |= RXDSC_TR;
+        }
+
+        qemu_printf("Recv packet[%d] len: %d   rxdsc_addr: 0x%X   ctrl: 0x%X\n", rxIndex, length, rxdsc_addr, rxdsc.ctrl);
+
+        // Write received data to RX buffer
+        tsim_write_cpu_mem(rxdsc.daddr, data, length);
+
+        // Increment RX index
+        if (rxdsc.ctrl & (1 << RXDSC_WR))
+        {
+            rxIndex = 0;
+        }
+        else
+        {
+            rxIndex++;
+        }
+
+        // Save received packet length to control register
+        rxdsc.ctrl |= length < 8 ? 8 : length & 0x1FFFFFF; // lenght must be >= 8
+        rxdsc.ctrl &= ~(1 << RXDSC_EN);
+
+        // Write RX descriptor
+        tsim_write_cpu_mem(rxdsc_addr, &rxdsc, sizeof(rxdsc));
+
+        // Set received packet flag
+        stixspw->reg.dmaControl |= (1 << STIXSPW_DMACONTROL_PR);
     }
 
-    // Save received packet length to control register
-    rxdsc.ctrl |= length < 8 ? 8 : length & 0x1FFFFFF;   // lenght must be >= 8
-    rxdsc.ctrl &= ~(1 << RXDSC_EN);
-
-    // Write RX descriptor
-    tsim_write_cpu_mem(rxdsc_addr, &rxdsc, sizeof(rxdsc));
-
-    // Set received packet flag
-    spwRegs.dmaControl |= (1 << STIXSPW_DMACONTROL_PR);
-
-  }
-
-  // Generate IRQ
-  ioif.set_irq(IRQ_SPW0_IOM, 0);*/
+    // generate interrupt
+    qemu_irq_pulse(stixspw->irq);*/
 }
 
 static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXSPW *stixspw = opaque;
 
-    uint32_t regval = ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr/sizeof(uint32_t)];
+    uint32_t regval = ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
     qemu_printf("SPW | Read requested: addr = %lu, regval = 0x%x\n", //, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
                 addr, regval);                                       //, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
@@ -168,9 +170,9 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
     STIXSPW *stixspw = opaque;
 
     // update the register as per write request
-    ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr/sizeof(uint32_t)] = (uint32_t)value;
+    ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;
 
-    qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr/sizeof(uint32_t)]);
+    qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)]);
     qemu_printf("dma control %u\n", stixspw->reg.dmaControl);
 
     // shortcut for link running as per E_SPW_LINK_STATUS_RUN
@@ -196,7 +198,7 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
             qemu_printf("stixspw->reg.dmaTxDescAddr = 0x%x\n", stixspw->reg.dmaTxDescAddr);
 
             // endianness is incorrect for use in qemu; there may be a better way with address_space_read, but it's not working at the moment.
-            // using a small workaround           
+            // using a small workaround
             cpu_physical_memory_read(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
 
             txdsc.ctrl = bswap32(txdsc.ctrl);
@@ -216,7 +218,7 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
                 qemu_printf("\n\n\nUse %u bytes\n\n", txdsc.dlen);
                 for (uint32_t ix = 0; ix < txdsc.dlen / 4 + ((txdsc.dlen % 4) ? 1 : 0); ix++)
                 {
-                    //buffer32[ix] = bswap32(buffer32[ix]);
+                    // buffer32[ix] = bswap32(buffer32[ix]);
                     qemu_printf("%08x ", bswap32(buffer32[ix]));
                 }
                 qemu_printf("\n\n\n");
@@ -251,38 +253,6 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
         // clear DMA control register
         stixspw->reg.dmaControl = dma_control_modifier_mask;
     }
-
-    /*
-        switch (addr)
-        {
-        case 0: // control
-            if(value & (1 << STIXSPW_CONTROL_RS)) // request reset
-            {
-                // reset to zero to indicate correct reset, could also be faked to take a while if need be by letting it repeat a few times
-                *((uint32_t *)(&stixspw->reg + (uint32_t)addr)) &= ~(1 << STIXSPW_CONTROL_RS);
-            }
-            break;
-        case 8: // nodeAddress
-            // noop
-            break;
-        case 12: // clockDivisor
-            // noop
-            break;
-        case 24: // timerDisc
-            // noop
-            break;
-        case 32: // dmaControl
-            break;
-        case 36: // dmaMaxRxLength
-            // noop
-            break;
-        default:
-            qemu_printf("SPW | ADDRESS UNKNOWN = %lu\n", addr);
-            assert(0);
-        }*/
-
-    //qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, (uint32_t)value); //: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
-                                                                                                 // stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
 }
 
 static const MemoryRegionOps grlib_stixspw_ops = {
@@ -311,7 +281,7 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     // shortcut for link running as per E_SPW_LINK_STATUS_RUN
     STIXSPW->reg.status = 0xA00000;
 
-    init_tmtc_server(recv_packet_callback);
+    init_tmtc_server(recv_packet_callback, STIXSPW);
 }
 
 static void grlib_stixspw_reset(DeviceState *d)

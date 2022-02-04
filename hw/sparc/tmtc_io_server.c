@@ -45,7 +45,8 @@ typedef uint32_t SOCKET;
 
 #define IO_TCP_SERVER_HANDSHAKE_TOKEN_SIZE 12
 
-void (*receivedTcCallback)(unsigned char *data, int length);
+void (*receivedTcCallback)(unsigned char *data, int length, void *opaque);
+void *stixspw;
 int clientHandshaked = 0;
 const char handshakeToken[] = "STIX_CONTROL";
 SOCKET listeningSocket;
@@ -79,7 +80,7 @@ static void *tcHandler(void *arg)
       nReadBytes = recv(sd, acReadBuffer, IO_TCP_SERVER_INPUT_BUFFER_SIZE, 0);
       if (nReadBytes > 0)
       {
-        receivedTcCallback(acReadBuffer, nReadBytes);
+        receivedTcCallback(acReadBuffer, nReadBytes, stixspw);
       }
       else if (nReadBytes == SOCKET_ERROR)
       {
@@ -140,9 +141,10 @@ int send_tm_packet(unsigned char *data, int data_length)
  *  Creates and connects socket to localhost address and REMOTE_PORT port.
  *  Through this socket, this io module will receive external TC data.
  */
-void init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int))
+void init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void *), void *opaque)
 {
   receivedTcCallback = in_tc_received_callback;
+  stixspw = opaque;
   int nCode = 0;
   int port;
   pthread_t tid;
