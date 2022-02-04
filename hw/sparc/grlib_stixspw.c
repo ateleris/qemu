@@ -7,6 +7,7 @@
 #include "chardev/char-fe.h"
 #include "qemu/qemu-print.h"
 #include "StixIdpu.h"
+#include "tmtc_io_server.h"
 
 #include "trace.h"
 #include "qom/object.h"
@@ -69,6 +70,87 @@ struct STIXSPW
 
 static uint8_t buffer[8192];
 
+/**  Passes TC received by the TCP server to TSIM through memory read, signalized with IRQ */
+static void recv_packet_callback(uint8_t *data, int length)
+{
+    qemu_printf("recv_packet_callback\n");
+  /*int ix;
+  spwRXdsc_s rxdsc;
+  uint32_t rxdsc_addr = spwRegs.dmaRxDescAddr + (sizeof(spwRXdsc_s) * rxIndex);
+
+  // Skip header
+  data += 8;
+  length -= 8;
+
+  if (length <= 0)
+  {
+     fprintf(stderr, "%s: Not valid packet received\n", __FUNCTION__);
+     return;
+  }
+
+  if (length == 4 && data[0] == ((SPW_ESC_CHAR << 2) & SPW_TIME_CODE_PARITY_AND_CONTROL))
+  {
+    //
+    // Receive timecode
+    //  
+    spwRegs.time = swap32(*(uint32_t *)data) & SPW_TIME_CODE_TIME_MASK;
+    spwRegs.status |= (1 << STIXSPW_STATUS_TO);
+    PRINTF("RX timecode: %d  datalen: %d\n", spwRegs.time, length);
+  }
+  else
+  {
+    //
+    // Receive data
+    //   
+
+    // Swap received dwords
+    uint32_t *data32 = (uint32_t *)data;
+    for (ix = 0; ix < length / 4 + length % 4; ix++)
+    {
+      data32[ix] = swap32(data32[ix]);
+    }
+
+    // Read RX descriptor   
+    tsim_read_cpu_mem(rxdsc_addr , &rxdsc, sizeof(rxdsc)); 
+
+    if (length > spwRegs.dmaMaxRxLength)
+    {
+       // Received packet was truncated 
+       length = 0;
+       rxdsc.ctrl |= RXDSC_TR;
+    }
+
+    PRINTF("Recv packet[%d] len: %d   rxdsc_addr: 0x%X   ctrl: 0x%X\n", rxIndex, length, rxdsc_addr,  rxdsc.ctrl);
+
+    // Write received data to RX buffer
+    tsim_write_cpu_mem(rxdsc.daddr, data, length);
+
+    // Increment RX index 
+    if (rxdsc.ctrl & (1 << RXDSC_WR))
+    {
+       rxIndex = 0;
+    }
+    else
+    {
+      rxIndex++;
+    }
+
+    // Save received packet length to control register
+    rxdsc.ctrl |= length < 8 ? 8 : length & 0x1FFFFFF;   // lenght must be >= 8
+    rxdsc.ctrl &= ~(1 << RXDSC_EN);
+
+    // Write RX descriptor
+    tsim_write_cpu_mem(rxdsc_addr, &rxdsc, sizeof(rxdsc));
+
+    // Set received packet flag
+    spwRegs.dmaControl |= (1 << STIXSPW_DMACONTROL_PR);
+
+  }
+
+  // Generate IRQ
+  ioif.set_irq(IRQ_SPW0_IOM, 0);*/
+}
+
 static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXSPW *stixspw = opaque;
@@ -126,17 +208,20 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
 
             if (txdsc.dlen < sizeof(buffer))
             {
+                memset(buffer, 0xFF, sizeof(buffer));
                 cpu_physical_memory_read(txdsc.daddr, buffer, txdsc.dlen);
 
                 // swap buffer dwords to fix endianness
-                int ix;
                 uint32_t *buffer32 = (uint32_t *)buffer;
-                for (ix = 0; ix < txdsc.dlen / 4 + txdsc.dlen % 4; ix++)
+                qemu_printf("\n\n\nUse %u bytes\n\n", txdsc.dlen);
+                for (uint32_t ix = 0; ix < txdsc.dlen / 4 + ((txdsc.dlen % 4) ? 1 : 0); ix++)
                 {
-                    buffer32[ix] = bswap32(buffer32[ix]);
+                    //buffer32[ix] = bswap32(buffer32[ix]);
+                    qemu_printf("%08x ", bswap32(buffer32[ix]));
                 }
+                qemu_printf("\n\n\n");
 
-                // sendPacket(buffer, txdsc.dlen);
+                send_tm_packet(buffer, txdsc.dlen);
 
                 qemu_printf("Send packet len: %d\n", txdsc.dlen);
             }
@@ -225,6 +310,8 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     // I know, it's a little cheating
     // shortcut for link running as per E_SPW_LINK_STATUS_RUN
     STIXSPW->reg.status = 0xA00000;
+
+    init_tmtc_server(recv_packet_callback);
 }
 
 static void grlib_stixspw_reset(DeviceState *d)
