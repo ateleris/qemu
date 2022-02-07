@@ -52,4 +52,10 @@ void grlib_irqmp_ack(DeviceState *dev, int intno);
 /* STIX SPW */
 #define TYPE_GRLIB_STIXSPW "grlib,stixspw"
 
+/* STIX WD */
+#define TYPE_GRLIB_STIXWD "grlib,stixwd"
+
+/* STIX CTRL */
+#define TYPE_GRLIB_STIXCTRL "grlib,stixctrl"
+
 #endif /* GRLIB_H */

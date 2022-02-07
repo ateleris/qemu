@@ -45,29 +45,37 @@
 
 #include "hw/sparc/grlib.h"
 #include "hw/misc/grlib_ahb_apb_pnp.h"
+#include "StixIdpu.h"
 
 /* Default system clock.  */
 #define CPU_CLK (20 * 1000 * 1000)
 
-#define LEON3_PROM_FILENAME "u-boot.bin"
+#define LEON3_PROM_FILENAME     "u-boot.bin"
 #define LEON3_PROM_OFFSET       (0x00000000)
 #define LEON3_RAM_OFFSET        (0x40000000)
 
 #define MAX_PILS 16
 
-#define LEON3_UART_OFFSET       (0x80000100)
-#define LEON3_UART_IRQ          (2)
+#define LEON3_UART_OFFSET       (UART_APB_BASE)
+#define LEON3_UART_IRQ          (IRQ_UART)
 
-#define STIX_FLASH_OFFSET       (0x80000800)
-#define STIX_FLASH_IRQ          (1)
+#define STIX_CTRL_OFFSET            (STIXCTRL_APB_BASE)
+#define STIX_CTRL_DETECTRORS_IRQ    (IRQ_STIXCTRL_DETCTRL)
+#define STIX_CTRL_HK_IRQ            (IRQ_STIXCTRL_HK)
+#define STIX_CTRL_OTHER_IRQ         (IRQ_STIXCTRL_OTHERISON)
+#define STIX_CTRL_EDAC_IRQ          (IRQ_STIXCTRL_EDAC)
+#define STIX_CTRL_ROTB_IRQ          (IRQ_STIXCTRL_ROTB)
 
-#define STIX_SPW_OFFSET         (0x80000A00)
-#define STIX_SPW_IRQ            (13)
+#define STIX_FLASH_OFFSET       (FLASH_APB_BASE)
+#define STIX_FLASH_IRQ          (IRQ_FLASH)
 
-#define LEON3_IRQMP_OFFSET      (0x80000200)
+#define STIX_SPW_OFFSET         (SPW_APB_BASE)
+#define STIX_SPW_IRQ            (IRQ_SPW)
 
-#define LEON3_TIMER_OFFSET      (0x80000300)
-#define LEON3_TIMER_IRQ         (10)
+#define LEON3_IRQMP_OFFSET      (IRQCTRL_APB_BASE)
+
+#define LEON3_TIMER_OFFSET      (TIMER_APB_BASE)
+#define LEON3_TIMER_IRQ         (IRQ_TIMER_TIMER0)
 #define LEON3_TIMER_COUNT       (2)
 
 #define LEON3_APB_PNP_OFFSET (0x800FF000)
@@ -360,6 +368,28 @@ static void leon3_generic_hw_init(MachineState *machine)
     grlib_apb_pnp_add_entry(apb_pnp, LEON3_UART_OFFSET, 0xFFF,
                             GRLIB_VENDOR_GAISLER, GRLIB_APBUART_DEV, 1,
                             LEON3_UART_IRQ, GRLIB_APBIO_AREA);
+
+    /* Allocate WD */
+    /*dev = qdev_new(TYPE_GRLIB_STIXWD);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIX_WD_OFFSET);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_WD_IRQ]);
+    grlib_apb_pnp_add_entry(apb_pnp, STIX_WD_OFFSET, 0xFFF,
+                            GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL, 0,
+                            STIX_WD_IRQ, GRLIB_APBIO_AREA);*/
+
+    /* Allocate ctrl */
+    dev = qdev_new(TYPE_GRLIB_STIXCTRL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIX_CTRL_OFFSET);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_CTRL_DETECTRORS_IRQ]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_CTRL_HK_IRQ]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_CTRL_OTHER_IRQ]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_CTRL_EDAC_IRQ]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irqs[STIX_CTRL_ROTB_IRQ]);
+    grlib_apb_pnp_add_entry(apb_pnp, STIX_CTRL_OFFSET, 0xFFF,
+                            GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL, 0,
+                            STIX_CTRL_DETECTRORS_IRQ, GRLIB_APBIO_AREA);
 
     /* Allocate flash */
     dev = qdev_new(TYPE_GRLIB_STIXFLASH);
