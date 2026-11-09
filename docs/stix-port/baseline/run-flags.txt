@@ -1,0 +1,7 @@
+qemu-binary: /tmp/qemu-stix-baseline/build/sparc-softmmu/qemu-system-sparc
+asw-elf: /mnt/c/Users/laszl/Development/stix_asw_src/ASW/ASW/bin/ASW_em.elf
+machine-args: -M leon3_generic -m 64M -no-reboot -display none -monitor none -serial file:<uart>
+icount: none (see header note in capture-golden.sh)
+duration-seconds: 90
+tmtc-port: 21000 (IO_TCP_SERVER_BASE_PORT + getuid)
+flash-bin: /tmp/stix-baseline-run/flash.bin (16.5 GB, persistent, never delete)
