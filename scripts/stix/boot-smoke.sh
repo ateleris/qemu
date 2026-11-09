@@ -63,3 +63,24 @@ else
     echo "BOOT SMOKE: FAIL (diff above)"
     exit 1
 fi
+
+# Optional TM check (--with-tm): TM flows over TCP 20000+uid as RAW packets
+# (no TSIM length prefix). Runs a second boot with the probe attached and
+# asserts non-empty telemetry with the CCSDS-looking header byte 0x49.
+if [ "${2:-}" = "--with-tm" ] || [ "${STIX_WITH_TM:-}" = "1" ]; then
+    TMTC_PORT=$((20000 + $(id -u)))
+    rm -f tm.smoke.log
+    ( timeout 60 python3 "$REPO_ROOT/scripts/stix/tmtc-probe.py" \
+        --port "$TMTC_PORT" --seconds 40 > tm.smoke.log 2>&1 ) &
+    PROBE_PID=$!
+    sleep 1
+    timeout 45 "$QEMU_BIN" -M leon3_generic -m 64M -no-reboot \
+        -display none -monitor none -serial file:/dev/null \
+        -kernel "$ASW_ELF" > /dev/null 2>&1 || true
+    wait $PROBE_PID || true
+    if grep -Eq '\+ *[0-9]+B 49' tm.smoke.log; then
+        echo "TM CHECK: PASS (telemetry observed on port $TMTC_PORT)"
+    else
+        echo "TM CHECK: FAIL"; cat tm.smoke.log; exit 1
+    fi
+fi

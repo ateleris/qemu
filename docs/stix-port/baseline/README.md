@@ -66,8 +66,13 @@ REPAIRED old model.
   of range` (ADC reads 0), `LUTMgmt *E could not find LUT` (empty flash).
   These are part of the golden content, not failures.
 - `tmtc_io_server.c` defines the `"STIX_CONTROL"` token but never checks it;
-  the SPW TC-receive path is a printf stub (TM out works, TC in cannot reach
-  the guest).
+  the SPW TC-receive path is a printf stub (TC in cannot reach the guest).
+- **TM DOES flow** (correcting the earlier "console-only" recollection): the
+  model emits real telemetry on TCP 20000+getuid() — raw packets, NO 4-byte
+  TSIM length prefix (that framing exists only in the FSW-side
+  ioTcpServer). See `tm.golden.log` (37 B housekeeping ~2 s cadence,
+  CCSDS-looking 0x49 header). The ported v11.1 model produces the same
+  stream (`boot-smoke.sh <new-binary> --with-tm`).
 - grlib_stixflash read asserts `addr == 0`; write asserts a strict
   RAM→page→cmd ordering; unknown offsets `assert(0)`. CTRL SCET-set writes
   (`0xC8`/`0xCC`) `assert(0)`. CTRL `reg[addr/4]` indexing is bounded by the
