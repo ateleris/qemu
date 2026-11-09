@@ -1,3 +1,7 @@
+..
+  THIS BRANCH IS NOT VANILLA QEMU — it carries the STIX IDPU emulation.
+  See README-STIX.md (what it is, how to use it, where the docs are).
+
 ===========
 QEMU README
 ===========
