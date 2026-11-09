@@ -60,12 +60,12 @@
 #define MAX_CPUS  4
 
 #define LEON3_UART_OFFSET  (0x80000100)
-#define LEON3_UART_IRQ     (3)
+#define LEON3_UART_IRQ     (IRQ_UART) /* baseline: 2 */
 
 #define LEON3_IRQMP_OFFSET (0x80000200)
 
 #define LEON3_TIMER_OFFSET (0x80000300)
-#define LEON3_TIMER_IRQ    (6)
+#define LEON3_TIMER_IRQ    (IRQ_TIMER_TIMER0) /* baseline: 10 */
 #define LEON3_TIMER_COUNT  (2)
 
 #define LEON3_APB_PNP_OFFSET (0x800FF000)
