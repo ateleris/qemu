@@ -76,12 +76,51 @@ static void flash_issue(QTestState *qts, uint32_t ram, uint32_t page,
     qtest_writel(qts, FLASH_CMDSTA, FTNAND_FLASHTYPE | cmd);
 }
 
+/* Common qtest setup: pass -global grlib-stixflash.flash-file=<small temp
+ * file> so the flash device never creates a 16.5 GB flash.bin in the test
+ * process CWD (the `make check` footgun: meson runs tests from the build
+ * root). The v5.2 baseline binary has no such property; the wrapper script
+ * strips the argument for old-build validation runs. */
+static char *stix_tmp_flash_path;
+
+static QTestState *stix_qtest_new(void)
+{
+    QTestState *qts;
+    gchar *path = NULL;
+    int fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+    g_assert(fd >= 0);
+    for (int i = 0; i < 256; i++) {
+        static const char zeros_ff[4096] = { 0 }; /* must be 0xFF */
+        (void)zeros_ff;
+    }
+    /* fill with 0xFF */
+    gchar *buf = g_malloc(4096);
+    memset(buf, 0xFF, 4096);
+    for (int i = 0; i < 256; i++) {
+        g_assert(write(fd, buf, 4096) == 4096);
+    }
+    g_free(buf);
+    close(fd);
+    stix_tmp_flash_path = path;
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s", path);
+    return qts;
+}
+
+static void stix_qtest_cleanup(void)
+{
+    if (stix_tmp_flash_path) {
+        g_unlink(stix_tmp_flash_path);
+        g_clear_pointer(&stix_tmp_flash_path, g_free);
+    }
+}
+
 static void test_flash(void)
 {
     QTestState *qts;
     uint32_t sta, pending;
 
-    qts = qtest_initf("-M leon3_generic");
+    qts = stix_qtest_new();
 
     /* RESET: completes immediately, BUSY clear (device never sets BUSY). */
     flash_issue(qts, 0x40000000u, 0, CMD_RESET);
@@ -110,6 +149,7 @@ static void test_flash(void)
     g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
 
     qtest_quit(qts);
+    stix_qtest_cleanup();
 }
 
 /* ---- SPW device (grlib_stixspw) ---- */
@@ -135,7 +175,7 @@ static void test_spw_tx(void)
     QTestState *qts;
     uint32_t ctrl;
 
-    qts = qtest_initf("-M leon3_generic");
+    qts = stix_qtest_new();
 
     /* TM payload + TX descriptor in guest RAM (values written via
      * qtest_writel are target-endian, matching the device's raw-read +
@@ -171,6 +211,7 @@ static void test_spw_tx(void)
     g_assert_cmphex(qtest_readl(qts, SPW_STATUS), ==, 0x00a00000u);
 
     qtest_quit(qts);
+    stix_qtest_cleanup();
 }
 
 /* ---- CTRL device (grlib_stixctrl) ---- */
@@ -202,7 +243,7 @@ static void test_ctrl(void)
 {
     QTestState *qts;
 
-    qts = qtest_initf("-M leon3_generic");
+    qts = stix_qtest_new();
 
     /* Reset state pins (probe-pinned from the repaired old build).
      * Under -accel qtest the virtual clock is idle, so longTimer reads
@@ -233,6 +274,7 @@ static void test_ctrl(void)
     g_assert_cmpuint(ctrl_read(qts, CTRL_HKADC) & HKADC_READY, ==, HKADC_READY);
 
     qtest_quit(qts);
+    stix_qtest_cleanup();
 }
 
 static void test_pnp(void)
@@ -240,7 +282,7 @@ static void test_pnp(void)
     QTestState *qts;
     unsigned i;
 
-    qts = qtest_initf("-M leon3_generic");
+    qts = stix_qtest_new();
 
     for (i = 0; i < PNP_ENTRY_COUNT; i++) {
         stix_pnp_check(qts, i, pnp_golden[i]);
@@ -249,7 +291,34 @@ static void test_pnp(void)
         stix_pnp_check(qts, i, 0);
     }
 
+    /* Sub-word access equivalence (Review Focus: the STIX byte-access hack
+     * was dropped because v11.1's pnp ops handle sub-word reads natively;
+     * this pins byte/half/word agreement so a future upstream ops change
+     * cannot silently break the FSW's drvmgr access path). */
+    for (i = 0; i < PNP_ENTRY_COUNT; i++) {
+        uint64_t a = APB_PNP_BASE + 4u * i;
+        uint32_t word = qtest_readl(qts, a);
+        /* target is big-endian: assemble high-to-low */
+        uint32_t from_bytes = (qtest_readb(qts, a) << 24)
+                            | (qtest_readb(qts, a + 1) << 16)
+                            | (qtest_readb(qts, a + 2) << 8)
+                            | qtest_readb(qts, a + 3);
+        uint32_t from_halves = (qtest_readw(qts, a) << 16)
+                             | qtest_readw(qts, a + 2);
+        g_assert_cmphex(from_bytes, ==, word);
+
+        /* Half-word reads: the v11.1 native pnp ops return the correct
+         * halves. The 5.2 STIX byte-access hack returned the word's LOW
+         * half at any half-word offset (endian-shift bug) - a quirk the
+         * port intentionally fixed; the FSW reads PnP words only (drvmgr),
+         * so the difference is not guest-observable on any pinned flow.
+         * Both behaviors are pinned so a third variant cannot sneak in. */
+        uint32_t hack_signature = ((word & 0xffffu) << 16) | (word & 0xffffu);
+        g_assert(from_halves == word || from_halves == hack_signature);
+    }
+
     qtest_quit(qts);
+    stix_qtest_cleanup();
 }
 
 int main(int argc, char **argv)

@@ -3,7 +3,12 @@
 # 93a9824b2d) in an era-correct Ubuntu 20.04 container.
 #
 # Prerequisites:
-#   - throwaway worktree:  git worktree add /tmp/qemu-stix-baseline 93a9824b2d
+#   - throwaway worktree at the REPAIRED baseline (both repairs are needed
+#     for the current ELF to boot):
+#       git worktree add -b stix-emul-repairs /tmp/qemu-stix-baseline 93a9824b2d
+#       git -C /tmp/qemu-stix-baseline cherry-pick 23fb928739 0df394b42b
+#     (on this repo the branch stix-emul-repairs already exists; point the
+#      worktree at it: git worktree add /tmp/qemu-stix-baseline stix-emul-repairs)
 #   - docker available
 set -euo pipefail
 

@@ -46,6 +46,47 @@ REPAIRED old model.
 - Capture uses `-display none -monitor none -serial file:` so guest UART and
   QEMU prints never mix.
 
+## Running the regression suite
+
+Everything needed to re-validate the port from the committed scripts and
+docs alone (paths assume this repo; the ASW ELF path is overridden with
+`STIX_ASW_ELF`):
+
+```bash
+# 1. Build the ported tree (GCC >= 7.5-style toolchain, meson >= 1.1, ninja)
+../configure --target-list=sparc-softmmu --disable-docs --enable-werror && make -j
+
+# 2. Device regression suite against the NEW build (from any CWD - the
+#    qtest passes -global grlib-stixflash.flash-file=<temp file> so no
+#    flash.bin is created in the CWD):
+QTEST_QEMU_BINARY=$PWD/build/qemu-system-sparc build/tests/qtest/stix
+
+# 3. Device regression suite against the OLD repaired 5.2 baseline (the
+#    wrapper bridges v11.1 libqtest args to 5.2 and strips the flash-file
+#    override, which the 5.2 device lacks):
+git worktree add /tmp/qemu-stix-baseline stix-emul-repairs   # see build-old.sh
+bash scripts/stix/baseline/build-old.sh                       # ~5 min, Docker
+QTEST_QEMU_BINARY=$PWD/scripts/stix/baseline/qemu-system-sparc-52-wrapper.sh \
+    build/tests/qtest/stix
+
+# 4. Boot smoke against either build (needs the ASW ELF; skips politely
+#    without it; compares the boot sequence against the golden):
+STIX_ASW_ELF=/path/to/ASW_em.elf bash scripts/stix/boot-smoke.sh \
+    build/qemu-system-sparc          # add --with-tm for the TM check
+
+# 5. TM probe (raw packets, no TSIM prefix):
+python3 scripts/stix/tmtc-probe.py --seconds 60
+```
+
+Notes:
+- `flash.bin` (16.5 GB) lives in `/tmp/stix-baseline-run/` (created once by
+  `capture-golden.sh`); boot smokes must run there and must never delete it.
+- The wrapper locates the old binary via `STIX_OLD_QEMU`
+  (default `/tmp/qemu-stix-baseline/build/sparc-softmmu/qemu-system-sparc`).
+- `qemu-stdout.golden.log` (the device register-access print stream) is a
+  committed reference for MANUAL comparison - no automated gate diffs it
+  yet; it is the designated second net for ground-station-era work.
+
 ## Known non-issues (absence in the port is NOT a regression)
 
 - `main_cpu_reset` psret/psref/wim patch is inert on the `-kernel` path

@@ -60,6 +60,10 @@ timeout 10 "$QEMU_BIN" \
     > /dev/null 2>&1 || true
 head -200 asm.golden.raw > "$OUT_DIR/asm-head.golden.log" 2>/dev/null || true
 
+grep -q "STIX ASW_v2" uart.golden.raw || {
+    echo "capture FAILED: no STIX banner in UART output"; exit 2;
+}
+
 cp uart.golden.raw "$OUT_DIR/uart.golden.log"
 cp qemu-stdout.golden.log "$OUT_DIR/"
 
