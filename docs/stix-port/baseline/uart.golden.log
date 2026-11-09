@@ -1,0 +1,96 @@
+00:00:00.007  Main             STIX ASW_v2, ver. 1.86 [laszl-1770654006 Feb  9 2026 17:20:31]
+00:00:00.008  Main             Build optimized for size
+00:00:00.008  Main             RTEMS configuration:
+00:00:00.009  Main             --------------------
+00:00:00.009  Main                 EXECUTIVE_RAM_SIZE            = 504016
+00:00:00.010  Main                 MESSAGE_BUFFER_MEMORY         = 134584
+00:00:00.010  Main                 MEMORY_OVERHEAD               = 128
+00:00:00.011  Main                 MAXIMUM_TASKS                 = 21
+00:00:00.011  Main                 MAXIMUM_SEMAPHORES            = 20
+00:00:00.012  Main                 MAXIMUM_MESSAGE_QUEUES        = 10
+00:00:00.012  Main                 MAXIMUM_TIMERS                = 20
+00:00:00.012  Main                 MAXIMUM_PARTITIONS            = 2
+00:00:00.012  Main                 MAXIMUM BARRIERS              = 0
+00:00:00.012  Main                 MINIMUM_STACK_SIZE            = 16384
+00:00:00.013  Main             EDAC CONFIGURATION ON ASW STARTUP
+00:00:00.013  Main             ---------------------------------
+00:00:00.013  Main                 E_EDAC_MODULE_EEPROM          = 0
+00:00:00.013  Main                 E_EDAC_MODULE_SDRAM           = 0
+00:00:00.014  Main                 E_EDAC_MODULE_CACHE           = 0
+00:00:00.014  Main                 E_EDAC_MODULE_ROTBUF          = 0
+00:00:00.014  Main             init: ParamMgmt
+00:00:00.015  Main             init: ADCs default registers
+00:00:00.016  Main             init: MemCommon
+00:00:00.018  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:00.030  Main             init: TM buffer
+00:00:00.031  Main             init: ContextMgmt PRE INIT
+00:00:00.033  Main             init: Timing
+00:00:00.034  Main             init: TC buffer
+00:00:00.034  Main             init: FDIR
+00:00:00.035  Main             init: MODE
+00:00:00.036  Main             init: HKReport
+00:00:00.036  Main             init: SPW control
+00:00:00.067  Main             do: selftest
+00:00:00.067  HKAcquire     *E reference voltage 0 is with value 0 out of range (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HK/HKAcquire.c:460)
+00:00:00.067  HKAcquire     *E reference voltage 1 is with value 0 out of range (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HK/HKAcquire.c:460)
+00:00:00.068  HKAcquire     *E reference voltage 2 is with value 0 out of range (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HK/HKAcquire.c:460)
+00:00:00.068  Main             do: boot report
+00:00:00.070  Main             do: enable HK IRQ
+00:00:00.070  Main             FDIR init - other is on protection
+00:00:00.070  Main             init: Background task
+00:00:00.070  Main             init: AttCtrl
+00:00:00.070  Main             init: AspectCtrl
+00:00:00.070  Main             init: ROTB
+00:00:00.071  Main             init: QL task
+00:00:00.071  Main             init: ROTB task
+00:00:00.072  Main             init: BG accumulator
+00:00:00.072  Main             init: SAFE mode
+00:00:00.189  LUTMgmt       *E could not find LUT (type=1, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.189  LUTMgmt       *E could not find LUT (type=2, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.190  LUTMgmt       *E could not find LUT (type=3, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.190  LUTMgmt       *E could not find LUT (type=4, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.197  Main             delete init
+00:00:01.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:02.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:03.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:04.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:05.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:06.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:07.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:08.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:09.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:10.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:11.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:12.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:13.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:14.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:15.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:16.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:17.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:18.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:19.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:20.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:21.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:22.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:23.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:24.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:25.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:26.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:27.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:28.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:29.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:30.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:31.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:32.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:33.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:34.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:35.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:36.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:37.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:38.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:39.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:40.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:41.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:42.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+00:00:43.015  Watchdog      *E invalid number of cycles after reset: exp=63 hw=0 (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HWControl/Watchdog.c:199)
+
