@@ -155,9 +155,20 @@ static void recv_packet_callback(uint8_t *data, int length, void *opaque)
     qemu_irq_pulse(stixspw->irq);*/
 }
 
+#define STIXSPW_REG_WORDS (sizeof(stixSpwRegs_s) / sizeof(uint32_t))
+
 static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXSPW *stixspw = opaque;
+
+    /* security fix: the MMIO window (256 bytes) is larger than the register
+     * struct (48 bytes); offsets past the struct must not index host memory.
+     * The pinned baseline flows only ever access 0x00-0x2F. */
+    if ((uint32_t)addr / sizeof(uint32_t) >= STIXSPW_REG_WORDS)
+    {
+        qemu_printf("SPW | Read outside register block: addr = %lu\n", addr);
+        return 0;
+    }
 
     uint32_t regval = ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
@@ -170,6 +181,13 @@ static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
 static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     STIXSPW *stixspw = opaque;
+
+    /* security fix: same bounds rule as the read handler. */
+    if ((uint32_t)addr / sizeof(uint32_t) >= STIXSPW_REG_WORDS)
+    {
+        qemu_printf("SPW | Write outside register block ignored: addr = %lu\n", addr);
+        return;
+    }
 
     // update the register as per write request
     ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;

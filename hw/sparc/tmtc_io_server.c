@@ -176,7 +176,10 @@ void init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void
     {
       struct sockaddr_in sinInterface;
       sinInterface.sin_family = AF_INET;
-      sinInterface.sin_addr.s_addr = INADDR_ANY;
+      /* security fix: bind loopback — the code computed localhostAddress but
+       never used it (latent 2022 bug). A remote ground station later will
+       want a bind-address property instead. */
+      sinInterface.sin_addr.s_addr = localhostAddress;
       sinInterface.sin_port = htons(port);
 
       int optval = 1;
