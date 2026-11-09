@@ -47,9 +47,11 @@
 #include "hw/char/grlib_uart.h"
 #include "hw/intc/grlib_irqmp.h"
 #include "hw/misc/grlib_ahb_apb_pnp.h"
+#include "hw/sparc/grlib_stix.h"
+#include "StixIdpu.h"
 
 /* Default system clock.  */
-#define CPU_CLK (40 * 1000 * 1000)
+#define CPU_CLK (20 * 1000 * 1000) /* baseline: STIX IDPU runs at 20 MHz */
 
 #define LEON3_PROM_FILENAME "u-boot.bin"
 #define LEON3_PROM_OFFSET    (0x00000000)
@@ -160,6 +162,13 @@ static void leon3_cpu_reset(void *opaque)
     cpu->halted = cpu->cpu_index != 0;
     env->pc = s->entry;
     env->npc = s->entry + 4;
+    /* carried from the baseline model: enable traps and FPU when running
+     * a RAM image (pc != 0). Inert on the -kernel path (entry = 0). */
+    if (env->pc) {
+        env->psret = 1;
+        env->psref = 1;
+        env->wim = 2;
+    }
 }
 
 static void leon3_cache_control_int(CPUSPARCState *env)
@@ -432,6 +441,57 @@ static void leon3_generic_hw_init(MachineState *machine)
     grlib_apb_pnp_add_entry(apb_pnp, LEON3_UART_OFFSET, 0xFFF,
                             GRLIB_VENDOR_GAISLER, GRLIB_APBUART_DEV, 1,
                             LEON3_UART_IRQ, GRLIB_APBIO_AREA);
+
+    /* ---- STIX IDPU devices (carried from the baseline model) ---- */
+
+    /* Allocate ctrl. Deliberately preserved baseline bug: all five CTRL
+     * outputs connect via line 0, last-wins to the ROTB CPU IRQ line —
+     * see docs/stix-port/baseline/README.md. */
+    dev = qdev_new(TYPE_GRLIB_STIXCTRL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIXCTRL_APB_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_DETCTRL));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_HK));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_OTHERISON));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_EDAC));
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_ROTB));
+    grlib_apb_pnp_add_entry(apb_pnp, STIXCTRL_APB_BASE, 0xFFF,
+                            GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL_DEV, 0,
+                            IRQ_STIXCTRL_DETCTRL, GRLIB_APBIO_AREA);
+
+    /* Allocate SDRAM controller registers (model repair: the FSW's
+     * RamUtils_initSDRAM() polls configStatus for the INIT bit). */
+    dev = qdev_new(TYPE_GRLIB_STIXSDRAM);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SDRAM_APB_BASE);
+
+    /* Allocate flash */
+    dev = qdev_new(TYPE_GRLIB_STIXFLASH);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, FLASH_APB_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(irqmpdev, IRQ_FLASH));
+    grlib_apb_pnp_add_entry(apb_pnp, FLASH_APB_BASE, 0xFFF,
+                            GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL_DEV, 0,
+                            IRQ_FLASH, GRLIB_APBIO_AREA);
+
+    /* Allocate SpW */
+    dev = qdev_new(TYPE_GRLIB_STIXSPW);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SPW_APB_BASE);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                       qdev_get_gpio_in(irqmpdev, IRQ_SPW));
+    grlib_apb_pnp_add_entry(apb_pnp, SPW_APB_BASE, 0xFFF,
+                            GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL_DEV, 0,
+                            IRQ_SPW, GRLIB_APBIO_AREA);
+
+    /* The WD device (grlib_stixwd) stays commented out, like the
+     * baseline. See the baseline README for the carried state. */
 }
 
 static void leon3_generic_machine_init(MachineClass *mc)

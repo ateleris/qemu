@@ -27,4 +27,9 @@
 /* STIX SDRAM controller register stub (model repair commit) */
 #define TYPE_GRLIB_STIXSDRAM "grlib,stixsdram"
 
+/* The IDPU's custom devices were (deliberately, like-for-like with the
+ * 2022 model) registered in the AMBA PnP table under the FTMCTRL device
+ * id — drvmgr sees three FTMCTRLs. Pinned by the PnP qtest. */
+#define GRLIB_FTMCTRL_DEV (0x054)
+
 #endif /* HW_SPARC_GRLIB_STIX_H */

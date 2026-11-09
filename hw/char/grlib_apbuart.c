@@ -270,8 +270,10 @@ static void grlib_apbuart_reset(DeviceState *d)
 
     /* Transmitter FIFO and shift registers are always empty in QEMU */
     uart->status =  UART_TRANSMIT_FIFO_EMPTY | UART_TRANSMIT_SHIFT_EMPTY;
-    /* Everything is off */
-    uart->control = 0;
+    /* Carried from the baseline model: reset control = 0xf. Inert on the
+     * -kernel path (the PROM stub writes 3 before the guest runs) but
+     * observable to qtest. See docs/stix-port/baseline/README.md. */
+    uart->control = 0xf;
     /* Flush receive FIFO */
     uart->len = 0;
     uart->current = 0;
