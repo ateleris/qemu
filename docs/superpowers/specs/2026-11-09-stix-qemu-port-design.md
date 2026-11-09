@@ -252,7 +252,7 @@ the port.
 | Trace baseline | capture-what-exists (irqmp/apbuart/pnp); new STIX trace points allowed in port but never golden-asserted | old branch has no STIX trace events to validate against |
 | ELF fallback order | current `ASW_em.elf` → `History/` ELFs → FSW **copy** outside the read-only tree + README's `TMBuffer_init` tweak → if all fail: **stop and ask** (defining the baseline as "current ELF on the new build" is circular — no regression reference remains) | rebuild touches a copy, never the read-only FSW tree |
 | Test homes | qtest in-tree; boot smoke as repo script | qtest is QEMU-native/hermetic; boot test depends on machine-local ELF |
-| TMTC round-trip test | downgraded to a **probe, not a test**: old model was console-only per Laszlo (2026-11-09); probe settles it definitively and records the finding | ground-station TCP attachment is a named follow-up, out of scope |
+| TMTC round-trip test | probe result 2026-11-09: **TM DOES flow** from the old model (raw CCSDS-looking packets, no TSIM prefix) — recollection corrected; probe + `--with-tm` smoke check are part of the delivered tests | ground-station TCP attachment is a named follow-up; framing (raw vs +4B header) is the open GS-integration question |
 
 ## Left to the builder
 
