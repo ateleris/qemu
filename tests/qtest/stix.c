@@ -173,6 +173,68 @@ static void test_spw_tx(void)
     qtest_quit(qts);
 }
 
+/* ---- CTRL device (grlib_stixctrl) ---- */
+
+#define CTRL_BASE 0x80000500u
+
+/* Register offsets in stixCtrlRegs_s */
+#define CTRL_ROTBCMDSTA 0x54u
+#define CTRL_ROTBCONFIG 0x58u
+#define CTRL_HKCMDSTA   0x88u
+#define CTRL_HKADC      0x8cu
+#define CTRL_WatchDog   0xd4u
+#define CTRL_MAGICREG   0xd8u
+#define CTRL_STIXSTATUS 0xf0u
+
+#define HKADC_READY (1u << 7)
+
+static uint32_t ctrl_read(QTestState *qts, uint32_t off)
+{
+    return qtest_readl(qts, CTRL_BASE + off);
+}
+
+static void ctrl_write(QTestState *qts, uint32_t off, uint32_t val)
+{
+    qtest_writel(qts, CTRL_BASE + off, val);
+}
+
+static void test_ctrl(void)
+{
+    QTestState *qts;
+
+    qts = qtest_initf("-M leon3_generic");
+
+    /* Reset state pins (probe-pinned from the repaired old build).
+     * Under -accel qtest the virtual clock is idle, so longTimer reads
+     * (0xC8/0xCC, handled by the read handler's SCET refresh) are stable.
+     * NOTE: reads of 0xC8/0xCC are fine; WRITES to them assert(0). */
+    g_test_message("ctrl[0x54] = 0x%08x", ctrl_read(qts, CTRL_ROTBCMDSTA));
+    g_test_message("ctrl[0x58] = 0x%08x", ctrl_read(qts, CTRL_ROTBCONFIG));
+    g_test_message("ctrl[0x88] = 0x%08x", ctrl_read(qts, CTRL_HKCMDSTA));
+    g_test_message("ctrl[0xf0] = 0x%08x", ctrl_read(qts, CTRL_STIXSTATUS));
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_ROTBCMDSTA), ==, 0x00000000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ROTBCONFIG), ==, 0x00000000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0x00000000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_STIXSTATUS), ==, 0x00000000u);
+
+    /* Benign write/readback: watchdog register stores anything (the FSW
+     * writes 0x40000000 in its shutdown path). */
+    ctrl_write(qts, CTRL_WatchDog, 0x40000000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_WatchDog), ==, 0x40000000u);
+
+    /* magicReg stores too (FSW start-up magic 0xa56d5b74). */
+    ctrl_write(qts, CTRL_MAGICREG, 0xa56d5b74u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_MAGICREG), ==, 0xa56d5b74u);
+
+    /* Model repair pin: an hkAdc write completes the conversion
+     * immediately — READY (bit 7) must be set in the stored value. */
+    ctrl_write(qts, CTRL_HKADC, 0x18u);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_HKADC) & HKADC_READY, ==, HKADC_READY);
+
+    qtest_quit(qts);
+}
+
 static void test_pnp(void)
 {
     QTestState *qts;
@@ -198,6 +260,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/pnp", test_pnp);
         qtest_add_func("/sparc/stix/flash", test_flash);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
+        qtest_add_func("/sparc/stix/ctrl", test_ctrl);
     }
 
     return g_test_run();
