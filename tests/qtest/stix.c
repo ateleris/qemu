@@ -46,6 +46,72 @@ static void stix_pnp_check(QTestState *qts, unsigned index, uint32_t expected)
     g_assert_cmphex(actual, ==, expected);
 }
 
+/* ---- flash device (grlib_stixflash) ---- */
+
+#define FLASH_BASE    0x80000800u
+#define FLASH_CMDSTA  (FLASH_BASE + 0u)   /* status/command (read asserted 0) */
+#define FLASH_PAGEAD  (FLASH_BASE + 4u)
+#define FLASH_RAMAD   (FLASH_BASE + 8u)
+
+#define IRQMP_BASE    0x80000200u
+#define IRQMP_PENDING (IRQMP_BASE + 0x04u)
+#define IRQMP_CLEAR   (IRQMP_BASE + 0x0cu)
+#define FLASH_IRQ_BIT (1u << 1)           /* IRQ_FLASH = 1 */
+
+#define FTNAND_BUSY      (1u << 4)
+#define FTNAND_FLASHTYPE (1u << 7)          /* MEMORY_TYPE_BIT in the FSW driver */
+
+#define CMD_RESET       0u
+#define CMD_BLOCK_ERASE 1u
+#define CMD_PAGE_READ   2u
+#define CMD_PAGE_WRITE  3u
+
+/* Driver register order: ram address, page address, cmd/sta. The device
+ * asserts this exact write_counter sequence (0 -> 1 -> 2 -> execute). */
+static void flash_issue(QTestState *qts, uint32_t ram, uint32_t page,
+                        uint32_t cmd)
+{
+    qtest_writel(qts, FLASH_RAMAD, ram);
+    qtest_writel(qts, FLASH_PAGEAD, page);
+    qtest_writel(qts, FLASH_CMDSTA, FTNAND_FLASHTYPE | cmd);
+}
+
+static void test_flash(void)
+{
+    QTestState *qts;
+    uint32_t sta, pending;
+
+    qts = qtest_initf("-M leon3_generic");
+
+    /* RESET: completes immediately, BUSY clear (device never sets BUSY). */
+    flash_issue(qts, 0x40000000u, 0, CMD_RESET);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_BUSY, ==, 0);
+
+    /* PAGE_READ page 0 chip 0: page content lands at the RAM address and
+     * IRQ 1 pulses. flash.bin is all-0xFF, so RAM reads back 0xffffffff. */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 0, CMD_PAGE_READ);
+    pending = qtest_readl(qts, IRQMP_PENDING);
+    g_assert_cmpuint(pending & FLASH_IRQ_BIT, ==, FLASH_IRQ_BIT);
+    g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_BUSY, ==, 0);
+
+    /* BLOCK_ERASE block 0: IRQ 1 pulses again; content stays 0xFF. */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 0, CMD_BLOCK_ERASE);
+    pending = qtest_readl(qts, IRQMP_PENDING);
+    g_assert_cmpuint(pending & FLASH_IRQ_BIT, ==, FLASH_IRQ_BIT);
+
+    /* PAGE_READ after erase: RAM still 0xFF. */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 0, CMD_PAGE_READ);
+    g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
+
+    qtest_quit(qts);
+}
+
 static void test_pnp(void)
 {
     QTestState *qts;
@@ -69,6 +135,7 @@ int main(int argc, char **argv)
 
     if (qtest_has_machine("leon3_generic")) {
         qtest_add_func("/sparc/stix/pnp", test_pnp);
+        qtest_add_func("/sparc/stix/flash", test_flash);
     }
 
     return g_test_run();
