@@ -13,19 +13,19 @@
 #define HW_SPARC_GRLIB_STIX_H
 
 /* STIX FLASH (FTNANDCTRL register emulation) */
-#define TYPE_GRLIB_STIXFLASH "grlib,stixflash"
+#define TYPE_GRLIB_STIXFLASH "grlib-stixflash"
 
 /* STIX SPW (GRSPW register emulation + TMTC TCP bridge) */
-#define TYPE_GRLIB_STIXSPW "grlib,stixspw"
+#define TYPE_GRLIB_STIXSPW "grlib-stixspw"
 
 /* STIX WD (compiled but not instantiated on the baseline machine) */
-#define TYPE_GRLIB_STIXWD "grlib,stixwd"
+#define TYPE_GRLIB_STIXWD "grlib-stixwd"
 
 /* STIX CTRL (detector/HK/EDAC/ROTB controller registers) */
-#define TYPE_GRLIB_STIXCTRL "grlib,stixctrl"
+#define TYPE_GRLIB_STIXCTRL "grlib-stixctrl"
 
 /* STIX SDRAM controller register stub (model repair commit) */
-#define TYPE_GRLIB_STIXSDRAM "grlib,stixsdram"
+#define TYPE_GRLIB_STIXSDRAM "grlib-stixsdram"
 
 /* The IDPU's custom devices were (deliberately, like-for-like with the
  * 2022 model) registered in the AMBA PnP table under the FTMCTRL device
