@@ -22,8 +22,9 @@ import time
 
 def main():
     ap = argparse.ArgumentParser()
+    import os
     ap.add_argument("--port", type=int,
-                    default=20000 + 1000,  # IO_TCP_SERVER_BASE_PORT + uid 1000
+                    default=20000 + os.getuid(),  # IO_TCP_SERVER_BASE_PORT + getuid()
                     help="TMTC server port (default: 20000+getuid)")
     ap.add_argument("--seconds", type=float, default=120)
     args = ap.parse_args()

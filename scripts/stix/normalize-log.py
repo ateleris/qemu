@@ -30,7 +30,7 @@ def main():
         stripped = TS.sub("", line)
         if stripped == "":
             blanks += 1
-            if blanks >= 3:
+            if blanks >= 2:  # 3+ consecutive blanks collapse to one
                 continue
         else:
             blanks = 0
