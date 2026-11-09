@@ -112,6 +112,67 @@ static void test_flash(void)
     qtest_quit(qts);
 }
 
+/* ---- SPW device (grlib_stixspw) ---- */
+
+#define SPW_BASE       0x80000a00u
+#define SPW_CONTROL    (SPW_BASE + 0x00u)
+#define SPW_STATUS     (SPW_BASE + 0x04u)
+#define SPW_DMAControl (SPW_BASE + 0x20u)
+#define SPW_DMATxDesc  (SPW_BASE + 0x28u)
+
+#define SPW_DMA_TE (1u << 0)
+#define SPW_DMA_PS (1u << 5)
+#define SPW_IRQ_BIT (1u << 13)              /* IRQ_SPW = 13 */
+
+#define TXDSC_EN (1u << 12)
+
+/* TX descriptor layout (spwTXdsc_s): ctrl@0, haddr@4, dlen@8, daddr@12. */
+#define TXDSC_ADDR  0x40001000u
+#define TXDATA_ADDR 0x40002000u
+
+static void test_spw_tx(void)
+{
+    QTestState *qts;
+    uint32_t ctrl;
+
+    qts = qtest_initf("-M leon3_generic");
+
+    /* TM payload + TX descriptor in guest RAM (values written via
+     * qtest_writel are target-endian, matching the device's raw-read +
+     * bswap32 handling). */
+    qtest_writel(qts, TXDATA_ADDR, 0xaabbccddu);
+    qtest_writel(qts, TXDATA_ADDR + 4, 0x11223344u);
+    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN);        /* ctrl: EN, no IE */
+    qtest_writel(qts, TXDSC_ADDR + 4, 0);               /* haddr */
+    qtest_writel(qts, TXDSC_ADDR + 8, 8);               /* dlen */
+    qtest_writel(qts, TXDSC_ADDR + 12, TXDATA_ADDR);    /* daddr */
+
+    /* Point the DMA engine at the descriptor table. */
+    qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+
+    /* Trigger transmission (TE). No TCP client is attached: the TM send
+     * fails silently in the model and the exchange still completes. */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_TE);
+
+    /* Descriptor EN bit cleared in guest RAM. */
+    ctrl = qtest_readl(qts, TXDSC_ADDR);
+    g_assert_cmpuint(ctrl & TXDSC_EN, ==, 0);
+
+    /* IRQ 13 latched in IRQMP pending. */
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+
+    /* dmaControl ends with PS set (exchange-complete modifier). */
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PS,
+                     ==, SPW_DMA_PS);
+
+    /* Status forced to the link-running value by the write handler. */
+    g_assert_cmphex(qtest_readl(qts, SPW_STATUS), ==, 0x00a00000u);
+
+    qtest_quit(qts);
+}
+
 static void test_pnp(void)
 {
     QTestState *qts;
@@ -136,6 +197,7 @@ int main(int argc, char **argv)
     if (qtest_has_machine("leon3_generic")) {
         qtest_add_func("/sparc/stix/pnp", test_pnp);
         qtest_add_func("/sparc/stix/flash", test_flash);
+        qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
     }
 
     return g_test_run();
