@@ -303,3 +303,55 @@ refused to start on the unknown `inverted-storage` property (the
 missing-file case was guarded out of the red run — the B2 binary would
 have filled 16.5 GB). All guest-visible expectations of the existing
 tests are unchanged; the new tests are expected RED on the 5.2 wrapper.
+
+## 10. CTRL watchdog (0xD4): modeled, golden regenerated (baseline-inherited defect)
+
+**Baseline:** 0xD4 was plain storage. A write stored the raw command word
+and a read returned it, so COUNT (bits 10:5) read back 0. The FSW Watchdog
+task checks COUNT after every feed (`HWControl/Watchdog.c:199`). It logged
+`Watchdog *E invalid number of cycles after reset: exp=63 hw=0` once per
+second and raised the FDIR path, which the hardware never takes.
+
+**Model (R3):** a command register, with semantics taken from the FSW
+driver (BSW `WDT.c` header comment, `WDT.c`, `HWControl/Watchdog.c`):
+- Not running at power-up or after a system reset.
+- CHANGE sets RELOADVAL only. RELOAD loads COUNT from RELOADVAL and starts
+  counting. DISABLE freezes COUNT, ENABLE resumes from it. FORCE resets
+  the IDPU at once. SAFE does nothing.
+- While running, COUNT drops by one every 105 ms (`WATCHDOG_CYCLE_DURATION`)
+  on `QEMU_CLOCK_VIRTUAL`, counted lazily. At 0 the model requests a guest
+  reset (~6.6 s after the last feed at the FSW's 63 cycles). With
+  `-no-reboot`, QEMU then exits.
+- A read returns RELOADVAL and the live COUNT.
+- Trace events: `stixctrl_watchdog_cmd`, `stixctrl_watchdog_reset`.
+
+**Open point:** the ELFs are built with `-DDISABLE_WATCHDOG`, yet
+`Watchdog_feed()` still issues RELOAD every second. The model treats RELOAD
+as "load and run", per the `WDT.c` header. Whether RELOAD restarts
+counting while disabled is still to be confirmed against the FPGA/HSWICD
+description (roadmap §3). Effect: a Watchdog task that stalls for over
+~6.6 s resets the IDPU, and the soak reports it as an early QEMU exit
+(exit 2).
+
+**Golden regenerated** (`docs/stix-port/baseline/`, `run-flags.txt`). It
+is now captured from this model, not the repaired v5.2 model, on the
+**normal** FSW ELF `ASW_em_baseline.elf` (sha256 in `run-flags.txt`). The
+traced build would make the golden depend on a debug configuration. The
+flash is a device-created sparse, inverted file (D-I, §9). Against the old
+golden, the normalized UART log differs **only** by the removed per-second
+`Watchdog *E invalid number of cycles` lines; there are no other added or
+changed lines. Two consecutive 90 s boots on the same flash give identical
+normalized logs. `asm-head.golden.log` changes only as described in §1:
+the SMP preamble, and the scaler at 19 instead of 39 (§6).
+`qemu-stdout.golden.log` was recaptured from the same run; it is a manual
+reference and is not gated.
+
+**Soak gate:** with the watchdog modeled, the normal ELF's UART goes
+silent after boot, so the soak's liveness gate is TM flow per 60 s slice
+(commit "stix: soak heartbeat = TM flow").
+
+**Evidence:** qtest `/sparc/stix/ctrl-watchdog`: power-up not running,
+CHANGE keeps COUNT, RELOAD starts at 63, one cycle per 105 ms, the
+DISABLE/ENABLE freeze, a 1 s feed cadence never expires, no feed resets
+once the count runs out, reset stops it, and FORCE resets at once. It is
+expected red on the 5.2 wrapper.

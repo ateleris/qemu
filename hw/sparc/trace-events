@@ -30,3 +30,5 @@ stixflash_punch_fallback(int err) "punch-hole erase unavailable or failed (err=%
 
 # grlib_stixctrl.c (STIX)
 stixctrl_scet_write(uint32_t addr, uint32_t value) "SCET write addr=0x%x value=0x%x"
+stixctrl_watchdog_cmd(uint32_t cmd, uint32_t reload, uint32_t count, int running) "watchdog cmd=%u reload=%u count=%u running=%d"
+stixctrl_watchdog_reset(const char *why) "watchdog resets the IDPU: %s"

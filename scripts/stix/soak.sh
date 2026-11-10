@@ -43,7 +43,7 @@ SLICE="${STIX_SOAK_SLICE:-60}"
 MARGIN="${STIX_SOAK_MARGIN:-30}"
 ASW_ELF="${STIX_ASW_ELF:-/mnt/c/Users/laszl/Development/stix_asw_src/ASW/ASW/bin/ASW_em.elf}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-baseline-run}"
+RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
 
 if [ "$SECONDS_TOTAL" -le "$((WINDOW + MARGIN))" ]; then
     echo "soak window ${WINDOW}s + margin ${MARGIN}s does not fit in ${SECONDS_TOTAL}s"

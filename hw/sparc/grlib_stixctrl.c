@@ -6,6 +6,8 @@
 #include "qemu/module.h"
 #include "chardev/char-fe.h"
 #include "qemu/qemu-print.h"
+#include "qemu/timer.h"
+#include "system/runstate.h"
 #include "StixIdpu.h"
 
 #include "trace.h"
@@ -50,6 +52,13 @@ struct STIXCTRL
      * COMMITS (staged seconds, written subsec) as the new on-board time. */
     uint32_t staged_secs;
     uint32_t unsynced_flag;
+    /* Watchdog (0xD4), counted lazily from QEMU_CLOCK_VIRTUAL: while
+     * running, COUNT = wdg_count - cycles elapsed since wdg_base_ns. */
+    uint32_t wdg_reload;
+    uint32_t wdg_count;
+    bool wdg_running;
+    int64_t wdg_base_ns;
+    QEMUTimer *wdg_timer;
 };
 
 /*static void grlib_stixctrl_timer_tick(void *opaque)
@@ -78,6 +87,89 @@ static stixCtrl_scet_s nsToSCET(int64_t ns)
 	return scet;
 }
 
+/* Watchdog, from the FSW driver (BSW WDT.c header comment, WDT.c,
+ * HWControl/Watchdog.c): not running at power-up; RELOAD loads COUNT from
+ * RELOADVAL and enables counting; DISABLE stops counting, ENABLE resumes
+ * it; CHANGE sets RELOADVAL only; FORCE resets the IDPU at once. COUNT
+ * drops by one every 105 ms (WATCHDOG_CYCLE_DURATION) and the IDPU resets
+ * when it reaches 0 (~6.6 s at the FSW's 63 cycles). Before this the
+ * register read back the raw last write (COUNT = 0), so the FSW's
+ * Watchdog task logged "invalid number of cycles" every second and
+ * raised FDIR — a path the hardware never takes. */
+#define STIX_WDG_CYCLE_NS (105 * 1000 * 1000LL)
+
+static uint32_t stixctrl_wdg_count(STIXCTRL *s)
+{
+    int64_t cycles;
+
+    if (!s->wdg_running) {
+        return s->wdg_count;
+    }
+    cycles = (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->wdg_base_ns)
+             / STIX_WDG_CYCLE_NS;
+    return cycles >= s->wdg_count ? 0 : s->wdg_count - (uint32_t)cycles;
+}
+
+/* (Re)start counting down from <count> now; arm the expiry. */
+static void stixctrl_wdg_run(STIXCTRL *s, uint32_t count)
+{
+    s->wdg_count = count;
+    s->wdg_running = true;
+    s->wdg_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    timer_mod_ns(s->wdg_timer, s->wdg_base_ns + count * STIX_WDG_CYCLE_NS);
+}
+
+static void stixctrl_wdg_stop(STIXCTRL *s)
+{
+    s->wdg_count = stixctrl_wdg_count(s);
+    s->wdg_running = false;
+    timer_del(s->wdg_timer);
+}
+
+static void stixctrl_wdg_expired(void *opaque)
+{
+    STIXCTRL *s = opaque;
+
+    trace_stixctrl_watchdog_reset("count expired");
+    s->wdg_running = false;
+    s->wdg_count = 0;
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static void stixctrl_wdg_write(STIXCTRL *s, uint32_t value)
+{
+    uint32_t cmd = (value >> STIXCTRL_WATCHDOG_COMMAND) & STIXCTRL_WATCHDOG_COMMAND_MASK;
+
+    switch (cmd) {
+    case STIXCTRL_WATCHDOG_COMMAND_V_RELOAD:
+        stixctrl_wdg_run(s, s->wdg_reload);
+        break;
+    case STIXCTRL_WATCHDOG_COMMAND_V_FORCE:
+    case STIXCTRL_WATCHDOG_COMMAND_V_FORCE1:
+    case STIXCTRL_WATCHDOG_COMMAND_V_FORCE2:
+        stixctrl_wdg_stop(s);
+        trace_stixctrl_watchdog_reset("FORCE command");
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        break;
+    case STIXCTRL_WATCHDOG_COMMAND_V_DISABLE:
+        if (s->wdg_running) {
+            stixctrl_wdg_stop(s);
+        }
+        break;
+    case STIXCTRL_WATCHDOG_COMMAND_V_ENABLE:
+        if (!s->wdg_running) {
+            stixctrl_wdg_run(s, s->wdg_count);
+        }
+        break;
+    case STIXCTRL_WATCHDOG_COMMAND_V_CHANGE:
+        s->wdg_reload = (value >> STIXCTRL_WATCHDOG_RELOADVAL) & STIXCTRL_WATCHDOG_RELOADVAL_MASK;
+        break;
+    default: /* SAFE: no action */
+        break;
+    }
+    trace_stixctrl_watchdog_cmd(cmd, s->wdg_reload, stixctrl_wdg_count(s), s->wdg_running);
+}
+
 static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXCTRL *stixctrl = opaque;
@@ -88,6 +180,9 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
      * the FSW reads and checks it (Timing.c:136). */
     stixctrl->reg.longTimerSec = scet.coarse | (stixctrl->unsynced_flag << 31);
     stixctrl->reg.longTimerSubSec = scet.fine;
+    stixctrl->reg.watchDog =
+        (stixctrl->wdg_reload << STIXCTRL_WATCHDOG_RELOADVAL) |
+        (stixctrl_wdg_count(stixctrl) << STIXCTRL_WATCHDOG_COUNT);
     
     uint32_t regval = ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
@@ -99,6 +194,12 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     STIXCTRL *stixctrl = opaque;
+
+    if (addr == 0xD4 /* watchDog */)
+    {
+        stixctrl_wdg_write(stixctrl, (uint32_t)value);
+        return;
+    }
 
     // update the register as per write request
     // mostly automatic, special for timing
@@ -202,6 +303,8 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
 
     sysbus_init_mmio(sbd, &STIXCTRL->iomem);
 
+    STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
+
     //STIXCTRL->reference_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     //STIXCTRL->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, grlib_stixctrl_timer_tick, STIXCTRL);
     //timer_mod(STIXCTRL->timer, 1);
@@ -216,6 +319,13 @@ static void grlib_stixctrl_reset(DeviceState *d)
      * the FSW has committed). */
     stixctrl->staged_secs = 0;
     stixctrl->unsynced_flag = 0;
+
+    /* the watchdog is not running after a reset (WDT.c: "it is not
+     * running at startup"); the FSW programs it again at init */
+    timer_del(stixctrl->wdg_timer);
+    stixctrl->wdg_running = false;
+    stixctrl->wdg_count = 0;
+    stixctrl->wdg_reload = 0;
 }
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)

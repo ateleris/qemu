@@ -787,10 +787,9 @@ static void test_ctrl(void)
     g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0x00000000u);
     g_assert_cmphex(ctrl_read(qts, CTRL_STIXSTATUS), ==, 0x00000000u);
 
-    /* Benign write/readback: watchdog register stores anything (the FSW
-     * writes 0x40000000 in its shutdown path). */
-    ctrl_write(qts, CTRL_WatchDog, 0x40000000u);
-    g_assert_cmphex(ctrl_read(qts, CTRL_WatchDog), ==, 0x40000000u);
+    /* The watchdog register (0xD4) is a command register, not plain
+     * storage: the FSW's 0x40000000 is FORCE, which resets the IDPU.
+     * Pinned in /sparc/stix/ctrl-watchdog. */
 
     /* magicReg stores too (FSW start-up magic 0xa56d5b74). */
     ctrl_write(qts, CTRL_MAGICREG, 0xa56d5b74u);
@@ -887,6 +886,104 @@ static void test_ctrl_rotb(void)
     stix_qtest_cleanup();
 }
 
+/* CTRL watchdog (0xD4). Semantics from the FSW driver (BSW WDT.c header
+ * comment, WDT.c and HWControl/Watchdog.c): COMMAND bits 31:29, RELOADVAL
+ * bits 16:11, COUNT bits 5:0. Not running at power-up. RELOAD loads COUNT
+ * from RELOADVAL and also enables counting; DISABLE stops it; ENABLE
+ * resumes; CHANGE sets RELOADVAL without touching COUNT; FORCE resets the
+ * IDPU at once. COUNT drops by one every 105 ms (Watchdog.c
+ * WATCHDOG_CYCLE_DURATION) and the IDPU resets when it runs out.
+ * Unmodeled, the register read back 0 after every feed, so the FSW's
+ * Watchdog task logged an error each second and raised FDIR — a path the
+ * hardware never takes. */
+#define WDG                0xD4u
+#define WDG_CMD(c)         ((uint32_t)(c) << 29)
+#define WDG_RELOAD         WDG_CMD(1)
+#define WDG_FORCE          WDG_CMD(2)
+#define WDG_DISABLE        WDG_CMD(5)
+#define WDG_ENABLE         WDG_CMD(6)
+#define WDG_CHANGE(n)      (WDG_CMD(7) | ((uint32_t)(n) << 11))
+#define WDG_COUNT(qts)     (ctrl_read(qts, WDG) & 0x3Fu)
+#define WDG_CYCLE_NS       (105 * 1000 * 1000LL)
+
+/* true if a RESET event arrived; the QMP round trip pulls in any event
+ * emitted before it (events are only buffered while reading QMP) */
+static bool wdg_saw_reset(QTestState *qts)
+{
+    QDict *ev;
+    bool seen;
+
+    qobject_unref(qtest_qmp(qts, "{'execute': 'query-status'}"));
+    ev = qtest_qmp_event_ref(qts, "RESET");
+    seen = ev != NULL;
+    qobject_unref(ev);
+    return seen;
+}
+
+static void test_ctrl_watchdog(void)
+{
+    g_autofree gchar *port = stix_private_tm_port_arg();
+    QTestState *qts = stix_qtest_new_extra(port);
+
+    /* power-up: not running */
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 0);
+    qtest_clock_step(qts, 100 * WDG_CYCLE_NS);
+    g_assert_false(wdg_saw_reset(qts));
+
+    /* the FSW init sequence, DISABLE_WATCHDOG build (Watchdog_init ->
+     * setRefreshInterval(63), enable): CHANGE, RELOAD, DISABLE, ENABLE,
+     * DISABLE, RELOAD. The final feed must read back 63 cycles — the
+     * check behind the per-second "invalid number of cycles" error. */
+    ctrl_write(qts, WDG, WDG_CHANGE(63));
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 0);       /* CHANGE keeps COUNT */
+    g_assert_cmpuint((ctrl_read(qts, WDG) >> 11) & 0x3Fu, ==, 63);
+    ctrl_write(qts, WDG, WDG_RELOAD);
+    ctrl_write(qts, WDG, WDG_DISABLE);
+    ctrl_write(qts, WDG, WDG_ENABLE);
+    ctrl_write(qts, WDG, WDG_DISABLE);
+    ctrl_write(qts, WDG, WDG_RELOAD);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
+
+    /* RELOAD enabled counting: one cycle per 105 ms */
+    qtest_clock_step(qts, 10 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 53);
+
+    /* DISABLE freezes the count, ENABLE resumes from it */
+    ctrl_write(qts, WDG, WDG_DISABLE);
+    qtest_clock_step(qts, 20 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 53);
+    ctrl_write(qts, WDG, WDG_ENABLE);
+    qtest_clock_step(qts, 3 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 50);
+
+    /* a 1 s feed cadence (Watchdog task period) never expires */
+    for (int i = 0; i < 20; i++) {
+        ctrl_write(qts, WDG, WDG_RELOAD);
+        g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
+        qtest_clock_step(qts, 1000 * 1000 * 1000LL);
+    }
+    g_assert_false(wdg_saw_reset(qts));
+
+    /* no feed: the IDPU resets once the count runs out (~6.6 s) */
+    ctrl_write(qts, WDG, WDG_RELOAD);
+    qtest_clock_step(qts, 62 * WDG_CYCLE_NS);
+    g_assert_false(wdg_saw_reset(qts));
+    qtest_clock_step(qts, 2 * WDG_CYCLE_NS);
+    qtest_qmp_eventwait(qts, "RESET");
+
+    /* reset stops the watchdog again */
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 0);
+    qtest_clock_step(qts, 100 * WDG_CYCLE_NS);
+    g_assert_false(wdg_saw_reset(qts));
+
+    /* FORCE resets at once (WDT_forceIdpuReset, the trap handler) */
+    ctrl_write(qts, WDG, WDG_FORCE);
+    qtest_qmp_eventwait(qts, "RESET");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 /* GPTIMER prescaler set by the -kernel boot stub (hw/sparc/leon3.c).
  * On the IDPU the boot PROM programs the prescaler for a 1 MHz timer tick
  * at the 20 MHz system clock (reload 19, BSW IIR.h IIR_GPT_PRESCALER) and
@@ -967,6 +1064,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);
         qtest_add_func("/sparc/stix/ctrl-rotb", test_ctrl_rotb);
         qtest_add_func("/sparc/stix/gptimer-prescaler", test_gptimer_prescaler);
+        qtest_add_func("/sparc/stix/ctrl-watchdog", test_ctrl_watchdog);
     }
 
     return g_test_run();
