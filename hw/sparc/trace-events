@@ -42,7 +42,7 @@ stixctrl_io_read(uint32_t addr, uint32_t val) "CTRL | Read requested: addr = 0x%
 stixctrl_io_write(uint32_t addr, uint32_t val) "CTRL | Write completed addr = 0x%x, new regval = 0x%x"
 
 # grlib_stixspw.c (STIX)
-stixspw_recv_packet_callback(int len) "TCP TC callback: %d bytes"
+stixspw_recv_packet_callback(int len) "TC callback: %d bytes"
 stixspw_io_read_outside(uint64_t addr) "SPW | Read outside register block: addr = %"PRIu64
 stixspw_io_read(uint64_t addr, uint32_t val) "SPW | Read requested: addr = %"PRIu64", regval = 0x%x"
 stixspw_io_write_outside(uint64_t addr) "SPW | Write outside register block ignored: addr = %"PRIu64
@@ -80,3 +80,10 @@ stixtmtc_token_stripped(void) "STIX_CONTROL token stripped"
 stixtmtc_tc_unit(uint32_t len) "TC unit framed: %u bytes"
 stixtmtc_resync(void) "TC framing resync: one byte dropped"
 stixtmtc_listening(int port) "IOTCPSERVER - Server listening on port: %d"
+stixtmtc_udp_tc_bind(int port) "UDP TC socket bound on 127.0.0.1:%d"
+stixtmtc_udp_tc_unit(int len, int from_port) "UDP TC datagram accepted as one unit: %d bytes from source port %d"
+stixtmtc_udp_tc_dropped(int len) "UDP TC datagram dropped: size out of bounds (%d bytes)"
+stixtmtc_udp_tc_error(int err) "UDP TC receive error: %d"
+stixtmtc_udp_tm_send(int len) "UDP TM datagram sent: %d bytes"
+stixtmtc_udp_tm_dropped(int len, int err) "UDP TM datagram dropped: sendto failed (len=%d errno=%d)"
+stixtmtc_udp_tm_short(int len) "UDP TM packet dropped: shorter than the SpW header (%d bytes)"

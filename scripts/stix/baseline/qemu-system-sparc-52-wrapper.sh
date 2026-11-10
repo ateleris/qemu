@@ -4,7 +4,8 @@
 # libqtest always passes: -qtest ... -qtest-log ... -chardev socket ...
 # -object monitor-qmp ... -display none -audio none [-run-with ...] -accel qtest
 # and the STIX qtest adds: -global grlib-stixflash.flash-file=<path>
-# plus, since P2-1, -global grlib-stixspw.tmtc-server=... (stripped below)
+# plus, since P2-1, -global grlib-stixspw.tmtc-server=..., and since
+# P2-8 the grlib-stixspw.udp-* properties (all stripped below)
 #
 # Override the baseline binary location with STIX_OLD_QEMU (default:
 # /tmp/qemu-stix-baseline/build/sparc-softmmu/qemu-system-sparc).
@@ -22,15 +23,21 @@ while [ "$i" -lt "${#raw[@]}" ]; do
             i=$((i + 2)) # drop the option and its value
             ;;
         -global)
-            if [ "${raw[$((i + 1))]:-}" = "grlib-stixflash.flash-file" ] || \
-               [[ "${raw[$((i + 1))]:-}" == grlib-stixflash.flash-file=* ]] || \
-               [ "${raw[$((i + 1))]:-}" = "grlib-stixspw.tmtc-server" ] || \
-               [[ "${raw[$((i + 1))]:-}" == grlib-stixspw.tmtc-server=* ]]; then
-                i=$((i + 2)) # 5.2 has no such property; drop the pair
-            else
-                args+=("$a" "${raw[$((i + 1))]:-}")
-                i=$((i + 2))
-            fi
+            prop="${raw[$((i + 1))]:-}"
+            case "$prop" in
+                grlib-stixflash.flash-file|grlib-stixflash.flash-file=*|\
+grlib-stixspw.tmtc-server|grlib-stixspw.tmtc-server=*|\
+grlib-stixspw.udp-tm-host|grlib-stixspw.udp-tm-host=*|\
+grlib-stixspw.udp-tm-port|grlib-stixspw.udp-tm-port=*|\
+grlib-stixspw.udp-tc-port|grlib-stixspw.udp-tc-port=*|\
+grlib-stixspw.udp-spw-header|grlib-stixspw.udp-spw-header=*)
+                    i=$((i + 2)) # 5.2 has no such property; drop the pair
+                    ;;
+                *)
+                    args+=("$a" "$prop")
+                    i=$((i + 2))
+                    ;;
+            esac
             ;;
         -object)
             if [ "${raw[$((i + 1))]:-}" = "monitor-qmp,id=qmp0,chardev=char0" ]; then

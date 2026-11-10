@@ -3155,6 +3155,542 @@ static void test_spw_timecode(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P2-8: UDP transport for the ground station (spw-udp) ---- */
+
+#define UDP_TEST_PORT_ENV "STIX_TEST_UDP_PORT"
+#define UDP_TEST_HOST_ENV "STIX_TEST_UDP_HOST"
+
+/*
+ * Bind a UDP socket on 127.0.0.1:0 and keep it: the returned port stays
+ * taken (no TOCTOU) and receives the datagrams.
+ */
+static int stix_udp_bind_free(int *port)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t addrlen = sizeof(addr);
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(bind(fd, (struct sockaddr *)&addr, sizeof(addr)), ==, 0);
+    g_assert(getsockname(fd, (struct sockaddr *)&addr, &addrlen) == 0);
+    *port = ntohs(addr.sin_port);
+    g_assert_cmpint(*port, >, 0);
+    return fd;
+}
+
+/*
+ * A free UDP port for QEMU's own bind: bind, read, close (the same
+ * release-then-bind window stix_free_tcp_port() accepts).
+ */
+static int stix_free_udp_port(void)
+{
+    int port;
+    int fd = stix_udp_bind_free(&port);
+
+    close(fd);
+    return port;
+}
+
+/*
+ * Send one datagram from an unrelated ephemeral source port (D-N: the
+ * model's TC socket is not connected, so any source must be accepted).
+ */
+static void stix_udp_send_ephemeral(int port, const void *buf, size_t len)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons((uint16_t)port),
+    };
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(sendto(fd, buf, len, 0, (struct sockaddr *)&addr,
+                           sizeof(addr)), ==, (int)len);
+    close(fd);
+}
+
+/*
+ * A shared sender socket for a burst. One source port is one flow, and
+ * the kernel keeps loopback order within a flow but does NOT order
+ * across flows — a fresh socket per datagram (what
+ * stix_udp_send_ephemeral opens, and measured here: about 2/3 of
+ * three-datagram bursts arrive reordered) must not be used when the
+ * test pins the arrival order.
+ */
+static int stix_udp_sender_open(void)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    return fd;
+}
+
+static void stix_udp_send_on(int fd, int port, const void *buf, size_t len)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons((uint16_t)port),
+    };
+
+    g_assert_cmpint(sendto(fd, buf, len, 0, (struct sockaddr *)&addr,
+                           sizeof(addr)), ==, (int)len);
+}
+
+/*
+ * recvfrom one datagram, non-blocking and bounded (10 s). *from_port
+ * gets the sender's source port when non-NULL.
+ */
+static ssize_t stix_udp_recv(int fd, void *buf, size_t len, int *from_port)
+{
+    gint64 deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    ssize_t n;
+
+    while (g_get_monotonic_time() < deadline) {
+        n = recvfrom(fd, buf, len, MSG_DONTWAIT, (struct sockaddr *)&addr,
+                     &addrlen);
+        if (n >= 0) {
+            if (from_port != NULL) {
+                *from_port = ntohs(addr.sin_port);
+            }
+            return n;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            g_assert_cmpint(errno, ==, 0); /* always fails, prints errno */
+        }
+        g_usleep(1000);
+    }
+    g_assert_not_reached(); /* no datagram within the timeout */
+}
+
+/*
+ * Bounded wait (10 s) until the RX descriptor i loses EN, i.e. a unit
+ * was delivered into it.
+ */
+static void spw_udp_wait_rx(QTestState *qts, int i)
+{
+    gint64 deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+    uint32_t addr = RXDSC_ADDR + 8u * (uint32_t)i;
+
+    while (g_get_monotonic_time() < deadline &&
+           (qtest_readl(qts, addr) & SPW_RXDSC_EN)) {
+        g_usleep(20 * 1000);
+    }
+}
+
+/*
+ * (a) + (b) in one instance (no TCP server: the UDP transport is
+ * independent of the tmtc-server OnOffAuto), plus the size bounds and
+ * the drain loop:
+ * (a) one TX yields exactly one datagram = the DMA'd buffer minus its
+ *     4-byte SpW header, first byte CCSDS version 0;
+ * (b) a bare TC(17,1) datagram from an unrelated ephemeral source port
+ *     fills an armed descriptor with 40 02 00 00 + the SP (len 16),
+ *     nothing beyond it;
+ * (m6) an undersized datagram (below the 7-byte bare-SP floor) is
+ *     dropped, and the next valid one is still delivered; three
+ *     datagrams sent back to back from one sender socket come out in
+ *     send order through the drain loop and the no-spill queue (the
+ *     kernel orders within one flow, not across the fresh-per-datagram
+ *     sockets of stix_udp_send_ephemeral). The upper bound is not
+ *     testable over IPv4 loopback: a UDP payload above 65507 fails
+ *     sendto with EMSGSIZE, and the bound (65542) lies above that.
+ */
+static void spw_udp_case_tm_tc(void)
+{
+    /* the DMA'd TX buffer: SpW header 49 02 00 00 + a version-0 SP */
+    static const uint8_t tm_full[12] = {
+        0x49, 0x02, 0x00, 0x00, 0x0d, 0x5e, 0x5e, 0xc0,
+        0x00, 0x03, 0x19, 0x42
+    };
+    /*
+     * TC(17,1) seq 0..2 (FSW-RX §6), each with the SpW header the
+     * model adds; the bare datagram is the last 12 bytes
+     */
+    static const uint8_t tc_unit[3][16] = {
+        { 0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x00,
+          0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xd7, 0x7e },
+        { 0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x01,
+          0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0x6f, 0x1f },
+        { 0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x02,
+          0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xb7, 0x9d },
+    };
+    static const uint8_t short_dg[6] = {
+        0x1d, 0xac, 0xc0, 0x00, 0x00, 0x05
+    };
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    g_autofree uint8_t *got = g_malloc(2 * RX_BUF_STEP);
+    uint8_t buf[128];
+    QTestState *qts;
+    ssize_t n;
+    int burst_fd, from;
+    int tm_fd, tm_port, tc_port;
+
+    tm_fd = stix_udp_bind_free(&tm_port);
+    tc_port = stix_free_udp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.udp-tm-port=%d "
+                            "-global grlib-stixspw.udp-tc-port=%d",
+                            tm_port, tc_port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    /* a. one TX, one datagram, the 4-byte SpW header stripped */
+    qtest_memwrite(qts, TXDATA_ADDR, tm_full, sizeof(tm_full));
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    stix_drive_tx(qts, sizeof(tm_full));
+
+    n = stix_udp_recv(tm_fd, buf, sizeof(buf), &from);
+    g_assert_cmpint(n, ==, (ssize_t)sizeof(tm_full) - 4);
+    g_assert_cmpint(memcmp(buf, tm_full + 4, n), ==, 0);
+    g_assert_cmpuint(buf[0] >> 5, ==, 0); /* CCSDS version 0 */
+    g_assert_cmpint(from, >, 0); /* a real source port sent it */
+    /* exactly one datagram: a second one never arrives */
+    g_usleep(100 * 1000);
+    errno = 0;
+    g_assert_cmpint(recv(tm_fd, buf, sizeof(buf), MSG_DONTWAIT), ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+
+    /* b. a bare TC datagram from an ephemeral source port fills desc0 */
+    stix_rx_setup(qts);
+    memset(got, RX_GUARD, 2 * RX_BUF_STEP);
+    qtest_memwrite(qts, RXBUF_BASE, got, 2 * RX_BUF_STEP);
+    stix_udp_send_ephemeral(tc_port, tc_unit[0] + 4, 12);
+    spw_udp_wait_rx(qts, 0);
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR),
+                    ==, SPW_RXDSC_IE | sizeof(tc_unit[0]));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc_unit[0]));
+    g_assert_cmpint(memcmp(got, tc_unit[0], sizeof(tc_unit[0])), ==, 0);
+    qtest_memread(qts, RXBUF_BASE + sizeof(tc_unit[0]), got, 1);
+    g_assert_cmpuint(got[0], ==, RX_GUARD); /* nothing beyond the unit */
+
+    /* an undersized datagram is dropped: desc0 and its buffer unchanged */
+    stix_udp_send_ephemeral(tc_port, short_dg, sizeof(short_dg));
+    g_usleep(100 * 1000);
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR),
+                    ==, SPW_RXDSC_IE | sizeof(tc_unit[0]));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc_unit[0]));
+    g_assert_cmpint(memcmp(got, tc_unit[0], sizeof(tc_unit[0])), ==, 0);
+
+    /* and the next valid one is still delivered (into armed desc1) */
+    stix_udp_send_ephemeral(tc_port, tc_unit[1] + 4, 12);
+    spw_udp_wait_rx(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR + 8u),
+                    ==, SPW_RXDSC_IE | SPW_RXDSC_WR | sizeof(tc_unit[1]));
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP, got, sizeof(tc_unit[1]));
+    g_assert_cmpint(memcmp(got, tc_unit[1], sizeof(tc_unit[1])), ==, 0);
+
+    /*
+     * m6: three datagrams sent back to back from ONE sender socket,
+     * both descriptors now unarmed — they queue (the drain loop) and
+     * come out in send order as the descriptors are re-armed: tc2
+     * first, then tc0, then tc1. One socket is one flow: the kernel
+     * keeps loopback order within a flow, and does not order across
+     * flows (a fresh socket per datagram, as stix_udp_send_ephemeral
+     * opens, reorders) — so the burst shares one socket.
+     */
+    burst_fd = stix_udp_sender_open();
+    stix_udp_send_on(burst_fd, tc_port, tc_unit[2] + 4, 12);
+    stix_udp_send_on(burst_fd, tc_port, tc_unit[0] + 4, 12);
+    stix_udp_send_on(burst_fd, tc_port, tc_unit[1] + 4, 12);
+    close(burst_fd);
+
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN); /* RD: retry */
+    spw_udp_wait_rx(qts, 0);
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR),
+                    ==, SPW_RXDSC_IE | sizeof(tc_unit[2]));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc_unit[2]));
+    g_assert_cmpint(memcmp(got, tc_unit[2], sizeof(tc_unit[2])), ==, 0);
+    stix_rx_arm(qts, 1, true, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    spw_udp_wait_rx(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR + 8u),
+                    ==, SPW_RXDSC_IE | SPW_RXDSC_WR | sizeof(tc_unit[0]));
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP, got, sizeof(tc_unit[0]));
+    g_assert_cmpint(memcmp(got, tc_unit[0], sizeof(tc_unit[0])), ==, 0);
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    spw_udp_wait_rx(qts, 0);
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc_unit[1]));
+    g_assert_cmpint(memcmp(got, tc_unit[1], sizeof(tc_unit[1])), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    close(tm_fd);
+}
+
+/*
+ * (c) udp-spw-header=on: a TM datagram keeps the 4-byte header, a TC
+ * datagram passes unchanged, and nothing lands beyond the unit.
+ */
+static void spw_udp_case_header(void)
+{
+    static const uint8_t tm_full[12] = {
+        0x49, 0x02, 0x00, 0x00, 0x0d, 0x5e, 0x5e, 0xc0,
+        0x00, 0x03, 0x19, 0x42
+    };
+    static const uint8_t tc_unit[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x00,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xd7, 0x7e
+    };
+    g_autofree gchar *extra = NULL;
+    g_autofree uint8_t *got = g_malloc(2 * RX_BUF_STEP);
+    uint8_t buf[128];
+    QTestState *qts;
+    ssize_t n;
+    int tm_fd, tm_port, tc_port;
+
+    tm_fd = stix_udp_bind_free(&tm_port);
+    tc_port = stix_free_udp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.udp-tm-port=%d "
+                            "-global grlib-stixspw.udp-tc-port=%d "
+                            "-global grlib-stixspw.udp-spw-header=on",
+                            tm_port, tc_port);
+    qts = stix_qtest_new_extra(extra);
+
+    qtest_memwrite(qts, TXDATA_ADDR, tm_full, sizeof(tm_full));
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    stix_drive_tx(qts, sizeof(tm_full));
+    n = stix_udp_recv(tm_fd, buf, sizeof(buf), NULL);
+    g_assert_cmpint(n, ==, (ssize_t)sizeof(tm_full));
+    g_assert_cmpint(memcmp(buf, tm_full, sizeof(tm_full)), ==, 0);
+
+    stix_rx_setup(qts);
+    memset(got, RX_GUARD, 2 * RX_BUF_STEP);
+    qtest_memwrite(qts, RXBUF_BASE, got, 2 * RX_BUF_STEP);
+    /* the datagram carries the SpW header itself: delivered unchanged */
+    stix_udp_send_ephemeral(tc_port, tc_unit, sizeof(tc_unit));
+    spw_udp_wait_rx(qts, 0);
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR),
+                    ==, SPW_RXDSC_IE | sizeof(tc_unit));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc_unit));
+    g_assert_cmpint(memcmp(got, tc_unit, sizeof(tc_unit)), ==, 0);
+    qtest_memread(qts, RXBUF_BASE + sizeof(tc_unit), got, 1);
+    g_assert_cmpuint(got[0], ==, RX_GUARD); /* nothing beyond the unit */
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    close(tm_fd);
+}
+
+/*
+ * (d) TCP and UDP both on: one TX reaches both, TCP raw (the D-K unit)
+ * and UDP stripped.
+ */
+static void spw_udp_case_both(void)
+{
+    static const uint8_t tm_full[12] = {
+        0x49, 0x02, 0x00, 0x00, 0x0d, 0x5e, 0x5e, 0xc0,
+        0x00, 0x03, 0x19, 0x42
+    };
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[128];
+    QTestState *qts;
+    ssize_t n;
+    int fd, tcp_port, tm_fd, tm_port;
+
+    tcp_port = stix_free_tcp_port();
+    tm_fd = stix_udp_bind_free(&tm_port);
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d "
+                            "-global grlib-stixspw.udp-tm-port=%d",
+                            tcp_port, tm_port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    /* the TCP client first, so the TX below has somewhere to go */
+    fd = stix_tm_connect((uint16_t)tcp_port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+
+    qtest_memwrite(qts, TXDATA_ADDR, tm_full, sizeof(tm_full));
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    stix_drive_tx(qts, sizeof(tm_full));
+
+    stix_tm_read_exact(fd, buf, sizeof(tm_full)); /* TCP raw */
+    g_assert_cmpint(memcmp(buf, tm_full, sizeof(tm_full)), ==, 0);
+    stix_tm_read_eagain(fd, buf, sizeof(buf));
+    n = stix_udp_recv(tm_fd, buf, sizeof(buf), NULL); /* UDP stripped */
+    g_assert_cmpint(n, ==, (ssize_t)sizeof(tm_full) - 4);
+    g_assert_cmpint(memcmp(buf, tm_full + 4, n), ==, 0);
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    close(tm_fd);
+}
+
+/*
+ * (f) udp-tm-port with nothing listening: three TXs complete (an
+ * unconnected UDP socket never reports the loopback ICMP error, which
+ * would only surface on a LATER send — three TXs make a wrongly
+ * connected socket fail here), nothing is counted in tm-dropped, QEMU
+ * stays alive.
+ */
+static void spw_udp_case_no_listener(void)
+{
+    static const uint8_t tm_full[12] = {
+        0x49, 0x02, 0x00, 0x00, 0x0d, 0x5e, 0x5e, 0xc0,
+        0x00, 0x03, 0x19, 0x42
+    };
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    QTestState *qts;
+    int dead_port, i;
+
+    dead_port = stix_free_udp_port(); /* bound, then closed: no listener */
+    extra = g_strdup_printf("-global grlib-stixspw.udp-tm-port=%d",
+                            dead_port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    qtest_memwrite(qts, TXDATA_ADDR, tm_full, sizeof(tm_full));
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    for (i = 0; i < 3; i++) {
+        stix_drive_tx(qts, sizeof(tm_full));
+        /* let the loopback ICMP be processed between the sends */
+        g_usleep(50 * 1000);
+    }
+
+    /* every exchange ran to completion */
+    g_assert_cmphex(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PS,
+                     ==, SPW_DMA_PS);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+    /* QEMU alive; no send was counted (see the accepted-diffs §21) */
+    g_assert_cmphex(qtest_readl(qts, SPW_STATUS), ==, 0x00a00000u);
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * UDP transport (P2-8, D-B): one bare CCSDS Space Packet per datagram,
+ * in both directions; the sub-cases live in spw_udp_case_* (one QEMU
+ * instance each, so nothing is reassigned on g_autofree locals).
+ * RED on the pre-P2-8 binary: the udp-* -global properties are unknown.
+ */
+static void test_spw_udp(void)
+{
+    spw_udp_case_tm_tc();
+    spw_udp_case_header();
+    spw_udp_case_both();
+    spw_udp_case_no_listener();
+}
+
+/* g_test_trap_subprocess child: udp-tc-port on an occupied port. */
+static void test_spw_udp_bind_error_subprocess(void)
+{
+    const char *port = g_getenv(UDP_TEST_PORT_ENV);
+    const char *flash = g_getenv(TMTC_TEST_FLASH_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(port);
+    g_assert_nonnull(flash);
+
+    /* qtest_init aborts: QEMU realize fails on the bind and exits */
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s "
+                      "-global grlib-stixspw.udp-tc-port=%s", flash, port);
+    qtest_quit(qts);
+}
+
+/*
+ * e. udp-tc-port already bound by the test: QEMU fails at realize with
+ * the port and strerror in the message (the tmtc-bind-error pattern).
+ * RED on the pre-P2-8 binary: the property is unknown, so the stderr
+ * text differs.
+ */
+static void test_spw_udp_bind_error(void)
+{
+    g_autofree gchar *path = NULL;
+    g_autofree gchar *portstr = NULL;
+    g_autofree gchar *pat = NULL;
+    g_autofree gchar *sub = stix_test_path("spw-udp-bind-error/subprocess");
+    int fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+    int port;
+    int held;
+
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+
+    /* hold a UDP port race-free across the subprocess run */
+    held = stix_udp_bind_free(&port);
+    g_assert_cmpint(held, >=, 0);
+
+    portstr = g_strdup_printf("%d", port);
+    g_setenv(UDP_TEST_PORT_ENV, portstr, TRUE);
+    g_setenv(TMTC_TEST_FLASH_ENV, path, TRUE);
+
+    g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+    g_test_trap_assert_failed();
+    /* one glob: the bind message carries loopback, the port and strerror */
+    pat = g_strdup_printf("*127.0.0.1:%d*Address already in use*", port);
+    g_test_trap_assert_stderr(pat);
+
+    close(held);
+    close(fd);
+    g_unlink(path);
+}
+
+/* g_test_trap_subprocess child: udp-tm-host that is not IPv4. */
+static void test_spw_udp_host_error_subprocess(void)
+{
+    const char *host = g_getenv(UDP_TEST_HOST_ENV);
+    const char *flash = g_getenv(TMTC_TEST_FLASH_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(host);
+    g_assert_nonnull(flash);
+
+    /* qtest_init aborts: QEMU realize fails on the host and exits */
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s "
+                      "-global grlib-stixspw.udp-tm-host=%s "
+                      "-global grlib-stixspw.udp-tm-port=21501",
+                      flash, host);
+    qtest_quit(qts);
+}
+
+/*
+ * m6: a udp-tm-host that is not an IPv4 address fails realize with an
+ * error naming the value. RED on the pre-P2-8 binary: the property is
+ * unknown, so the stderr text differs.
+ */
+static void test_spw_udp_host_error(void)
+{
+    g_autofree gchar *path = NULL;
+    g_autofree gchar *pat = NULL;
+    g_autofree gchar *sub = stix_test_path("spw-udp-host-error/subprocess");
+    int fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+
+    g_setenv(UDP_TEST_HOST_ENV, "not-an-ip", TRUE);
+    g_setenv(TMTC_TEST_FLASH_ENV, path, TRUE);
+
+    g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+    g_test_trap_assert_failed();
+    pat = g_strdup_printf("*udp-tm-host 'not-an-ip'*IPv4*");
+    g_test_trap_assert_stderr(pat);
+
+    close(fd);
+    g_unlink(path);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -3196,6 +3732,15 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/spw-rx", test_spw_rx);
         qtest_add_func("/sparc/stix/tc-tcp", test_tc_tcp);
         qtest_add_func("/sparc/stix/spw-timecode", test_spw_timecode);
+        qtest_add_func("/sparc/stix/spw-udp", test_spw_udp);
+        qtest_add_func("/sparc/stix/spw-udp-bind-error/subprocess",
+                       test_spw_udp_bind_error_subprocess);
+        qtest_add_func("/sparc/stix/spw-udp-bind-error",
+                       test_spw_udp_bind_error);
+        qtest_add_func("/sparc/stix/spw-udp-host-error/subprocess",
+                       test_spw_udp_host_error_subprocess);
+        qtest_add_func("/sparc/stix/spw-udp-host-error",
+                       test_spw_udp_host_error);
     }
 
     return g_test_run();

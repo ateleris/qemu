@@ -1126,3 +1126,124 @@ the pre-P2-7 binary: the first rollover gave no TO (`status.TO == 0`).
 Green: `spw-timecode`, `ctrl-scet`, `ctrl`, `spw-regs`, `spw-tx`,
 `spw-rx`, `tc-tcp`, and all 30 tests. checkpatch on the diff: 0
 errors, 0 warnings.
+
+## 21. UDP transport: one bare Space Packet per datagram (baseline: TCP only)
+
+**Baseline:** the only transport is the TCP server (D-K units), so the
+ground station — which speaks UDP with one bare Space Packet per
+datagram — needed the Python bridge
+(`scripts/stix/gs/stix_gs_bridge.py`) to strip and re-add the 4-byte
+SpW header and to split and join the TCP stream on the CCSDS length.
+
+**Model (P2-8, D-B as amended):** four new properties on
+`grlib-stixspw`:
+
+| Property | Type | Default | Meaning |
+|---|---|---|---|
+| `udp-tm-host` | string | 127.0.0.1 | TM datagram destination (numeric IPv4 only, no name resolution on the realize path) |
+| `udp-tm-port` | uint32 | 0 | TM destination port; 0 = off |
+| `udp-tc-port` | uint32 | 0 | local TC bind; 0 = off |
+| `udp-spw-header` | bool | off | keep the 4-byte SpW header in both directions |
+
+- The sockets are plain `qemu_socket(AF_INET, SOCK_DGRAM)`, non-blocking
+  and **not connected** (D-N: QEMU's `char-udp` connects its socket,
+  which would drop datagrams from the GS's ephemeral source port). They
+  open at realize when the respective port is non-zero, independent of
+  the TCP `tmtc-server` OnOffAuto — UDP works with the TCP server off.
+  A port above 65535 is an `errp` error; a bind failure is an `errp`
+  error carrying `127.0.0.1:<port>` and strerror. The TC socket is
+  served by a main-loop fd handler, like the TCP side.
+- **TM:** every TX is one `sendto` of one datagram, the 4-byte SpW
+  header stripped unless `udp-spw-header=on`. Never blocks (a datagram
+  is all-or-nothing by protocol). With TCP also on, one TX reaches both
+  — TCP raw (D-K), UDP stripped.
+- **TM failure accounting (item f, review m5):** `tm-dropped` is now a
+  **per-sink** counter: the TCP queue-full drop and a UDP `sendto`
+  failure each count, so one TX can count twice (once per failing
+  sink) — or once, when only one sink failed. An unconnected UDP socket
+  never sees ICMP port-unreachable feedback on Linux, so a TX with
+  nothing listening is indistinguishable from a delivered one and is
+  **not** counted — the datagram is silently lost, like the TCP
+  no-client drop (the review's kernel check: `__udp4_lib_err` ignores
+  ICMP for a socket that is not established unless IP_RECVERR is set,
+  which the model never sets). Only synchronous `sendto` failures
+  (EAGAIN, ENOBUFS, a bad route) are counted. Both UDP TM traces log
+  the datagram length (stripped), not the DMA'd length.
+- **TC:** each datagram from any source is exactly one unit. The model
+  prepends `40 02 00 00` (what the bridge would add) unless
+  `udp-spw-header=on`, then hands the unit to the same RX DMA path as
+  TCP (no-spill queue, truncation, PR, IRQ). The size bounds follow the
+  framing mode: a datagram smaller than a bare Space Packet header
+  (7 bytes) — or `4 + 7` with the header kept, the TCP framer's minimum
+  unit — or bigger than the largest possible unit is dropped and traced
+  (`stixtmtc_udp_tc_dropped`); in stripped mode the ceiling is 65542
+  (`TC_UNIT_MAX - 4`), which a 16-bit CCSDS length cannot exceed
+  anyway. There is no resync logic: the datagram boundaries are the
+  framing, and a malformed unit is the FSW's CRC problem, not a framing
+  one.
+- **Counters (review m5, decided):** UDP TC size drops are traced only,
+  with no QOM counter — unlike the TCP `tc-resync` (which signals a
+  framing problem on a healthy byte stream), a size drop means the
+  sender is broken, and the trace is enough. UDP TM failures share
+  `tm-dropped` (per-sink, above); a separate `tm-udp-dropped` was
+  considered and not added.
+- **The TC drain loop is capped** at 64 datagrams per wake-up (the
+  no-spill queue's length): past that every further datagram is only
+  `rx-dropped`, and draining a full socket buffer would hold the BQL
+  where the TCP side reads one 8 KiB chunk per wake-up (review m4).
+- **TCP unchanged** (D-K): framing, token strip, resync — all as in
+  §17/§19. The `stixspw_recv_packet_callback` trace message drops its
+  "TCP" prefix: it is now the callback for both transports. The stdout
+  golden changes only by that trace text — the golden run has no TC
+  traffic (no callback lines) and the `stixtmtc_udp_*` events fire only
+  when a `udp-*` port is set; boot-smoke compares only the UART.
+- `run-qemu-gs.sh --udp` starts the emulator with
+  `udp-tm-port=21501` and `udp-tc-port=21502` (the GS's documented
+  ports); the TCP server stays on 21500. **The bridge cannot run
+  alongside `--udp`** (both bind 127.0.0.1:21502, and both would feed
+  TM to 21501); it remains for TCP-only setups. `run-qemu-gs.sh`
+  rejects unknown arguments, validates the port overrides, and prints
+  `qemu.log`'s tail when QEMU dies at startup. The 5.2 wrapper strips
+  the four `udp-*` properties like `tmtc-server`.
+
+Gates: see the reviewer's run — boot-smoke, tc-smoke (TCP) and soak,
+then the §5 end-to-end UDP run (QEMU + ground station, no bridge). None
+of them is recorded here; the ground-station status table stays at
+"expected to work; pending the §5 run" until they pass.
+
+**Evidence:** qtest `/sparc/stix/spw-udp`: (a) `udp-tm-port` alone (no
+TCP server): one TX yields exactly one datagram, the DMA'd buffer minus
+its 4-byte header, first byte CCSDS version 0, and a follow-up
+non-blocking recv hits EAGAIN; (b) a bare TC(17,1) datagram from an
+unrelated ephemeral source port fills an armed descriptor with
+`40 02 00 00` + the SP (len 16, ctrl = IE|16), nothing beyond the unit
+written; an undersized datagram (6 bytes, below the bare-SP floor) is
+dropped with the descriptor untouched and the next valid one still
+delivered; three datagrams sent back to back from one sender socket
+come out in send order through the drain loop and the no-spill queue
+— the kernel keeps order within one flow (the ground station sends
+every TC from one socket), but does not order across flows: fresh
+sockets per datagram reorder, measured at about two in three
+three-datagram bursts, which is why the burst shares one sender; the
+upper size bound is untestable over IPv4 loopback: a UDP payload
+above 65507 fails `sendto` with EMSGSIZE, and the bound lies above
+that; (c) with
+`udp-spw-header=on` a TM datagram keeps the header, a TC datagram is
+delivered unchanged, nothing beyond the unit; (d) TCP and UDP both on:
+one TX reaches both, TCP raw and UDP stripped; (f) `udp-tm-port` with
+nothing listening: three TXs (the loopback ICMP would only surface on
+a later send, so a wrongly connected socket would count here) complete
+with EN cleared, PS set, IRQ 13, QEMU alive and `tm-dropped` unchanged.
+`/sparc/stix/spw-udp-bind-error`: an occupied `udp-tc-port` fails
+realize with `127.0.0.1:<port>` and "Address already in use" on stderr
+(the TCP server, when also enabled, is torn down on that path — not
+externally observable: with `&error_fatal` the process exits, so every
+fd dies with it; the cleanup call keeps the "a failed realize leaks
+nothing" invariant). `/sparc/stix/spw-udp-host-error`: a `udp-tm-host`
+that is not IPv4 fails realize with the value in the message. Red on
+the pre-P2-8 binary: `Property 'grlib-stixspw.udp-tm-port' not found`
+(the tc-port and host variants likewise in the subprocess tests).
+Green: `spw-udp`, `spw-udp-bind-error`, `spw-udp-host-error`,
+`tm-tcp`, `tc-tcp`, `spw-rx`, `spw-tx`, `spw-timecode`, and the full
+suite. checkpatch on the diff: 0 errors, 0 warnings.
+

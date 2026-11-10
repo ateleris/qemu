@@ -1,11 +1,11 @@
 # Attaching the ATS ground station to the STIX emulator
 
-Status 2026-11-10:
+Status 2026-11-10 (updated by P2-8):
 
 | Direction | Status |
 |---|---|
-| **TM (emulator → ground station)** | Works end to end. Heartbeats and HK are decoded in the ground station's UI and history. |
-| **TC (ground station → FSW)** | Reaches QEMU, but the model's SpW receive path is a stub, so the TC is dropped. Not usable until roadmap Phase 2. |
+| **TM (emulator → ground station)** | Works end to end. Heartbeats and HK are decoded in the ground station's UI and history. Over TCP (bridge) or direct UDP. |
+| **TC (ground station → FSW)** | Expected to work via direct UDP (`run-qemu-gs.sh --udp`, no bridge): the model binds 21502/udp and feeds each datagram to the RX DMA path (P2-8). **Pending the reviewer's end-to-end run** (§5 of the Phase 2 plan; gates: see the reviewer's run). Over TCP the bridge is still needed (its TC forwarding reaches the same RX path since P2-6). |
 
 The findings, with file:line references on both sides, are in
 `drafts/2026-11-10-gs-attach-report.md`.
@@ -20,7 +20,8 @@ The findings, with file:line references on both sides, are in
                      ◀─TC─  add SpW hdr 40 02 00 00   ◀─UDP─  out_port :21502
 ```
 
-The bridge exists because the two sides frame packets differently:
+The bridge exists because the two sides frame packets differently
+(it is optional since P2-8 — see "Direct UDP (no bridge)" below):
 - **QEMU** is a TCP server that streams whatever the FSW puts into the SpW
   TX DMA. Each unit is a 4-byte SpaceWire CCSDS-transfer header
   (`49 02 00 00` for OBC traffic, `30 02 00 00` for SSMM/science), followed
@@ -213,6 +214,67 @@ done
 broad `pkill -f` from a shell whose own command line contains the pattern:
 it kills that shell.
 
+## Direct UDP (no bridge)
+
+Since P2-8 the emulator itself speaks the ground station's framing
+(decision D-B: one bare Space Packet per datagram, in both directions),
+so the bridge is optional. `run-qemu-gs.sh --udp` adds two `-global`
+options to the same QEMU command line:
+
+- `grlib-stixspw.udp-tm-port=21501` — every TM packet also goes out as
+  one UDP datagram to `127.0.0.1:21501`, the 4-byte SpW header stripped;
+- `grlib-stixspw.udp-tc-port=21502` — QEMU binds 21502/udp and accepts
+  each datagram from any source port as one TC unit, adding the SpW
+  header (`40 02 00 00`) internally before the RX DMA.
+
+`udp-tm-host` (default 127.0.0.1) and `udp-spw-header=on` (deliver the
+header in both directions) exist for tools that want them; the ground
+station needs neither. The TCP server on 21500 stays up, so
+`tmtc-probe.py` still works alongside. **The bridge does not:** `--udp`
+and `stix_gs_bridge.py` are mutually exclusive — both bind
+127.0.0.1:21502, so whichever starts second fails (QEMU's realize error
+lands only in `qemu.log`; `run-qemu-gs.sh` prints it when QEMU dies at
+startup), and even without the bind clash both would feed TM to 21501,
+so the ground station would see every packet twice. Stop the bridge
+before starting `--udp`; the bridge is for runs without `--udp`.
+
+```
+ QEMU (STIX model)                        ATS ground station
+ sendto 127.0.0.1:21501  ──TM datagrams─▶  in_port  :21501
+ recv on 21502/udp       ◀─TC datagrams──  out_port :21502
+                                         web UI   :21503
+```
+
+The satellite config is unchanged from "One-time setup" (in_port 21501,
+out 127.0.0.1:21502). Two terminals instead of three:
+
+```bash
+# 1. Emulator with direct UDP:
+/home/laszlo/dev/qemu-stix-tc/scripts/stix/gs/run-qemu-gs.sh --udp \
+    /home/laszlo/dev/qemu-stix-tc/build/qemu-system-sparc
+
+# 2. Ground station web app, as above
+cd /home/laszlo/dev/ATS-GroundStation-stix
+.venv/bin/uvicorn main:app --host 127.0.0.1 --port 21503
+```
+
+TCs are expected to work end to end, pending the reviewer's §5 run: the
+UI sends TC(17,1) and the acks TM(1,1)/TM(17,2)/TM(1,7) should come back
+as TM. That needs the ground station's `stix_pus` serializer and the IDB
+command definitions, which live on branch `stix-qemu-integration` (see
+"Where the ground-station changes are"). The bridge remains for TCP-only
+setups (a ground station build that cannot speak UDP).
+
+UDP-specific notes: there is no connection handshake, so datagrams sent
+before the other side starts are simply lost (same as the TCP no-client
+drop); datagram order is kept within one sender socket — which is what
+the ground station uses for every TC — but NOT across different source
+sockets, so a tool that opens a fresh socket per datagram can have its
+bursts reordered (the model delivers in arrival order);
+`tmtc-probe.py` stays TCP-only — it talks to 21500; and QEMU binds TC
+on 127.0.0.1 only (`udp-tm-host` can point TM at a remote address, but
+a remote ground station cannot send TC to this model).
+
 ## Notes and limits
 
 - **Order doesn't matter.** The bridge retries the QEMU connection. QEMU
@@ -220,6 +282,12 @@ it kills that shell.
   first packets of a boot are lost if the bridge starts late.
 - **One TM client at a time.** QEMU accepts a single TCP client, so don't
   run `tmtc-probe.py` on 21500 while the bridge is connected.
+- **The bridge and `--udp` are mutually exclusive.** Both bind
+  127.0.0.1:21502 (the bridge's TC listener, QEMU's TC socket) and both
+  would send TM to 21501. Whichever starts second fails — the bridge
+  with an OSError traceback, QEMU with a realize error that
+  `run-qemu-gs.sh` surfaces only when QEMU dies within the first
+  second. Run one or the other.
 - **Definition matching.** On `main`, definitions are keyed by APID only.
   HK SID 1 and SID 2 share 0x5A4, so only the SID field can be decoded.
   Commit `14f6ee4` on the branch adds matching by APID + PUS type +
@@ -233,7 +301,7 @@ it kills that shell.
 
   | Port | Use |
   |---|---|
-  | 21500/tcp | QEMU TM |
-  | 21501/udp | ground station TM in |
-  | 21502/udp | ground station TC out (the bridge listens) |
+  | 21500/tcp | QEMU TM (TCP; the bridge or `tmtc-probe.py` connects) |
+  | 21501/udp | ground station TM in (bridge forwards, or QEMU sends direct with `--udp`) |
+  | 21502/udp | ground station TC out (the bridge listens, or QEMU binds it with `--udp`) |
   | 21503/tcp | ground station web UI |

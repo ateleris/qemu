@@ -15,6 +15,8 @@ static const char stix_control_token[] = "STIX_CONTROL";
 static void stix_tmtc_accept(void *opaque);
 static void stix_tmtc_client_read(void *opaque);
 static void stix_tmtc_client_write(void *opaque);
+static void stix_tmtc_udp_tc_read(void *opaque);
+static void stix_tmtc_udp_close(StixTmtc *t);
 
 /*
  * Close the client once (the baseline closed it twice), drop the queue
@@ -285,6 +287,7 @@ void stix_tmtc_cleanup(StixTmtc *t)
         close(t->listen_fd);
         t->listen_fd = -1;
     }
+    stix_tmtc_udp_close(t);
     g_free(t->in_buf);
     t->in_buf = NULL;
     g_free(t->out_buf);
@@ -379,4 +382,233 @@ bool init_tmtc_server(StixTmtc *tmtc, StixTmtcRecvFn tc_received, void *opaque,
     trace_stixtmtc_listening(port);
 
     return true;
+}
+
+/*
+ * One wake-up drains at most this many datagrams. The RX no-spill queue
+ * (SPW_RX_QUEUE_LEN in grlib_stixspw.c) holds 64 units, so past 64 every
+ * further datagram is only rx-dropped; and draining the whole socket
+ * buffer in one go would hold the BQL for hundreds of deliveries, where
+ * the TCP side reads one 8 KiB chunk per wake-up. The level-triggered
+ * handler re-fires while datagrams remain (P2-8 review m4).
+ */
+#define UDP_DRAIN_MAX 64
+
+/*
+ * D-B TC ingress over UDP: each datagram is exactly one unit. The
+ * datagram is read after room for the 4-byte SpW header, so the
+ * default (stripped) mode only prepends it in place; with
+ * udp-spw-header=on the datagram already starts with its own header
+ * and is delivered as received. A datagram smaller than a bare Space
+ * Packet (7 bytes; 4 + 7 with the header kept, the TCP framer's
+ * minimum) or bigger than the largest possible unit is dropped and
+ * traced; there is no resync logic, the datagram boundaries are the
+ * framing.
+ */
+static void stix_tmtc_udp_tc_read(void *opaque)
+{
+    StixTmtc *t = opaque;
+    static const uint8_t spw_hdr[4] = { 0x40, 0x02, 0x00, 0x00 };
+    struct sockaddr_in sin;
+    /*
+     * the largest accepted datagram plus one, so an oversize one shows
+     * up as a short read instead of a silent truncation; in the default
+     * (stripped) mode the datagram is a bare Space Packet, which can
+     * never exceed TC_UNIT_MAX - 4 (16-bit CCSDS length)
+     */
+    const size_t max = (t->udp_spw_header ? TC_UNIT_MAX
+                                          : TC_UNIT_MAX - 4) + 1;
+    const size_t min = t->udp_spw_header ? 4u + 7u : 7u;
+    uint8_t *unit = t->udp_buf;
+    int i;
+    ssize_t n;
+
+    for (i = 0; i < UDP_DRAIN_MAX; i++) {
+        socklen_t addrlen = sizeof(sin);
+
+        do {
+            n = recvfrom(t->udp_tc_fd, t->udp_buf + 4, max, 0,
+                         (struct sockaddr *)&sin, &addrlen);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                trace_stixtmtc_udp_tc_error(errno);
+            }
+            return;
+        }
+        if (n < min || (size_t)n > max - 1) {
+            trace_stixtmtc_udp_tc_dropped((int)n);
+            continue;
+        }
+        if (!t->udp_spw_header) {
+            memcpy(t->udp_buf, spw_hdr, sizeof(spw_hdr));
+        } else {
+            /* the datagram carries its own header: deliver as received */
+            unit = t->udp_buf + 4;
+        }
+        trace_stixtmtc_udp_tc_unit(t->udp_spw_header ? (int)n : (int)(n + 4),
+                                    ntohs(sin.sin_port));
+        if (t->tc_received) {
+            t->tc_received(unit, t->udp_spw_header ? (int)n : (int)(n + 4),
+                           t->opaque);
+        }
+    }
+}
+
+/*
+ * Close the UDP sockets opened so far. The TCP server state (listen
+ * fd, client, queue) is untouched: a UDP failure must not tear it down.
+ */
+static void stix_tmtc_udp_close(StixTmtc *t)
+{
+    if (t->udp_tc_fd >= 0) {
+        qemu_set_fd_handler(t->udp_tc_fd, NULL, NULL, NULL);
+        close(t->udp_tc_fd);
+        t->udp_tc_fd = -1;
+    }
+    if (t->udp_tm_fd >= 0) {
+        close(t->udp_tm_fd);
+        t->udp_tm_fd = -1;
+    }
+    g_free(t->udp_buf);
+    t->udp_buf = NULL;
+}
+
+/*
+ * Open the D-B UDP sockets. The TM socket is send-only towards one
+ * destination (no bind, unconnected); the TC socket binds the loopback
+ * port and is served by a main-loop fd handler. Both are non-blocking
+ * and unconnected (any TC source port is accepted).
+ */
+bool stix_tmtc_udp_open(StixTmtc *t, StixTmtcRecvFn tc_received,
+                        void *opaque, const char *udp_tm_host,
+                        uint32_t udp_tm_port, uint32_t udp_tc_port,
+                        bool udp_spw_header, Error **errp)
+{
+    /*
+     * set unconditionally: when the TCP server is off (tmtc-server=off,
+     * or auto under qtest) this is the only place the RX callback is
+     * wired
+     */
+    t->tc_received = tc_received;
+    t->opaque = opaque;
+    t->udp_spw_header = udp_spw_header;
+
+    if (udp_tm_port > 0xffff) {
+        error_setg(errp, "TMTC UDP: udp-tm-port %u is out of range",
+                   udp_tm_port);
+        return false;
+    }
+    if (udp_tc_port > 0xffff) {
+        error_setg(errp, "TMTC UDP: udp-tc-port %u is out of range",
+                   udp_tc_port);
+        return false;
+    }
+
+    if (udp_tm_port != 0) {
+        struct sockaddr_in *d = &t->udp_tm_dest;
+
+        t->udp_tm_fd = qemu_socket(AF_INET, SOCK_DGRAM, 0);
+        if (t->udp_tm_fd < 0) {
+            error_setg_errno(errp, errno,
+                             "TMTC UDP: cannot create the TM socket");
+            return false;
+        }
+        if (!qemu_set_blocking(t->udp_tm_fd, false, errp)) {
+            stix_tmtc_udp_close(t);
+            return false;
+        }
+        memset(d, 0, sizeof(*d));
+        d->sin_family = AF_INET;
+        /*
+         * numeric IPv4 only: no name resolution on the realize path
+         * (the default and documented value is 127.0.0.1)
+         */
+        if (inet_pton(AF_INET, udp_tm_host, &d->sin_addr) != 1) {
+            error_setg(errp, "TMTC UDP: udp-tm-host '%s' is not an"
+                             " IPv4 address", udp_tm_host);
+            stix_tmtc_udp_close(t);
+            return false;
+        }
+        d->sin_port = htons((uint16_t)udp_tm_port);
+    }
+
+    if (udp_tc_port != 0) {
+        struct sockaddr_in sin = {
+            .sin_family = AF_INET,
+            .sin_addr.s_addr = inet_addr("127.0.0.1"),
+        };
+        int port = (int)udp_tc_port;
+
+        t->udp_tc_fd = qemu_socket(AF_INET, SOCK_DGRAM, 0);
+        if (t->udp_tc_fd < 0) {
+            error_setg_errno(errp, errno,
+                             "TMTC UDP: cannot create the TC socket"
+                             " (port %d)", port);
+            stix_tmtc_udp_close(t);
+            return false;
+        }
+        sin.sin_port = htons((uint16_t)port);
+        if (bind(t->udp_tc_fd, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+            int err = errno;
+
+            error_setg_errno(errp, err,
+                             "TMTC UDP: cannot bind 127.0.0.1:%d", port);
+            stix_tmtc_udp_close(t);
+            return false;
+        }
+        if (!qemu_set_blocking(t->udp_tc_fd, false, errp)) {
+            stix_tmtc_udp_close(t);
+            return false;
+        }
+        /* the datagram scratch: hdr room + the largest datagram + 1 */
+        t->udp_buf = g_malloc(4 + TC_UNIT_MAX + 1);
+        qemu_set_fd_handler(t->udp_tc_fd, stix_tmtc_udp_tc_read, NULL, t);
+        trace_stixtmtc_udp_tc_bind(port);
+    }
+
+    return true;
+}
+
+void stix_tmtc_udp_send(StixTmtc *t, const uint8_t *data, int len)
+{
+    /*
+     * the datagram length: the DMA'd buffer minus the stripped header,
+     * so every UDP TM trace logs the same length (review m5)
+     */
+    int dlen;
+    ssize_t n;
+
+    if (t->udp_tm_fd < 0 || len <= 0) {
+        return;
+    }
+    if (t->udp_spw_header) {
+        dlen = len;
+        n = sendto(t->udp_tm_fd, data, len, 0,
+                   (struct sockaddr *)&t->udp_tm_dest,
+                   sizeof(t->udp_tm_dest));
+    } else {
+        if (len < 4) {
+            /* nothing to strip: not a SpW packet; a send failure */
+            t->tm_dropped++;
+            trace_stixtmtc_udp_tm_short(len);
+            return;
+        }
+        dlen = len - 4;
+        n = sendto(t->udp_tm_fd, data + 4, dlen, 0,
+                   (struct sockaddr *)&t->udp_tm_dest,
+                   sizeof(t->udp_tm_dest));
+    }
+    if (n < 0) {
+        /*
+         * a whole datagram failed (UDP has no partial sends): dropped
+         * and counted, like an out-queue overflow. An unconnected
+         * socket never sees ICMP feedback, so a TX with nothing
+         * listening is NOT a failure.
+         */
+        t->tm_dropped++;
+        trace_stixtmtc_udp_tm_dropped(dlen, errno);
+        return;
+    }
+    trace_stixtmtc_udp_tm_send(dlen);
 }

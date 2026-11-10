@@ -102,6 +102,16 @@ struct STIXSPW
 
     OnOffAuto tmtc_server; /* auto = on, except under qtest (hermetic tests) */
     uint32_t tmtc_port; /* 0 = dynamic: IO_TCP_SERVER_BASE_PORT + getuid() */
+
+    /*
+     * D-B direct UDP for the ground station (P2-8); the ports are 0 =
+     * off and the sockets live in tmtc (StixTmtc)
+     */
+    char *udp_tm_host;  /* TM destination host, default 127.0.0.1 */
+    uint32_t udp_tm_port; /* TM destination port (datagrams out) */
+    uint32_t udp_tc_port; /* local TC bind (datagrams in) */
+    bool udp_spw_header; /* keep the 4-byte SpW header in both directions */
+
     MemoryRegion iomem;
     qemu_irq irq;
     /*
@@ -142,9 +152,9 @@ static uint8_t buffer[8192];
 static void stixspw_rx_deliver(STIXSPW *s, const uint8_t *buf, int len);
 
 /*
- * A whole TC unit arrived from the TCP transport (D-K framing, BQL
- * held): hand it to the RX DMA path (P2-5), which applies truncation
- * and the no-spill queue.
+ * A whole TC unit arrived from the transport (TCP D-K framing, or one
+ * UDP datagram, D-B; BQL held): hand it to the RX DMA path (P2-5),
+ * which applies truncation and the no-spill queue.
  */
 static void recv_packet_callback(uint8_t *data, int length, void *opaque)
 {
@@ -506,6 +516,8 @@ static void grlib_stixspw_tx(STIXSPW *stixspw)
         }
 
         stix_tmtc_send(&stixspw->tmtc, buffer, txdsc.dlen);
+        /* D-B: a second copy goes out as one bare-SP datagram */
+        stix_tmtc_udp_send(&stixspw->tmtc, buffer, txdsc.dlen);
 
         trace_stixspw_tx_send(txdsc.dlen);
     } else {
@@ -685,6 +697,27 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
         }
     }
 
+    /*
+     * D-B: the UDP transport is independent of the TCP OnOffAuto — the
+     * ground station talks plain UDP, with or without the TCP server.
+     */
+    if (STIXSPW->udp_tm_port != 0 || STIXSPW->udp_tc_port != 0) {
+        if (!stix_tmtc_udp_open(&STIXSPW->tmtc, recv_packet_callback, STIXSPW,
+                                STIXSPW->udp_tm_host ? : "127.0.0.1",
+                                STIXSPW->udp_tm_port, STIXSPW->udp_tc_port,
+                                STIXSPW->udp_spw_header, errp))
+        {
+            /*
+             * m1 of the P2-8 review: undo the TCP server too, so a
+             * failed realize leaves nothing behind (no listening socket
+             * with a dangling-opaque fd handler, no buffers). The UDP
+             * sockets are already closed by stix_tmtc_udp_open.
+             */
+            stix_tmtc_cleanup(&STIXSPW->tmtc);
+            return;
+        }
+    }
+
     STIXSPW->tc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixspw_tc_timer,
                                      STIXSPW);
     if (STIXSPW->timecodes) {
@@ -807,6 +840,8 @@ static void grlib_stixspw_instance_init(Object *obj)
     /* no fd 0: the transport is off until realize starts it */
     STIXSPW->tmtc.listen_fd = -1;
     STIXSPW->tmtc.client_fd = -1;
+    STIXSPW->tmtc.udp_tm_fd = -1;
+    STIXSPW->tmtc.udp_tc_fd = -1;
     STIXSPW->timecodes = true;
 
     object_property_add_uint32_ptr(obj, "tm-dropped",
@@ -854,9 +889,17 @@ static void grlib_stixspw_reset(DeviceState *d)
     stixspw_tc_arm(STIXSPW);
 }
 
+/*
+ * udp-tm-host is a DEFINE_PROP_STRING: the property's release frees it
+ * at object destruction, so there is no instance_finalize here.
+ */
 static const Property grlib_stixspw_properties[] = {
     DEFINE_PROP_ON_OFF_AUTO("tmtc-server", STIXSPW, tmtc_server, ON_OFF_AUTO_AUTO),
     DEFINE_PROP_UINT32("tmtc-port", STIXSPW, tmtc_port, 0),
+    DEFINE_PROP_STRING("udp-tm-host", STIXSPW, udp_tm_host),
+    DEFINE_PROP_UINT32("udp-tm-port", STIXSPW, udp_tm_port, 0),
+    DEFINE_PROP_UINT32("udp-tc-port", STIXSPW, udp_tc_port, 0),
+    DEFINE_PROP_BOOL("udp-spw-header", STIXSPW, udp_spw_header, false),
     DEFINE_PROP_LINK("scet-source", STIXSPW, scet_ctrl,
                      TYPE_GRLIB_STIXCTRL, STIXCTRL *),
 };
