@@ -1206,10 +1206,14 @@ SpW header and to split and join the TCP stream on the CCSDS length.
   `qemu.log`'s tail when QEMU dies at startup. The 5.2 wrapper strips
   the four `udp-*` properties like `tmtc-server`.
 
-Gates: see the reviewer's run — boot-smoke, tc-smoke (TCP) and soak,
-then the §5 end-to-end UDP run (QEMU + ground station, no bridge). None
-of them is recorded here; the ground-station status table stays at
-"expected to work; pending the §5 run" until they pass.
+Gates (reviewer's run, 2026-11-10, normal ELF): boot-smoke PASS; soak
+300 s PASS; tc-smoke over TCP PASS (all six expectations). The §5
+end-to-end UDP run (QEMU `866ee37709` with `--udp` and ground station
+`0dcb1af`, no bridge) passed. TC(17,1) `1DACC000000519110100D77E` gave
+TM(1,1), TM(17,2) and TM(1,7). TC(9,129)
+`1DACC001000B1909810010000000000035C6` gave TM(1,1) and TM(1,7) 4–6 s
+later, and the heartbeat CUC counted on from 0x10000000. The transcript
+is in the Phase 2 acceptance checklist.
 
 **Evidence:** qtest `/sparc/stix/spw-udp`: (a) `udp-tm-port` alone (no
 TCP server): one TX yields exactly one datagram, the DMA'd buffer minus

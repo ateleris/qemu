@@ -1,11 +1,11 @@
 # Attaching the ATS ground station to the STIX emulator
 
-Status 2026-11-10 (updated by P2-8):
+Status 2026-11-10 (after the Phase 2 end-to-end run):
 
 | Direction | Status |
 |---|---|
-| **TM (emulator → ground station)** | Works end to end. Heartbeats and HK are decoded in the ground station's UI and history. Over TCP (bridge) or direct UDP. |
-| **TC (ground station → FSW)** | Expected to work via direct UDP (`run-qemu-gs.sh --udp`, no bridge): the model binds 21502/udp and feeds each datagram to the RX DMA path (P2-8). **Pending the reviewer's end-to-end run** (§5 of the Phase 2 plan; gates: see the reviewer's run). Over TCP the bridge is still needed (its TC forwarding reaches the same RX path since P2-6). |
+| **TM (emulator → ground station)** | Works end to end. Heartbeats, HK and TC reports are decoded in the ground station's UI and history, over direct UDP (`--udp`) or over TCP with the bridge. |
+| **TC (ground station → FSW)** | Works end to end over direct UDP (`run-qemu-gs.sh --udp`, no bridge), verified 2026-11-10 with QEMU `866ee37709` and ground station `0dcb1af`. TC(17,1) gave TM(1,1), TM(17,2) and TM(1,7). TC(9,129) coarse 0x10000000 gave TM(1,1) and TM(1,7), and the heartbeat CUC then counted from 0x10000000. The transcript is in the Phase 2 acceptance checklist. Over TCP the bridge with `--forward-tc` reaches the same RX path (P2-6; shown in the 2026-11-10 bridge demo). |
 
 The findings, with file:line references on both sides, are in
 `drafts/2026-11-10-gs-attach-report.md`.
@@ -88,6 +88,10 @@ test and `CLAUDE.md` differences.
 The full commit list of `stix-qemu-integration` (never merged to `main`):
 
 ```
+2946e01 docs: STIX satellite over direct UDP to the QEMU emulator
+0dcb1af commands: stix_pus stops encoding at the PUS size limit
+1306f7e commands: stix_pus serializer (big-endian PUS TC with CRC-16/CCITT-FALSE)
+b443eec commands: PUS service type and bit widths in STIX TC definitions
 b4f8e31 telemetry: reject markup characters in units and calibration texts
 8990d41 frontend: escape definition and telemetry text before inserting HTML
 b7fcdf5 definitions: STIX TC generated from IDB v2.26.36
