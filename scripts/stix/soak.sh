@@ -3,33 +3,43 @@
 # still alive at the end of the window. Catches steady-state crashes like
 # the SCET assert abort (review finding T1) and guest hangs.
 #
-# Liveness = QEMU still runs at the end, and the UART log grew over a
-# WINDOW-second window ending MARGIN seconds before the end — sampled
-# WHILE QEMU IS STILL RUNNING; the script itself ends the run. The first version of this script ran QEMU in the
-# foreground and sampled afterwards, so it compared a closed file with
-# itself and failed every run — the reported "FSW stall at ~4.8 min" was
-# the 600 s kill landing at FSW time (which runs ~0.48x wall). See
-# docs/stix-port/2026-11-09-task-b-stall-analysis.md and
+# Liveness = QEMU still runs at the end, and the TM FLOW kept going over a
+# WINDOW-second window ending MARGIN seconds before the end: the window is
+# split into consecutive SLICE-second slices and every slice must see at
+# least one new TM chunk line in the probe log — sampled WHILE QEMU IS
+# STILL RUNNING; the script itself ends the run. The first version of this
+# script ran QEMU in the foreground and sampled afterwards, so it compared
+# a closed file with itself and failed every run — the reported "FSW stall
+# at ~4.8 min" was the 600 s kill landing at FSW time (which runs ~0.48x
+# wall). See docs/stix-port/2026-11-09-task-b-stall-analysis.md and
 # scripts/stix/tests/test-soak.sh.
 #
-# The heartbeat today is the FSW Watchdog task's once-per-second error
-# print (the watchdog device is not modeled, so the error never clears).
-# The TM probe stays attached as the operational configuration (ground
-# station present); its TM total is reported, not gated.
+# The heartbeat is TM flow, not UART growth: R3 models the watchdog device,
+# so the FSW Watchdog task's once-per-second error print is gone and a
+# healthy guest can have a silent UART for the whole window. Housekeeping
+# TM packets arrive about once per second on the TMTC TCP port that
+# tmtc-probe.py reads (started here, as the operational configuration).
+# A chunk line is what the probe prints per received chunk:
+# "HH:MM:SS +NNNNB <hex>"; only its COUNT is sampled — the HH:MM:SS
+# timestamps are wall clock and WSL2 steps the clock. UART growth over the
+# window is still measured and reported in the PASS line, but not gated on.
 #
 # Usage: soak.sh <qemu-binary> [seconds=600]
 #   STIX_RUN_DIR, STIX_ASW_ELF   as in boot-smoke.sh
 #   STIX_SOAK_WINDOW (120)       liveness window, seconds
+#   STIX_SOAK_SLICE (60)         slice length; WINDOW must be a positive
+#                                multiple of SLICE
 #   STIX_TMTC_PROBE              TM probe script (tests substitute a fake)
 #   STIX_SOAK_MARGIN (30)        gap between window end and the end of the run
 #
-# Exit codes: 0 pass, 1 UART heartbeat stopped (guest hung),
+# Exit codes: 0 pass, 1 TM heartbeat stopped (no TM chunk in some slice),
 #             2 environment problem, QEMU crash, or QEMU exited early.
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: soak.sh <qemu-binary> [seconds]}"
 SECONDS_TOTAL="${2:-600}"
 WINDOW="${STIX_SOAK_WINDOW:-120}"
+SLICE="${STIX_SOAK_SLICE:-60}"
 MARGIN="${STIX_SOAK_MARGIN:-30}"
 ASW_ELF="${STIX_ASW_ELF:-/mnt/c/Users/laszl/Development/stix_asw_src/ASW/ASW/bin/ASW_em.elf}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -37,6 +47,10 @@ RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-baseline-run}"
 
 if [ "$SECONDS_TOTAL" -le "$((WINDOW + MARGIN))" ]; then
     echo "soak window ${WINDOW}s + margin ${MARGIN}s does not fit in ${SECONDS_TOTAL}s"
+    exit 2
+fi
+if [ "$SLICE" -le 0 ] || [ "$WINDOW" -le 0 ] || [ $((WINDOW % SLICE)) -ne 0 ]; then
+    echo "soak: STIX_SOAK_WINDOW (${WINDOW}s) must be a positive multiple of STIX_SOAK_SLICE (${SLICE}s)"
     exit 2
 fi
 
@@ -69,8 +83,11 @@ cleanup() {
 trap cleanup EXIT
 
 # TM probe: retries connecting until its own deadline, so start it first
-# and let it catch the server as soon as QEMU binds.
-timeout "$((SECONDS_TOTAL + 20))" python3 "${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}" \
+# and let it catch the server as soon as QEMU binds. -u because stdout is
+# a file here, so Python block-buffers it — the per-slice counts below read
+# this log while the probe still runs, and unflushed lines would read as
+# "no TM" until exit. (STIX_TMTC_PROBE names a python script too.)
+timeout "$((SECONDS_TOTAL + 20))" python3 -u "${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}" \
     --port "$TMTC_PORT" --seconds "$((SECONDS_TOTAL + 10))" \
     > tm.soak-probe.log 2>&1 &
 PROBE_PID=$!
@@ -113,9 +130,38 @@ qemu_ended_early() {
     exit 2
 }
 
-sleep_until_while_qemu_runs "$((SECONDS_TOTAL - WINDOW - MARGIN))" || qemu_ended_early
+# The TM gate: sample the probe log's chunk-line COUNT at every slice
+# boundary (monotonic clock, sampled while QEMU runs). The HH:MM:SS
+# timestamps in the log are NOT parsed: they are wall clock, and WSL2
+# steps the clock.
+N_SLICES=$((WINDOW / SLICE))
+WINDOW_START=$((SECONDS_TOTAL - WINDOW - MARGIN))
+CHUNK_RE='^[0-9]{2}:[0-9]{2}:[0-9]{2} \+ *[0-9]+B '
+tm_chunk_count() {
+    grep -cE "$CHUNK_RE" tm.soak-probe.log 2>/dev/null || true
+}
+
+sleep_until_while_qemu_runs "$WINDOW_START" || qemu_ended_early
 SIZE_START=$(stat -c %s uart.soak.raw)
-sleep_until_while_qemu_runs "$((SECONDS_TOTAL - MARGIN))" || qemu_ended_early
+TM_PREV="$(tm_chunk_count)"
+TM_PREV="${TM_PREV:-0}"
+SLICE_COUNTS=""
+for ((i = 1; i <= N_SLICES; i++)); do
+    SLICE_START=$((WINDOW_START + (i - 1) * SLICE))
+    SLICE_END=$((WINDOW_START + i * SLICE))
+    sleep_until_while_qemu_runs "$SLICE_END" || qemu_ended_early
+    TM_NOW="$(tm_chunk_count)"
+    TM_NOW="${TM_NOW:-0}"
+    NEW_CHUNKS=$((TM_NOW - TM_PREV))
+    TM_PREV="$TM_NOW"
+    SLICE_COUNTS="$SLICE_COUNTS $NEW_CHUNKS"
+    if [ "$NEW_CHUNKS" -eq 0 ]; then
+        echo "SOAK: FAIL — TM heartbeat stopped: no TM in slice ${i}/${N_SLICES} (${SLICE_START}s..${SLICE_END}s after start)"
+        echo "TM probe log tail:"
+        tail -5 tm.soak-probe.log
+        exit 1
+    fi
+done
 SIZE_END=$(stat -c %s uart.soak.raw)
 
 # QEMU must still be running at the end of the run; then this script
@@ -132,12 +178,8 @@ for _ in 1 2 3 4 5; do
     sleep 1
 done
 
-if [ "$SIZE_END" -le "$SIZE_START" ]; then
-    echo "SOAK: FAIL — UART heartbeat stopped: no output in the ${WINDOW}s window before T-${MARGIN}s ($SIZE_START -> $SIZE_END bytes)"
-    echo "UART tail:"
-    tail -5 uart.soak.raw | tr -d '\000'
-    exit 1
-fi
-
+# UART growth is reported, not gated: since R3 models the watchdog, a
+# healthy guest can have a silent UART (the once-per-second watchdog error
+# print is gone). The TM gate above is the liveness verdict.
 TM_TOTAL=$(grep '^# total' tm.soak-probe.log 2>/dev/null | awk '{print $3}' || true)
-echo "SOAK: PASS (${SECONDS_TOTAL}s; UART grew $SIZE_START -> $SIZE_END bytes in the ${WINDOW}s window; probe TM total ${TM_TOTAL:-none} bytes)"
+echo "SOAK: PASS (${SECONDS_TOTAL}s; TM chunks/slice:${SLICE_COUNTS}  — ${N_SLICES} slices of ${SLICE}s; UART grew $SIZE_START -> $SIZE_END bytes in the ${WINDOW}s window; probe TM total ${TM_TOTAL:-none} bytes)"
