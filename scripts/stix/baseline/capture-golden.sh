@@ -23,7 +23,7 @@ set -euo pipefail
 
 QEMU_BIN="${1:?usage: capture-golden.sh <qemu-binary> <out-dir>}"
 OUT_DIR="${2:?usage: capture-golden.sh <qemu-binary> <out-dir>}"
-ASW_ELF="${STIX_ASW_ELF:-/mnt/c/Users/laszl/Development/stix_asw_src/ASW/ASW/bin/ASW_em.elf}"
+ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
 DURATION=90
 

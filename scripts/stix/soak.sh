@@ -41,7 +41,7 @@ SECONDS_TOTAL="${2:-600}"
 WINDOW="${STIX_SOAK_WINDOW:-120}"
 SLICE="${STIX_SOAK_SLICE:-60}"
 MARGIN="${STIX_SOAK_MARGIN:-30}"
-ASW_ELF="${STIX_ASW_ELF:-/mnt/c/Users/laszl/Development/stix_asw_src/ASW/ASW/bin/ASW_em.elf}"
+ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
 

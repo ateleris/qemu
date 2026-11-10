@@ -10,7 +10,7 @@
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: boot-smoke.sh <qemu-binary> [--with-tm]}"
-ASW_ELF="${STIX_ASW_ELF:-/mnt/c/Users/laszl/Development/stix_asw_src/ASW/ASW/bin/ASW_em.elf}"
+ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GOLDEN_DIR="$REPO_ROOT/docs/stix-port/baseline"
 RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
