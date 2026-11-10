@@ -55,6 +55,9 @@ stixspw_tx_bytes(uint32_t len) "Use %u bytes"
 stixspw_tx_dump_word(uint32_t word) "0x%08x"
 stixspw_tx_send(uint32_t len) "Send packet len: %u"
 stixspw_tx_overflow(void) "error: buffer overwflow"
+stixspw_tx_skip_en(uint32_t ctrl) "TX skipped: TXDSC_EN clear (ctrl=0x%x)"
+stixspw_irq_latched(void) "IRQ event latched: control.IE=0"
+stixspw_irq_deferred(void) "latched IRQ pulsed on control.IE 0->1"
 
 # tmtc_io_server.c (STIX)
 stixtmtc_wait_client(void) "Waiting for TC client..."

@@ -637,10 +637,19 @@ static void test_flash_storage(void)
 #define SPW_DMATxDesc  (SPW_BASE + 0x28u)
 
 #define SPW_DMA_TE (1u << 0)
+#define SPW_DMA_TI (1u << 2)
 #define SPW_DMA_PS (1u << 5)
 #define SPW_IRQ_BIT (1u << 13)              /* IRQ_SPW = 13 */
 
+#define SPW_CTRL_IE (1u << 3)
+#define SPW_CTRL_RS (1u << 6)
+
+#define SPW_DMAXRX    (SPW_BASE + 0x24u)
+#define SPW_NODEADDR  (SPW_BASE + 0x08u)
+
 #define TXDSC_EN (1u << 12)
+#define TXDSC_WR (1u << 13)
+#define TXDSC_IE (1u << 14)
 
 /* TX descriptor layout (spwTXdsc_s): ctrl@0, haddr@4, dlen@8, daddr@12. */
 #define TXDSC_ADDR  0x40001000u
@@ -653,12 +662,16 @@ static void test_spw_tx(void)
 
     qts = stix_qtest_new();
 
-    /* TM payload + TX descriptor in guest RAM (values written via
+    /*
+     * TM payload + TX descriptor in guest RAM (values written via
      * qtest_writel are target-endian, matching the device's raw-read +
-     * bswap32 handling). */
+     * bswap32 handling). The descriptor is armed exactly as the FSW
+     * does it: ctrl 0x7000 = EN|WR|IE (SPW.c:718-721, txdsc.ctrl in
+     * the golden stdout).
+     */
     qtest_writel(qts, TXDATA_ADDR, 0xaabbccddu);
     qtest_writel(qts, TXDATA_ADDR + 4, 0x11223344u);
-    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN);        /* ctrl: EN, no IE */
+    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN | TXDSC_WR | TXDSC_IE);
     qtest_writel(qts, TXDSC_ADDR + 4, 0);               /* haddr */
     qtest_writel(qts, TXDSC_ADDR + 8, 8);               /* dlen */
     qtest_writel(qts, TXDSC_ADDR + 12, TXDATA_ADDR);    /* daddr */
@@ -667,9 +680,18 @@ static void test_spw_tx(void)
     qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
     qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
 
-    /* Trigger transmission (TE). No TCP client is attached: the TM send
-     * fails silently in the model and the exchange still completes. */
-    qtest_writel(qts, SPW_DMAControl, SPW_DMA_TE);
+    /*
+     * control.IE set first: the FSW wraps SPW_send in an IE critical
+     * section (SPW.c:707-731, D-M).
+     */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+
+    /*
+     * Trigger transmission (TE|TI, the SPW.c:725 dmaControl |= TE
+     * write). No TCP client is attached: the TM send fails silently in
+     * the model and the exchange still completes.
+     */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_TE | SPW_DMA_TI);
 
     /* Descriptor EN bit cleared in guest RAM. */
     ctrl = qtest_readl(qts, TXDSC_ADDR);
@@ -683,7 +705,7 @@ static void test_spw_tx(void)
     g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PS,
                      ==, SPW_DMA_PS);
 
-    /* Status forced to the link-running value by the write handler. */
+    /* Status keeps LS = RUN (0x00a00000). */
     g_assert_cmphex(qtest_readl(qts, SPW_STATUS), ==, 0x00a00000u);
 
     qtest_quit(qts);
@@ -1730,6 +1752,214 @@ static void test_flash_create_error(void)
     g_rmdir(dir);
 }
 
+/* ---- P2-3: SPW register semantics (W1C, reserved bits, D-M) ---- */
+
+#define SPW_DMA_FSW_OPEN 0x181eu /* RD|NS|AI|RE|TI|RI, SPW.c:572-584 */
+
+/*
+ * The FSW's SPW_open sequence (SPW.c:495-584) and the GRSPW register
+ * rules behind it: RS self-clears, dmaMaxRxLength reads back, the
+ * dmaControl clear write 0xFFFE01E0 reads 0 (reserved 31:17 + W1C
+ * PR/PS/TA/RA), the latched write 0x181e reads back; status is W1C with
+ * LS stuck at RUN; PS is set by a TX and cleared by writing 1; a write
+ * to another register leaves dmaControl alone; TE clears after every
+ * processed TE write; TXDSC_EN gates the TX; the TX IRQ needs TXDSC_IE
+ * and TI and is deferred while control.IE = 0 (D-M); system reset
+ * restores the power-on values and clears the latch.
+ * RED on the pre-P2-3 binary: the write handler clobbered status to
+ * 0xA00000 and dmaControl to 0 or PS on every write.
+ */
+static void test_spw_regs(void)
+{
+    QTestState *qts;
+    uint32_t v;
+
+    qts = stix_qtest_new();
+
+    /* ---- SPW_open sequence ---- */
+
+    /* control: RS self-clears, no other bit was set */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_RS);
+    g_assert_cmphex(qtest_readl(qts, SPW_CONTROL), ==, 0);
+
+    /* dmaMaxRxLength: the read-back must equal 252 (SPW.c:523-528) */
+    qtest_writel(qts, SPW_DMAXRX, 252);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAXRX), ==, 252);
+
+    /*
+     * clear write 0xFFFE0000|RA|TA|PR|PS: reserved 31:17 and the W1C
+     * bits set; the read-back must be exactly 0 (SPW.c:531-542)
+     */
+    qtest_writel(qts, SPW_DMAControl, 0xFFFE01E0u);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, 0);
+
+    /*
+     * RX (bit 10) is the read-only reception status and AT (bit 9) a
+     * self-clearing strobe: writes are ignored and both read 0
+     */
+    qtest_writel(qts, SPW_DMAControl, (1u << 9) | (1u << 10));
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, 0);
+
+    /* the latched write reads back its latched bits */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, SPW_DMA_FSW_OPEN);
+
+    /* reserved bits 31:17 never read back */
+    qtest_writel(qts, SPW_DMAControl, 0xFFFE0000u | SPW_DMA_FSW_OPEN);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, SPW_DMA_FSW_OPEN);
+
+    /* ---- status: W1C writes never disturb LS = RUN ---- */
+    qtest_writel(qts, SPW_STATUS, 0xFFFFFFFFu);
+    g_assert_cmphex(qtest_readl(qts, SPW_STATUS), ==, 0x00a00000u);
+    qtest_writel(qts, SPW_STATUS, 0);
+    g_assert_cmphex(qtest_readl(qts, SPW_STATUS), ==, 0x00a00000u);
+
+    /* ---- TX: PS set, TE clears, latch bits kept, IRQ deferred ---- */
+
+    /* descriptor EN|WR|IE with 8 payload bytes (txdsc.ctrl 0x7000) */
+    qtest_writel(qts, TXDATA_ADDR, 0xaabbccddu);
+    qtest_writel(qts, TXDATA_ADDR + 4, 0x11223344u);
+    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, TXDSC_ADDR + 4, 0);
+    qtest_writel(qts, TXDSC_ADDR + 8, 8);
+    qtest_writel(qts, TXDSC_ADDR + 12, TXDATA_ADDR);
+    qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+
+    /*
+     * control.IE is 0: inside the FSW's SPW_send critical section
+     * (SPW.c:707-731). FSW-style read-modify-write: dmaControl |= TE.
+     */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+
+    v = qtest_readl(qts, SPW_DMAControl);
+    g_assert_cmpuint(v & SPW_DMA_PS, ==, SPW_DMA_PS);
+    g_assert_cmpuint(v & SPW_DMA_TE, ==, 0);
+    g_assert_cmphex(v, ==, SPW_DMA_FSW_OPEN | SPW_DMA_PS);
+    /* descriptor EN cleared in guest RAM */
+    g_assert_cmpuint(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, 0);
+
+    /* IE was 0: the IRQ is latched, not pending */
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    /* a write to another register keeps PS and the latch bits (RD) */
+    qtest_writel(qts, SPW_NODEADDR, 0x40);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl),
+                    ==, SPW_DMA_FSW_OPEN | SPW_DMA_PS);
+
+    /* IE 0->1 pulses exactly the latched IRQ */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE); /* no 0->1 edge */
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    /* ---- a control write with RS drops the latch (SPW_close) ---- */
+    qtest_writel(qts, SPW_CONTROL, 0);
+    qtest_writel(qts, TXDSC_ADDR, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_RS); /* RS clears the latch */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE); /* IE 0->1 */
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    /* ---- control.IE already set: the TX IRQ comes directly ---- */
+    qtest_writel(qts, TXDSC_ADDR, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+
+    /* ---- TXDSC_IE clear: the TX runs, no IRQ ---- */
+    qtest_writel(qts, TXDSC_ADDR, TXDSC_EN | TXDSC_WR);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_PS);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PS, ==, 0);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+    /* the TX ran: descriptor EN cleared, PS set again, no IRQ */
+    g_assert_cmpuint(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PS,
+                     ==, SPW_DMA_PS);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    /* ---- TI clear: the TX runs, no IRQ; latch bits as written ---- */
+    qtest_writel(qts, TXDSC_ADDR, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_PS); /* W1C PS, latch 0 */
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, 0);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_TE);
+    /* the TX ran: EN cleared, PS set (TI was clear, so no IRQ) */
+    g_assert_cmpuint(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, SPW_DMA_PS);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    /* ---- correction 9: TE clears even with TXDSC_EN clear ---- */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_PS); /* W1C: clear PS */
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, 0);
+    qtest_writel(qts, TXDSC_ADDR, 0); /* descriptor not armed */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_TE);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    /*
+     * ---- system reset: power-on values, latch cleared ----
+     *
+     * positive control first: with IE = 0 an armed TX latches (the
+     * descriptor EN is cleared, nothing pending) and IE 0->1 gives the
+     * IRQ.
+     */
+    qtest_writel(qts, SPW_CONTROL, 0);
+    qtest_writel(qts, TXDSC_ADDR, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+
+    /* latch again: IE off, armed TX, nothing pending */
+    qtest_writel(qts, SPW_CONTROL, 0);
+    qtest_writel(qts, TXDSC_ADDR, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    qtest_system_reset(qts);
+
+    g_assert_cmphex(qtest_readl(qts, SPW_CONTROL), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SPW_STATUS), ==, 0x00a00000u);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAXRX), ==, 0);
+
+    /*
+     * the reset cleared dmaTxDescAddr: point it back. The latch must be
+     * cleared too, so IE 0->1 gives no IRQ.
+     */
+    qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+
+    /*
+     * positive control after the reset: an armed TX with IE = 0 latches
+     * again and IE 0->1 pulses
+     */
+    qtest_writel(qts, SPW_CONTROL, 0);
+    qtest_writel(qts, TXDSC_ADDR, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, 0);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1763,6 +1993,7 @@ int main(int argc, char **argv)
                        test_flash_create_error_subprocess);
         qtest_add_func("/sparc/stix/flash-create-error",
                        test_flash_create_error);
+        qtest_add_func("/sparc/stix/spw-regs", test_spw_regs);
     }
 
     return g_test_run();

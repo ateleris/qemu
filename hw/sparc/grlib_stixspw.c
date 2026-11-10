@@ -42,6 +42,36 @@
 #define TXDSC_NONCRCLEN 8 /**< 4 bits field = 0*/
 #define TXDSC_HEADERLEN 0 /**< 8 bits field = 0*/
 
+/*
+ * Register write rules (StixIdpu.h bit positions; FSW contract in
+ * recon-phase2-fsw-rx §1.2):
+ * - status: TO/CE/ER/DE/PE/WE/IA/EE are write-1-to-clear; LS (23:21)
+ *   stays at RUN and nothing in the model sets the error bits.
+ * - dmaControl: PR/PS/TA/RA are write-1-to-clear; TE/RE/TI/RI/AI/RD/
+ *   NS/LE latch as written; RX (bit 10) is the read-only reception
+ *   status and AT (bit 9) a self-clearing strobe — the model never
+ *   sets them, so writes are ignored and both read 0; bits 15:13 and
+ *   31:17 are reserved and read 0, so the FSW's SPW_open clear write
+ *   0xFFFE01E0 reads back 0 (SPW.c:531-542).
+ */
+#define SPW_STATUS_RUN 0xA00000u
+#define SPW_STATUS_W1C_MASK                                    \
+    ((1u << STIXSPW_STATUS_TO) | (1u << STIXSPW_STATUS_CE) |   \
+     (1u << STIXSPW_STATUS_ER) | (1u << STIXSPW_STATUS_DE) |   \
+     (1u << STIXSPW_STATUS_PE) | (1u << STIXSPW_STATUS_WE) |   \
+     (1u << STIXSPW_STATUS_IA) | (1u << STIXSPW_STATUS_EE))
+#define SPW_DMACONTROL_W1C_MASK                                \
+    ((1u << STIXSPW_DMACONTROL_PS) | (1u << STIXSPW_DMACONTROL_PR) | \
+     (1u << STIXSPW_DMACONTROL_TA) | (1u << STIXSPW_DMACONTROL_RA))
+#define SPW_DMACONTROL_LATCH_MASK                              \
+    ((1u << STIXSPW_DMACONTROL_TE) | (1u << STIXSPW_DMACONTROL_RE) | \
+     (1u << STIXSPW_DMACONTROL_TI) | (1u << STIXSPW_DMACONTROL_RI) | \
+     (1u << STIXSPW_DMACONTROL_AI) | (1u << STIXSPW_DMACONTROL_RD) | \
+     (1u << STIXSPW_DMACONTROL_NS) | (1u << STIXSPW_DMACONTROL_LE))
+#define SPW_DMACONTROL_RESERVED_MASK                           \
+    ((STIXSPW_DMACONTROL_RESERVED_2_MASK << STIXSPW_DMACONTROL_RESERVED_2) | \
+     (STIXSPW_DMACONTROL_RESERVED_1_MASK << STIXSPW_DMACONTROL_RESERVED_1))
+
 OBJECT_DECLARE_SIMPLE_TYPE(STIXSPW, GRLIB_STIXSPW)
 
 typedef struct
@@ -71,6 +101,11 @@ struct STIXSPW
     uint32_t tmtc_port; /* 0 = dynamic: IO_TCP_SERVER_BASE_PORT + getuid() */
     MemoryRegion iomem;
     qemu_irq irq;
+    /*
+     * D-M: an IRQ event that arrived while IE = 0; must go into a
+     * vmstate if one is ever added
+     */
+    bool irq_latched;
 };
 
 static uint8_t buffer[8192];
@@ -180,103 +215,155 @@ static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
     return regval;
 }
 
-static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+/*
+ * One TX exchange, run from a dmaControl write with TE set (the FSW's
+ * dmaControl |= TE, SPW.c:725). TE always clears, even when the
+ * descriptor is not armed (correction 9). The completion IRQ needs
+ * TXDSC_IE and TI, and D-M defers it while control.IE = 0.
+ */
+static void grlib_stixspw_tx(STIXSPW *stixspw)
+{
+    spwTXdsc_s txdsc;
+    uint32_t ctrl;
+
+    stixspw->reg.dmaControl &= ~(1u << STIXSPW_DMACONTROL_TE);
+
+    /* read TX descriptor from STIX */
+    trace_stixspw_tx_desc_addr(stixspw->reg.dmaTxDescAddr);
+
+    /*
+     * endianness is incorrect for use in qemu; there may be a better
+     * way with address_space_read, but it's not working at the moment.
+     * using a small workaround
+     */
+    physical_memory_read(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
+
+    txdsc.ctrl = bswap32(txdsc.ctrl);
+    txdsc.daddr = bswap32(txdsc.daddr);
+    txdsc.dlen = bswap32(txdsc.dlen);
+    txdsc.haddr = bswap32(txdsc.haddr);
+
+    trace_stixspw_tx_descriptor(txdsc.ctrl, txdsc.daddr,
+                                txdsc.dlen, txdsc.haddr);
+
+    ctrl = txdsc.ctrl;
+
+    if (!(ctrl & (1 << TXDSC_EN))) {
+        /* not armed: no send, no write-back, no PS, no IRQ */
+        trace_stixspw_tx_skip_en(ctrl);
+        return;
+    }
+
+    if (txdsc.dlen < sizeof(buffer)) {
+        memset(buffer, 0xFF, sizeof(buffer));
+        physical_memory_read(txdsc.daddr, buffer, txdsc.dlen);
+
+        /* swap buffer dwords to fix endianness */
+        uint32_t *buffer32 = (uint32_t *)buffer;
+        trace_stixspw_tx_bytes(txdsc.dlen);
+        for (uint32_t ix = 0; ix < DIV_ROUND_UP(txdsc.dlen, 4); ix++) {
+            /* buffer32[ix] = bswap32(buffer32[ix]); */
+            trace_stixspw_tx_dump_word(bswap32(buffer32[ix]));
+        }
+
+        send_tm_packet(buffer, txdsc.dlen);
+
+        trace_stixspw_tx_send(txdsc.dlen);
+    } else {
+        trace_stixspw_tx_overflow();
+    }
+
+    /* clear desc enabled flag */
+    txdsc.ctrl &= ~(1 << TXDSC_EN);
+
+    /* before using the exchange variable, correct for endienness */
+    txdsc.ctrl = bswap32(txdsc.ctrl);
+    txdsc.daddr = bswap32(txdsc.daddr);
+    txdsc.dlen = bswap32(txdsc.dlen);
+    txdsc.haddr = bswap32(txdsc.haddr);
+
+    /* write TX decriptor to STIX */
+    physical_memory_write(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
+
+    /* exchange complete */
+    stixspw->reg.dmaControl |= (1u << STIXSPW_DMACONTROL_PS);
+
+    /* generate interrupt, gated per D-M */
+    if ((ctrl & (1 << TXDSC_IE)) &&
+        (stixspw->reg.dmaControl & (1u << STIXSPW_DMACONTROL_TI))) {
+        if (stixspw->reg.control & (1u << STIXSPW_CONTROL_IE)) {
+            qemu_irq_pulse(stixspw->irq);
+        } else {
+            stixspw->irq_latched = true;
+            trace_stixspw_irq_latched();
+        }
+    }
+}
+
+static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size)
 {
     STIXSPW *stixspw = opaque;
+    volatile uint32_t *regs = (volatile uint32_t *)&stixspw->reg; /* re-read */
+    uint32_t val = (uint32_t)value;
+    uint32_t old;
+    uint32_t updated;
 
     /* security fix: same bounds rule as the read handler. */
-    if ((uint32_t)addr / sizeof(uint32_t) >= STIXSPW_REG_WORDS)
-    {
+    if ((uint32_t)addr / sizeof(uint32_t) >= STIXSPW_REG_WORDS) {
         trace_stixspw_io_write_outside(addr);
         return;
     }
 
-    // update the register as per write request
-    ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;
+    switch ((uint32_t)addr / sizeof(uint32_t)) {
+    case 0: /* control */
+        old = stixspw->reg.control;
 
-    volatile uint32_t *regs = (volatile uint32_t *)&stixspw->reg; /* re-read */
+        stixspw->reg.control = val;
+
+        /*
+         * the reset flag self-clears; a core reset (SPW_close, the
+         * AHB-error reinit) also drops any latched IRQ
+         */
+        stixspw->reg.control &= ~(1u << STIXSPW_CONTROL_RS);
+        if (val & (1u << STIXSPW_CONTROL_RS)) {
+            stixspw->irq_latched = false;
+        }
+
+        /* D-M: an IE 0->1 write pulses the IRQ latched while IE was 0 */
+        if (!(old & (1u << STIXSPW_CONTROL_IE)) &&
+            (val & (1u << STIXSPW_CONTROL_IE)) && stixspw->irq_latched) {
+            stixspw->irq_latched = false;
+            trace_stixspw_irq_deferred();
+            qemu_irq_pulse(stixspw->irq);
+        }
+        break;
+    case 1: /* status: W1C, LS stays RUN */
+        stixspw->reg.status &= ~(SPW_STATUS_W1C_MASK & val);
+        break;
+    case 8: /* dmaControl: W1C + latch, reserved bits read 0 */
+        updated = stixspw->reg.dmaControl;
+
+        updated &= ~(SPW_DMACONTROL_W1C_MASK & val);
+        updated = (updated & ~SPW_DMACONTROL_LATCH_MASK) |
+                  (val & SPW_DMACONTROL_LATCH_MASK);
+        updated &= ~SPW_DMACONTROL_RESERVED_MASK;
+        stixspw->reg.dmaControl = updated;
+
+        /* the exchange runs only on a dmaControl write with TE set */
+        if (val & (1u << STIXSPW_DMACONTROL_TE)) {
+            trace_stixspw_data_exchange();
+            grlib_stixspw_tx(stixspw);
+        }
+        break;
+    default:
+        /* update the register as per write request */
+        regs[(uint32_t)addr / sizeof(uint32_t)] = val;
+        break;
+    }
 
     trace_stixspw_io_write(addr, regs[(uint32_t)addr / sizeof(uint32_t)]);
     trace_stixspw_dma_control(stixspw->reg.dmaControl);
-
-    // shortcut for link running as per E_SPW_LINK_STATUS_RUN
-    stixspw->reg.status = 0xA00000;
-
-    // clear the reset flag
-    stixspw->reg.control &= ~(1 << STIXSPW_CONTROL_RS);
-
-    // used later e.g., to signal transmit OK
-    uint32_t dma_control_modifier_mask = 0;
-
-    // clear the DMA control register
-    if (stixspw->reg.dmaControl != 0)
-    {
-        trace_stixspw_data_exchange();
-
-        // is transmit enabled?
-        if (stixspw->reg.dmaControl & (1 << STIXSPW_DMACONTROL_TE))
-        {
-            spwTXdsc_s txdsc;
-
-            // read TX descriptor from STIX
-            trace_stixspw_tx_desc_addr(stixspw->reg.dmaTxDescAddr);
-
-            // endianness is incorrect for use in qemu; there may be a better way with address_space_read, but it's not working at the moment.
-            // using a small workaround
-            physical_memory_read(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
-
-            txdsc.ctrl = bswap32(txdsc.ctrl);
-            txdsc.daddr = bswap32(txdsc.daddr);
-            txdsc.dlen = bswap32(txdsc.dlen);
-            txdsc.haddr = bswap32(txdsc.haddr);
-
-            trace_stixspw_tx_descriptor(txdsc.ctrl, txdsc.daddr,
-                                        txdsc.dlen, txdsc.haddr);
-
-            if (txdsc.dlen < sizeof(buffer))
-            {
-                memset(buffer, 0xFF, sizeof(buffer));
-                physical_memory_read(txdsc.daddr, buffer, txdsc.dlen);
-
-                // swap buffer dwords to fix endianness
-                uint32_t *buffer32 = (uint32_t *)buffer;
-                trace_stixspw_tx_bytes(txdsc.dlen);
-                for (uint32_t ix = 0; ix < txdsc.dlen / 4 + ((txdsc.dlen % 4) ? 1 : 0); ix++)
-                {
-                    // buffer32[ix] = bswap32(buffer32[ix]);
-                    trace_stixspw_tx_dump_word(bswap32(buffer32[ix]));
-                }
-
-                send_tm_packet(buffer, txdsc.dlen);
-
-                trace_stixspw_tx_send(txdsc.dlen);
-            }
-            else
-            {
-                trace_stixspw_tx_overflow();
-            }
-
-            // clear desc enabled flag
-            txdsc.ctrl &= ~(1 << TXDSC_EN);
-
-            // before using the exchange variable, correct for endienness
-            txdsc.ctrl = bswap32(txdsc.ctrl);
-            txdsc.daddr = bswap32(txdsc.daddr);
-            txdsc.dlen = bswap32(txdsc.dlen);
-            txdsc.haddr = bswap32(txdsc.haddr);
-
-            // write TX decriptor to STIX
-            physical_memory_write(stixspw->reg.dmaTxDescAddr, &txdsc, sizeof(txdsc));
-
-            dma_control_modifier_mask = (1 << STIXSPW_DMACONTROL_PS);
-
-            // generate interrupt
-            qemu_irq_pulse(stixspw->irq);
-        }
-
-        // clear DMA control register
-        stixspw->reg.dmaControl = dma_control_modifier_mask;
-    }
 }
 
 static const MemoryRegionOps grlib_stixspw_ops = {
@@ -303,7 +390,7 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     // set link to up from the start
     // I know, it's a little cheating
     // shortcut for link running as per E_SPW_LINK_STATUS_RUN
-    STIXSPW->reg.status = 0xA00000;
+    STIXSPW->reg.status = SPW_STATUS_RUN;
 
     /* tmtc-server=auto keeps the server off whenever the qtest harness
      * drives this QEMU (the -qtest chardev is connected, whatever the
@@ -323,7 +410,15 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
 
 static void grlib_stixspw_reset(DeviceState *d)
 {
-    // STIXSPW *STIXSPW = grlib_stixspw(d);
+    STIXSPW *STIXSPW = GRLIB_STIXSPW(d);
+
+    /*
+     * power-on register values; the TMTC transport (P2-1) is kept. The
+     * RX queue and index (P2-5) will clear here too.
+     */
+    memset(&STIXSPW->reg, 0, sizeof(STIXSPW->reg));
+    STIXSPW->reg.status = SPW_STATUS_RUN;
+    STIXSPW->irq_latched = false;
 }
 
 static const Property grlib_stixspw_properties[] = {

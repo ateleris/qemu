@@ -654,3 +654,84 @@ matched all three tests — green after. All 23 qtests pass.
 `-trace help | grep -c stix` = 38 in the default backend, and a
 `spw-tx` run with `-trace 'stix*'` shows the events carrying the old
 texts (`stixspw_io_write SPW | Write completed addr = 32, ...`).
+
+## 16. SPW register semantics: W1C, reserved bits, IRQ gating (baseline: write clobbered status/dmaControl, IRQ always)
+
+**Baseline:** the SPW write handler raw-stored the register, then forced
+`status = 0xA00000` and cleared `control.RS` on **every** write to any
+register, re-processed `dmaControl` on every write (TX on TE, then
+`dmaControl = PS or 0` — wiping the latched bits), and pulsed IRQ 13
+unconditionally on every TX. The FSW's `SPW_open` only passed because
+its clear write (no TE) reads back 0; the latched write `0x181e` read
+back 0, and any non-dmaControl write destroyed the dmaControl state.
+
+**Model (P2-3):**
+- **status:** W1C for TO/CE/ER/DE/PE/WE/IA/EE; LS (23:21) stays at RUN
+  and nothing sets the error bits (recon-fsw §5: "the model should never
+  set the error bits"). status is only touched by status writes now.
+- **control:** raw store; RS self-clears (on the control write, instead
+  of on every write) and drops any latched IRQ — the minimal core-reset
+  semantics, so a latch from before `SPW_close` (SPW.c:622-632) or the
+  AHB-error reinit cannot be pulsed by the next `SPW_open` IE 0→1
+  write; a control write that takes IE 0→1 pulses the latched IRQ.
+- **dmaControl:** PR/PS/TA/RA are W1C; TE/RE/TI/RI/AI/RD/NS/LE
+  latch as written (the FSW's RMWs carry them, SPW.c:264-360, 725);
+  RX (bit 10) is the read-only reception status and AT (bit 9) a
+  self-clearing strobe — the model never sets them, so writes are
+  ignored and both read 0; bits 15:13 and 31:17 read 0, so `0xFFFE01E0`
+  reads back 0 and `0x181e` reads back its latched bits.
+- **TX:** runs only on a dmaControl write with TE set; TE always clears,
+  armed or not (correction 9); TXDSC_EN gates it (clear: no send, no
+  write-back, no PS, no IRQ, traced as `stixspw_tx_skip_en`); the
+  completion sets PS and needs TXDSC_IE **and** dmaControl.TI for the
+  IRQ.
+- **D-M (assumption):** control.IE gates every SpW IRQ, unlike stock
+  GRSPW where IE gates only link-error IRQs. An event arriving while
+  IE = 0 is latched (`irq_latched`, new state) and the IRQ is pulsed
+  once on the next IE 0→1 write. The FSW uses IE only as a short
+  critical section around `SPW_send` (SPW.c:707-731), so the IRQ is
+  just deferred. The deferred pulse is unconditional once latched — it
+  does not re-check its cause; the FSW never W1Cs a flag inside the
+  IE=0 window, and the ISR tolerates a no-flag entry. Traces:
+  `stixspw_irq_latched`, `stixspw_irq_deferred`.
+- **Reset handler:** registers go to their power-on values
+  (status = 0xA00000, everything else 0) and the latch clears; guest
+  RAM and the TMTC transport (P2-1) are untouched. The RX queue/index
+  of P2-5 will clear here too. This is a behaviour change for warm
+  resets: a guest-triggered system reset (the CTRL/watchdog reset
+  request) now restores the SPW registers, where the baseline kept
+  them. It is FSW-neutral because `SPW_open` runs again after every
+  reset.
+- Trace note: `stixspw_io_write`/`stixspw_dma_control` now log the
+  post-write register value (after W1C/latch and TX processing), so the
+  trace stream shows the read-back state.
+
+**Pinned-test edit (decision of 2026-11-10, correction 1):**
+`test_spw_tx` now arms the descriptor exactly as the FSW does —
+ctrl `0x7000` = EN|WR|IE (SPW.c:718-721) — sets control.IE first (the
+SPW_send critical section, SPW.c:707-731) and writes `TE|TI` (the
+SPW.c:725 `dmaControl |= TE`). Every other expectation is unchanged.
+On the pre-P2-3 binary the edited test still passes, which shows the
+edit only adds bits the FSW uses; without it, the new IE/TX gating
+would have broken a pinned test (a plan stop condition).
+
+**Correction 15 (golden):** in the golden stdout the ISR runs inside
+the IE=0 window (stdout lines 16359-16364); after D-M it runs after the
+IE restore — in every SPW_send cycle, not only there — so the stdout
+order changes. The UART is not expected to change — boot-smoke and a
+short soak (reviewer-side) confirm it; any UART diff is a
+stop-and-report.
+
+**Evidence:** qtest `/sparc/stix/spw-regs` (the full SPW_open sequence
+with read-backs, including the RX/AT write behaviour; status W1C; PS
+set/W1C/kept across another-register writes; TE clearing with and
+without TXDSC_EN; the IRQ matrix — deferred while IE=0, direct with
+IE=1, absent with TXDSC_IE or TI clear, each proven to have run a TX by
+the descriptor EN clear and a fresh PS; RS dropping the latch; reset
+restoring power-on values and clearing the latch, with positive
+controls on both sides of the reset). Red on the pre-P2-3 binary at the
+first failing read-back: `0x181e` read `0x00000000`, wanted
+`0x0000181e`. Green: `spw-regs`, the edited `spw-tx`, and all 24 tests.
+checkpatch on the diff: 0 errors, 0 warnings. The `stix*` trace-event
+count rises 38 → 41 (`stixspw_tx_skip_en`, `stixspw_irq_latched`,
+`stixspw_irq_deferred`).
