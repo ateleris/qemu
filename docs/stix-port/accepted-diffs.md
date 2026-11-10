@@ -454,3 +454,52 @@ kept). All red on the pre-A2 binary at their first data-path assertion
 n=24); all green after. Existing `/sparc/stix/ctrl-rotb` passes
 unchanged on the composed 0x54 read. All six are expected red on the 5.2
 wrapper.
+
+## 13. STIXCTRL AHB windows mapped (baseline: unmapped)
+
+**Baseline:** the CTRL device registered only its APB register bank; the
+whole 0xE0000000–0xE06000FF AHB data area was unmapped — writes were
+dropped and reads returned 0.
+
+**Model (A3, D-A device RAM, D-G):** four plain RAM regions on the CTRL
+device, sysbus MMIO indices 2–5, mapped in `leon3.c`:
+
+| Index | Base | Size | Contents (StixIdpu.h) |
+|---|---|---|---|
+| 2 | 0xE0000000 | 0x200000 | SRAM: ELUT, LACC0-3, EACC0-1, TLUT0-1 (`STIXCTRL_SRAM_SIZE`) |
+| 3 | 0xE0200000 | 0x400 | LVAR BRAM incl. WDT `UNCHANGED_STORAGE` 0xE02000A8 (WDT.c:74) and `MemBram_STORAGE_ADDRESS` 0xE02003C0 (commonFSW.h:228) |
+| 4 | 0xE0400000 | 0x100 | LTRG0-3 |
+| 5 | 0xE0600000 | 0x80 | ETRG0-1 |
+
+Sizes use the StixIdpu.h macros where they exist: SRAM from
+`STIXCTRL_SRAM_SIZE`; LTRG/ETRG derived from their `*_END − *_START + 1`.
+The LVAR window has no macro: 0x400 covers LVAR0-3 (4 × 0x100 stride,
+ending 0xE020039F) plus the BRAM areas behind them — MemBram's 64 B end
+exactly at 0xE0200400.
+
+**Persistence (D-G):** the regions are zeroed at power-on (realize) only
+and survive system reset — QEMU RAM is not cleared by the reset path, and
+the CTRL reset handler deliberately touches nothing (comment in
+`grlib_stixctrl_reset`). This matters now that R3's watchdog can reset
+the guest: BRAM carries the FSW's reboot-persistent state. All widths
+(8/16/32-bit) are accepted.
+
+**Fidelity gap, not modeled:** the real BRAM keeps only the low 16 bits
+of each 32-bit write (WDT.c:90-92). The model stores all 32 bits. No FSW
+path reads the upper half is known; recorded here per the roadmap.
+
+**Boot impact:** the FSW writes MemBram (a byte store, OpModeMgmt.c:950-954
+→ MemBram.c:79-82) and reads and clears UNCHANGED_STORAGE (WDT.c:239-276)
+at every boot. Those accesses hit unmapped space today; after this commit
+they land in fresh RAM, which reads 0 exactly like unmapped space did, so
+no golden diff is expected. Boot-smoke (reviewer-side) confirms it; any
+diff is a stop-and-report.
+
+**Evidence:** qtests `/sparc/stix/ahb-windows` (fresh instance reads 0;
+distinct patterns across all four windows including the LACC banks, an
+SRAM gap and each window's last word; 16-bit and 8-bit access at MemBram
+with big-endian byte placement; window edges do not alias) and
+`/sparc/stix/bram-persist` (UNCHANGED_STORAGE, a MemBram byte and an SRAM
+word survive `qtest_system_reset`). Red on the pre-A3 binary: the first
+write/read check failed (read 0x00000000 after the write). Both are
+expected red on the 5.2 wrapper.

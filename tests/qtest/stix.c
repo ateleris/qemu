@@ -1378,6 +1378,108 @@ static void test_rotb_reset(void)
     stix_qtest_cleanup();
 }
 
+/* ---- CTRL AHB data windows (A3): SRAM/ELUT/LACC, LVAR BRAM, LTRG, ETRG ---- */
+
+#define AHB_SRAM       0xE0000000u  /* STIXCTRL_SRAM_START, 2 MB */
+#define AHB_SRAM_GAP   0xE0100000u  /* inside SRAM, between ELUT and LACC0 */
+#define AHB_SRAM_LAST  0xE01FFFFCu  /* last SRAM word */
+#define AHB_LACC0      0xE0180000u  /* STIXCTRL_LACC0_START */
+#define AHB_LVAR       0xE0200000u  /* STIXCTRL_LVAR0_START, 0x400 window */
+#define AHB_LVAR_LAST  0xE02003FCu  /* last LVAR window word */
+#define AHB_UNCHANGED  0xE02000A8u  /* WDT UNCHANGED_STORAGE (trap info) */
+#define AHB_MEMBRAM    0xE02003C0u  /* MemBram_STORAGE_ADDRESS (op mode) */
+#define AHB_LTRG       0xE0400000u  /* STIXCTRL_LTRG0_START, 0x100 window */
+#define AHB_LTRG_LAST  0xE04000FCu
+#define AHB_ETRG       0xE0600000u  /* STIXCTRL_ETRG0_START, 0x80 window */
+#define AHB_ETRG_LAST  0xE060007Cu
+
+/* the four AHB windows are plain device RAM (D-A): fresh instance reads
+ * 0, all of 8/16/32-bit accesses work (D-G), and the windows neither
+ * alias each other nor lose data. The FSW byte-stores MemBram at every
+ * boot (OpModeMgmt.c:950-954 -> MemBram.c:79-82). */
+static void test_ahb_windows(void)
+{
+    QTestState *qts = rotb_qtest_new(4);
+    uint16_t w16;
+    uint8_t b8;
+
+    /* a fresh instance reads 0 everywhere */
+    g_assert_cmpuint(qtest_readl(qts, AHB_SRAM), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, AHB_LVAR), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, AHB_LTRG), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, AHB_ETRG), ==, 0);
+
+    /* 32-bit write/read of distinct patterns across all four windows,
+     * including the LACC banks, a gap inside SRAM and the last word of
+     * each window */
+    qtest_writel(qts, AHB_SRAM, 0x10101010u);
+    qtest_writel(qts, AHB_LACC0, 0x22222222u);
+    qtest_writel(qts, AHB_SRAM_GAP, 0x33333333u);
+    qtest_writel(qts, AHB_SRAM_LAST, 0x44444444u);
+    qtest_writel(qts, AHB_LVAR, 0x55555555u);
+    qtest_writel(qts, AHB_LVAR_LAST, 0x66666666u);
+    qtest_writel(qts, AHB_LTRG, 0x77777777u);
+    qtest_writel(qts, AHB_LTRG_LAST, 0x88888888u);
+    qtest_writel(qts, AHB_ETRG, 0x99999999u);
+    qtest_writel(qts, AHB_ETRG_LAST, 0xAAAAAAAAu);
+
+    g_assert_cmphex(qtest_readl(qts, AHB_SRAM), ==, 0x10101010u);
+    g_assert_cmphex(qtest_readl(qts, AHB_LACC0), ==, 0x22222222u);
+    g_assert_cmphex(qtest_readl(qts, AHB_SRAM_GAP), ==, 0x33333333u);
+    g_assert_cmphex(qtest_readl(qts, AHB_SRAM_LAST), ==, 0x44444444u);
+    g_assert_cmphex(qtest_readl(qts, AHB_LVAR), ==, 0x55555555u);
+    g_assert_cmphex(qtest_readl(qts, AHB_LVAR_LAST), ==, 0x66666666u);
+    g_assert_cmphex(qtest_readl(qts, AHB_LTRG), ==, 0x77777777u);
+    g_assert_cmphex(qtest_readl(qts, AHB_LTRG_LAST), ==, 0x88888888u);
+    g_assert_cmphex(qtest_readl(qts, AHB_ETRG), ==, 0x99999999u);
+    g_assert_cmphex(qtest_readl(qts, AHB_ETRG_LAST), ==, 0xAAAAAAAAu);
+
+    /* 16-bit and 8-bit access (D-G: all widths; the SRAM window covers
+     * 0xE01FFFFC so the SRAM/LVAR edge does not alias into LVAR) */
+    qtest_writew(qts, AHB_MEMBRAM, 0xBEEFu);
+    qtest_writew(qts, AHB_MEMBRAM + 2, 0xF00Du);
+    w16 = qtest_readw(qts, AHB_MEMBRAM);
+    g_assert_cmphex(w16, ==, 0xBEEFu);
+    b8 = qtest_readb(qts, AHB_MEMBRAM + 2);
+    g_assert_cmphex(b8, ==, 0xF0);
+
+    /* a byte store touches only its byte; big-endian, so byte 0 of the
+     * word at 0xE02003C0 is the most significant */
+    qtest_writel(qts, AHB_MEMBRAM, 0x00000000u);
+    qtest_writeb(qts, AHB_MEMBRAM, 0x03u);
+    g_assert_cmphex(qtest_readl(qts, AHB_MEMBRAM), ==, 0x03000000u);
+
+    /* window edges do not alias: the last ETRG write left the first
+     * ETRG word untouched */
+    g_assert_cmphex(qtest_readl(qts, AHB_ETRG), ==, 0x99999999u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* the FSW's reboot-persistent BRAM state survives a system reset (D-G):
+ * UNCHANGED_STORAGE holds the low half of the bad-trap magic (WDT.c:74),
+ * MemBram gets the operation mode as a byte at every boot
+ * (OpModeMgmt.c:950-954), and SRAM is ordinary scratch. QEMU RAM is
+ * zeroed at power-on only; nothing in the reset path clears it. */
+static void test_bram_persist(void)
+{
+    QTestState *qts = rotb_qtest_new(4);
+
+    qtest_writel(qts, AHB_UNCHANGED, 0x00002C45u);
+    qtest_writeb(qts, AHB_MEMBRAM, 0x03u);
+    qtest_writel(qts, AHB_SRAM + 0x1000u, 0xCAFEF00Du);
+
+    qtest_system_reset(qts);
+
+    g_assert_cmphex(qtest_readl(qts, AHB_UNCHANGED), ==, 0x00002C45u);
+    g_assert_cmphex(qtest_readb(qts, AHB_MEMBRAM), ==, 0x03u);
+    g_assert_cmphex(qtest_readl(qts, AHB_SRAM + 0x1000u), ==, 0xCAFEF00Du);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 /* GPTIMER prescaler set by the -kernel boot stub (hw/sparc/leon3.c).
  * On the IDPU the boot PROM programs the prescaler for a 1 MHz timer tick
  * at the 20 MHz system clock (reload 19, BSW IIR.h IIR_GPT_PRESCALER) and
@@ -1466,6 +1568,8 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/rotb-selftest-shape", test_rotb_selftest_shape);
         qtest_add_func("/sparc/stix/rotb-strobe", test_rotb_strobe);
         qtest_add_func("/sparc/stix/rotb-reset", test_rotb_reset);
+        qtest_add_func("/sparc/stix/ahb-windows", test_ahb_windows);
+        qtest_add_func("/sparc/stix/bram-persist", test_bram_persist);
     }
 
     return g_test_run();

@@ -70,6 +70,12 @@ struct STIXCTRL
     uint32_t rotb_count;
     bool rotb_full;
     MemoryRegion rotb_block_window;
+    /* AHB data windows (D-A device RAM, D-G reset-persistent): the
+     * SRAM/ELUT/LACC area, the LVAR BRAM, LTRG and ETRG */
+    MemoryRegion sram;
+    MemoryRegion lvar;
+    MemoryRegion ltrg;
+    MemoryRegion etrg;
 };
 
 /*static void grlib_stixctrl_timer_tick(void *opaque)
@@ -449,6 +455,30 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
 
     sysbus_init_mmio(sbd, &STIXCTRL->rotb_block_window);
 
+    /* AHB data windows (plan §3.3, D-A/D-G): plain device RAM, zeroed at
+     * power-on only, contents survive system reset. Sizes: SRAM has a
+     * STIXCTRL_SRAM_SIZE macro; the LVAR window has none — 0x400 covers
+     * LVAR0-3 (4 × 0x100 stride, ending 0xE020039F) plus the BRAM areas
+     * behind them (WDT UNCHANGED_STORAGE 0xE02000A8, MemBram 64 B ending
+     * 0xE0200400); LTRG and ETRG derive from their END/START macros. */
+    if (!memory_region_init_ram(&STIXCTRL->sram, OBJECT(dev), "stixctrl.sram",
+                                STIXCTRL_SRAM_SIZE, errp) ||
+        !memory_region_init_ram(&STIXCTRL->lvar, OBJECT(dev), "stixctrl.lvar",
+                                0x400, errp) ||
+        !memory_region_init_ram(&STIXCTRL->ltrg, OBJECT(dev), "stixctrl.ltrg",
+                                STIXCTRL_LTRG3_END - STIXCTRL_LTRG0_START + 1,
+                                errp) ||
+        !memory_region_init_ram(&STIXCTRL->etrg, OBJECT(dev), "stixctrl.etrg",
+                                STIXCTRL_ETRG1_END - STIXCTRL_ETRG0_START + 1,
+                                errp)) {
+        return;
+    }
+
+    sysbus_init_mmio(sbd, &STIXCTRL->sram);
+    sysbus_init_mmio(sbd, &STIXCTRL->lvar);
+    sysbus_init_mmio(sbd, &STIXCTRL->ltrg);
+    sysbus_init_mmio(sbd, &STIXCTRL->etrg);
+
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 
     //STIXCTRL->reference_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
@@ -480,6 +510,11 @@ static void grlib_stixctrl_reset(DeviceState *d)
     stixctrl->rotb_wr = 0;
     stixctrl->rotb_count = 0;
     stixctrl->rotb_full = false;
+
+    /* the AHB windows (stixctrl.sram/.lvar/.ltrg/.etrg) are deliberately
+     * NOT cleared here: they are plain RAM, zeroed at power-on only, and
+     * their contents survive system reset (D-G) — the FSW's BRAM keeps
+     * the reboot-persistent state (WDT UNCHANGED_STORAGE, MemBram). */
 }
 
 static void grlib_stixctrl_unrealize(DeviceState *dev)
