@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Fake QEMU for boot-smoke tests: parses -serial file:X and, per
+# Fake QEMU for the gate-script tests: parses -serial file:X and, per
 # FAKE_QEMU_MODE, either writes the golden UART log to X (good), writes
-# nothing (silent), or exits 1 immediately (crash).
+# nothing (silent), exits 1 immediately (crash), appends a line every
+# 0.5 s until killed or FAKE_QEMU_RUN_SECONDS elapse (heartbeat), or
+# appends for FAKE_QEMU_FREEZE_AFTER seconds and then stays alive but
+# silent — a hung guest (freeze).
 set -u
 MODE="${FAKE_QEMU_MODE:-good}"
 SELF="$(readlink -f "$0")"
@@ -21,6 +24,21 @@ case "$MODE" in
         sleep "${FAKE_QEMU_RUN_SECONDS:-30}"
         ;;
     silent)
+        sleep "${FAKE_QEMU_RUN_SECONDS:-30}"
+        ;;
+    heartbeat)
+        end=$((SECONDS + ${FAKE_QEMU_RUN_SECONDS:-30}))
+        while [ "$SECONDS" -lt "$end" ]; do
+            echo "fake-qemu heartbeat $SECONDS" >> "$SERIAL_OUT"
+            sleep 0.5
+        done
+        ;;
+    freeze)
+        end=$((SECONDS + ${FAKE_QEMU_FREEZE_AFTER:-2}))
+        while [ "$SECONDS" -lt "$end" ]; do
+            echo "fake-qemu heartbeat $SECONDS" >> "$SERIAL_OUT"
+            sleep 0.5
+        done
         sleep "${FAKE_QEMU_RUN_SECONDS:-30}"
         ;;
     crash)
