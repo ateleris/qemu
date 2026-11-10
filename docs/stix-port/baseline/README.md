@@ -64,6 +64,15 @@ REPAIRED old model.
     at all, so boot-smoke fails with "no UART output".
 - The TMTC server binds `IO_TCP_SERVER_BASE_PORT + getuid()` = **21000**
   (uid 1000), not the 2221 constant in `tmtc_io_server.h`.
+- Since P2-1 (`accepted-diffs.md` §14) the ported model starts **no TM
+  server when the qtest harness drives QEMU**
+  (`grlib-stixspw.tmtc-server=auto`), so the qtest suite needs no port
+  lock against itself — except `/sparc/stix/tmtc-hermetic`, which holds
+  20000+uid in LISTEN while it runs. So don't run the qtests at the same
+  moment as a boot gate or a live-FSW QEMU. The boot gates
+  (`boot-smoke.sh`, `soak.sh`, `tc-smoke.sh`) and the 5.2-wrapper run
+  (step 3) still use the lock: the 5.2 device always binds 21000 and has
+  no `tmtc-server` property.
 - Capture uses `-display none -monitor none -serial file:` so guest UART and
   QEMU prints never mix.
 

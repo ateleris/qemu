@@ -1,5 +1,6 @@
 #include "qemu/osdep.h"
 #include "tmtc_io_server.h"
+#include "qapi/error.h"
 #include "qemu/qemu-print.h"
 
 //#include <stdio.h>
@@ -140,8 +141,9 @@ int send_tm_packet(unsigned char *data, int data_length)
 /**
  *  Creates and connects socket to localhost address and REMOTE_PORT port.
  *  Through this socket, this io module will receive external TC data.
+ *  Returns true on success; on failure sets @errp and returns false.
  */
-void init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void *), void *opaque, uint32_t tmtc_port)
+bool init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void *), void *opaque, uint32_t tmtc_port, Error **errp)
 {
   receivedTcCallback = in_tc_received_callback;
   stixspw = opaque;
@@ -187,23 +189,43 @@ void init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void
 
       if (bind(listeningSocket, (struct sockaddr *)&sinInterface, sizeof(struct sockaddr_in)) != SOCKET_ERROR)
       {
+        if (listen(listeningSocket, 1) == SOCKET_ERROR)
+        {
+          int err = errno;
+
+          close(listeningSocket);
+          listeningSocket = INVALID_SOCKET;
+          error_setg_errno(errp, err,
+                           "TMTC server: cannot listen on 127.0.0.1:%d",
+                           port);
+          return false;
+        }
+
         qemu_printf("IOTCPSERVER - Server listening on port: %d\n", port);
-        listen(listeningSocket, 1);
 
         // Create TC thread
         pthread_create(&tid, NULL, tcHandler, NULL);
       }
       else
       {
+        int err = errno;
+
+        close(listeningSocket);
         listeningSocket = INVALID_SOCKET;
-        qemu_printf("IOTCPSERVER - Bind failed... port: %d, error: %d\n", port, errno);
-        exit(1);
+        error_setg_errno(errp, err,
+                         "TMTC server: cannot bind 127.0.0.1:%d",
+                         port);
+        return false;
       }
     }
     else
     {
-      qemu_printf("IOTCPSERVER - Invalid socket... port: %d, error: %d\n", port, errno);
-      exit(1);
+      error_setg_errno(errp, errno,
+                       "TMTC server: cannot create the listening socket (port %d)",
+                       port);
+      return false;
     }
   }
+
+  return true;
 }

@@ -4,6 +4,7 @@
 #include "hw/sparc/grlib_stix.h"
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
+#include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "chardev/char-fe.h"
 #include "system/physmem.h"
@@ -565,21 +566,23 @@ static const MemoryRegionOps grlib_stixflash_ops = {
     },
 };
 
-static void init_and_load_flash_file(STIXFLASH *stixflash)
+static bool init_and_load_flash_file(STIXFLASH *stixflash, Error **errp)
 {
     qemu_printf("page size: %llu\n", FLASH_PAGE_SIZE);
     qemu_printf("file: %s\n", stixflash->flash_file);
 
     stixflash->f = fopen(stixflash->flash_file, "r+b");
-    while (stixflash->f == NULL)
+    if (stixflash->f == NULL)
     {
         qemu_printf("can't open file, creating a new one\n");
 
         stixflash->f = fopen(stixflash->flash_file, "w+b");
         if (stixflash->f == NULL)
         {
-            qemu_printf("can't create file %d\n", errno);
-            exit(1);
+            error_setg_errno(errp, errno,
+                             "stixflash: cannot create flash file %s",
+                             stixflash->flash_file);
+            return false;
         }
 
         if (stixflash->inverted_storage) {
@@ -589,11 +592,18 @@ static void init_and_load_flash_file(STIXFLASH *stixflash)
              * 0xFF. */
             if (ftruncate(fileno(stixflash->f),
                           (off_t)FLASH_TOTAL_STORAGE) != 0) {
-                error_report("stixflash: cannot size %s to %llu bytes: %s",
-                             stixflash->flash_file,
-                             (unsigned long long)FLASH_TOTAL_STORAGE,
-                             strerror(errno));
-                exit(1);
+                int err = errno;
+
+                /* the file was created by this very call: do not leave an
+                 * empty backing file behind for the next run to open */
+                fclose(stixflash->f);
+                stixflash->f = NULL;
+                unlink(stixflash->flash_file);
+                error_setg_errno(errp, err,
+                                 "stixflash: cannot size %s to %llu bytes",
+                                 stixflash->flash_file,
+                                 (unsigned long long)FLASH_TOTAL_STORAGE);
+                return false;
             }
         } else
         {
@@ -613,13 +623,22 @@ static void init_and_load_flash_file(STIXFLASH *stixflash)
         {
             qemu_printf("problem closing file");
         }
-        
+
         stixflash->f = fopen(stixflash->flash_file, "r+b");
+        if (stixflash->f == NULL)
+        {
+            error_setg_errno(errp, errno,
+                             "stixflash: cannot reopen flash file %s",
+                             stixflash->flash_file);
+            return false;
+        }
     }
 
     fseek(stixflash->f, 0L, SEEK_END);
     qemu_printf("file size = %ld\n", ftell(stixflash->f));
     fseek(stixflash->f, 0L, SEEK_SET);
+
+    return true;
 }
 
 static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
@@ -636,7 +655,9 @@ static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
     if (!stixflash->flash_file) {
         stixflash->flash_file = g_strdup("flash.bin");
     }
-    init_and_load_flash_file(stixflash);
+    if (!init_and_load_flash_file(stixflash, errp)) {
+        return;
+    }
 }
 
 static void grlib_stixflash_reset(DeviceState *d)

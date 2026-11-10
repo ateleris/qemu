@@ -6,7 +6,10 @@
 #include "qemu/module.h"
 #include "chardev/char-fe.h"
 #include "qemu/qemu-print.h"
+#include "qapi/error.h"
+#include "qapi/qapi-types-common.h"
 #include "system/physmem.h"
+#include "system/qtest.h"
 #include "StixIdpu.h"
 #include "tmtc_io_server.h"
 
@@ -65,6 +68,7 @@ struct STIXSPW
 
     stixSpwRegs_s reg;
 
+    OnOffAuto tmtc_server; /* auto = on, except under qtest (hermetic tests) */
     uint32_t tmtc_port; /* 0 = dynamic: IO_TCP_SERVER_BASE_PORT + getuid() */
     MemoryRegion iomem;
     qemu_irq irq;
@@ -301,7 +305,20 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     // shortcut for link running as per E_SPW_LINK_STATUS_RUN
     STIXSPW->reg.status = 0xA00000;
 
-    init_tmtc_server(recv_packet_callback, STIXSPW, STIXSPW->tmtc_port);
+    /* tmtc-server=auto keeps the server off whenever the qtest harness
+     * drives this QEMU (the -qtest chardev is connected, whatever the
+     * accelerator: some qtests boot real code under TCG): no qtest attaches
+     * a TM client, and the default port (20000+uid) must stay free for the
+     * boot gates and a live FSW session. With the server off, TM sends
+     * drop silently, as they do today with no client. */
+    if (STIXSPW->tmtc_server == ON_OFF_AUTO_ON ||
+        (STIXSPW->tmtc_server == ON_OFF_AUTO_AUTO && !qtest_driver()))
+    {
+        if (!init_tmtc_server(recv_packet_callback, STIXSPW, STIXSPW->tmtc_port, errp))
+        {
+            return;
+        }
+    }
 }
 
 static void grlib_stixspw_reset(DeviceState *d)
@@ -310,6 +327,7 @@ static void grlib_stixspw_reset(DeviceState *d)
 }
 
 static const Property grlib_stixspw_properties[] = {
+    DEFINE_PROP_ON_OFF_AUTO("tmtc-server", STIXSPW, tmtc_server, ON_OFF_AUTO_AUTO),
     DEFINE_PROP_UINT32("tmtc-port", STIXSPW, tmtc_port, 0),
 };
 

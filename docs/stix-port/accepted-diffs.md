@@ -503,3 +503,84 @@ with big-endian byte placement; window edges do not alias) and
 word survive `qtest_system_reset`). Red on the pre-A3 binary: the first
 write/read check failed (read 0x00000000 after the write). Both are
 expected red on the 5.2 wrapper.
+
+## 14. TM server off under qtest; realize errors instead of exit(1) (baseline: exit)
+
+**Baseline:** the SPW realize always started the TMTC TCP server, and a
+bind/socket failure ended QEMU with `exit(1)` after a stdout print
+(`tmtc_io_server.c:200,206`) — so every qtest and every upstream generic
+test (qom-test, cdrom-test) that instantiates `leon3_generic` fought over
+port 20000+getuid() = 21000, and the suite ran only under the
+`/tmp/stix-qtest-21000.lock` convention. The flash realize did the same
+for its backing file: a `while (f == NULL)` creation loop whose create and
+ftruncate failures `exit(1)` (`grlib_stixflash.c:574,582,596`), printing
+only "can't create file <errno>" — no path, and on stdout.
+
+**Model (P2-1):**
+- New `grlib-stixspw` property `tmtc-server` (OnOffAuto, default `auto`).
+  `auto` starts the server **except when the qtest harness drives QEMU**;
+  `on`/`off` force it everywhere (boot gates and the GS use the default or
+  `on`, and keep the server). With the server off, TM sends drop silently,
+  exactly as with no client connected ("Error: socket is closed" print
+  stays). `tmtc-port` keeps its meaning (0 = 20000+getuid()).
+  - Predicate note (deviation from the plan's `qtest_enabled()`): the gate
+    is `qtest_driver()` — the `-qtest` chardev connected — because
+    `/sparc/stix/gptimer-prescaler` boots real guest code with
+    `-accel tcg` while the qtest chardev is attached; with the
+    accel-based check the server would still bind 21000 there and the
+    held-port hermeticity gate would fail. `qtest_driver()` is set before
+    machine realize (`qemu_create_late_backends()` runs before
+    `machine_run_board_init()`), so it is reliable in realize.
+- `init_tmtc_server()` returns bool and takes `Error **errp`; the
+  `exit(1)`s became `error_setg_errno` messages that carry the port
+  ("TMTC server: cannot bind 127.0.0.1:<port>"; strerror supplies
+  "Address already in use"). `listen()` is checked too, and every socket
+  error path closes the fd before reporting. Realize propagates through
+  `&error_fatal` (`leon3.c`), so QEMU still exits, with the reason on
+  stderr.
+- Flash realize: the retry loop became a one-shot creation; create,
+  ftruncate-size and reopen failures name the backing-file path via
+  `error_setg_errno` ("stixflash: cannot create flash file <path>").
+  A failed ftruncate closes the just-created file, clears `f` and unlinks
+  it, so no empty backing file survives for the next run. No `leon3.c`
+  change (both devices already realize under `&error_fatal`).
+
+**Not changed:** the pthread accept/recv server itself (P2-4 moves the
+transport onto the main loop); the `recv_packet_callback` TC stub; every
+other `qemu_printf` (P2-2). The 5.2 wrapper strips the new
+`grlib-stixspw.tmtc-server` global like `flash-file`. In the qtests,
+`stix_private_tm_port_arg()` (the pid%20000 guess) is gone; tests hold
+ports race-free with bind-:0+listen helpers. `stix_free_tcp_port()`
+(release-then-rebind) comes back only when a test needs a port QEMU
+itself will bind (P2-4 `tm-tcp`), where the window is unavoidable.
+
+**Evidence:** qtests `/sparc/stix/tmtc-hermetic` (holds 21000 itself,
+starts the machine, PnP readl alive; the hold is only skipped when the
+port is genuinely busy (EADDRINUSE), other failures skip the test; red
+before: "Bind failed... port: 21000, error: 98" then the qtest abort),
+`/sparc/stix/tmtc-bind-error` (`g_test_trap_subprocess` child starts with
+`tmtc-server=on` on a held port; asserts the child failed and stderr
+matches one glob `*127.0.0.1:<port>*Address already in use*`; red before:
+the property was unknown — "can't apply global grlib-stixspw.tmtc-server=on:
+Property ... not found"), `/sparc/stix/flash-create-error` (child passes
+`flash-file=<tmpdir>/missing/flash.bin`; asserts the child failed and
+stderr matches `*cannot create flash file <path>*`; red before: exit(1)
+with "can't create file 2" on stdout, nothing on stderr). Green: all 23
+tests, and the full suite without the port lock while a listener holds
+21000; upstream `qom-test -p /sparc/qom/leon3_generic` also passes with
+21000 held (red before with the same "Bind failed" exit). Note
+`tmtc-hermetic` itself holds 20000+uid while it runs, so a qtest run must
+not overlap a boot gate (baseline/README.md).
+
+**On the 5.2 wrapper** the picture is different, and worse than "red":
+the 5.2 SPW has no properties at all (it calls
+`init_tmtc_server(cb, opaque)` unconditionally and always binds 21000).
+`tmtc-hermetic` aborts the whole old-binary run (`qtest_init` aborts in
+the parent), so `tmtc-bind-error` and `flash-create-error`, registered
+after it, are **not run** there rather than red. `tmtc-bind-error` would
+fail on the unknown `grlib-stixspw.tmtc-port` global (the wrapper strips
+only `tmtc-server`), not on a bind. Side effect of dropping the old
+`tmtc-port` arguments from the existing tests: they no longer abort on
+5.2 over an unknown property; with 21000 free they run against the old
+device. The exact 5.2 expected-red/not-run list comes from the per-commit
+wrapper run (plan §6).

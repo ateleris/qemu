@@ -110,13 +110,57 @@ static QTestState *stix_qtest_new(void)
     return stix_qtest_new_extra("");
 }
 
-/* -global arg moving the TM server off the default 20000+uid port, so a
- * test can run beside a live FSW session (Task C will make the server
- * opt-in under qtest; this stays valid then). */
-static gchar *stix_private_tm_port_arg(void)
+/* P2-1: qtest starts no TM server (grlib-stixspw tmtc-server=auto is off
+ * under qtest), so tests that never attach a TM client pass no port at
+ * all. Tests hold ports with stix_hold_tcp_port() (a specific port) or
+ * stix_hold_free_tcp_port() (an ephemeral one, returned already held, so
+ * no other process can take it in between). */
+
+/* Hold 127.0.0.1:<port> with bind+listen. SO_REUSEADDR is set like on the
+ * device's own bind, so the hold fails only when a real listener owns the
+ * port (EADDRINUSE). Returns the socket (close it to release the port) or
+ * -1 with errno preserved for the caller. */
+static int stix_hold_tcp_port(int port)
 {
-    return g_strdup_printf("-global grlib-stixspw.tmtc-port=%d",
-                           30000 + (int)(getpid() % 20000));
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(port),
+    };
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int optval = 1;
+
+    if (fd < 0) {
+        return -1;
+    }
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 1) != 0) {
+        int err = errno;
+
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    return fd;
+}
+
+/* Race-free hold: bind 127.0.0.1:0, listen, and hand back BOTH the fd and
+ * the kernel-assigned port — the port is never released before the caller
+ * is done with it. */
+static int stix_hold_free_tcp_port(int *port)
+{
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    int fd = stix_hold_tcp_port(0);
+
+    if (fd < 0) {
+        return -1;
+    }
+    g_assert(getsockname(fd, (struct sockaddr *)&addr, &addrlen) == 0);
+    *port = ntohs(addr.sin_port);
+    g_assert_cmpint(*port, >, 0);
+    return fd;
 }
 
 static void stix_qtest_cleanup(void)
@@ -178,14 +222,13 @@ static void test_flash(void)
  * skipped, write -> FAILED, file never extended). */
 static void test_flash_error_paths(void)
 {
-    g_autofree gchar *port = stix_private_tm_port_arg();
     g_autofree uint8_t *zeros = g_malloc0(FLASH_PAGE_BYTES);
     QTestState *qts;
     uint32_t sta, pending;
     struct stat st;
     const uint32_t failed_ready = FTNAND_FAILED | FTNAND_READY;
 
-    qts = stix_qtest_new_extra(port);
+    qts = stix_qtest_new();
 
     /* 1. Out-of-order PAGEAD write (write_counter == 0; driver order is
      *    ram -> page -> cmd): sequence violation. FAILED|READY set, BUSY
@@ -278,7 +321,6 @@ static void test_flash_error_paths(void)
 static QTestState *flash_qtest_new_sparse(uint64_t size, gchar **path)
 {
     gchar *tmp = NULL;
-    gchar *port;
     struct stat st;
     QTestState *qts;
     int fd = g_file_open_tmp("stix-flash-sparse-XXXXXX", &tmp, NULL);
@@ -296,10 +338,8 @@ static QTestState *flash_qtest_new_sparse(uint64_t size, gchar **path)
         return NULL;
     }
 
-    port = stix_private_tm_port_arg();
-    qts = qtest_initf("-M leon3_generic -global grlib-stixflash.flash-file=%s %s",
-                      tmp, port);
-    g_free(port);
+    qts = qtest_initf("-M leon3_generic -global grlib-stixflash.flash-file=%s",
+                      tmp);
     *path = tmp;
     return qts;
 }
@@ -463,7 +503,6 @@ static void test_flash_storage(void)
         g_autofree gchar *dir = g_dir_make_tmp("stix-flash-storage-XXXXXX",
                                                NULL);
         g_autofree gchar *path = g_build_filename(dir, "flash.bin", NULL);
-        g_autofree gchar *port = stix_private_tm_port_arg();
         g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
         g_autofree uint8_t *z0 = g_malloc0(FLASH_PAGE_BYTES);
         g_autofree uint8_t *pff = g_malloc(FLASH_PAGE_BYTES);
@@ -479,9 +518,8 @@ static void test_flash_storage(void)
         }
         memset(pff, 0xFF, FLASH_PAGE_BYTES);
 
-        qts = qtest_initf("-M leon3_generic "
-                          "-global grlib-stixflash.flash-file=%s %s",
-                          path, port);
+        qts = qtest_initf("-M leon3_generic -global grlib-stixflash.flash-file=%s",
+                          path);
 
         /* creation is one ftruncate: the size is there, the blocks are
          * not. If this filesystem cannot do sparse files, skip rather
@@ -542,7 +580,6 @@ static void test_flash_storage(void)
     /* ---- (c) legacy plain storage keeps all-0xFF files usable ---- */
     {
         g_autofree gchar *path = NULL;
-        g_autofree gchar *port = stix_private_tm_port_arg();
         g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
         g_autofree uint8_t *pff = g_malloc(FLASH_PAGE_BYTES);
         g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
@@ -566,8 +603,8 @@ static void test_flash_storage(void)
 
         qts = qtest_initf("-M leon3_generic "
                           "-global grlib-stixflash.flash-file=%s "
-                          "-global grlib-stixflash.inverted-storage=off %s",
-                          path, port);
+                          "-global grlib-stixflash.inverted-storage=off",
+                          path);
 
         /* guest: a file byte 0xFF reads back 0xFF in plain mode */
         qtest_writel(qts, 0x40000000u, 0);
@@ -922,8 +959,7 @@ static bool wdg_saw_reset(QTestState *qts)
 
 static void test_ctrl_watchdog(void)
 {
-    g_autofree gchar *port = stix_private_tm_port_arg();
-    QTestState *qts = stix_qtest_new_extra(port);
+    QTestState *qts = stix_qtest_new();
 
     /* power-up: not running */
     g_assert_cmpuint(WDG_COUNT(qts), ==, 0);
@@ -996,8 +1032,7 @@ static void test_ctrl_watchdog(void)
  * (StixIdpu.h IRQ_STIXCTRL_*). */
 static void test_ctrl_irq_lines(void)
 {
-    g_autofree gchar *port = stix_private_tm_port_arg();
-    QTestState *qts = stix_qtest_new_extra(port);
+    QTestState *qts = stix_qtest_new();
     QDict *resp;
     QList *props;
     const QListEntry *entry;
@@ -1105,7 +1140,7 @@ static bool rotb_blocks_supported(void)
     static int supported = -1;
 
     if (supported < 0) {
-        QTestState *qts = stix_qtest_new_extra(stix_private_tm_port_arg());
+        QTestState *qts = stix_qtest_new();
         QDict *resp;
         QList *props;
         const QListEntry *entry;
@@ -1132,18 +1167,17 @@ static bool rotb_blocks_supported(void)
     return supported != 0;
 }
 
-/* one test instance: private TM port plus a small ring (the default ring
- * costs ~53.5 MB of host RAM per instance) */
+/* one test instance: a small ring (the default ring costs ~53.5 MB of
+ * host RAM per instance) */
 static QTestState *rotb_qtest_new(unsigned blocks)
 {
-    g_autofree gchar *port = stix_private_tm_port_arg();
     g_autofree gchar *extra = NULL;
 
     if (rotb_blocks_supported()) {
-        extra = g_strdup_printf("%s -global grlib-stixctrl.rotb-blocks=%u",
-                                port, blocks);
+        extra = g_strdup_printf("-global grlib-stixctrl.rotb-blocks=%u",
+                                blocks);
     } else {
-        extra = g_strdup_printf("%s", port);
+        extra = g_strdup("");
     }
 
     return stix_qtest_new_extra(extra);
@@ -1520,7 +1554,6 @@ static void test_gptimer_prescaler(void)
 {
     g_autofree gchar *elf = write_spin_elf();
     g_autofree gchar *extra = NULL;
-    g_autofree gchar *port = stix_private_tm_port_arg();
     QTestState *qts;
     gint64 deadline;
 
@@ -1529,7 +1562,7 @@ static void test_gptimer_prescaler(void)
         g_unlink(elf);
         return;
     }
-    extra = g_strdup_printf("-accel tcg -kernel %s %s", elf, port);
+    extra = g_strdup_printf("-accel tcg -kernel %s", elf);
     qts = stix_qtest_new_extra(extra);
 
     /* the stub's last store enables timer 0; the prescaler precedes it */
@@ -1543,6 +1576,158 @@ static void test_gptimer_prescaler(void)
     qtest_quit(qts);
     stix_qtest_cleanup();
     g_unlink(elf);
+}
+
+/* ---- P2-1: hermetic TM server, realize errors instead of exit(1) ---- */
+
+#define TMTC_BASE_PORT 20000 /* IO_TCP_SERVER_BASE_PORT (tmtc_io_server.h) */
+
+/* env keys handing the g_test_trap_subprocess child its parameters; the
+ * parent picks the port and the temp flash file */
+#define TMTC_TEST_PORT_ENV  "STIX_TEST_TMTC_PORT"
+#define TMTC_TEST_FLASH_ENV "STIX_TEST_TMTC_FLASH"
+#define FLASH_TEST_DIR_ENV  "STIX_TEST_FLASH_DIR"
+
+/* full path of a qtest registered under "/sparc/stix/<name>"; the
+ * registration prepends qtest_get_arch() */
+static gchar *stix_test_path(const char *name)
+{
+    return g_strdup_printf("/%s/sparc/stix/%s", qtest_get_arch(), name);
+}
+
+/* /sparc/stix/tmtc-hermetic: the machine must start under qtest even with
+ * the default TM port (20000+uid) held — tmtc-server=auto starts no server
+ * under qtest (P2-1). RED on the pre-P2-1 binary: the device still binds
+ * the port at realize ("Bind failed"), QEMU exits, qtest_init aborts.
+ * The hold is skipped only when the port is genuinely busy (EADDRINUSE —
+ * with SO_REUSEADDR that means a real listener, i.e. the condition under
+ * test already holds); any other hold failure skips the test instead of
+ * passing it vacuously. */
+static void test_tmtc_hermetic(void)
+{
+    int listening = 0;
+    socklen_t llen = sizeof(listening);
+    int held = stix_hold_tcp_port(TMTC_BASE_PORT + (int)getuid());
+    QTestState *qts;
+
+    if (held < 0) {
+        if (errno == EADDRINUSE) {
+            g_test_message("port %d already busy, hold skipped",
+                           TMTC_BASE_PORT + (int)getuid());
+        } else {
+            g_autofree gchar *why = g_strdup_printf(
+                "cannot hold the default TM port %d: %s",
+                TMTC_BASE_PORT + (int)getuid(), g_strerror(errno));
+            g_test_skip(why);
+            return;
+        }
+    } else {
+        /* the hold is really a listener */
+        g_assert(getsockopt(held, SOL_SOCKET, SO_ACCEPTCONN,
+                            &listening, &llen) == 0);
+        g_assert_cmpint(listening, ==, 1);
+    }
+
+    qts = stix_qtest_new();
+
+    /* alive: a PnP readl round-trips, as in test_pnp */
+    g_assert_cmphex(stix_pnp_read(qts, 0), ==, pnp_golden[0]);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    if (held >= 0) {
+        close(held);
+    }
+}
+
+/* g_test_trap_subprocess child (precedent:
+ * tests/qtest/test-x86-cpuid-compat.c). tmtc-server=on on an occupied
+ * port must fail realize with the port number and strerror ("Address
+ * already in use") in the message. RED on the pre-P2-1 binary:
+ * tmtc-server is an unknown -global property, so QEMU dies with a
+ * different message. */
+static void test_tmtc_bind_error_subprocess(void)
+{
+    const char *port = g_getenv(TMTC_TEST_PORT_ENV);
+    const char *flash = g_getenv(TMTC_TEST_FLASH_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(port);
+    g_assert_nonnull(flash);
+
+    /* qtest_init aborts: QEMU realize fails on the bind and exits */
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s "
+                      "-global grlib-stixspw.tmtc-server=on "
+                      "-global grlib-stixspw.tmtc-port=%s",
+                      flash, port);
+    qtest_quit(qts);
+}
+
+static void test_tmtc_bind_error(void)
+{
+    g_autofree gchar *path = NULL;
+    g_autofree gchar *portstr = NULL;
+    g_autofree gchar *pat = NULL;
+    g_autofree gchar *sub = stix_test_path("tmtc-bind-error/subprocess");
+    int fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+    int port = 0;
+    int held;
+
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+
+    /* hold an ephemeral port race-free across the subprocess run */
+    held = stix_hold_free_tcp_port(&port);
+    g_assert_cmpint(held, >=, 0);
+
+    portstr = g_strdup_printf("%d", port);
+    g_setenv(TMTC_TEST_PORT_ENV, portstr, TRUE);
+    g_setenv(TMTC_TEST_FLASH_ENV, path, TRUE);
+
+    g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+    g_test_trap_assert_failed();
+    /* one glob: the bind message carries loopback, the port and strerror */
+    pat = g_strdup_printf("*127.0.0.1:%d*Address already in use*", port);
+    g_test_trap_assert_stderr(pat);
+
+    close(held);
+    close(fd);
+    g_unlink(path);
+}
+
+/* g_test_trap_subprocess child: a flash backing file under a nonexistent
+ * directory must fail realize with the path named in the error. RED on
+ * the pre-P2-1 binary: exit(1) with only "can't create file <errno>" on
+ * stdout, no path on stderr. */
+static void test_flash_create_error_subprocess(void)
+{
+    const char *dir = g_getenv(FLASH_TEST_DIR_ENV);
+    g_autofree gchar *path = NULL;
+    QTestState *qts;
+
+    g_assert_nonnull(dir);
+    path = g_strdup_printf("%s/missing/flash.bin", dir);
+
+    qts = qtest_initf("-M leon3_generic -global grlib-stixflash.flash-file=%s",
+                      path);
+    qtest_quit(qts);
+}
+
+static void test_flash_create_error(void)
+{
+    g_autofree gchar *dir = g_dir_make_tmp("stix-flash-err-XXXXXX", NULL);
+    g_autofree gchar *pat = g_strdup_printf("*cannot create flash file %s/missing/flash.bin*",
+                                            dir);
+    g_autofree gchar *sub = stix_test_path("flash-create-error/subprocess");
+
+    g_setenv(FLASH_TEST_DIR_ENV, dir, TRUE);
+
+    g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr(pat);
+
+    g_rmdir(dir);
 }
 
 int main(int argc, char **argv)
@@ -1570,6 +1755,14 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/rotb-reset", test_rotb_reset);
         qtest_add_func("/sparc/stix/ahb-windows", test_ahb_windows);
         qtest_add_func("/sparc/stix/bram-persist", test_bram_persist);
+        qtest_add_func("/sparc/stix/tmtc-hermetic", test_tmtc_hermetic);
+        qtest_add_func("/sparc/stix/tmtc-bind-error/subprocess",
+                       test_tmtc_bind_error_subprocess);
+        qtest_add_func("/sparc/stix/tmtc-bind-error", test_tmtc_bind_error);
+        qtest_add_func("/sparc/stix/flash-create-error/subprocess",
+                       test_flash_create_error_subprocess);
+        qtest_add_func("/sparc/stix/flash-create-error",
+                       test_flash_create_error);
     }
 
     return g_test_run();

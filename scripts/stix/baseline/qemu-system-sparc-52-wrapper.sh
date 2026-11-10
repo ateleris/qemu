@@ -4,6 +4,7 @@
 # libqtest always passes: -qtest ... -qtest-log ... -chardev socket ...
 # -object monitor-qmp ... -display none -audio none [-run-with ...] -accel qtest
 # and the STIX qtest adds: -global grlib-stixflash.flash-file=<path>
+# plus, since P2-1, -global grlib-stixspw.tmtc-server=... (stripped below)
 #
 # Override the baseline binary location with STIX_OLD_QEMU (default:
 # /tmp/qemu-stix-baseline/build/sparc-softmmu/qemu-system-sparc).
@@ -22,7 +23,9 @@ while [ "$i" -lt "${#raw[@]}" ]; do
             ;;
         -global)
             if [ "${raw[$((i + 1))]:-}" = "grlib-stixflash.flash-file" ] || \
-               [[ "${raw[$((i + 1))]:-}" == grlib-stixflash.flash-file=* ]]; then
+               [[ "${raw[$((i + 1))]:-}" == grlib-stixflash.flash-file=* ]] || \
+               [ "${raw[$((i + 1))]:-}" = "grlib-stixspw.tmtc-server" ] || \
+               [[ "${raw[$((i + 1))]:-}" == grlib-stixspw.tmtc-server=* ]]; then
                 i=$((i + 2)) # 5.2 has no such property; drop the pair
             else
                 args+=("$a" "${raw[$((i + 1))]:-}")
