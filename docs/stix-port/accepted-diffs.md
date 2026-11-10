@@ -90,3 +90,39 @@ the baseline lacks). Post-fix 600 s soak and boot smoke PASS (results
 in the Task B commit). The baseline never survived past the ~135 s
 time-set, so there is no baseline UART beyond the golden boot window to
 diff against.
+
+## 5. CTRL rotbCmdSta (0x54): strobe/status write masking (baseline-inherited defect)
+
+The baseline model stores every CTRL write raw. The FSW's EDAC counter
+reset for the rotating buffer (EDAC.c, `E_EDAC_MODULE_ROTBUF`) clears
+its strobe with a full-register write of `~(1u << EDACRESET)` =
+0xFFFFFFFB, so the model's `rotbCmdSta` read back with BLOCKCOUNT
+(bits 23:7) = 131071. The FSW's HK report asserts when the rotating
+buffer fill level (computed from BLOCKCOUNT) exceeds its 3-bit field
+(`HKAcquire.c:325`) — level 8 > mask 7 — and halts.
+
+**Why it surfaced now, and why it is a model defect and not FSW
+behavior:** BLOCKCOUNT/SECCOUNT/READY/FULL/DEDETECTED are read-only
+status on the real FPGA; a strobe write cannot touch them. The defect
+is baseline-inherited (identical raw store in the 5.2 model) and was
+masked for as long as the SCET `assert(0)` killed every run at ~60 s
+FSW — 4 FSW-seconds before the first HK report after the EDAC strobe.
+Fixing T1 unmasked it (two soak runs RED at FSW 00:01:04).
+
+**Fix:** writes to 0x54 latch only the writable fields — COMMAND
+(bits 1:0) and EDACRESET (bit 2); status fields ignore writes. The
+FSW's GETBLOCK read-modify-write still lands in COMMAND.
+
+**Companion repair — rotbCmdSta.READY:** with the raw store gone, the
+FSW's `RotBuf_init` READY wait (bit 3, timeout fatal: "Fatal error: 1"
+at init) exposed that the model never asserted READY at all — the
+baseline passed it **by accident**, because the same EDAC strobe-clear
+write 0xFFFFFFFB happened to set bit 3. The model now emulates the
+real FPGA behavior: the rotbConfig (0x58) ENABLE bit (31) asserts
+READY, disabling clears it.
+
+Evidence: qtest `stix/ctrl-rotb` pins both (red shown: readback
+`0xfffffff8` after the strobe pair; READY `(0 == 1)` after enable);
+suite 6/6 green; boot smoke PASS (init path restored, golden UART
+match intact). The EEPROM/SDRAM/CACHE EDAC
+resets use read-modify-writes of single bits and are unaffected.
