@@ -214,12 +214,20 @@ The run: QEMU `866ee37709` with `run-qemu-gs.sh --udp`, the ground station `0dcb
    directory.** It uses 0 blocks, but it is a trap on the nearly full Windows disk. Point the
    default `flash-file` elsewhere or make it opt-in in Phase 3.
 5. **The `grlib_stixwd.c` prints stay.** The device is not instantiated.
-6. **Phase 3 inputs:**
-   - NOMINAL mode needs TC(20,128) at least every 30 s (`drafts/2026-11-10-recon-tc20.md`).
-   - The HK ADC model: the boot TM(5,4) and the self-test `*E reference voltage` lines come
-     from reading 0 (`drafts/2026-11-10-recon-hk-adc.md`).
-   - Link-error and AHB-error injection.
-   - More than one TM client.
+6. **Phase 3 inputs** (status 2026-11-10, after Phase 3):
+   - NOMINAL mode needs TC(20,128) at least every 30 s
+     (`drafts/2026-11-10-recon-tc20.md`) — **superseded by D-P3c:** the
+     TC(20,128) reaction is disabled with TC(236,6) ReactionToS20 = 0
+     in CONFIGURATION instead; there is no TC(20,128) generator and no
+     GS reaction. See the NOMINAL recipe in `ground-station.md` and the
+     Phase 3 checklist.
+   - The HK ADC model: the boot TM(5,4) and the self-test
+     `*E reference voltage` lines come from reading 0
+     (`drafts/2026-11-10-recon-hk-adc.md`) — **done**, P3-1
+     `f2e8664506`: the boot report is the success TM(5,1) 0x0022 and
+     the reference-voltage lines are gone (accepted-diffs §22).
+   - Link-error and AHB-error injection. (still open)
+   - More than one TM client. (still open)
 
 ## Cleanup (run only after acceptance; the owner runs these)
 

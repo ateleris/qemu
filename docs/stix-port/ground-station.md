@@ -6,6 +6,7 @@ Status 2026-11-10 (after the Phase 2 end-to-end run):
 |---|---|
 | **TM (emulator → ground station)** | Works end to end. Heartbeats, HK and TC reports are decoded in the ground station's UI and history, over direct UDP (`--udp`) or over TCP with the bridge. |
 | **TC (ground station → FSW)** | Works end to end over direct UDP (`run-qemu-gs.sh --udp`, no bridge), verified 2026-11-10 with QEMU `866ee37709` and ground station `0dcb1af`. TC(17,1) gave TM(1,1), TM(17,2) and TM(1,7). TC(9,129) coarse 0x10000000 gave TM(1,1) and TM(1,7), and the heartbeat CUC then counted from 0x10000000. The transcript is in the Phase 2 acceptance checklist. Over TCP the bridge with `--forward-tc` reaches the same RX path (P2-6; shown in the 2026-11-10 bridge demo). |
+| **Modes (SAFE → CONFIGURATION → NOMINAL)** | Works: the three TCs of the NOMINAL recipe below move the FSW through the modes. The gate `nominal-smoke.sh` passes in both modes (positive and `--negative`; gate record in `accepted-diffs.md` §23), including SID2 with the NOMINAL mode nibble. **A NOMINAL entry writes a flash context — use a scratch run dir** (see the recipe). |
 
 The findings, with file:line references on both sides, are in
 `drafts/2026-11-10-gs-attach-report.md`.
@@ -278,6 +279,74 @@ bursts reordered (the model delivers in arrival order);
 `tmtc-probe.py` stays TCP-only — it talks to 21500; and QEMU binds TC
 on 127.0.0.1 only (`udp-tm-host` can point TM at a remote address, but
 a remote ground station cannot send TC to this model).
+
+## NOMINAL mode
+
+The FSW boots into SAFE. Three telecommands move it to NOMINAL; all
+three are in the ground station's IDB command definitions (branch
+`stix-qemu-integration`), and the model gate `nominal-smoke.sh` runs
+the same sequence (gate record in `accepted-diffs.md` §23).
+
+**The recipe, in order:**
+
+1. **Wait for the boot TC20 timer.** Enter CONFIGURATION only after
+   TM(5,1) EID 0x142E has arrived — the boot-armed TC(20,128) timer
+   fires about 30 s after boot, and its reaction would pull the FSW
+   back to SAFE. (The gate waits until +50 s.)
+2. **ZIX36001 "STIX Mode transition"** — TC(236,1) with
+   "Operation mode (PIX00080)" = **4** (CONFIGURATION) and
+   "Mode transition (PIX00081)" = **0** (MANUAL_NOMINAL, as
+   used by the gate).
+   Expected: TM(1,1), TM(5,1) `0021 02 04` (CONFIGURATION ← SAFE,
+   reason TC), TM(1,7) — near-instant.
+3. **ZIX36607 "STIX ASW config"** — TC(236,6) with "ASW" fixed **7**,
+   "Parameter ID ASW (PIX00095)" = **4** (ReactionToS20) and
+   "Parameter (236,6) (PIX00120)" = **0**, which disables the
+   TC(20,128) reaction. Send it AFTER entering CONFIGURATION: the
+   CONFIGURATION entry resets the RAM copy of the context, which wipes
+   a value set in SAFE. Expected: TM(1,1) and TM(1,7) (the FSW sends
+   two TM(1,7) here).
+4. **ZIX36001 again** with "Operation mode" = **5** (NOMINAL),
+   "Mode transition" = 0. Expected: TM(1,1) at once, then a few
+   seconds later TM(5,1) `0021 04 05` (NOMINAL ← CONFIGURATION) and
+   TM(1,7); SID2 (0x5A4, TM(3,25)) with mode byte 0x15 follows at the
+   64 s HK cadence.
+
+The raw TC units are in `scripts/stix/nominal-smoke.sh` (the FSW does
+not check the sequence count; the CRC trailers are precomputed).
+
+**Flash-context warning.** Any NOMINAL entry writes a flash context
+(`ContextMgmt_deinit`), and every later boot **on that flash.bin**
+starts from it — the TC20 reaction stays disabled, the other context
+parameters come from it too, and a golden captured on such a flash
+would differ. `run-qemu-gs.sh` has **no** fresh-flash mechanism: it
+uses `STIX_GS_RUN_DIR` (default `/tmp/stix-gs-run`), creates the
+directory, `cd`s into it and lets the device create `flash.bin` only
+when it is missing — so a reused run dir silently reuses its old
+flash (its only built-in refusal is `/tmp/stix-baseline-run`). For
+NOMINAL sessions, point it at a **new, empty** directory and never
+reuse it for a second NOMINAL session:
+
+```bash
+STIX_GS_RUN_DIR=/tmp/stix-gs-nominal-$(date +%Y%m%d-%H%M%S) \
+    scripts/stix/gs/run-qemu-gs.sh --udp build/qemu-system-sparc
+```
+
+Never use `/tmp/stix-uprev-run` (the golden run dir) or
+`/tmp/stix-baseline-run` (frozen). For scripted runs,
+`nominal-smoke.sh` enforces all of this itself.
+
+**What NOMINAL looks like here:**
+- heartbeats (0x5E5) continue, and SID2 (0x5A4, TM(3,25)) arrives every
+  64 s with mode 0x15;
+- **no quick-look or science TM** — there is no detector/IDeF-X model
+  and no ROTB data path;
+- at NOMINAL entry the UART shows 384 `*E writing register … failed`
+  lines (`XrayDetFDIR.c:731`): the ASIC register writes time out and
+  the NOMINAL path carries on. Expected, not a failure;
+- SID2 shows LV/HV/SpW **off** even in NOMINAL, because the model
+  leaves POWERSTAT (hkCmdSta bits 9:5) at 0 (D-P3a); one TM(5,2)
+  0x542C (no LUTs in flash) is also expected at entry.
 
 ## Notes and limits
 

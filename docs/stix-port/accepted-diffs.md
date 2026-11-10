@@ -1415,3 +1415,42 @@ guard.
 - **Unchanged:** tc-smoke PASS, boot-smoke PASS (P3-1 golden), probe self-test PASS.
 - **Shared flash:** `/tmp/stix-uprev-run/flash.bin` mtime is still 13:05, i.e. untouched by the gate.
 
+## 24. Known limits after Phase 3
+
+What the model deliberately does **not** do, so a missing behaviour is
+not mistaken for a bug (plan P3-3; decisions D-P3a..c):
+
+- **No detector/IDeF-X model.** The ASIC serial interface is absent and
+  the 384 register writes time out (§23). The trap for later work
+  (recon-phase3-nominal §2.3): modelling only `ideFxCmdSta.CMDREADY`
+  makes things **worse** — the ASIC verification run every 4096 s would
+  read back zeros, emit TM(5,2) 0x542E and TM(5,3) 0x9438, and OR every
+  ASIC into `CALISTE_IGNORE_FLAGS`. An IDeF-X model must include
+  register readback, or not exist at all.
+- **No QL, science or ROTB data.** The readout FSM status stays 0, no
+  QL IRQ fires, and ROTB blocks come only from the detector hardware
+  that is not modelled — so no QL TM is produced and BLOCKCOUNT stays
+  0 (recon-phase3-nominal §2, §3).
+- **No POWERSTAT.** hkCmdSta bits 9:5 stay plain storage at 0 (D-P3a):
+  SID2 shows LV/HV/SpW off even in NOMINAL, and the FSW's SpW, ATT_V
+  and HV voltage checks stay skipped. Synthesising it later requires
+  the SpW voltages to track SPWEN atomically or a PFM/context run falls
+  into offline mode (§22).
+- **No HK hardware protection IRQ.** The FPGA's threshold compare
+  (`hkProtConfig`, IRQ 4) is not modelled, so no HK protection FDIR can
+  trigger.
+- **`hkIrqSta` stores the FSW's clear writes raw** (cosmetic): a
+  write-1-to-clear is not implemented, so the register reads back what
+  the FSW wrote (the golden shows `0x3fe20`).
+- **ATT_C (channel 8) is a static 20** — the attenuator is not modelled
+  to move. Latent: below the PFM two-motor minimum of 28 (ATT2M_C); a
+  future TC-driven attenuator test needs a motion-dependent value of
+  110..255 (AttCtrl.c:342 sums only < 0x100). See §22.
+- **`HK_getADCReadout` has no lock** between its hkAdc write and its
+  read (HK.c:130-157): a preempted reader can get another channel's
+  value. This was invisible at ADC = 0 and is an FSW property, not
+  something to model around (plan, Phase 3 risks).
+- **`tm.golden.log` is a historical artifact, not regenerated** by
+  `capture-golden.sh` (§22): it was last captured before the watchdog
+  model and the D-I flash, and Phase 3 does not change it.
+

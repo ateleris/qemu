@@ -158,9 +158,22 @@ From Windows the same files are at `\\wsl$\<distro>\tmp\stix-uprev-run\`.
 | `soak.sh` | `uart.soak.raw` | `qemu-stdout.soak.log` | `tm.soak-probe.log` |
 | `boot-smoke.sh` | `uart.smoke.raw` (+ `.norm`) | `qemu-stdout.smoke.log` | `tm.smoke.log` (`--with-tm`) |
 | `tc-smoke.sh` | `uart.tc.raw` | `qemu-stdout.tc.log` | `tc.smoke.probe.log` (framed units + expectations) |
+| `nominal-smoke.sh` | `uart.nominal.raw` (+ `.txt`) | `qemu-stdout.nominal.log` | `nominal.probe.log` |
 | `capture-golden.sh` | `uart.golden.raw` | `qemu-stdout.golden.log` | — |
 
 All of these are in the run directory. Each run overwrites its own files.
+
+**NOMINAL experiments need a fresh run dir.** Entering NOMINAL — by any
+route, scripted or manual — makes the FSW write a flash context
+(`ContextMgmt_deinit`), and every later boot **on that `flash.bin`**
+starts from it (the TC20 reaction stays disabled; the other context
+parameters come from it too). Never point a NOMINAL session at
+`/tmp/stix-uprev-run` or `/tmp/stix-baseline-run`; use an empty
+directory of its own (`STIX_NOMINAL_RUN_DIR` for `nominal-smoke.sh`,
+which enforces this, or an empty dir with its own `flash.bin` for a
+manual run). Do not reuse another experiment's run dir either:
+the p3probe4 experiment silently booted from p3probe3's context, and
+its boot looked cleaner than a fresh flash's for that reason alone.
 
 **Interactive run, console in your terminal.** Only do this while no
 other QEMU is running, because the TM server binds port 21000. Ctrl-C ends
@@ -188,8 +201,10 @@ cd /tmp/stix-uprev-run && /path/to/build/qemu-system-sparc \
   goes **quiet**. This is correct: the once-per-second
   `Watchdog *E invalid number of cycles` error disappeared with the
   watchdog model (R3).
-- The expected steady-state errors `HKAcquire *E reference voltage` and
-  `LUTMgmt *E could not find LUT` are part of the golden.
+- The expected steady-state error `LUTMgmt *E could not find LUT` is
+  part of the golden. The `HKAcquire *E reference voltage` lines are
+  gone since P3-1 (`accepted-diffs.md` §22): the ADC now returns the
+  nominal values and the boot self-test passes.
 - TM keeps ticking at about one packet per second (FSW time runs ~0.5–0.9×
   wall time).
 
@@ -219,9 +234,10 @@ cd /tmp/stix-uprev-run && /path/to/build/qemu-system-sparc \
   runs because the EDAC param is 0 on the emulator).
 - EDAC configuration prints all-zero on the emulator (hardware shows
   EEPROM/CACHE = 1).
-- Expected steady-state guest errors: `HKAcquire *E reference voltage ... out
-  of range` (ADC reads 0), `LUTMgmt *E could not find LUT` (empty flash).
-  These are part of the golden content, not failures.
+- Expected steady-state guest error: `LUTMgmt *E could not find LUT`
+  (empty flash) — part of the golden content, not failures. The
+  `HKAcquire *E reference voltage` errors left with P3-1
+  (`accepted-diffs.md` §22).
 - The `"STIX_CONTROL"` token and the SPW TC-receive path: **fixed since
   P2-4/P2-6** (accepted-diffs §17/§19) — the token is stripped per
   connection and framed TC units reach the guest's RX DMA. This bullet
