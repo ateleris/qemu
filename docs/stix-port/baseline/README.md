@@ -54,11 +54,14 @@ REPAIRED old model.
   copy that file: the host is a WSL VM on a nearly full Windows disk. A
   plain file used with the new model reads all 0x00 (all blocks bad); use
   `-global grlib-stixflash.inverted-storage=off` for it.
-- Pass the ELF explicitly: `STIX_ASW_ELF=/tmp/stix-baseline-run/ASW_em_baseline.elf`
-  (reading it is fine). The default path in the scripts,
-  `stix_asw_src/.../ASW_em.elf`, is whatever was built last on Windows. On
-  2026-11-10 that was a `LIMIT_FS_SIZE=32` build without `DEBUG_PRINT`,
-  which has no UART output at all.
+- **The ELF.** The gate scripts (`boot-smoke.sh`, `soak.sh`,
+  `capture-golden.sh`) default to the normal ELF the golden was captured
+  from, `/tmp/stix-baseline-run/ASW_em_baseline.elf` (reading it is fine).
+  - `STIX_ASW_ELF` overrides it.
+  - Don't point it at `stix_asw_src/.../ASW_em.elf` for a gate. That file is
+    whatever was built last on Windows. On 2026-11-10 that was a
+    `LIMIT_FS_SIZE=32` build without `DEBUG_PRINT`, which has no UART output
+    at all, so boot-smoke fails with "no UART output".
 - The TMTC server binds `IO_TCP_SERVER_BASE_PORT + getuid()` = **21000**
   (uid 1000), not the 2221 constant in `tmtc_io_server.h`.
 - Capture uses `-display none -monitor none -serial file:` so guest UART and
