@@ -751,6 +751,14 @@ static void test_spw_tx(void)
 #define CTRL_STIXSTATUS 0xf0u
 
 #define HKADC_READY (1u << 7)
+/*
+ * hkAdc layout (StixIdpu.h:920-968): VAL 31:20, READY 7, ADDR 6:0,
+ * bits 19:8 reserved-zero.
+ */
+#define HKADC_VAL_SHIFT 20u
+#define HKADC_VAL_MASK 0xFFFu
+#define HKADC_RESV_MASK 0xFFF00u
+#define HKADC_ADDR_MASK 0x7Fu
 
 static uint32_t ctrl_read(QTestState *qts, uint32_t off)
 {
@@ -3691,6 +3699,149 @@ static void test_spw_udp_host_error(void)
     g_unlink(path);
 }
 
+/* ---- P3-1: HK ADC returns nominal values (hk-adc) ---- */
+
+#define CTRL_IDEFXCONFIG 0x0cu /* idefxConfig; bits 3:0 = quarter power */
+
+/*
+ * One HK ADC conversion: write the channel command to hkAdc and read
+ * the register back. The model completes the conversion immediately
+ * (the FSW writes the channel and polls READY, HK.c:130-158).
+ */
+static uint32_t hk_convert(QTestState *qts, uint32_t ch)
+{
+    ctrl_write(qts, CTRL_HKADC, ch);
+    return ctrl_read(qts, CTRL_HKADC);
+}
+
+/*
+ * The whole hkAdc layout in one check: READY set, ADDR echoing the
+ * channel, bits 19:8 zero, VAL = the expected raw value.
+ */
+static void hk_check(QTestState *qts, uint32_t ch, uint32_t val)
+{
+    uint32_t reg = hk_convert(qts, ch);
+
+    g_assert_cmpuint(reg & HKADC_READY, ==, HKADC_READY);
+    g_assert_cmpuint(reg & HKADC_ADDR_MASK, ==, ch);
+    g_assert_cmpuint(reg & HKADC_RESV_MASK, ==, 0);
+    g_assert_cmpuint((reg >> HKADC_VAL_SHIFT) & HKADC_VAL_MASK, ==, val);
+}
+
+/*
+ * P3-1 (D-P3a): an hkAdc write converts immediately and returns the
+ * nominal raw value of the addressed channel (recon-hk-adc §4), with
+ * the state overrides taken from the CURRENT hkCmdSta and idefxConfig:
+ * SPWEN (hkCmdSta bits 4:3) drives SPW_C by line count and SPW0_V /
+ * SPW1_V by their own bit, idefxConfig[3:0] gives the DET_C quarter
+ * count, LVEN / HV0116EN / HV1732EN the ATT_V and HV lines. Unused
+ * channels read 0. POWERSTAT (bits 9:5) stays plain storage. With
+ * hk-adc=off the legacy behaviour (VAL 0, READY forced) is kept.
+ * RED on the pre-P3-1 binary: VAL is 0 everywhere and the property is
+ * unknown.
+ */
+static void test_hk_adc(void)
+{
+    static const uint32_t spw_c[4] = { 50, 900, 900, 1830 };
+    static const struct {
+        uint32_t mask;
+        uint32_t val;
+    } idefx[] = {
+        { 0x0, 20 },  { 0x1, 95 },  { 0x3, 170 }, { 0x7, 245 },
+        { 0xF, 320 }, { 0x5, 170 }, { 0xA, 170 },
+    };
+    QTestState *qts;
+    uint32_t spwen, i;
+
+    qts = stix_qtest_new();
+
+    /* a. the BSW boot self-test channels (HK.c:34-39) */
+    hk_check(qts, 24, 2048);
+    hk_check(qts, 28, 3413);
+    hk_check(qts, 44, 3958);
+
+    /*
+     * a2. the write replaces the whole register, it does not OR: the
+     * command's upper bits and any stale VAL must not survive
+     */
+    ctrl_write(qts, CTRL_HKADC, 0xFFFFFF18u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKADC),
+                    ==, (2048u << HKADC_VAL_SHIFT) | HKADC_READY | 0x18u);
+
+    /* b. one spot check per group */
+    hk_check(qts, 0, 700);   /* DPU_1V5_C */
+    hk_check(qts, 32, 2450); /* DET_Q2_T */
+    hk_check(qts, 60, 2000); /* FPGA_T */
+    hk_check(qts, 68, 3125); /* ASP_REF_2V5A */
+    hk_check(qts, 71, 1700); /* VSENSA */
+
+    /*
+     * c. SPWEN (hkCmdSta bits 4:3): SPW_C follows the line count,
+     * SPW0_V / SPW1_V their own bit
+     */
+    for (spwen = 0; spwen < 4; spwen++) {
+        ctrl_write(qts, CTRL_HKCMDSTA, spwen << 3);
+        hk_check(qts, 3, spw_c[spwen]);
+        hk_check(qts, 48, spwen & 1 ? 3240 : 20);
+        hk_check(qts, 52, spwen & 2 ? 3240 : 20);
+    }
+    ctrl_write(qts, CTRL_HKCMDSTA, 0);
+
+    /*
+     * d. idefxConfig[3:0]: DET_C = 20 + 75 * quarters, non-contiguous
+     * masks too; a bit above the field does not count
+     */
+    for (i = 0; i < G_N_ELEMENTS(idefx); i++) {
+        ctrl_write(qts, CTRL_IDEFXCONFIG, idefx[i].mask);
+        hk_check(qts, 4, idefx[i].val);
+    }
+    ctrl_write(qts, CTRL_IDEFXCONFIG, 0x10u);
+    hk_check(qts, 4, 20);
+
+    /* e. the PSU enable bits */
+    ctrl_write(qts, CTRL_HKCMDSTA, 1u); /* LVEN */
+    hk_check(qts, 12, 1670);            /* ATT_V on */
+    ctrl_write(qts, CTRL_HKCMDSTA, 0);
+    hk_check(qts, 12, 10);              /* ATT_V off */
+    ctrl_write(qts, CTRL_HKCMDSTA, 1u << 1); /* HV0116EN */
+    hk_check(qts, 20, 1000);
+    ctrl_write(qts, CTRL_HKCMDSTA, 1u << 2); /* HV1732EN */
+    hk_check(qts, 16, 1000);
+    ctrl_write(qts, CTRL_HKCMDSTA, 0);
+    hk_check(qts, 20, 15);
+    hk_check(qts, 16, 16);
+
+    /* f. unused channels read 0, READY still set */
+    hk_check(qts, 5, 0);
+    hk_check(qts, 100, 0);
+    hk_check(qts, 127, 0);
+
+    /*
+     * h. POWERSTAT (bits 9:5) is plain storage: what is written comes
+     * back, nothing is synthesised (from the enable bits or otherwise),
+     * and the overrides ignore it — every state-dependent line reads
+     * its off value with the status bits set
+     */
+    ctrl_write(qts, CTRL_HKCMDSTA, 0x3E0u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0x3E0u);
+    hk_check(qts, 48, 20);
+    hk_check(qts, 52, 20);
+    hk_check(qts, 12, 10);
+    hk_check(qts, 3, 50);
+    ctrl_write(qts, CTRL_HKCMDSTA, 1u << 5);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 1u << 5);
+    ctrl_write(qts, CTRL_HKCMDSTA, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* g. hk-adc=off: the legacy behaviour, VAL 0 with READY set */
+    qts = stix_qtest_new_extra("-global grlib-stixctrl.hk-adc=off");
+    hk_check(qts, 24, 0);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -3741,6 +3892,7 @@ int main(int argc, char **argv)
                        test_spw_udp_host_error_subprocess);
         qtest_add_func("/sparc/stix/spw-udp-host-error",
                        test_spw_udp_host_error);
+        qtest_add_func("/sparc/stix/hk-adc", test_hk_adc);
     }
 
     return g_test_run();

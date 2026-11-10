@@ -5,6 +5,7 @@
 #include "hw/sparc/grlib_stix.h"
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
+#include "qemu/host-utils.h"
 #include "chardev/char-fe.h"
 #include "qemu/timer.h"
 #include "system/runstate.h"
@@ -79,6 +80,13 @@ struct STIXCTRL
     MemoryRegion lvar;
     MemoryRegion ltrg;
     MemoryRegion etrg;
+    /*
+     * P3-1 (D-P3a): when true, an hkAdc write converts immediately and
+     * returns the nominal raw value (stixctrl_hk_value); when false the
+     * legacy behaviour (VAL 0, READY forced) is kept for A/B comparison
+     * and rollback.
+     */
+    bool hk_adc;
 };
 
 /*static void grlib_stixctrl_timer_tick(void *opaque)
@@ -329,6 +337,112 @@ static const MemoryRegionOps grlib_stixctrl_rotb_ops = {
     },
 };
 
+/*
+ * P3-1 (D-P3a): nominal HK ADC raw values, recon-hk-adc §4 "Proposed
+ * raw". Every value sits inside both the BSW boot self-test window
+ * (HK.c:34-39) and the PFM/IDB soft limits, so the build flavour (AX or
+ * PFM) and a flash context with flight limits do not matter. Unused
+ * channels read 0. The state-dependent entries (3, 4, 12, 16, 20, 48,
+ * 52) are never read — stixctrl_hk_value() overrides them; they are
+ * kept as the off/base value for documentation. POWERSTAT (hkCmdSta
+ * bits 9:5) is deliberately not modelled and reads 0, so the FSW's SpW
+ * voltage checks (HKMonitor_spwCheck) and the ATT_V/HV checks
+ * (HKMonitor_regularCheck) stay skipped.
+ */
+static const uint16_t stixctrl_hk_adc_table[128] = {
+    [0] = 700,   /* DPU_1V5_C, 162..2185 */
+    [1] = 800,   /* DPU_2V5_C, 0..1991 */
+    [2] = 1009,  /* DPU_3V3_C, 132..4037 */
+    [3] = 50,    /* DPU_SPW_C: overridden from SPWEN, 0 lines 0..294 */
+    [4] = 20,    /* DET_C: overridden, 0 quarters 0..80 */
+    /*
+     * ATT_C, 0 motors 0..166: static, the attenuator is not modelled
+     * to move. Latent: below the PFM two-motor minimum of 28 (ATT2M_C);
+     * no NOMINAL path moves the attenuator (RateCtrl_reset(FALSE)), and
+     * a future TC-driven test needs a motion value of 110..255
+     * (AttCtrl.c:342 sums only < 0x100).
+     */
+    [8] = 20,
+    [12] = 10,   /* ATT_V off; on: 1670 from LVEN, 585..3370 */
+    [16] = 16,   /* HV_17_32_V off; on: 1000 from HV1732EN, 0..2543 */
+    [20] = 15,   /* HV_01_16_V off; on: 1000 from HV0116EN, 0..2543 */
+    [24] = 2048, /* DPU_1V5_V, BSW self-test 1951..2193 */
+    [28] = 3413, /* DPU_2V5_V, BSW self-test 3357..3473 */
+    [32] = 2450, /* DET_Q2_T, 1690..4023 (~20 degC) */
+    [33] = 2450, /* DET_Q1_T */
+    [34] = 2450, /* DET_Q4_T */
+    [35] = 2450, /* DET_Q3_T */
+    [36] = 2450, /* ATT_T, 1196..3867 */
+    [40] = 2300, /* PSU_T, 824..3800 */
+    [44] = 3958, /* DPU_2V9_V, BSW self-test 3784..4094 */
+    [48] = 20,   /* SPW0_V off; on: 3240 from SPWEN bit 0, 3011..3468 */
+    [52] = 20,   /* SPW1_V off; on: 3240 from SPWEN bit 1 */
+    [56] = 2200, /* DPU_PCB_T, 824..3800 */
+    [60] = 2000, /* DPU_FPGA_T, 497..3800 */
+    [64] = 100,  /* ASP_PHOTOA0_V, 0..4095 */
+    [65] = 100,  /* ASP_PHOTOA1_V */
+    [66] = 2450, /* ASP_TIM05_T, ~20 degC */
+    [67] = 2450, /* ASP_TIM06_T */
+    [68] = 3125, /* ASP_REF_2V5A_V, 3050..3473 */
+    [69] = 2450, /* ASP_TIM01_T */
+    [70] = 2450, /* ASP_TIM03_T, TIM03/04 <= 3921 */
+    [71] = 1700, /* ASP_VSENSA_V, 1316..2095 */
+    [72] = 100,  /* ASP_PHOTOB0_V */
+    [73] = 100,  /* ASP_PHOTOB1_V */
+    [74] = 2450, /* ASP_TIM08_T */
+    [75] = 2450, /* ASP_TIM07_T */
+    [76] = 3125, /* ASP_REF_2V5B_V, 3050..3473 */
+    [77] = 2450, /* ASP_TIM02_T */
+    [78] = 2450, /* ASP_TIM04_T */
+    [79] = 1700, /* ASP_VSENSB_V, 1316..2095 */
+};
+
+/*
+ * The ADC value for one channel: the static nominal table plus the
+ * overrides that follow the CURRENT commanded register state (hkCmdSta
+ * and idefxConfig, as they stand when the hkAdc write happens).
+ * POWERSTAT (hkCmdSta bits 9:5) is neither consulted nor synthesised
+ * (D-P3a).
+ */
+static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
+{
+    uint32_t cmdsta = s->reg.hkCmdSta;
+    uint32_t spwen = (cmdsta >> STIXCTRL_HKCMDSTA_SPWEN) &
+                     STIXCTRL_HKCMDSTA_SPWEN_MASK;
+
+    switch (ch) {
+    case STIXCTRL_HKADC_ADDR_V_HK_DPU_SPW_C: /* 3 */
+        /* spw_c_limits[n], n = the SPWEN line count (recon §4) */
+        if (spwen == 0) {
+            return 50;
+        }
+        return spwen == 3 ? 1830 : 900;
+    case STIXCTRL_HKADC_ADDR_V_HK_DET_C: /* 4 */
+        /*
+         * det_c_limits[n]; idefxConfig[3:0] = the quarter power
+         * (Detectors.c:555-558)
+         */
+        return 20u + 75u * ctpop32(s->reg.idefxConfig & 0xFu);
+    case STIXCTRL_HKADC_ADDR_V_HK_ATT_V: /* 12 */
+        return ((cmdsta >> STIXCTRL_HKCMDSTA_LVEN) &
+                STIXCTRL_HKCMDSTA_LVEN_MASK) ? 1670 : 10;
+    case STIXCTRL_HKADC_ADDR_V_HK_HV_17_32_V: /* 16 */
+        return ((cmdsta >> STIXCTRL_HKCMDSTA_HV1732EN) &
+                STIXCTRL_HKCMDSTA_HV1732EN_MASK) ? 1000 : 16;
+    case STIXCTRL_HKADC_ADDR_V_HK_HV_01_16_V: /* 20 */
+        return ((cmdsta >> STIXCTRL_HKCMDSTA_HV0116EN) &
+                STIXCTRL_HKCMDSTA_HV0116EN_MASK) ? 1000 : 15;
+    case STIXCTRL_HKADC_ADDR_V_HK_DPU_SPW0_V: /* 48 */
+        /* no single-bit define: hkCmdSta bit 3 = SPWEN bit 0 */
+        return ((cmdsta >> STIXCTRL_HKCMDSTA_SPWEN) & 1u) ? 3240 : 20;
+    case STIXCTRL_HKADC_ADDR_V_HK_DPU_SPW1_V: /* 52 */
+        /* no single-bit define: hkCmdSta bit 4 = SPWEN bit 1 */
+        return ((cmdsta >> (STIXCTRL_HKCMDSTA_SPWEN + 1)) & 1u) ? 3240 : 20;
+    default:
+        return stixctrl_hk_adc_table[ch];
+    }
+}
+
 static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXCTRL *stixctrl = opaque;
@@ -405,13 +519,29 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
         trace_stixctrl_scet_write((uint32_t)addr, (uint32_t)value);
     }
 
-    /* model repair: HK ADC conversion completes immediately. The FSW
-     * (HK.c) writes a conversion command to hkAdc (0x8c) and polls the
-     * READY bit (bit 7) until the conversion is done; the real FPGA
-     * asserts it per conversion. Without this the poll never ends. */
+    /*
+     * P3-1 (D-P3a): the HK ADC conversion completes immediately — the
+     * real FPGA scans continuously and asserts READY per conversion
+     * ("except the first 130 ms after reset", HK.c:142), so READY is
+     * always set by the time the FSW's poll (HK.c:130-158) reads it;
+     * the old model only forced READY and left VAL at 0, which failed
+     * the BSW boot self-test. The value is the nominal raw reading of
+     * the addressed channel (recon-hk-adc §4), with the state overrides
+     * from the CURRENT hkCmdSta/idefxConfig. hk-adc=off keeps the
+     * legacy behaviour for A/B comparison and rollback.
+     */
     if (addr == 0x8c /* hkAdc */)
     {
-        value |= (1u << STIXCTRL_HKADC_READY);
+        if (stixctrl->hk_adc) {
+            uint32_t ch = (uint32_t)value & STIXCTRL_HKADC_ADDR_MASK;
+            uint32_t val = stixctrl_hk_value(stixctrl, ch);
+
+            value = ((val & STIXCTRL_HKADC_VAL_MASK) << STIXCTRL_HKADC_VAL) |
+                    (1u << STIXCTRL_HKADC_READY) |
+                    ch;
+        } else {
+            value |= (1u << STIXCTRL_HKADC_READY);
+        }
     }
 
     /* rotbCmdSta (0x54): writable fields are COMMAND (1:0) and the
@@ -554,6 +684,7 @@ static void grlib_stixctrl_unrealize(DeviceState *dev)
 static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_UINT32("rotb-blocks", STIXCTRL, rotb_blocks,
                        STIXCTRL_ROTB_MAX_BLOCKS),
+    DEFINE_PROP_BOOL("hk-adc", STIXCTRL, hk_adc, true),
 };
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)

@@ -1251,3 +1251,93 @@ Green: `spw-udp`, `spw-udp-bind-error`, `spw-udp-host-error`,
 `tm-tcp`, `tc-tcp`, `spw-rx`, `spw-tx`, `spw-timecode`, and the full
 suite. checkpatch on the diff: 0 errors, 0 warnings.
 
+## 22. HK ADC returns nominal values (baseline: VAL 0)
+
+**Baseline:** `hkAdc` (CTRL 0x8C) was plain storage with READY forced
+on write, so a read returned `cmd | 0x80` and VAL (bits 31:20) was
+always 0. The BSW boot self-test (1V5 1951..2193, 2V5 3357..3473, 2V9
+3784..4094; HK.c:34-39) therefore failed and the boot report became
+TM(5,3) 0x8002 + TM(5,4) 0xD420 instead of the success TM(5,1) 0x0022.
+
+**Model (P3-1, D-P3a):** an `hkAdc` write now converts immediately and
+the register becomes
+`(VAL & 0xFFF) << 20 | 1 << 7 | (value & 0x7F)`, bits 19:8 zero. The
+write replaces the whole register (a later write is not OR-ed into a
+stale VAL). READY stays immediate (the real FPGA scans continuously;
+only the first 130 ms after reset are pending, HK.c:142, and the FSW's
+poll HK.c:130-158 therefore never waits). VAL comes from a
+`static const uint16_t[128]` table (recon-hk-adc §4 "Proposed raw");
+every value sits inside both the BSW self-test window and the PFM/IDB
+soft limits (except ATT_C with two motors, see below), so the build
+flavour (AX/PFM) and a flash context with flight limits do not matter.
+Seven lines are overridden at conversion time from the CURRENT
+commanded register state (`hkCmdSta`, `idefxConfig`, as they stand
+when the write happens):
+
+| Line | Rule |
+|---|---|
+| DPU_SPW_C (3) | 50 / 900 / 900 / 1830 for SPWEN (hkCmdSta bits 4:3) = 0/1/2/3 lines (`spw_c_limits[n]`) |
+| DET_C (4) | `20 + 75 * popcount(idefxConfig & 0xF)` (`det_c_limits[n]`) |
+| ATT_V (12) | 1670 when LVEN (bit 0), else 10 |
+| HV_17_32_V (16) | 1000 when HV1732EN (bit 2), else 16 |
+| HV_01_16_V (20) | 1000 when HV0116EN (bit 1), else 15 |
+| SPW0_V (48) | 3240 when hkCmdSta bit 3 (SPWEN bit 0) is set, else 20 |
+| SPW1_V (52) | 3240 when hkCmdSta bit 4 (SPWEN bit 1) is set, else 20 |
+
+**POWERSTAT stays 0 (D-P3a, deliberate):** `hkCmdSta` bits 9:5 remain
+plain storage — what is written comes back, nothing is synthesised.
+With POWERSTAT = 0 the SpW voltage checks (`HKMonitor_spwCheck` gates
+SPW0_V/SPW1_V on the status bits) and the ATT_V/HV checks
+(`HKMonitor_regularCheck`) stay skipped, so `SpwControl_init` cannot
+fall into offline mode and no new pass/fail outcomes arise. The values
+do change, and so does the detector-temperature/TLUT path: the 64 s
+average goes 0 → ~2450, which may re-select the TLUT or emit
+TM(5,2) 0x542C (recorded, not tuned away). Synthesising POWERSTAT in
+the same commit would arm those checks, and the SpW voltages would
+then have to track SPWEN atomically or a PFM/context run falls offline
+— the recon's "zero-risk step 1" line. The state overrides above exist
+so SID2 HK and any later POWERSTAT model see values consistent with
+the commanded state, and so the state-dependent limits pass under PFM
+and context limits, not only under the AX 0..4095 window.
+
+**No protection compare and no HK IRQ:** the FPGA's 9-channel threshold
+compare (`hkProtConfig`, IRQ 4) is left out; all proposed values sit
+below every default threshold (SPW 3826, the rest 0xFFF).
+
+**ATT_C (8) is a static 20** — the attenuator is not modelled to move.
+Latent limit: 20 is below the PFM two-motor minimum of 28 (ATT2M_C).
+No NOMINAL path moves the attenuator (`RateCtrl_reset(FALSE)`), so
+nothing reads it in that window today; a future TC-driven attenuator
+test must return a motion-dependent value of 110 or more, kept below
+0x100 (`AttCtrl.c:342` drops samples >= 0x100 from the summed current).
+
+**Property `hk-adc` (bool, default true):** `false` restores the legacy
+VAL = 0 behaviour (READY still forced), for A/B comparison and rollback.
+
+No new trace events: the existing `stixctrl_io_write`/`io_read` traces
+already show the synthesised register value at 0x8C.
+
+**Golden changes** (regenerated with `capture-golden.sh` on the normal ELF, shared run dir `/tmp/stix-uprev-run`):
+- **`uart.golden.log`:** the three `HKAcquire *E reference voltage n is with value 0 out of range (HKAcquire.c:460)` lines after `do: selftest` are gone. Apart from them, the normalized log is identical, and boot-smoke passes against the new golden.
+- **`qemu-stdout.golden.log`:**
+  - Every `0x8c` access now carries VAL. For example, the first self-test read is `0x80000098`, which is ch 24, VAL 0x800 = 2048.
+  - The rest of the diff is the usual run-to-run timing noise: SCET reads at 0xC8/0xCC, `hkCmdSta` poll counts, SPW status polls and TX dump words. The HK TM payloads also carry the new values.
+- **Boot report:** on a fresh flash (run p31boot) the first event is TM(5,1) `0022 00000008 00000000 ba`, the success report. TM(5,3) 0x8002 and TM(5,4) 0xD420 are no longer sent. The only UART `*E` lines left at boot are the four `LUTMgmt could not find LUT` lines, which come from the empty flash.
+- **`tm.golden.log`** is not regenerated by `capture-golden.sh`. It was last captured in 2d2b782b51 (2026-11-09), before the watchdog model (5cda8ac82e) and before the D-I flash. Its boot TM(5,3) 0x8021 ("warm SW reset by WDT failed") and its late 0x14A3 come from that older model. It stays a historical artifact; P3-1 does not change it.
+- **5.2 wrapper:** `/sparc/stix/hk-adc` is expected red (the 5.2 model has VAL 0). `ctrl` and `spw-tx` stay green there.
+
+**Evidence:** qtest `/sparc/stix/hk-adc`: (a) ch 24 → 2048, ch 28 →
+3413, ch 44 → 3958 (the self-test channels) with READY set and ADDR
+echoed; (b) ch 0 → 700, ch 32 → 2450, ch 60 → 2000, ch 68 → 3125,
+ch 71 → 1700; (c) SPWEN 0..3 → SPW_C 50/900/900/1830 and SPW0_V/SPW1_V
+3240 only when their own bit is set, else 20; (d) idefxConfig masks
+0x0/0x1/0x3/0x7/0xF/0x5/0xA → DET_C 20/95/170/245/320/170/170, and a
+bit above the field (0x10) does not count; (e) LVEN → ATT_V 1670/10,
+HV0116EN → 1000/15, HV1732EN → 1000/16; (f) unused channels 5/100/127
+→ VAL 0, READY set; (g) `hk-adc=off` → ch 24 reads VAL 0 with READY set;
+(h) POWERSTAT bits 9:5 read back as written (0x3E0, and bit 5 alone),
+nothing synthesised. Red on the pre-P3-1 binary: `(VAL == 2048)` failed
+with 0 (and the `hk-adc` property is unknown). Green: `hk-adc`, `ctrl`
+(the READY pin), and the full suite (34 tests). checkpatch on the diff:
+0 errors, 0 warnings.
+

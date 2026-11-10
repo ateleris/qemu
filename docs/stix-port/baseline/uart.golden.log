@@ -1,52 +1,49 @@
-00:00:00.019  Main             STIX ASW_v2, ver. 1.86 [laszl-1794253052 Nov  9 2026 20:37:51]
-00:00:00.026  Main             Build optimized for size
-00:00:00.026  Main             RTEMS configuration:
-00:00:00.026  Main             --------------------
-00:00:00.027  Main                 EXECUTIVE_RAM_SIZE            = 504016
-00:00:00.028  Main                 MESSAGE_BUFFER_MEMORY         = 134584
-00:00:00.029  Main                 MEMORY_OVERHEAD               = 128
-00:00:00.030  Main                 MAXIMUM_TASKS                 = 21
-00:00:00.030  Main                 MAXIMUM_SEMAPHORES            = 20
-00:00:00.031  Main                 MAXIMUM_MESSAGE_QUEUES        = 10
-00:00:00.032  Main                 MAXIMUM_TIMERS                = 20
-00:00:00.032  Main                 MAXIMUM_PARTITIONS            = 2
-00:00:00.033  Main                 MAXIMUM BARRIERS              = 0
-00:00:00.034  Main                 MINIMUM_STACK_SIZE            = 16384
-00:00:00.034  Main             EDAC CONFIGURATION ON ASW STARTUP
-00:00:00.035  Main             ---------------------------------
-00:00:00.035  Main                 E_EDAC_MODULE_EEPROM          = 0
-00:00:00.036  Main                 E_EDAC_MODULE_SDRAM           = 0
-00:00:00.036  Main                 E_EDAC_MODULE_CACHE           = 0
-00:00:00.037  Main                 E_EDAC_MODULE_ROTBUF          = 0
-00:00:00.037  Main             init: ParamMgmt
-00:00:00.040  Main             init: ADCs default registers
-00:00:00.041  Main             init: MemCommon
-00:00:00.072  Main             init: TM buffer
-00:00:00.073  Main             init: ContextMgmt PRE INIT
-00:00:00.078  Main             init: Timing
-00:00:00.079  Main             init: TC buffer
-00:00:00.080  Main             init: FDIR
-00:00:00.084  Main             init: MODE
-00:00:00.085  Main             init: HKReport
-00:00:00.086  Main             init: SPW control
-00:00:00.118  Main             do: selftest
-00:00:00.120  HKAcquire     *E reference voltage 0 is with value 0 out of range (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HK/HKAcquire.c:460)
-00:00:00.121  HKAcquire     *E reference voltage 1 is with value 0 out of range (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HK/HKAcquire.c:460)
-00:00:00.122  HKAcquire     *E reference voltage 2 is with value 0 out of range (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/HK/HKAcquire.c:460)
-00:00:00.123  Main             do: boot report
-00:00:00.126  Main             do: enable HK IRQ
-00:00:00.127  Main             FDIR init - other is on protection
-00:00:00.127  Main             init: Background task
-00:00:00.128  Main             init: AttCtrl
-00:00:00.129  Main             init: AspectCtrl
-00:00:00.129  Main             init: ROTB
-00:00:00.131  Main             init: QL task
-00:00:00.132  Main             init: ROTB task
-00:00:00.132  Main             init: BG accumulator
-00:00:00.133  Main             init: SAFE mode
-00:00:00.377  LUTMgmt       *E could not find LUT (type=1, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
-00:00:00.378  LUTMgmt       *E could not find LUT (type=2, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
-00:00:00.379  LUTMgmt       *E could not find LUT (type=3, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
-00:00:00.380  LUTMgmt       *E could not find LUT (type=4, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
-00:00:00.395  Main             delete init
+00:00:00.018  Main             STIX ASW_v2, ver. 1.86 [laszl-1794253052 Nov  9 2026 20:37:51]
+00:00:00.024  Main             Build optimized for size
+00:00:00.025  Main             RTEMS configuration:
+00:00:00.025  Main             --------------------
+00:00:00.025  Main                 EXECUTIVE_RAM_SIZE            = 504016
+00:00:00.026  Main                 MESSAGE_BUFFER_MEMORY         = 134584
+00:00:00.027  Main                 MEMORY_OVERHEAD               = 128
+00:00:00.027  Main                 MAXIMUM_TASKS                 = 21
+00:00:00.028  Main                 MAXIMUM_SEMAPHORES            = 20
+00:00:00.028  Main                 MAXIMUM_MESSAGE_QUEUES        = 10
+00:00:00.029  Main                 MAXIMUM_TIMERS                = 20
+00:00:00.029  Main                 MAXIMUM_PARTITIONS            = 2
+00:00:00.030  Main                 MAXIMUM BARRIERS              = 0
+00:00:00.030  Main                 MINIMUM_STACK_SIZE            = 16384
+00:00:00.031  Main             EDAC CONFIGURATION ON ASW STARTUP
+00:00:00.031  Main             ---------------------------------
+00:00:00.031  Main                 E_EDAC_MODULE_EEPROM          = 0
+00:00:00.032  Main                 E_EDAC_MODULE_SDRAM           = 0
+00:00:00.033  Main                 E_EDAC_MODULE_CACHE           = 0
+00:00:00.034  Main                 E_EDAC_MODULE_ROTBUF          = 0
+00:00:00.034  Main             init: ParamMgmt
+00:00:00.037  Main             init: ADCs default registers
+00:00:00.038  Main             init: MemCommon
+00:00:00.070  Main             init: TM buffer
+00:00:00.071  Main             init: ContextMgmt PRE INIT
+00:00:00.075  Main             init: Timing
+00:00:00.076  Main             init: TC buffer
+00:00:00.077  Main             init: FDIR
+00:00:00.080  Main             init: MODE
+00:00:00.080  Main             init: HKReport
+00:00:00.081  Main             init: SPW control
+00:00:00.112  Main             do: selftest
+00:00:00.115  Main             do: boot report
+00:00:00.118  Main             do: enable HK IRQ
+00:00:00.118  Main             FDIR init - other is on protection
+00:00:00.119  Main             init: Background task
+00:00:00.119  Main             init: AttCtrl
+00:00:00.120  Main             init: AspectCtrl
+00:00:00.120  Main             init: ROTB
+00:00:00.121  Main             init: QL task
+00:00:00.122  Main             init: ROTB task
+00:00:00.122  Main             init: BG accumulator
+00:00:00.123  Main             init: SAFE mode
+00:00:00.355  LUTMgmt       *E could not find LUT (type=1, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.356  LUTMgmt       *E could not find LUT (type=2, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.357  LUTMgmt       *E could not find LUT (type=3, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.358  LUTMgmt       *E could not find LUT (type=4, id=0, ret=0) (C:\Users\laszl\Development\stix_asw_src\ASW/ASW/src/SWStatus/LUTMgmt.c:1146)
+00:00:00.371  Main             delete init
 
