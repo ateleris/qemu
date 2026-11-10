@@ -65,8 +65,26 @@ STIX APIDs are PID << 4 | category:
   The planned shape is a `stix_pus` serializer (the same hook `sdls_ep`
   uses), plus `definitions/commands/stix_cmd.json`.
 
-All ground-station changes live on branch **`stix-qemu-integration`**
-(worktree `/home/laszlo/dev/ATS-GroundStation-stix`), never on `main`:
+### Where the ground-station changes are (2026-11-10)
+
+| What | Branch | Where |
+|---|---|---|
+| Generic fixes, proposed for `main` | `fix/robustness-and-html-escaping` | Pushed; **PR ateleris/ATS-GroundStation#12**, reviewer Beckicious. Worktree `/home/laszlo/dev/ATS-GroundStation-fixes`. |
+| Everything, including the STIX-only parts | `stix-qemu-integration` | **Local only, not pushed.** Worktree `/home/laszlo/dev/ATS-GroundStation-stix`. |
+
+What the PR contains:
+- the cherry-picks of `0635cad`, `14f6ee4`, `5980aa2`, `8990d41` and `b4f8e31`;
+- a fix-up commit `f9d5a6d`, which makes one test and `CLAUDE.md` independent of STIX.
+
+What is STIX-only and stays on `stix-qemu-integration`:
+- the definitions: `232efd3`, `0330e5f`, `b7fcdf5`;
+- the converter: `0c3068c`, `b93bd1f`.
+
+Once PR #12 is merged, rebase `stix-qemu-integration` onto the new `main`.
+The five generic commits then drop out, apart from the fix-up's small
+test and `CLAUDE.md` differences.
+
+The full commit list of `stix-qemu-integration` (never merged to `main`):
 
 ```
 b4f8e31 telemetry: reject markup characters in units and calibration texts
