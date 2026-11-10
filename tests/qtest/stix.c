@@ -93,17 +93,11 @@ static QTestState *stix_qtest_new_extra(const char *extra)
     gchar *path = NULL;
     int fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
     g_assert(fd >= 0);
-    for (int i = 0; i < 256; i++) {
-        static const char zeros_ff[4096] = { 0 }; /* must be 0xFF */
-        (void)zeros_ff;
-    }
-    /* fill with 0xFF */
-    gchar *buf = g_malloc(4096);
-    memset(buf, 0xFF, 4096);
-    for (int i = 0; i < 256; i++) {
-        g_assert(write(fd, buf, 4096) == 4096);
-    }
-    g_free(buf);
+    /* D-I: the default is inverted storage (file byte 0x00 = guest 0xFF),
+     * so the erased 1 MB backing file is 1 MB of holes, created instantly
+     * with ftruncate. Guest-visible expectations do not change: the guest
+     * still reads 0xFF everywhere. */
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
     close(fd);
     stix_tmp_flash_path = path;
     qts = qtest_initf("-M leon3_generic "
@@ -334,20 +328,34 @@ static void flash_pread_page(const gchar *path, uint64_t offset, void *buf)
     close(fd);
 }
 
+/* D-I: with the default inverted storage the file stores every byte
+ * XOR 0xFF, so a host-side pread must be inverted before it can be
+ * compared against the guest pattern (in place is fine). */
+static void flash_invert(uint8_t *buf, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        buf[i] ^= 0xFFu;
+    }
+}
+
 /* B2: addressing. The baseline computed the file offset as the raw
  * pageAddress register * 4224: chip c landed at c*2^20 pages*4224 (the
  * real stride is 2^18 pages), MCM was ignored so FLASH B's control
  * region aliased exactly onto FLASH A's (MCM1 block 64 == MCM0 block
  * 64), and the 16.5 GB file truncated to 512 MiB through uint32 ftell.
- * Chip 0/MCM 0 offsets are page*4224 before and after; the full-size
- * sparse backing file has holes that read 0x00. */
+ * Chip 0/MCM 0 offsets are page*4224 before and after. The full-size
+ * sparse backing file holds erased flash (D-I: holes read 0x00, which
+ * inverted storage turns into guest 0xFF), so host-side preads are
+ * inverted before comparing; an erased page is host 0x00. */
 static void test_flash_addressing(void)
 {
     g_autofree uint8_t *pa = g_malloc(FLASH_PAGE_BYTES);
     g_autofree uint8_t *pb = g_malloc(FLASH_PAGE_BYTES);
     g_autofree uint8_t *pc = g_malloc(FLASH_PAGE_BYTES);
     g_autofree uint8_t *pd = g_malloc(FLASH_PAGE_BYTES);
-    g_autofree uint8_t *pff = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *z0 = g_malloc0(FLASH_PAGE_BYTES);
     g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
     QTestState *qts;
     gchar *path = NULL;
@@ -357,7 +365,6 @@ static void test_flash_addressing(void)
     memset(pb, 0xBB, FLASH_PAGE_BYTES);
     memset(pc, 0xCC, FLASH_PAGE_BYTES);
     memset(pd, 0xDD, FLASH_PAGE_BYTES);
-    memset(pff, 0xFF, FLASH_PAGE_BYTES);
 
     qts = flash_qtest_new_sparse(FLASH_TOTAL_STORAGE, &path);
     if (!qts) {
@@ -376,6 +383,7 @@ static void test_flash_addressing(void)
     qtest_memwrite(qts, 0x40000000u, pb, FLASH_PAGE_BYTES);
     flash_issue_mcm(qts, 0x40000000u, 1, 0, CMD_PAGE_WRITE, 0);
     flash_pread_page(path, (uint64_t)262144 * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
     g_assert_cmpint(memcmp(host, pb, FLASH_PAGE_BYTES), ==, 0);
 
     /* 3. MCM separation (the FLASH A/B alias). The same page 4096 on
@@ -388,9 +396,11 @@ static void test_flash_addressing(void)
     qtest_memwrite(qts, 0x40000000u, pd, FLASH_PAGE_BYTES);
     flash_issue_mcm(qts, 0x40000000u, 0, 4096, CMD_PAGE_WRITE, 1);
     flash_pread_page(path, (uint64_t)4096 * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
     g_assert_cmpint(memcmp(host, pc, FLASH_PAGE_BYTES), ==, 0);
     flash_pread_page(path, ((uint64_t)8 * 262144 + 4096) * FLASH_PAGE_BYTES,
                      host);
+    flash_invert(host, FLASH_PAGE_BYTES);
     g_assert_cmpint(memcmp(host, pd, FLASH_PAGE_BYTES), ==, 0);
     flash_issue_mcm(qts, 0x40000000u, 0, 4096, CMD_PAGE_READ, 0);
     qtest_memread(qts, 0x40000000u, host, FLASH_PAGE_BYTES);
@@ -411,15 +421,18 @@ static void test_flash_addressing(void)
 
     /* step 1's host check: still before qtest_quit (the page must be on
      * disk while QEMU lives - the fflush), and before step 5's erase,
-     * which covers block 0 and therefore wipes page 5. */
+     * which covers block 0 and therefore wipes page 5. The file holds
+     * the inverted pattern (D-I). */
     flash_pread_page(path, (uint64_t)5 * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
     g_assert_cmpint(memcmp(host, pa, FLASH_PAGE_BYTES), ==, 0);
 
     /* 5. The erase covers the block CONTAINING the commanded page
      *    (base = page & ~63, 64 pages, never crossing a chip); the FSW
      *    aligns the page itself before issuing, so the device-side rule
      *    is defensive. The erase is commanded with page 10, hence block
-     *    0 = pages 0..63: page 63 is erased, page 64 keeps A. */
+     *    0 = pages 0..63: page 63 is erased (a file hole, host 0x00
+     *    under D-I), page 64 keeps A (host ~A). */
     qtest_memwrite(qts, 0x40000000u, pa, FLASH_PAGE_BYTES);
     flash_issue_mcm(qts, 0x40000000u, 0, 63, CMD_PAGE_WRITE, 0);
     flash_issue_mcm(qts, 0x40000000u, 0, 64, CMD_PAGE_WRITE, 0);
@@ -427,13 +440,155 @@ static void test_flash_addressing(void)
     sta = qtest_readl(qts, FLASH_CMDSTA);
     g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
     flash_pread_page(path, (uint64_t)63 * FLASH_PAGE_BYTES, host);
-    g_assert_cmpint(memcmp(host, pff, FLASH_PAGE_BYTES), ==, 0);
+    g_assert_cmpint(memcmp(host, z0, FLASH_PAGE_BYTES), ==, 0);
     flash_pread_page(path, (uint64_t)64 * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
     g_assert_cmpint(memcmp(host, pa, FLASH_PAGE_BYTES), ==, 0);
 
     qtest_quit(qts);
     g_unlink(path);
     g_free(path);
+}
+
+/* B3 storage (D-I): the backing file stores every byte XOR 0xFF, so a
+ * sparse hole (0x00) is erased flash. A missing file is created
+ * instantly as a sparse 17,716,740,096-byte ftruncate; an erase of an
+ * inverted block punches a hole (host 0x00). Legacy plain storage
+ * (inverted-storage=off) keeps all-0xFF files - such as the frozen
+ * baseline copy - byte-identical. */
+static void test_flash_storage(void)
+{
+    /* ---- (a) missing file: created instantly, sparse, erased ---- */
+    {
+        g_autofree gchar *dir = g_dir_make_tmp("stix-flash-storage-XXXXXX",
+                                               NULL);
+        g_autofree gchar *path = g_build_filename(dir, "flash.bin", NULL);
+        g_autofree gchar *port = stix_private_tm_port_arg();
+        g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+        g_autofree uint8_t *z0 = g_malloc0(FLASH_PAGE_BYTES);
+        g_autofree uint8_t *pff = g_malloc(FLASH_PAGE_BYTES);
+        g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+        struct stat st;
+        gboolean sparse = TRUE;
+        size_t i;
+        QTestState *qts;
+        uint32_t sta;
+
+        for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+            p[i] = (uint8_t)(i ^ 0xA5u); /* position-tagged pattern P */
+        }
+        memset(pff, 0xFF, FLASH_PAGE_BYTES);
+
+        qts = qtest_initf("-M leon3_generic "
+                          "-global grlib-stixflash.flash-file=%s %s",
+                          path, port);
+
+        /* creation is one ftruncate: the size is there, the blocks are
+         * not. If this filesystem cannot do sparse files, skip rather
+         * than hold 16.5 GB (clean up first, also on the skip path). */
+        g_assert(stat(path, &st) == 0);
+        if ((uint64_t)st.st_blocks * 512 > 1024u * 1024u) {
+            sparse = FALSE;
+        } else {
+            g_assert_cmpuint((uint64_t)st.st_size, ==, FLASH_TOTAL_STORAGE);
+        }
+
+        if (sparse) {
+            /* guest: the fresh file reads back erased */
+            qtest_writel(qts, 0x40000000u, 0);
+            qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+            flash_issue(qts, 0x40000000u, 0, CMD_PAGE_READ);
+            g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
+
+            /* ---- (b) write / read / erase round trip ---- */
+            qtest_memwrite(qts, 0x40000000u, p, FLASH_PAGE_BYTES);
+            flash_issue(qts, 0x40000000u, 5, CMD_PAGE_WRITE);
+
+            /* guest read-back (RAM clobbered first so the fetch is
+             * proven) */
+            qtest_memwrite(qts, 0x40000000u, z0, FLASH_PAGE_BYTES);
+            flash_issue(qts, 0x40000000u, 5, CMD_PAGE_READ);
+            qtest_memread(qts, 0x40000000u, host, FLASH_PAGE_BYTES);
+            g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+            /* host: the file holds the inverted pattern */
+            flash_pread_page(path, (uint64_t)5 * FLASH_PAGE_BYTES, host);
+            flash_invert(host, FLASH_PAGE_BYTES);
+            g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+            /* erase page 5's block: guest page 5 is 0xFF again, the host
+             * range is a hole (0x00) */
+            flash_issue(qts, 0x40000000u, 5, CMD_BLOCK_ERASE);
+            sta = qtest_readl(qts, FLASH_CMDSTA);
+            g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+            qtest_memwrite(qts, 0x40000000u, p, FLASH_PAGE_BYTES);
+            flash_issue(qts, 0x40000000u, 5, CMD_PAGE_READ);
+            qtest_memread(qts, 0x40000000u, host, FLASH_PAGE_BYTES);
+            g_assert_cmpint(memcmp(host, pff, FLASH_PAGE_BYTES), ==, 0);
+            flash_pread_page(path, (uint64_t)5 * FLASH_PAGE_BYTES, host);
+            g_assert_cmpint(memcmp(host, z0, FLASH_PAGE_BYTES), ==, 0);
+        }
+
+        qtest_quit(qts);
+        g_unlink(path);
+        g_rmdir(dir);
+
+        if (!sparse) {
+            g_test_skip("filesystem does not create sparse files");
+            return;
+        }
+    }
+
+    /* ---- (c) legacy plain storage keeps all-0xFF files usable ---- */
+    {
+        g_autofree gchar *path = NULL;
+        g_autofree gchar *port = stix_private_tm_port_arg();
+        g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+        g_autofree uint8_t *pff = g_malloc(FLASH_PAGE_BYTES);
+        g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+        g_autofree gchar *buf = g_malloc(4096);
+        int fd = g_file_open_tmp("stix-flash-legacy-XXXXXX", &path, NULL);
+        int i;
+        size_t k;
+        QTestState *qts;
+
+        g_assert(fd >= 0);
+        memset(buf, 0xFF, 4096);
+        for (i = 0; i < 256; i++) {
+            g_assert(write(fd, buf, 4096) == 4096);
+        }
+        close(fd);
+
+        for (k = 0; k < FLASH_PAGE_BYTES; k++) {
+            p[k] = (uint8_t)(k ^ 0xA5u);
+        }
+        memset(pff, 0xFF, FLASH_PAGE_BYTES);
+
+        qts = qtest_initf("-M leon3_generic "
+                          "-global grlib-stixflash.flash-file=%s "
+                          "-global grlib-stixflash.inverted-storage=off %s",
+                          path, port);
+
+        /* guest: a file byte 0xFF reads back 0xFF in plain mode */
+        qtest_writel(qts, 0x40000000u, 0);
+        qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+        flash_issue(qts, 0x40000000u, 0, CMD_PAGE_READ);
+        g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
+
+        /* write P to page 2: the host file holds P un-inverted */
+        qtest_memwrite(qts, 0x40000000u, p, FLASH_PAGE_BYTES);
+        flash_issue(qts, 0x40000000u, 2, CMD_PAGE_WRITE);
+        flash_pread_page(path, (uint64_t)2 * FLASH_PAGE_BYTES, host);
+        g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+        /* erase page 2's block: plain erase writes 0xFF */
+        flash_issue(qts, 0x40000000u, 2, CMD_BLOCK_ERASE);
+        flash_pread_page(path, (uint64_t)2 * FLASH_PAGE_BYTES, host);
+        g_assert_cmpint(memcmp(host, pff, FLASH_PAGE_BYTES), ==, 0);
+
+        qtest_quit(qts);
+        g_unlink(path);
+    }
 }
 
 /* ---- SPW device (grlib_stixspw) ---- */
@@ -806,6 +961,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/flash", test_flash);
         qtest_add_func("/sparc/stix/flash-error-paths", test_flash_error_paths);
         qtest_add_func("/sparc/stix/flash-addressing", test_flash_addressing);
+        qtest_add_func("/sparc/stix/flash-storage", test_flash_storage);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);

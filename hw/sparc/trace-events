@@ -25,6 +25,8 @@ stixflash_error(const char *why, uint32_t cmd_sta, uint32_t page_address) "comma
 stixflash_unmapped_write(uint64_t addr, uint64_t value) "unmapped write addr=0x%"PRIx64" value=0x%"PRIx64""
 stixflash_unmapped_read(uint64_t addr) "unmapped read addr=0x%"PRIx64""
 stixflash_midseq_read(uint64_t addr, uint32_t write_counter) "read mid-sequence addr=0x%"PRIx64" write_counter=%u"
+stixflash_create(const char *path, uint64_t size, int inverted) "created backing file %s size=%"PRIu64" inverted=%d"
+stixflash_punch_fallback(int err) "punch-hole erase unavailable or failed (err=%d), writing 0x00 pages"
 
 # grlib_stixctrl.c (STIX)
 stixctrl_scet_write(uint32_t addr, uint32_t value) "SCET write addr=0x%x value=0x%x"

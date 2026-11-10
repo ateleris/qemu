@@ -247,3 +247,59 @@ chip-1 write landed at the raw-register offset 4,429,185,024, the MCM1
 write overwrote MCM0's page, and the unaligned erase wiped pages
 10..73. The new tests are expected RED on the 5.2 wrapper (they pin
 B1/B2 behavior the baseline lacks; `flash-error-paths` likewise).
+
+## 9. Flash storage: sparse, inverted (D-I)
+
+**What:** the flash backing file now stores every byte XOR 0xFF (new
+qdev property `inverted-storage`, default `on`): a file byte 0x00 is
+guest 0xFF. Erased flash is therefore a sparse hole, and a hole reads
+back as erased.
+
+**Why:** the host runs as a WSL VM on a nearly full Windows disk. The
+FSW filesystem writes FLASH B (MCM1 chip 0, page 0x1d240 and up, about
+9.4 GB into the file), so neither a short file nor a plain sparse file
+works: holes read 0x00, which the FSW's boot scan classifies as
+bad-block markers. Inverting makes the hole mean erased, which is what
+a fresh 17.7 GB image actually is.
+
+**Creation:** when the file does not exist, the inverted default creates
+it with one `ftruncate` to 17,716,740,096 bytes — instant, zero blocks —
+instead of the old 16.5 GB 0xFF fill loop (kept unchanged for
+`inverted-storage=off`). A failed `ftruncate` is reported with
+`error_report` + `exit(1)`, matching the existing open-failure handling
+in the same function (`init_and_load_flash_file` takes no `errp`).
+`stixflash_create` traces the event (path, size, inverted).
+
+**Erase:** an inverted erase punches a hole over the containing block
+(`fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`, guarded by
+`CONFIG_FALLOCATE_PUNCH_HOLE` like `block/file-posix.c`), clamped to
+EOF so D-H is preserved (pages past EOF are skipped, the file is never
+extended). The `FILE *` is `fflush`ed before the punch — buffered data
+written after the punch would refill the hole. If the punch fails or
+the build lacks it, the erase falls back to writing 0x00 pages
+(`stixflash_punch_fallback` trace). Plain mode still writes 0xFF.
+
+**Read/write:** reads invert the freshly read page into `page_data`
+(beyond-EOF reads are unchanged: guest 0xFF, D-H). Writes invert the
+guest image into a scratch buffer (`io_page`), so `page_data` always
+holds guest bytes; beyond-EOF writes still fail with FAILED + IRQ and
+never extend the file; the post-write `fflush` stays.
+
+**Legacy and format incompatibility:** `inverted-storage=off` restores
+byte-identical plain storage, which is what keeps all-0xFF files — such
+as the frozen baseline copy `/tmp/stix-baseline-run/flash.bin` (never
+touched) — usable. Conversely, feeding a PLAIN `flash.bin` to the
+default reads all 0x00, i.e. every block bad: use `inverted-storage=off`
+or convert the file by XOR 0xFF.
+
+Evidence: qtest `stix/flash-storage` (missing file → sparse 17.7 GB with
+a guest-erased read; write/read/erase round trip with host-side ~P and
+hole checks; legacy mode with a 1 MB all-0xFF file), plus the reworked
+host checks in `stix/flash-addressing` (~pattern, erased = host 0x00)
+and the now hole-filled 1 MB common temp file. Red shown on the B2
+binary: the guest read the zero-filled common file as 0x00000000, the
+addressing host checks failed against plain-stored bytes, and QEMU
+refused to start on the unknown `inverted-storage` property (the
+missing-file case was guarded out of the red run — the B2 binary would
+have filled 16.5 GB). All guest-visible expectations of the existing
+tests are unchanged; the new tests are expected RED on the 5.2 wrapper.

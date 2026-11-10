@@ -10,6 +10,10 @@
 #include "qemu/qemu-print.h"
 #include "StixIdpu.h"
 
+#if defined(CONFIG_FALLOCATE_PUNCH_HOLE)
+#include <linux/falloc.h>
+#endif
+
 #include "trace.h"
 #include "qom/object.h"
 
@@ -71,8 +75,15 @@ struct STIXFLASH
     SysBusDevice parent_obj;
 
     char *flash_file;   /* qdev property, defaults to "flash.bin" */
+    /* D-I: when set (the default), the file stores every byte XOR 0xFF,
+     * so sparse holes (file byte 0x00) are erased flash. With off, the
+     * file is plain storage and legacy all-0xFF files stay usable. */
+    bool inverted_storage;
     FILE *f;
     uint8_t page_data[FLASH_PAGE_SIZE];
+    /* scratch buffer holding the on-disk (inverted) image of a page, so
+     * page_data itself always keeps the guest image */
+    uint8_t io_page[FLASH_PAGE_SIZE];
 
     MemoryRegion iomem;
     qemu_irq irq;
@@ -132,6 +143,19 @@ static uint64_t flash_offset(const STIXFLASH *stixflash, uint32_t page_in_chip)
             + (page_in_chip & 0x3FFFF)) * FLASH_PAGE_SIZE;
 }
 
+/* D-I: with inverted storage the file stores every byte XOR 0xFF, so a
+ * sparse hole (0x00) reads back as guest 0xFF. In place is fine: the
+ * callers invert either the freshly read page or the io_page scratch
+ * image, never a buffer the guest image must be preserved in. */
+static void flash_invert_page(uint8_t *buf)
+{
+    size_t i;
+
+    for (i = 0; i < (size_t)FLASH_PAGE_SIZE; i++) {
+        buf[i] ^= 0xFFu;
+    }
+}
+
 /* Fail the in-flight command: STATUS.FAILED (bit 24) and STATUS.READY
  * (bit 30) set, BUSY (bit 4) clear, write sequence aborted. The FSW's ISR
  * (BSW_ASW/src/BSW/Flash/Flash.c:138-148) waits for the IRQ, then
@@ -184,6 +208,7 @@ static bool execute_flash_erase(STIXFLASH *stixflash)
 {
     off_t file_size = flash_file_size(stixflash);
     uint32_t base_page;
+    uint64_t offset;
 
     if (file_size < 0) {
         flash_io_error(stixflash, "erase");
@@ -197,8 +222,47 @@ static bool execute_flash_erase(STIXFLASH *stixflash)
     // 18-bit page field). The FSW aligns the page itself
     // (Flash.c:251-254), so the device-side rule is defensive.
     base_page = stixflash->page & ~(uint32_t)(FLASH_PAGENUM_IN_BLOCK - 1);
+    offset = flash_offset(stixflash, base_page);
 
-    // iterate through pages in block
+    if (stixflash->inverted_storage) {
+        uint64_t length = (uint64_t)FLASH_PAGENUM_IN_BLOCK * FLASH_PAGE_SIZE;
+
+        // pages past the backing file are skipped: the erase still
+        // succeeds and the file is not extended (D-H)
+        if ((uint64_t)file_size <= offset) {
+            qemu_irq_pulse(stixflash->irq);
+            return true;
+        }
+        if (offset + length > (uint64_t)file_size) {
+            length = (uint64_t)file_size - offset;
+        }
+
+        // flush BEFORE punching: buffered data written after the punch
+        // would refill the hole
+        if (fflush(stixflash->f) != 0) {
+            flash_io_error(stixflash, "erase");
+            return false;
+        }
+
+#ifdef CONFIG_FALLOCATE_PUNCH_HOLE
+        // the inverted erased block IS a file hole
+        if (fallocate(fileno(stixflash->f),
+                      FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                      (off_t)offset, (off_t)length) == 0) {
+            qemu_irq_pulse(stixflash->irq);
+            return true;
+        }
+        trace_stixflash_punch_fallback(errno);
+#else
+        trace_stixflash_punch_fallback(ENOSYS);
+#endif
+
+        // fallback (and builds without punch support): store the erased
+        // page as 0x00 bytes, which inverted reads turn into guest 0xFF
+        memset(stixflash->page_data, 0x00, FLASH_PAGE_SIZE);
+    }
+
+    // iterate through pages in block (plain mode writes 0xFF pages)
     for(uint32_t i = 0; i < FLASH_PAGENUM_IN_BLOCK; i++)
     {
         uint64_t position_in_file = flash_offset(stixflash, base_page + i);
@@ -258,6 +322,11 @@ static bool execute_flash_read(STIXFLASH *stixflash)
             flash_io_error(stixflash, "read");
             return false;
         }
+
+        // D-I: a file byte 0x00 is guest 0xFF
+        if (stixflash->inverted_storage) {
+            flash_invert_page(stixflash->page_data);
+        }
     }
 
     // update the flash register to be not busy anymore
@@ -275,6 +344,7 @@ static bool execute_flash_write(STIXFLASH *stixflash)
 {
     uint64_t position_in_file = flash_offset(stixflash, stixflash->page);
     off_t file_size = flash_file_size(stixflash);
+    const uint8_t *out = stixflash->page_data;
     size_t ret;
 
     if (file_size < 0) {
@@ -298,7 +368,15 @@ static bool execute_flash_write(STIXFLASH *stixflash)
     // the address space of QEMU is NOT FSW; must use wrapper function to translate the address and properly copy the data
     physical_memory_read(stixflash->ram_address, stixflash->page_data, FLASH_PAGE_SIZE);
 
-    ret = fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
+    // D-I: on disk every byte is stored XOR 0xFF. The inversion goes into
+    // the io_page scratch image; page_data itself keeps the guest image.
+    if (stixflash->inverted_storage) {
+        memcpy(stixflash->io_page, stixflash->page_data, FLASH_PAGE_SIZE);
+        flash_invert_page(stixflash->io_page);
+        out = stixflash->io_page;
+    }
+
+    ret = fwrite(out, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
     if (ret != (size_t)FLASH_PAGE_SIZE) {
         flash_io_error(stixflash, "write");
         return false;
@@ -504,16 +582,33 @@ static void init_and_load_flash_file(STIXFLASH *stixflash)
             exit(1);
         }
 
-        memset(stixflash->page_data, 0xFF, FLASH_PAGE_SIZE);
-
-        fseek(stixflash->f, 0, SEEK_SET);
-        for (uint32_t i = 0; i < FLASH_TOTAL_STORAGE / FLASH_PAGE_SIZE; i++)
+        if (stixflash->inverted_storage) {
+            /* D-I: erased flash is a file hole. Create the backing file
+             * sparse and instantly instead of writing 16.5 GB of 0xFF;
+             * holes read 0x00, which inverted reads turn into guest
+             * 0xFF. */
+            if (ftruncate(fileno(stixflash->f),
+                          (off_t)FLASH_TOTAL_STORAGE) != 0) {
+                error_report("stixflash: cannot size %s to %llu bytes: %s",
+                             stixflash->flash_file,
+                             (unsigned long long)FLASH_TOTAL_STORAGE,
+                             strerror(errno));
+                exit(1);
+            }
+        } else
         {
-            fwrite(stixflash->page_data, sizeof(stixflash->page_data[0]), sizeof(stixflash->page_data) / sizeof(stixflash->page_data[0]), stixflash->f);
+            memset(stixflash->page_data, 0xFF, FLASH_PAGE_SIZE);
+
+            fseek(stixflash->f, 0, SEEK_SET);
+            for (uint32_t i = 0; i < FLASH_TOTAL_STORAGE / FLASH_PAGE_SIZE; i++)
+            {
+                fwrite(stixflash->page_data, sizeof(stixflash->page_data[0]), sizeof(stixflash->page_data) / sizeof(stixflash->page_data[0]), stixflash->f);
+            }
         }
 
-        qemu_printf("file has been created");
-        
+        trace_stixflash_create(stixflash->flash_file, FLASH_TOTAL_STORAGE,
+                               stixflash->inverted_storage);
+
         if (0 != fclose(stixflash->f))
         {
             qemu_printf("problem closing file");
@@ -552,6 +647,7 @@ static void grlib_stixflash_reset(DeviceState *d)
 
 static const Property grlib_stixflash_properties[] = {
     DEFINE_PROP_STRING("flash-file", STIXFLASH, flash_file),
+    DEFINE_PROP_BOOL("inverted-storage", STIXFLASH, inverted_storage, true),
 };
 
 static void grlib_stixflash_class_init(ObjectClass *klass, const void *data)
