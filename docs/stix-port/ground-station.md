@@ -41,10 +41,13 @@ STIX APIDs are PID << 4 | category:
 
 ## Ground station side: what it needs
 
-- **For TM, no code change is needed.** Only configuration and data:
+- **Basic TM needs no code change.** It needs only configuration and data:
   - a satellite entry in `instance/satellites.json` (shown below);
-  - the STIX telemetry definitions `definitions/telemetry/stix_tlm.json`,
-    which are data (JSON), not code.
+  - the hand-written STIX definitions `definitions/telemetry/stix_tlm.json`.
+    They decode the heartbeat plus the headers of HK, events and acks.
+- **Full TM decoding from the IDB needs the branch's code changes**
+  (`14f6ee4`: PUS key, bit fields, calibrations). See "Definitions
+  generated from the IDB" below.
 - **One code change, only while liboqs isn't installed.** Without the
   native liboqs, the ground station's PKI import raises `SystemExit`, and
   the satellite never connects. Commit `0635cad` on branch
@@ -66,9 +69,51 @@ All ground-station changes live on branch **`stix-qemu-integration`**
 (worktree `/home/laszlo/dev/ATS-GroundStation-stix`), never on `main`:
 
 ```
+b4f8e31 telemetry: reject markup characters in units and calibration texts
+8990d41 frontend: escape definition and telemetry text before inserting HTML
+b7fcdf5 definitions: STIX TC generated from IDB v2.26.36
+b93bd1f scripts: stix_idb_to_gs.py also converts telecommands (--tc-dir)
+5980aa2 commands: refuse to send with a serializer that is not implemented
+0330e5f definitions: STIX TM generated from IDB v2.26.36
+0c3068c scripts: STIX IDB (SCOS-2000 MIB in SQLite) to TM definition converter
+14f6ee4 telemetry: PUS packet key, bit fields and calibrations in TM definitions
 232efd3 definitions: STIX FSW telemetry (heartbeat, HK SID, events, TC acks)
 0635cad connection: keep the link up when liboqs is missing (PKI disabled)
 ```
+
+The last six commits are **code changes** that the IDB definitions need:
+- PUS matching by type, subtype and first-parameter key;
+- bit fields and calibrations;
+- a guard that refuses to send with a serializer that isn't implemented.
+
+`8990d41` fixes HTML injection from definition and TM text. It applies
+to `main` too, so it is a candidate for a cherry-pick there.
+
+## Definitions generated from the IDB
+
+`scripts/stix_idb_to_gs.py` on the branch converts the STIX instrument
+database (SCOS-2000 MIB tables in SQLite) into ground-station JSON. Use
+IDB **v2.26.36**, which matches the FSW in use. The STIXCore copy is at
+`/home/laszlo/dev/STIX-TESTING/stix_ax_tm_processor/.venv/lib/python3.12/site-packages/stixcore/data/idb/v2.26.36/idb.sqlite`.
+
+```bash
+cd /home/laszlo/dev/ATS-GroundStation-stix
+.venv/bin/python scripts/stix_idb_to_gs.py <idb.sqlite> \
+    -o definitions/telemetry/stix_idb_tlm.json --tc-dir definitions/commands -v
+```
+
+What it produces:
+- **TM:** all 246 packets. 201 are complete. 45 are partial: the
+  variable-length (VPD) packets, which have only their fixed head decoded.
+- **TC:** 100 commands, in `stix_idb_cmd_5ac.json` and
+  `stix_idb_cmd_31c.json`.
+
+The generated files are committed, so the converter only needs to be
+re-run for a new IDB. Checked live against QEMU: all 246 packets decode,
+and 112 of 112 sampled parameter values agree with STIXCore.
+
+`stix_idb_tlm.json` supersedes the hand-written `stix_tlm.json`. Import
+one of the two, not both.
 
 ## One-time setup
 
@@ -122,13 +167,19 @@ cd /home/laszlo/dev/ATS-GroundStation-stix
 python3 /home/laszlo/dev/qemu-stix-uprev/scripts/stix/gs/stix_gs_bridge.py --forward-tc
 ```
 
-Once per fresh `instance/`, import the STIX telemetry definitions:
+Once per fresh `instance/`, import the STIX definitions. Use the
+IDB-generated TM file; the commands are optional, because TC can't be
+sent yet:
 
 ```bash
 cd /home/laszlo/dev/ATS-GroundStation-stix
 curl -X POST -H 'Content-Type: application/json' \
-    --data @definitions/telemetry/stix_tlm.json \
+    --data @definitions/telemetry/stix_idb_tlm.json \
     http://127.0.0.1:21503/api/sat/stix/telemetry/definitions/import
+for f in definitions/commands/stix_idb_cmd_*.json; do
+  curl -X POST -H 'Content-Type: application/json' --data @"$f" \
+      http://127.0.0.1:21503/api/sat/stix/commands/import
+done
 ```
 
 **Watch it:**
@@ -151,9 +202,13 @@ it kills that shell.
   first packets of a boot are lost if the bridge starts late.
 - **One TM client at a time.** QEMU accepts a single TCP client, so don't
   run `tmtc-probe.py` on 21500 while the bridge is connected.
-- **Definitions are keyed by APID only** in the ground station. HK SID 1
-  and SID 2 share 0x5A4, so only the SID field is decoded for HK, and
-  events decode only the event ID.
+- **Definition matching.** On `main`, definitions are keyed by APID only.
+  HK SID 1 and SID 2 share 0x5A4, so only the SID field can be decoded.
+  Commit `14f6ee4` on the branch adds matching by APID + PUS type +
+  subtype + first parameter (the SID or event ID), which every packet in
+  the IDB file uses.
+- **The definition store re-reads its JSON file for every packet.** That
+  is fine at the current TM rate, but a known inefficiency.
 - **The first time field has bit 31 set** (`0x800000F8`). That is the CUC
   "not synchronised" flag: no time sync has been sent, which TC needs.
 - **Ports used:**
