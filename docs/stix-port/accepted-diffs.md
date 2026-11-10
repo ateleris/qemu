@@ -584,3 +584,73 @@ only `tmtc-server`), not on a bind. Side effect of dropping the old
 5.2 over an unknown property; with 21000 free they run against the old
 device. The exact 5.2 expected-red/not-run list comes from the per-commit
 wrapper run (plan §6).
+
+## 15. SPW/TMTC/CTRL console prints are trace events (baseline: qemu_printf)
+
+**Baseline:** every SPW, CTRL and TMTC register access, TM send and
+socket event printed to stdout unconditionally via `qemu_printf` (14 live
+prints in `grlib_stixspw.c`, 8 in `tmtc_io_server.c`, 3 in
+`grlib_stixctrl.c`), and the flash realize printed its backing-file path,
+creation notice and size there too (5 prints). Under qtest this polluted
+every test's output, and a TM send without a client printed two lines per
+packet.
+
+**Model (P2-2, task F1):**
+- All live prints in the four device files became trace events, keeping
+  the verbatim message texts and arguments: 13 new `stixspw_*` events
+  (MMIO read/write incl. the outside-register-block guards, dmaControl,
+  TX descriptor, buffer dump, send), 8 `stixtmtc_*` (listen, accept,
+  client, recv, TM send / no-client), `stixctrl_io_read`/`stixctrl_io_write`
+  added to the CTRL section and `stixflash_page_size`, `stixflash_file`,
+  `stixflash_file_size` to the flash section — 26 new events, 38 `stix*`
+  events in total. The default (log) backend honours `-trace 'stix*'`;
+  nothing else about the build changes. A normal qtest realize now prints
+  nothing at all.
+- Only two flash realize prints stay user-visible on stderr, in the
+  file's `stixflash:` house style: `info_report` for the one-off
+  missing-file creation ("stixflash: flash file %s missing, creating a
+  new one") and `warn_report` for a failed close. The backing-file path
+  and size, like the "page size" constant, are trace events
+  (`stixflash_file`, `stixflash_file_size`, `stixflash_page_size`) — a
+  deliberate deviation from the plan wording "trace_ or warn_report" for
+  the path/size pair, which were plain status lines, not warnings.
+- The bare `\n\n\n` decoration prints around the TX dump carried no
+  information and are gone; the "Use %u bytes" line survives as
+  `stixspw_tx_bytes`, and the per-word dump is one trace line per word
+  (`0x%08x`), so the recaptured golden's TX dump layout is one line per
+  word instead of one wrapped paragraph. The dead `nCode`/WSAStartup and
+  `inet_addr` INADDR_NONE branches in `tmtc_io_server.c` (constant-false,
+  unreachable) are deleted outright, so the file has no `qemu_printf`
+  left. No device behaviour change: register semantics, TX path,
+  transport and realize flow are untouched, and the commented-out prints
+  stay as they are.
+- Trace calls from `tcHandler` run on the raw pthread (not RCU-registered);
+  the log backend takes `rcu_read_lock` there — harmless today, and P2-4
+  moves the transport onto the main loop anyway.
+- `capture-golden.sh` passes `-trace 'stix*'` (its golden log already
+  merges stdout+stderr), so the recaptured golden keeps the same
+  information, one `stix*` event per line. `run-qemu-gs.sh` enables
+  `-trace 'stixtmtc*' -trace stixspw_tx_send
+  -trace stixspw_recv_packet_callback` and keeps `^stix` lines plus
+  `qemu-system-sparc:` error/warning reports — the old "Send packet len"
+  and "recv_packet" content survives as `stixspw_tx_send` /
+  `stixspw_recv_packet_callback`. `boot-smoke.sh`/`soak.sh` only tail the
+  stdout log, so they are unaffected; their qemu-stdout logs simply
+  contain no device prints unless `-trace` is added.
+
+**Not changed:** the guest-reachable `error_report` on a flash host-I/O
+error (`grlib_stixflash.c`, once per instance) — not a `qemu_printf` and
+not in the plan's print list; the pre-existing `stixflash_*` /
+`stixctrl_*` events; and the live `qemu_printf`s in `grlib_stixwd.c`
+(device compiled but never instantiated, not in the P2-2 list).
+
+**Evidence:** the new guard script `scripts/stix/tests/test-no-console-prints.sh`
+(runs the `spw-tx`, `ctrl` and `flash` qtests with stdout+stderr captured;
+fails on a non-zero exit, a reported skip or failure, or any old console
+print, with the flash realize patterns from `grlib_stixflash.c`; covers
+the MMIO, TX/no-client and realize paths — the TMTC server paths are off
+under qtest, P2-1): red before — "SPW |", "CTRL |" and "page size: "
+matched all three tests — green after. All 23 qtests pass.
+`-trace help | grep -c stix` = 38 in the default backend, and a
+`spw-tx` run with `-trace 'stix*'` shows the events carrying the old
+texts (`stixspw_io_write SPW | Write completed addr = 32, ...`).

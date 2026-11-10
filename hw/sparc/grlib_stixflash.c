@@ -8,7 +8,6 @@
 #include "qemu/error-report.h"
 #include "chardev/char-fe.h"
 #include "system/physmem.h"
-#include "qemu/qemu-print.h"
 #include "StixIdpu.h"
 
 #if defined(CONFIG_FALLOCATE_PUNCH_HOLE)
@@ -568,13 +567,14 @@ static const MemoryRegionOps grlib_stixflash_ops = {
 
 static bool init_and_load_flash_file(STIXFLASH *stixflash, Error **errp)
 {
-    qemu_printf("page size: %llu\n", FLASH_PAGE_SIZE);
-    qemu_printf("file: %s\n", stixflash->flash_file);
+    trace_stixflash_page_size(FLASH_PAGE_SIZE);
+    trace_stixflash_file(stixflash->flash_file);
 
     stixflash->f = fopen(stixflash->flash_file, "r+b");
     if (stixflash->f == NULL)
     {
-        qemu_printf("can't open file, creating a new one\n");
+        info_report("stixflash: flash file %s missing, creating a new one",
+                    stixflash->flash_file);
 
         stixflash->f = fopen(stixflash->flash_file, "w+b");
         if (stixflash->f == NULL)
@@ -621,7 +621,8 @@ static bool init_and_load_flash_file(STIXFLASH *stixflash, Error **errp)
 
         if (0 != fclose(stixflash->f))
         {
-            qemu_printf("problem closing file");
+            warn_report("stixflash: problem closing %s",
+                        stixflash->flash_file);
         }
 
         stixflash->f = fopen(stixflash->flash_file, "r+b");
@@ -635,7 +636,7 @@ static bool init_and_load_flash_file(STIXFLASH *stixflash, Error **errp)
     }
 
     fseek(stixflash->f, 0L, SEEK_END);
-    qemu_printf("file size = %ld\n", ftell(stixflash->f));
+    trace_stixflash_file_size(ftell(stixflash->f));
     fseek(stixflash->f, 0L, SEEK_SET);
 
     return true;

@@ -16,10 +16,16 @@ RUN="${STIX_GS_RUN_DIR:-/tmp/stix-gs-run}"
 PORT="${STIX_GS_TM_PORT:-21500}"
 [ "$RUN" = /tmp/stix-baseline-run ] && { echo "refusing the frozen v11.1 run dir"; exit 2; }
 mkdir -p "$RUN" && cd "$RUN"
-# The model prints every SPW register access on stdout; keep only the
-# connection and packet lines so the log stays small.
+# Since P2-2 the model's device prints are trace events on stderr, not
+# console prints. Enable the TMTC events plus the TM send/receive markers
+# that used to be the "Send packet len"/"recv_packet" stdout lines, and
+# keep those lines plus QEMU's own error/warning reports so the log stays
+# small but still shows connections, packets and realize errors
+# (see docs/stix-port/accepted-diffs.md).
 "$QEMU" -M leon3_generic -m 64M -no-reboot -display none -monitor none \
     -serial file:"$RUN/uart.raw" -kernel "$ELF" \
-    -global grlib-stixspw.tmtc-port="$PORT" 2>&1 \
-  | grep --line-buffered -E "IOTCPSERVER|[Cc]lient|Send packet len|recv_packet|socket is closed" \
+    -global grlib-stixspw.tmtc-port="$PORT" \
+    -trace 'stixtmtc*' -trace stixspw_tx_send \
+    -trace stixspw_recv_packet_callback 2>&1 \
+  | grep --line-buffered -E "^stix|^qemu-system-sparc:" \
   > "$RUN/qemu.log"

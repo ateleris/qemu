@@ -33,7 +33,7 @@ REPAIRED old model.
 | File | Content |
 |---|---|
 | `uart.golden.log` | guest UART (own channel, `-serial file:`) |
-| `qemu-stdout.golden.log` | QEMU device prints — a free register-access trace (CTRL/SPW/flash) |
+| `qemu-stdout.golden.log` | the STIX `stix*` trace-event stream (`-trace 'stix*'` on stderr, merged) plus the one-off flash realize reports — the register-access trace |
 | `asm-head.golden.log` | first 200 translated guest blocks (`-d in_asm`) — bootloader/CPU-start tripwire |
 | `run-flags.txt` | the exact invocation |
 
@@ -118,9 +118,10 @@ Notes:
   the normal ELF goes quiet after boot.
 - The wrapper locates the old binary via `STIX_OLD_QEMU`
   (default `/tmp/qemu-stix-baseline/build/sparc-softmmu/qemu-system-sparc`).
-- `qemu-stdout.golden.log` (the device register-access print stream) is a
-  committed reference for MANUAL comparison - no automated gate diffs it
-  yet; it is the designated second net for ground-station-era work.
+- `qemu-stdout.golden.log` (the `stix*` trace-event stream, captured with
+  `-trace 'stix*'` — accepted-diffs §15) is a committed reference for
+  MANUAL comparison - no automated gate diffs it yet; it is the
+  designated second net for ground-station-era work.
 
 ## Watching a run (console, TM, model events)
 
@@ -135,7 +136,7 @@ tail -f /tmp/stix-uprev-run/tm.soak-probe.log              # TM chunks as they a
 
 From Windows the same files are at `\\wsl$\<distro>\tmp\stix-uprev-run\`.
 
-| Run | FSW console (UART) | QEMU device prints | TM probe log |
+| Run | FSW console (UART) | QEMU device prints / `stix*` traces | TM probe log |
 |---|---|---|---|
 | `soak.sh` | `uart.soak.raw` | `qemu-stdout.soak.log` | `tm.soak-probe.log` |
 | `boot-smoke.sh` | `uart.smoke.raw` (+ `.norm`) | `qemu-stdout.smoke.log` | `tm.smoke.log` (`--with-tm`) |
@@ -153,8 +154,13 @@ cd /tmp/stix-uprev-run && /path/to/build/qemu-system-sparc \
     -serial stdio -kernel /tmp/stix-baseline-run/ASW_em_baseline.elf
 ```
 
-- Add `-trace 'stix*'` to see the model's own events on stderr: flash
-  errors (`stixflash_error`), watchdog commands and resets, SCET writes. Use
+- Since P2-2 the model prints **no device activity by default** (the only
+  stderr lines left are one-off reports: the flash "missing, creating a
+  new one" info line, the flash host-I/O error and QEMU's own
+  error/warning reports). Add `-trace 'stix*'` to get the old
+  register-access output back on stderr: every SPW and CTRL MMIO access,
+  the flash file/size and TMTC server lines, plus the flash errors
+  (`stixflash_error`), watchdog commands and resets, and SCET writes. Use
   `-D <file>` to send them to a file.
 - `python3 scripts/stix/tmtc-probe.py --seconds 60` in a second terminal
   shows the TM stream.

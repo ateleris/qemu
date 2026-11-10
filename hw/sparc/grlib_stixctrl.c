@@ -6,7 +6,6 @@
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
 #include "chardev/char-fe.h"
-#include "qemu/qemu-print.h"
 #include "qemu/timer.h"
 #include "system/runstate.h"
 #include "StixIdpu.h"
@@ -328,14 +327,14 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
     {
         uint32_t regval = stixctrl_rotb_cmdsta(stixctrl);
 
-        qemu_printf("CTRL | Read requested: addr = 0x%x, regval = 0x%x\n", (uint32_t)addr, regval);
+        trace_stixctrl_io_read((uint32_t)addr, regval);
 
         return regval;
     }
 
     uint32_t regval = ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
-    qemu_printf("CTRL | Read requested: addr = 0x%x, regval = 0x%x\n", (uint32_t)addr, regval);
+    trace_stixctrl_io_read((uint32_t)addr, regval);
 
     return regval;
 }
@@ -412,7 +411,9 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
         stixctrl_rotb_command(stixctrl, (uint32_t)value & STIXCTRL_ROTBCMDSTA_COMMAND_MASK);
     }
 
-    qemu_printf("CTRL | Write completed addr = 0x%x, new regval = 0x%x\n", (uint32_t)addr, ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)]);
+    trace_stixctrl_io_write((uint32_t)addr,
+                            ((volatile uint32_t *)&stixctrl->reg) /* re-read */
+                            [(uint32_t)addr / sizeof(uint32_t)]);
 }
 
 static const MemoryRegionOps grlib_stixctrl_ops = {

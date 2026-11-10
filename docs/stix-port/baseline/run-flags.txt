@@ -1,6 +1,7 @@
-qemu-binary: /home/laszlo/dev/qemu-stix-r3/build/qemu-system-sparc
+qemu-binary: /home/laszlo/dev/qemu-stix-tc/build/qemu-system-sparc
 asw-elf: /tmp/stix-baseline-run/ASW_em_baseline.elf
-machine-args: -M leon3_generic -m 64M -no-reboot -display none -monitor none -serial file:<uart>
+machine-args: -M leon3_generic -m 64M -no-reboot -display none
+    -monitor none -serial file:<uart> -trace 'stix*'
 icount: none (see header note in capture-golden.sh)
 duration-seconds: 90
 tmtc-port: 21000 (IO_TCP_SERVER_BASE_PORT + getuid)

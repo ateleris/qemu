@@ -27,6 +27,9 @@ stixflash_unmapped_read(uint64_t addr) "unmapped read addr=0x%"PRIx64""
 stixflash_midseq_read(uint64_t addr, uint32_t write_counter) "read mid-sequence addr=0x%"PRIx64" write_counter=%u"
 stixflash_create(const char *path, uint64_t size, int inverted) "created backing file %s size=%"PRIu64" inverted=%d"
 stixflash_punch_fallback(int err) "punch-hole erase unavailable or failed (err=%d), writing 0x00 pages"
+stixflash_page_size(uint64_t size) "page size: %"PRIu64
+stixflash_file(const char *path) "using flash file %s"
+stixflash_file_size(int64_t size) "backing file size %"PRId64
 
 # grlib_stixctrl.c (STIX)
 stixctrl_scet_write(uint32_t addr, uint32_t value) "SCET write addr=0x%x value=0x%x"
@@ -35,3 +38,30 @@ stixctrl_watchdog_reset(const char *why) "watchdog resets the IDPU: %s"
 stixctrl_rotb_cmd(uint32_t cmd, uint32_t rd, uint32_t wr, uint32_t count, int full) "rotb cmd=%u rd=%u wr=%u count=%u full=%d"
 stixctrl_rotb_overflow(uint32_t count) "rotb overflow: block dropped, count=%u"
 stixctrl_rotb_ignored(const char *what, uint32_t off) "rotb ignored %s (off=0x%x)"
+stixctrl_io_read(uint32_t addr, uint32_t val) "CTRL | Read requested: addr = 0x%x, regval = 0x%x"
+stixctrl_io_write(uint32_t addr, uint32_t val) "CTRL | Write completed addr = 0x%x, new regval = 0x%x"
+
+# grlib_stixspw.c (STIX)
+stixspw_recv_packet_callback(void) "recv_packet_callback"
+stixspw_io_read_outside(uint64_t addr) "SPW | Read outside register block: addr = %"PRIu64
+stixspw_io_read(uint64_t addr, uint32_t val) "SPW | Read requested: addr = %"PRIu64", regval = 0x%x"
+stixspw_io_write_outside(uint64_t addr) "SPW | Write outside register block ignored: addr = %"PRIu64
+stixspw_io_write(uint64_t addr, uint32_t val) "SPW | Write completed addr = %"PRIu64", new regval = 0x%x"
+stixspw_dma_control(uint32_t val) "dma control %u"
+stixspw_data_exchange(void) "STIX SPW: Data exchange requested"
+stixspw_tx_desc_addr(uint32_t addr) "stixspw->reg.dmaTxDescAddr = 0x%x"
+stixspw_tx_descriptor(uint32_t ctrl, uint32_t daddr, uint32_t dlen, uint32_t haddr) "txdsc.ctrl = %u, txdsc.daddr = 0x%x, txdsc.dlen = %u, txdsc.haddr = 0x%x"
+stixspw_tx_bytes(uint32_t len) "Use %u bytes"
+stixspw_tx_dump_word(uint32_t word) "0x%08x"
+stixspw_tx_send(uint32_t len) "Send packet len: %u"
+stixspw_tx_overflow(void) "error: buffer overwflow"
+
+# tmtc_io_server.c (STIX)
+stixtmtc_wait_client(void) "Waiting for TC client..."
+stixtmtc_accept_failed(void) "accept failed"
+stixtmtc_client_connected(const char *addr, int port) "Client connected from: %s:%d"
+stixtmtc_recv_error(int err) "receive error: %d"
+stixtmtc_client_disconnected(void) "TC client disconnected"
+stixtmtc_tm_send(void) "sending a packet!!!!"
+stixtmtc_socket_closed(void) "Error: socket is closed"
+stixtmtc_listening(int port) "IOTCPSERVER - Server listening on port: %d"

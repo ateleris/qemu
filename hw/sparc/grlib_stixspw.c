@@ -5,7 +5,6 @@
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
 #include "chardev/char-fe.h"
-#include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/qapi-types-common.h"
 #include "system/physmem.h"
@@ -79,7 +78,7 @@ static uint8_t buffer[8192];
 /**  Passes TC received by the TCP server to TSIM through memory read, signalized with IRQ */
 static void recv_packet_callback(uint8_t *data, int length, void *opaque)
 {
-    qemu_printf("recv_packet_callback\n");
+    trace_stixspw_recv_packet_callback();
 
     /*STIXSPW *stixspw = opaque;
 
@@ -170,14 +169,13 @@ static uint64_t grlib_stixspw_read(void *opaque, hwaddr addr, unsigned size)
      * The pinned baseline flows only ever access 0x00-0x2F. */
     if ((uint32_t)addr / sizeof(uint32_t) >= STIXSPW_REG_WORDS)
     {
-        qemu_printf("SPW | Read outside register block: addr = %lu\n", addr);
+        trace_stixspw_io_read_outside(addr);
         return 0;
     }
 
     uint32_t regval = ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
-    qemu_printf("SPW | Read requested: addr = %lu, regval = 0x%x\n", //, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
-                addr, regval);                                       //, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
+    trace_stixspw_io_read(addr, regval);
 
     return regval;
 }
@@ -189,15 +187,17 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
     /* security fix: same bounds rule as the read handler. */
     if ((uint32_t)addr / sizeof(uint32_t) >= STIXSPW_REG_WORDS)
     {
-        qemu_printf("SPW | Write outside register block ignored: addr = %lu\n", addr);
+        trace_stixspw_io_write_outside(addr);
         return;
     }
 
     // update the register as per write request
     ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;
 
-    qemu_printf("SPW | Write completed addr = %lu, new regval = 0x%x\n", addr, ((volatile uint32_t *)&stixspw->reg)[(uint32_t)addr / sizeof(uint32_t)]);
-    qemu_printf("dma control %u\n", stixspw->reg.dmaControl);
+    volatile uint32_t *regs = (volatile uint32_t *)&stixspw->reg; /* re-read */
+
+    trace_stixspw_io_write(addr, regs[(uint32_t)addr / sizeof(uint32_t)]);
+    trace_stixspw_dma_control(stixspw->reg.dmaControl);
 
     // shortcut for link running as per E_SPW_LINK_STATUS_RUN
     stixspw->reg.status = 0xA00000;
@@ -211,7 +211,7 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
     // clear the DMA control register
     if (stixspw->reg.dmaControl != 0)
     {
-        qemu_printf("STIX SPW: Data exchange requested\n");
+        trace_stixspw_data_exchange();
 
         // is transmit enabled?
         if (stixspw->reg.dmaControl & (1 << STIXSPW_DMACONTROL_TE))
@@ -219,7 +219,7 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
             spwTXdsc_s txdsc;
 
             // read TX descriptor from STIX
-            qemu_printf("stixspw->reg.dmaTxDescAddr = 0x%x\n", stixspw->reg.dmaTxDescAddr);
+            trace_stixspw_tx_desc_addr(stixspw->reg.dmaTxDescAddr);
 
             // endianness is incorrect for use in qemu; there may be a better way with address_space_read, but it's not working at the moment.
             // using a small workaround
@@ -230,7 +230,8 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
             txdsc.dlen = bswap32(txdsc.dlen);
             txdsc.haddr = bswap32(txdsc.haddr);
 
-            qemu_printf("txdsc.ctrl = %u, txdsc.daddr = 0x%x, txdsc.dlen = %u, txdsc.haddr = 0x%x\n", txdsc.ctrl, txdsc.daddr, txdsc.dlen, txdsc.haddr);
+            trace_stixspw_tx_descriptor(txdsc.ctrl, txdsc.daddr,
+                                        txdsc.dlen, txdsc.haddr);
 
             if (txdsc.dlen < sizeof(buffer))
             {
@@ -239,21 +240,20 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value, unsig
 
                 // swap buffer dwords to fix endianness
                 uint32_t *buffer32 = (uint32_t *)buffer;
-                qemu_printf("\n\n\nUse %u bytes\n\n", txdsc.dlen);
+                trace_stixspw_tx_bytes(txdsc.dlen);
                 for (uint32_t ix = 0; ix < txdsc.dlen / 4 + ((txdsc.dlen % 4) ? 1 : 0); ix++)
                 {
                     // buffer32[ix] = bswap32(buffer32[ix]);
-                    qemu_printf("%08x ", bswap32(buffer32[ix]));
+                    trace_stixspw_tx_dump_word(bswap32(buffer32[ix]));
                 }
-                qemu_printf("\n\n\n");
 
                 send_tm_packet(buffer, txdsc.dlen);
 
-                qemu_printf("Send packet len: %d\n", txdsc.dlen);
+                trace_stixspw_tx_send(txdsc.dlen);
             }
             else
             {
-                qemu_printf("error: buffer overwflow\n");
+                trace_stixspw_tx_overflow();
             }
 
             // clear desc enabled flag

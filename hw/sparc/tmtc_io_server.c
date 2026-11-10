@@ -1,7 +1,7 @@
 #include "qemu/osdep.h"
 #include "tmtc_io_server.h"
 #include "qapi/error.h"
-#include "qemu/qemu-print.h"
+#include "trace.h"
 
 //#include <stdio.h>
 //#include <stdlib.h>
@@ -65,16 +65,17 @@ static void *tcHandler(void *arg)
 
   while (1)
   {
-    qemu_printf("Waiting for TC client...\n");
+    trace_stixtmtc_wait_client();
     sd = accept(listeningSocket, (struct sockaddr *)&sinRemote, &nAddrSize);
     if (sd == INVALID_SOCKET)
     {
-      qemu_printf("accept failed\n");
+      trace_stixtmtc_accept_failed();
       continue;
     }
 
     clientSocket = sd;
-    qemu_printf("Client connected from: %s:%d\n", inet_ntoa(sinRemote.sin_addr), ntohs(sinRemote.sin_port));
+    trace_stixtmtc_client_connected(inet_ntoa(sinRemote.sin_addr),
+                                    ntohs(sinRemote.sin_port));
 
     do
     {
@@ -85,14 +86,14 @@ static void *tcHandler(void *arg)
       }
       else if (nReadBytes == SOCKET_ERROR)
       {
-        qemu_printf("receive error: %d\n", errno);
+        trace_stixtmtc_recv_error(errno);
         close(sd);
         break;
       }
 
     } while (nReadBytes != 0); // connection has been gracefully closed (recv return value == 0)
 
-    qemu_printf("TC client disconnected\n");
+    trace_stixtmtc_client_disconnected();
 
     close(sd);
     clientSocket = -1;
@@ -103,10 +104,10 @@ static void *tcHandler(void *arg)
 
 int send_tm_packet(unsigned char *data, int data_length)
 {
-  qemu_printf("sending a packet!!!!\n");
+  trace_stixtmtc_tm_send();
   if (clientSocket == -1)
   {
-    qemu_printf("Error: socket is closed\n");
+    trace_stixtmtc_socket_closed();
   }
   else
   {
@@ -147,7 +148,6 @@ bool init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void
 {
   receivedTcCallback = in_tc_received_callback;
   stixspw = opaque;
-  int nCode = 0;
   int port;
   pthread_t tid;
 
@@ -161,18 +161,14 @@ bool init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void
     port = IO_TCP_SERVER_BASE_PORT + getuid();
   }
 
-  if (nCode != 0)
-  {
-    qemu_printf("WSAStartup() returned error code: %d", nCode);
-  }
-  else
+  /*
+   * the dead WSAStartup branch (Windows-only, nCode was always 0) and
+   * the unreachable INADDR_NONE check are gone; the block just scopes
+   * the socket setup
+   */
   {
     //-------------------------------------------- Setup listening socket -----------------------------------
     unsigned long localhostAddress = inet_addr("127.0.0.1");
-    if (localhostAddress == INADDR_NONE)
-    {
-      qemu_printf("error in allocating winsock address\n");
-    }
     listeningSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (listeningSocket != INVALID_SOCKET)
     {
@@ -201,7 +197,7 @@ bool init_tmtc_server(void (*in_tc_received_callback)(unsigned char *, int, void
           return false;
         }
 
-        qemu_printf("IOTCPSERVER - Server listening on port: %d\n", port);
+        trace_stixtmtc_listening(port);
 
         // Create TC thread
         pthread_create(&tid, NULL, tcHandler, NULL);

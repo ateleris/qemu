@@ -5,8 +5,10 @@
 # Usage: capture-golden.sh <qemu-binary> <out-dir>
 #
 # Notes:
-#   - Guest UART goes to its own file (-serial file:), QEMU's device prints
-#     (CTRL/SPW/flash register traces) go to stdout — captured separately.
+#   - Guest UART goes to its own file (-serial file:). QEMU's device
+#     activity (CTRL/SPW/flash/TMTC, -trace 'stix*' on stderr) and the
+#     flash realize info lines are captured into qemu-stdout.golden.log
+#     (stdout+stderr merged).
 #   - NO -icount: under icount the WDT path reaches the CTRL SCET-set
 #     registers and hits assert(0) in grlib_stixctrl.c (QEMU SIGABRT).
 #     Determinism is provided by content stability instead (verified: two
@@ -52,6 +54,7 @@ timeout "$DURATION" "$QEMU_BIN" \
     -display none -monitor none \
     -serial file:uart.golden.raw \
     -kernel "$ASW_ELF" \
+    -trace 'stix*' \
     > qemu-stdout.golden.log 2>&1 || true
 
 # in_asm head: translation log of the same run would need -d; a separate
@@ -73,7 +76,8 @@ cp qemu-stdout.golden.log "$OUT_DIR/"
 cat > "$OUT_DIR/run-flags.txt" <<EOF
 qemu-binary: $QEMU_BIN
 asw-elf: $ASW_ELF
-machine-args: -M leon3_generic -m 64M -no-reboot -display none -monitor none -serial file:<uart>
+machine-args: -M leon3_generic -m 64M -no-reboot -display none
+    -monitor none -serial file:<uart> -trace 'stix*'
 icount: none (see header note in capture-golden.sh)
 duration-seconds: $DURATION
 tmtc-port: $TMTC_PORT (IO_TCP_SERVER_BASE_PORT + getuid)
