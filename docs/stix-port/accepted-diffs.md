@@ -735,3 +735,95 @@ first failing read-back: `0x181e` read `0x00000000`, wanted
 checkpatch on the diff: 0 errors, 0 warnings. The `stix*` trace-event
 count rises 38 → 41 (`stixspw_tx_skip_en`, `stixspw_irq_latched`,
 `stixspw_irq_deferred`).
+
+## 17. TMTC transport on the main loop; non-blocking TM with whole-packet drop (baseline: pthread, blocking send)
+
+**Baseline:** a raw `pthread` ran the whole transport: `accept`/`recv`
+blocked on its own thread (writing `clientSocket` with no lock), TC
+bytes reached the device callback without the BQL, the client fd was
+closed twice per disconnect, and — the real defect — `send_tm_packet`
+called blocking `send()` on the vCPU/main-loop path: with a stalled
+client the whole of QEMU froze. A direct probe against the pre-P2-4
+binary (stalled client, SO_RCVBUF 1024, never reading) hung the machine
+on the **8th** 4 KiB TX; the qtest socket stopped answering.
+
+**Model (P2-4, D-N):**
+- The transport lives in a `StixTmtc` state struct owned by the SPW
+  device — no file globals, no thread. One listening socket, one
+  client, everything in `qemu_set_fd_handler` main-loop handlers under
+  the BQL: `qemu_socket`/`qemu_accept` (CLOEXEC), non-blocking via
+  `qemu_set_blocking(fd, false, errp)`.
+- **TM send never blocks.** The exchange is queued into a 256 KiB
+  whole-packet FIFO and flushed from the client's writable handler. A
+  packet that does not fit the queue is dropped **whole** (never split
+  on enqueue), counted in the read-only QOM property `tm-dropped` and
+  traced (`stixtmtc_tm_dropped`); a partial `send()` keeps its
+  remainder at the queue head and is finished before anything else, so
+  no half packet ever reaches the wire (that would desync the CCSDS
+  framing). With **no client** the packet is dropped silently
+  (`stixtmtc_socket_closed` as before) and is **not** counted in
+  `tm-dropped` — the counter means "a client was connected and the
+  model had to drop".
+- **One client.** A second connection waits in the listen backlog
+  (listen(1)) until the first disconnects. The accept handler is
+  unregistered while a client is connected — QEMU fd handlers are
+  level-triggered, so with a pending second connection the old
+  always-armed handler returned on every main-loop pass and
+  busy-spun the loop at ~93 % of a core (P2-4-review M1, shown with
+  a /proc CPU-time probe, see Evidence). A disconnect closes once,
+  clears the queue and re-arms the accept. Unrealize removes the
+  handlers and closes the fds.
+- **STIX_CONTROL strip (D-K):** the handshake is stripped when it forms
+  the first 12 bytes of a connection (traced
+  `stixtmtc_token_stripped`); anything else at the stream head is TC
+  data and goes through. A stream head shorter than 12 bytes that is
+  not the token is held back until more bytes arrive (and is dropped
+  with the connection if it disconnects) — no real client does this:
+  both tools send the 12-byte `STIX_CONTROL` first and the smallest
+  TC unit is ≥ 16 bytes. The token split across recv chunks and the
+  token-less head get their tests with the P2-6 TC work (`tc-tcp`).
+  TC bytes are received into a per-connection buffer and handed to
+  the device callback in the main loop; in this commit the callback
+  still traces and drops — reassembly across recv chunks is P2-6.
+- **Wire format unchanged:** TM is the raw `[4-byte SpW header][CCSDS
+  packet]` exactly as DMA'd, no length prefix, nothing else on the
+  stream. `scripts/stix/tmtc-probe.py` and
+  `scripts/stix/gs/stix_gs_bridge.py` work unchanged.
+- New read-only QOM properties on `grlib-stixspw`: `tm-dropped`
+  (counter) and `tmtc-connected` (accept state — the test-side
+  observable for correction 16's "wait for the accept before driving a
+  TX"). No vmstate exists for the device (pre-existing). A future one
+  carries `irq_latched` and `tm_dropped` only and starts with an empty
+  queue and no client: the TCP transport does not migrate, so the
+  queue and the connection are re-created empty on the destination.
+- Trace changes: `stixtmtc_wait_client` is gone (no accept loop), and
+  `stixtmtc_tm_dropped`/`stixtmtc_token_stripped` are new.
+
+**Not changed:** the `tmtc-server`/`tmtc-port` contract (P2-1: OnOffAuto,
+auto = off under qtest, `errp`/bool init with the same bind-error text —
+`tmtc-hermetic` and `tmtc-bind-error` pass unchanged); the device reset
+semantics (P2-3: a system reset does not touch the transport); the dead
+TSIM framing comments are gone with the rewrite.
+
+**Evidence:** qtests `/sparc/stix/tm-tcp` (connect + token + bounded
+accept wait + one TX + byte-exact read of the 8 DMA'd bytes on a
+non-blocking socket, then a non-blocking read that must hit EAGAIN —
+nothing else on the stream), `/sparc/stix/tm-stalled-client` (small
+SO_RCVBUF client that never reads, 2000 × 4 KiB TXes, every qtest round
+trip returns, wall-clock bounded, `tm-dropped` > 0; every TX is
+numbered in its first data word and the drained stream is parsed on
+whole-packet boundaries: only whole packets, strictly increasing
+numbers, gaps only from drops, received + dropped == sent — the
+no-split invariant the bridge's CCSDS splitter depends on; 72 packets
+received, 1928 dropped) and `/sparc/stix/tm-reconnect` (B waits in the
+backlog while A is served; after A disconnects the re-armed accept
+takes B and the next TX is byte-exact on B). Red on the pre-P2-4
+binary: all three wait for `tmtc-connected` and time out with
+"tmtc-connected is unknown" (the direct probe above shows the hang the
+new transport removes). The review M1 spin was shown on the pre-fix
+binary with a /proc CPU-time probe (A connected, B in the backlog, no
+traffic: ~93 % of a core over 3 s, vs 0.0 % with only A; post-fix
+0.0 % in both states) — a qtest cannot observe the spin, so the probe
+stays out of the suite on purpose. Green: all three TM tests,
+`tmtc-hermetic`, `tmtc-bind-error`, `spw-tx`, `spw-regs`, and all 27
+tests. checkpatch on the diff: 0 errors, 0 warnings.

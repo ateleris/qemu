@@ -106,6 +106,12 @@ struct STIXSPW
      * vmstate if one is ever added
      */
     bool irq_latched;
+
+    /*
+     * TMTC transport state (D-N); the fds are -1 while the server is
+     * off
+     */
+    StixTmtc tmtc;
 };
 
 static uint8_t buffer[8192];
@@ -266,7 +272,7 @@ static void grlib_stixspw_tx(STIXSPW *stixspw)
             trace_stixspw_tx_dump_word(bswap32(buffer32[ix]));
         }
 
-        send_tm_packet(buffer, txdsc.dlen);
+        stix_tmtc_send(&stixspw->tmtc, buffer, txdsc.dlen);
 
         trace_stixspw_tx_send(txdsc.dlen);
     } else {
@@ -401,11 +407,42 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     if (STIXSPW->tmtc_server == ON_OFF_AUTO_ON ||
         (STIXSPW->tmtc_server == ON_OFF_AUTO_AUTO && !qtest_driver()))
     {
-        if (!init_tmtc_server(recv_packet_callback, STIXSPW, STIXSPW->tmtc_port, errp))
+        if (!init_tmtc_server(&STIXSPW->tmtc, recv_packet_callback, STIXSPW,
+                              STIXSPW->tmtc_port, errp))
         {
             return;
         }
     }
+}
+
+static void grlib_stixspw_unrealize(DeviceState *dev)
+{
+    STIXSPW *STIXSPW = GRLIB_STIXSPW(dev);
+
+    stix_tmtc_cleanup(&STIXSPW->tmtc);
+}
+
+static bool grlib_stixspw_get_tmtc_connected(Object *obj, Error **errp)
+{
+    STIXSPW *STIXSPW = GRLIB_STIXSPW(obj);
+
+    return STIXSPW->tmtc.client_fd >= 0;
+}
+
+static void grlib_stixspw_instance_init(Object *obj)
+{
+    STIXSPW *STIXSPW = GRLIB_STIXSPW(obj);
+
+    /* no fd 0: the transport is off until realize starts it */
+    STIXSPW->tmtc.listen_fd = -1;
+    STIXSPW->tmtc.client_fd = -1;
+
+    object_property_add_uint32_ptr(obj, "tm-dropped",
+                                   &STIXSPW->tmtc.tm_dropped,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_bool(obj, "tmtc-connected",
+                             grlib_stixspw_get_tmtc_connected,
+                             NULL);
 }
 
 static void grlib_stixspw_reset(DeviceState *d)
@@ -431,6 +468,7 @@ static void grlib_stixspw_class_init(ObjectClass *klass, const void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = grlib_stixspw_realize;
+    dc->unrealize = grlib_stixspw_unrealize;
     device_class_set_legacy_reset(dc, grlib_stixspw_reset);
     device_class_set_props(dc, grlib_stixspw_properties);
 }
@@ -439,6 +477,7 @@ static const TypeInfo grlib_stixspw_info = {
     .name = TYPE_GRLIB_STIXSPW,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STIXSPW),
+    .instance_init = grlib_stixspw_instance_init,
     .class_init = grlib_stixspw_class_init,
 };
 

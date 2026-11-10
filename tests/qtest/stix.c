@@ -15,6 +15,8 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qobject/qbool.h"
+#include "qobject/qnum.h"
 
 #define APB_PNP_BASE 0x800FF000
 #define PNP_ENTRY_COUNT 12   /* words 0x00..0x0b; 0x0c.. must be zero */
@@ -161,6 +163,29 @@ static int stix_hold_free_tcp_port(int *port)
     *port = ntohs(addr.sin_port);
     g_assert_cmpint(*port, >, 0);
     return fd;
+}
+
+/*
+ * For tests where QEMU itself must bind the port (tmtc-port=<free>):
+ * the release-then-bind window is unavoidable there (P2-1 review).
+ */
+static int stix_free_tcp_port(void)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t addrlen = sizeof(addr);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int port;
+
+    g_assert(fd >= 0);
+    g_assert(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    g_assert(getsockname(fd, (struct sockaddr *)&addr, &addrlen) == 0);
+    port = ntohs(addr.sin_port);
+    close(fd);
+    g_assert_cmpint(port, >, 0);
+    return port;
 }
 
 static void stix_qtest_cleanup(void)
@@ -1960,6 +1985,415 @@ static void test_spw_regs(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P2-4: TMTC transport on the main loop, non-blocking TM ---- */
+
+/*
+ * Find the SPW device's QOM path: it is realized without an id, so it
+ * lives under /machine/unattached (correction 16: find it by a type
+ * scan).
+ */
+static gchar *stix_spw_path(QTestState *qts)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-list',"
+                            " 'arguments': {'path': '/machine/unattached'}}");
+    QList *list;
+    const QListEntry *e;
+    gchar *path = NULL;
+
+    list = qdict_get_qlist(resp, "return");
+    g_assert_nonnull(list);
+    QLIST_FOREACH_ENTRY(list, e) {
+        QDict *item = qobject_to(QDict, qlist_entry_obj(e));
+
+        if (strstr(qdict_get_str(item, "type"), "grlib-stixspw")) {
+            path = g_strdup_printf("/machine/unattached/%s",
+                                   qdict_get_str(item, "name"));
+            break;
+        }
+    }
+    qobject_unref(resp);
+    g_assert_nonnull(path);
+    return path;
+}
+
+/*
+ * Tolerant qom-get for a bool property: *ok is false when the
+ * property is missing (the pre-P2-4 binary).
+ */
+static bool stix_qom_get_bool(QTestState *qts, const char *path,
+                              const char *prop, bool *ok)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s, 'property': %s}}",
+                            path, prop);
+    QBool *b = qobject_to(QBool, qdict_get(resp, "return"));
+    bool val = b != NULL && qbool_get_bool(b);
+
+    if (ok != NULL) {
+        *ok = b != NULL;
+    }
+    qobject_unref(resp);
+    return val;
+}
+
+/* The tm-dropped counter, or -1 when the property is unknown. */
+static int64_t stix_qom_tm_dropped(QTestState *qts, const char *path)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'tm-dropped'}}",
+                            path);
+    QNum *n = qobject_to(QNum, qdict_get(resp, "return"));
+    int64_t val = n != NULL ? qnum_get_int(n) : -1;
+
+    qobject_unref(resp);
+    return val;
+}
+
+/*
+ * Connect to the TM server and send the ground station's 12-byte
+ * STIX_CONTROL handshake.
+ */
+static int stix_tm_connect(uint16_t port, bool small_rcvbuf)
+{
+    static const char token[] = "STIX_CONTROL";
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(port),
+    };
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    if (small_rcvbuf) {
+        int rcvbuf = 1024;
+
+        g_assert(setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                            &rcvbuf, sizeof(rcvbuf)) == 0);
+    }
+    g_assert(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    g_assert_cmpint(send(fd, token, sizeof(token) - 1, 0),
+                    ==, sizeof(token) - 1);
+    return fd;
+}
+
+/*
+ * Wait, bounded, until tmtc-connected reaches @want: the QEMU main
+ * loop runs freely between qtest commands, and the property flips on
+ * the accept (correction 16: wait for the accept before driving a TX)
+ * and again on the disconnect, when the accept is re-armed.
+ */
+static bool stix_wait_tmtc_state(QTestState *qts, const char *path,
+                                 bool want, int64_t timeout_us)
+{
+    gint64 deadline = g_get_monotonic_time() + timeout_us;
+    bool saw_property = false;
+
+    while (g_get_monotonic_time() < deadline) {
+        bool ok;
+        bool connected = stix_qom_get_bool(qts, path, "tmtc-connected", &ok);
+
+        if (ok) {
+            saw_property = true;
+            if (connected == want) {
+                return true;
+            }
+        }
+        g_usleep(20 * 1000);
+    }
+    g_test_message("tmtc-connected %s within the timeout",
+                   saw_property ? "never reached the wanted state"
+                                : "is unknown");
+    return false;
+}
+
+/*
+ * Arm the one TX descriptor for a dlen-byte payload at TXDATA_ADDR and
+ * trigger the exchange the way spw-tx does. The device clears the
+ * descriptor's EN, so every TX re-arms first.
+ */
+static void stix_drive_tx(QTestState *qts, uint32_t dlen)
+{
+    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, TXDSC_ADDR + 4, 0);
+    qtest_writel(qts, TXDSC_ADDR + 8, dlen);
+    qtest_writel(qts, TXDSC_ADDR + 12, TXDATA_ADDR);
+    qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_TE | SPW_DMA_TI);
+}
+
+/*
+ * Read exactly @len bytes off the TM stream, non-blocking and bounded
+ * (10 s). Reads never go past @len, so the caller can prove nothing
+ * else is on the stream with a follow-up EAGAIN read.
+ */
+static void stix_tm_read_exact(int fd, uint8_t *buf, size_t len)
+{
+    size_t got = 0;
+    gint64 deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+
+    while (got < len && g_get_monotonic_time() < deadline) {
+        ssize_t n = recv(fd, buf + got, len - got, MSG_DONTWAIT);
+
+        if (n > 0) {
+            got += n;
+        } else if (n == 0) {
+            g_assert_not_reached(); /* the server never closes first */
+        } else {
+            g_usleep(1000);
+        }
+    }
+    g_assert_cmpuint(got, ==, len);
+}
+
+/* A non-blocking read on a drained stream must hit EAGAIN. */
+static void stix_tm_read_eagain(int fd, uint8_t *buf, size_t len)
+{
+    errno = 0;
+    g_assert_cmpint(recv(fd, buf, len, MSG_DONTWAIT), ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+}
+
+/*
+ * TM over TCP: with tmtc-server=on on a private port the test connects,
+ * sends the STIX_CONTROL token, waits for the accept, drives one TX and
+ * reads exactly the DMA'd bytes back — the wire format is unchanged
+ * (raw [SpW header][CCSDS packet], no length prefix, nothing else on
+ * the stream: a follow-up non-blocking read must hit EAGAIN). RED on
+ * the pre-P2-4 binary: the accept is not observable (no
+ * tmtc-connected) and the bounded wait times out.
+ */
+static void test_tm_tcp(void)
+{
+    const uint8_t expect[8] = {
+        0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44
+    };
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[64];
+    QTestState *qts;
+    int fd, port;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    fd = stix_tm_connect(port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+
+    /* drive one TX exactly like spw-tx: 8 payload bytes */
+    qtest_writel(qts, TXDATA_ADDR, 0xaabbccddu);
+    qtest_writel(qts, TXDATA_ADDR + 4, 0x11223344u);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    stix_drive_tx(qts, 8);
+
+    /* read the DMA'd bytes back: non-blocking, bounded */
+    stix_tm_read_exact(fd, buf, sizeof(expect));
+    g_assert_cmpint(memcmp(buf, expect, sizeof(expect)), ==, 0);
+
+    /* nothing else on the stream: a non-blocking read must hit EAGAIN */
+    stix_tm_read_eagain(fd, buf, sizeof(buf));
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * A stalled client must not block the guest or the qtest. The client
+ * sets a small SO_RCVBUF and never reads; 2000 x 4 KiB TXes overflow
+ * the socket buffers and the 256 KiB out-queue many times over. Every
+ * qtest round trip must keep returning — a hang would leave the loop
+ * stuck inside one command, and the outer qt.sh timeout bounds that —
+ * and tm-dropped must be > 0 afterwards. Every TX carries its number
+ * in the first data word (the wire carries the guest's DMA'd bytes
+ * verbatim, the mapping test_tm_tcp pins), so the drained stream can
+ * be parsed on whole-packet boundaries: only whole 4096-byte packets,
+ * strictly increasing numbers, gaps only from drops, and nothing
+ * lost silently (received + dropped == sent) — the no-split
+ * invariant the GS bridge's CCSDS splitter depends on. RED on the
+ * pre-P2-4 binary: tmtc-connected is unknown (the direct probe showed
+ * the old transport hanging the whole of QEMU after 8 such TXes).
+ */
+#define TM_STALLED_PKT 4096
+#define TM_STALLED_TXES 2000
+#define TM_STALLED_STREAM (4u * 1024 * 1024)
+#define TM_STALLED_QUIET_US (500 * 1000)
+
+static void test_tm_stalled_client(void)
+{
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    g_autofree uint8_t *payload = g_malloc(TM_STALLED_PKT);
+    g_autofree uint8_t *stream = g_malloc(TM_STALLED_STREAM);
+    QTestState *qts;
+    gint64 hard_deadline, quiet_deadline;
+    size_t total, off, units;
+    int64_t dropped;
+    int fd, port, i, last_seq;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    fd = stix_tm_connect(port, true);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+
+    for (i = 0; i < TM_STALLED_PKT; i++) {
+        payload[i] = (uint8_t)(i ^ 0xa5);
+    }
+    qtest_memwrite(qts, TXDATA_ADDR, payload, TM_STALLED_PKT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+
+    g_test_timer_start();
+    for (i = 0; i < TM_STALLED_TXES; i++) {
+        /* number the packet: its first data word */
+        qtest_writel(qts, TXDATA_ADDR, (uint32_t)i);
+        stix_drive_tx(qts, TM_STALLED_PKT);
+        /* every round trip must keep returning */
+        qtest_readl(qts, SPW_STATUS);
+        g_assert_cmpfloat(g_test_timer_elapsed(), <, 60.0);
+    }
+
+    dropped = stix_qom_tm_dropped(qts, path);
+    g_assert_cmpint(dropped, >=, 0); /* the property exists */
+    g_assert_cmpint(dropped, >, 0);  /* and something was dropped */
+
+    /*
+     * Drain the stream and parse it on packet boundaries. The queue
+     * keeps draining while we read, so a single EAGAIN is not the end
+     * yet: stop after a short quiet period instead.
+     */
+    total = 0;
+    quiet_deadline = g_get_monotonic_time() + TM_STALLED_QUIET_US;
+    hard_deadline = g_get_monotonic_time() + 30 * G_TIME_SPAN_SECOND;
+    while (total < TM_STALLED_STREAM &&
+           g_get_monotonic_time() < hard_deadline &&
+           g_get_monotonic_time() < quiet_deadline) {
+        ssize_t n = recv(fd, stream + total, TM_STALLED_STREAM - total,
+                         MSG_DONTWAIT);
+
+        if (n > 0) {
+            total += n;
+            quiet_deadline = g_get_monotonic_time() + TM_STALLED_QUIET_US;
+        } else if (n == 0) {
+            g_assert_not_reached(); /* the server never closes first */
+        } else {
+            g_usleep(10 * 1000);
+        }
+    }
+
+    g_assert_cmpuint(total, >, 0);
+    /* no split packet on the wire after partial sends / drops */
+    g_assert_cmpuint(total % TM_STALLED_PKT, ==, 0);
+    units = 0;
+    last_seq = -1;
+    for (off = 0; off < total; off += TM_STALLED_PKT) {
+        const uint8_t *u = stream + off;
+        uint32_t seq = ((uint32_t)u[0] << 24) | ((uint32_t)u[1] << 16) |
+                       ((uint32_t)u[2] << 8) | u[3];
+
+        /* drops remove whole packets: gaps, never reordering */
+        g_assert_cmpint((int)seq, >, last_seq);
+        g_assert_cmpuint(seq, <, TM_STALLED_TXES);
+        g_assert_cmpint(memcmp(u + 4, payload + 4, TM_STALLED_PKT - 4),
+                        ==, 0);
+        last_seq = seq;
+        units++;
+    }
+    g_assert_cmpuint(units, >, 0);
+    /* nothing lost silently: the rest was dropped and counted */
+    g_assert_cmpuint(units + (size_t)dropped, ==, TM_STALLED_TXES);
+    g_test_message("tm-stalled-client: %zu whole packets received, "
+                   "%" PRId64 " dropped", units, dropped);
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * One client at a time, and the accept is re-armed on disconnect: A
+ * connects; B completes its handshake through the backlog and waits
+ * there; a TX reaches A only (B's socket stays empty). A disconnects,
+ * the transport accepts B and the next TX reaches B byte-exactly,
+ * with nothing else on its stream. All waits are bounded. While B
+ * waits in the backlog the accept handler must not busy-spin the main
+ * loop (the P2-4-review M1): it is unregistered while a client is
+ * connected. The spin itself is not observable from a qtest — its RED
+ * evidence is a /proc CPU-time probe, kept out of the suite on
+ * purpose (see accepted-diffs §17).
+ */
+static void test_tm_reconnect(void)
+{
+    const uint8_t expect_a[8] = {
+        0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44
+    };
+    const uint8_t expect_b[8] = {
+        0xde, 0xad, 0xbe, 0xef, 0x55, 0x66, 0x77, 0x88
+    };
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[64];
+    QTestState *qts;
+    bool saw_false;
+    int fd_a, fd_b, port;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    fd_a = stix_tm_connect(port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+
+    /* B's handshake completes in the kernel; B waits in the backlog */
+    fd_b = stix_tm_connect(port, false);
+
+    /* one TX: A takes it, B's socket stays empty */
+    qtest_writel(qts, TXDATA_ADDR, 0xaabbccddu);
+    qtest_writel(qts, TXDATA_ADDR + 4, 0x11223344u);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    stix_drive_tx(qts, 8);
+    stix_tm_read_exact(fd_a, buf, sizeof(expect_a));
+    g_assert_cmpint(memcmp(buf, expect_a, sizeof(expect_a)), ==, 0);
+    stix_tm_read_eagain(fd_b, buf, sizeof(buf));
+
+    /* A goes away: the accept is re-armed and takes B from the backlog */
+    close(fd_a);
+    saw_false = stix_wait_tmtc_state(qts, path, false, G_TIME_SPAN_SECOND);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+    if (!saw_false) {
+        g_test_message("tmtc-connected never showed false: the "
+                       "disconnect and the new accept beat one poll "
+                       "interval");
+    }
+
+    /* the next TX is byte-exact on B, and again nothing else */
+    qtest_writel(qts, TXDATA_ADDR, 0xdeadbeefu);
+    qtest_writel(qts, TXDATA_ADDR + 4, 0x55667788u);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    stix_drive_tx(qts, 8);
+    stix_tm_read_exact(fd_b, buf, sizeof(expect_b));
+    g_assert_cmpint(memcmp(buf, expect_b, sizeof(expect_b)), ==, 0);
+    stix_tm_read_eagain(fd_b, buf, sizeof(buf));
+
+    close(fd_b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1994,6 +2428,10 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/flash-create-error",
                        test_flash_create_error);
         qtest_add_func("/sparc/stix/spw-regs", test_spw_regs);
+        qtest_add_func("/sparc/stix/tm-tcp", test_tm_tcp);
+        qtest_add_func("/sparc/stix/tm-stalled-client",
+                       test_tm_stalled_client);
+        qtest_add_func("/sparc/stix/tm-reconnect", test_tm_reconnect);
     }
 
     return g_test_run();

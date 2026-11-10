@@ -60,11 +60,12 @@ stixspw_irq_latched(void) "IRQ event latched: control.IE=0"
 stixspw_irq_deferred(void) "latched IRQ pulsed on control.IE 0->1"
 
 # tmtc_io_server.c (STIX)
-stixtmtc_wait_client(void) "Waiting for TC client..."
 stixtmtc_accept_failed(void) "accept failed"
 stixtmtc_client_connected(const char *addr, int port) "Client connected from: %s:%d"
 stixtmtc_recv_error(int err) "receive error: %d"
 stixtmtc_client_disconnected(void) "TC client disconnected"
 stixtmtc_tm_send(void) "sending a packet!!!!"
 stixtmtc_socket_closed(void) "Error: socket is closed"
+stixtmtc_tm_dropped(uint32_t len) "TM packet dropped whole: out-queue full (len=%u)"
+stixtmtc_token_stripped(void) "STIX_CONTROL token stripped"
 stixtmtc_listening(int port) "IOTCPSERVER - Server listening on port: %d"
