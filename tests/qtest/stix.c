@@ -2508,6 +2508,29 @@ static int64_t stix_qom_tc_resync(QTestState *qts, const char *path)
 }
 
 /*
+ * qom-set a bool property; false when refused. (%s inserts a JSON
+ * string in libqtest's format, so the boolean itself must be a
+ * literal.)
+ */
+static bool stix_qom_set_bool(QTestState *qts, const char *path,
+                              const char *prop, bool value)
+{
+    QDict *resp = qtest_qmp(qts,
+                            value
+                            ? "{'execute': 'qom-set',"
+                              " 'arguments': {'path': %s, 'property': %s,"
+                              " 'value': true}}"
+                            : "{'execute': 'qom-set',"
+                              " 'arguments': {'path': %s, 'property': %s,"
+                              " 'value': false}}",
+                            path, prop);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+/*
  * RX descriptor DMA (P2-5, FSW-RX §2): units injected through the
  * qtest-only rx-inject property are DMA'd into the armed descriptor,
  * the ctrl word comes back with the length (EN cleared, WR/IE kept),
@@ -2958,6 +2981,180 @@ static void test_tc_tcp(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P2-7: SpW time codes from the CTRL SCET (spw-timecode) ---- */
+
+#define SPW_TIME (SPW_BASE + 0x14u)
+#define SPW_STATUS_TO (1u << 0)
+#define SPW_CTRL_TQ (1u << 8)
+#define SPW_CTRL_TR (1u << 11)
+/* the FSW's control value in the golden stdout: NP|TR|LI|TQ|IE|AS */
+#define SPW_CTRL_FSW 0x100b0cu
+
+/*
+ * Step the virtual clock to just past the next SCET coarse rollover;
+ * a 10 ms margin keeps the SCET fine field under 0x1000 (62.5 ms) at
+ * fire time, inside D-J's emit window.
+ */
+static void tc_step_rollover(QTestState *qts)
+{
+    int64_t ns_into = (int64_t)ctrl_sub(qts) * NSEC_PER_SEC / 65536;
+
+    qtest_clock_step(qts, NSEC_PER_SEC - ns_into + 10 * 1000 * 1000);
+}
+
+/*
+ * D-J: the SPW generates a time code at each SCET second rollover with
+ * TIMECNT = new coarse & 63 (TCTRL 7:6 = 0), only when control.TR is
+ * set, only in the first 1/16 s of the second (fine < 0x1000 — a
+ * mid-second code would drag the synchronised FSW clock,
+ * Timing.c:199-328). It latches status.TO and raises IRQ 13 when
+ * control.TQ is set, gated by control.IE with the D-M latch. The SCET
+ * comes from the CTRL device (the scet-source link); a guest 0xC8/0xCC
+ * commit moves the rollover (correction 6, the commit hook), and the
+ * timer survives a system reset (correction 16). RED on the pre-P2-7
+ * binary: no TO at the rollover.
+ */
+static void test_spw_timecode(void)
+{
+    g_autofree gchar *path = NULL;
+    QTestState *qts;
+    uint32_t coarse, time;
+    bool ok;
+
+    qts = stix_qtest_new();
+    path = stix_spw_path(qts);
+
+    /* the FSW's control value (golden stdout) */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+
+    /* a. a rollover emits: TO, TIMECNT = coarse & 63, TCTRL 0, IRQ 13 */
+    tc_step_rollover(qts);
+    coarse = ctrl_sec(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    time = qtest_readl(qts, SPW_TIME);
+    g_assert_cmpuint(time & 63u, ==, coarse & 63u);
+    g_assert_cmpuint((time >> 6) & 3u, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+
+    /*
+     * b. a TX in between (the spw-tx sequence) does not clear TO;
+     * writing 1 to TO does (W1C)
+     */
+    qtest_writel(qts, TXDATA_ADDR, 0xaabbccddu);
+    qtest_writel(qts, TXDATA_ADDR + 4, 0x11223344u);
+    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, TXDSC_ADDR + 4, 0);
+    qtest_writel(qts, TXDSC_ADDR + 8, 8);
+    qtest_writel(qts, TXDSC_ADDR + 12, TXDATA_ADDR);
+    qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_TE | SPW_DMA_TI);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO, ==, 0);
+
+    /*
+     * b2. the D-M path for TO (m4): a rollover with control.IE = 0 —
+     * the SPW_send window, SPW.c:707-731 — sets TO but no IRQ; the IE
+     * 0->1 write pulses the latch and TO is still there for the ISR
+     */
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_IE);
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, 0);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+
+    /* b3. TQ = 0 (m4): TO set and TIMECNT latched, but no IRQ */
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_TQ);
+    tc_step_rollover(qts);
+    coarse = ctrl_sec(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    time = qtest_readl(qts, SPW_TIME);
+    g_assert_cmpuint(time & 63u, ==, coarse & 63u);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, 0);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+
+    /* c. with control.TR = 0 a rollover gives no TO */
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_TR);
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO, ==, 0);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+
+    /* d. timecodes=false silences the generator; true re-arms it */
+    ok = stix_qom_set_bool(qts, path, "timecodes", false);
+    g_assert(ok);
+    tc_step_rollover(qts);
+    tc_step_rollover(qts);
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO, ==, 0);
+    ok = stix_qom_set_bool(qts, path, "timecodes", true);
+    g_assert(ok);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    tc_step_rollover(qts);
+    coarse = ctrl_sec(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    time = qtest_readl(qts, SPW_TIME);
+    g_assert_cmpuint(time & 63u, ==, coarse & 63u);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+
+    /*
+     * e. a guest SCET commit mid-second moves the rollover (correction
+     * 6): commit (0x12345678, fine 0x8000) and the next code comes
+     * 0.5 s later with the NEW coarse
+     */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x12345678u);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0x8000u);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_clock_step(qts, (int64_t)500 * 1000 * 1000 + 10 * 1000 * 1000);
+    coarse = ctrl_sec(qts);
+    g_assert_cmpuint(coarse, ==, 0x12345679u);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    time = qtest_readl(qts, SPW_TIME);
+    g_assert_cmpuint(time & 63u, ==, 0x12345679u & 63u);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+
+    /*
+     * f. across a system reset: the timer keeps running (QEMU timers
+     * are not deleted and the CTRL keeps its SCET correction), but TR
+     * cleared by the reset suppresses the code until the FSW re-writes
+     * control at SPW_open. (The reset's own re-arm is belt-and-braces:
+     * a surviving timer fires at the same rollover either way, so this
+     * case cannot distinguish it — it proves the timer is alive and
+     * silent while TR = 0, and emitting again after SPW_open.)
+     */
+    qtest_system_reset(qts);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO, ==, 0);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    tc_step_rollover(qts);
+    coarse = ctrl_sec(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    time = qtest_readl(qts, SPW_TIME);
+    g_assert_cmpuint(time & 63u, ==, coarse & 63u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -2998,6 +3195,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/tm-reconnect", test_tm_reconnect);
         qtest_add_func("/sparc/stix/spw-rx", test_spw_rx);
         qtest_add_func("/sparc/stix/tc-tcp", test_tc_tcp);
+        qtest_add_func("/sparc/stix/spw-timecode", test_spw_timecode);
     }
 
     return g_test_run();

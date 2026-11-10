@@ -15,8 +15,6 @@
 
 #define STIXCTRL_REG_SIZE sizeof(stixCtrlRegs_s) /* Size of memory mapped registers */ // TODO: Set to right size
 
-OBJECT_DECLARE_SIMPLE_TYPE(STIXCTRL, GRLIB_STIXCTRL)
-
 typedef struct
 {
   uint32_t coarse;
@@ -52,6 +50,12 @@ struct STIXCTRL
      * COMMITS (staged seconds, written subsec) as the new on-board time. */
     uint32_t staged_secs;
     uint32_t unsynced_flag;
+    /*
+     * D-J/correction 6: called after a 0xCC commit (the SPW re-arms
+     * its time-code timer at the moved rollover)
+     */
+    StixCtrlScetCommitFn scet_commit_fn;
+    void *scet_commit_opaque;
     /* Watchdog (0xD4), counted lazily from QEMU_CLOCK_VIRTUAL: while
      * running, COUNT = wdg_count - cycles elapsed since wdg_base_ns. */
     uint32_t wdg_reload;
@@ -101,6 +105,23 @@ static stixCtrl_scet_s nsToSCET(int64_t ns)
 	scet.fine = (uint16_t)(rem * STIX_SUBSEC_PER_SEC / STIX_NSEC_PER_SEC);
 
 	return scet;
+}
+
+/* D-J: the live SCET, without a guest register access (grlib_stix.h) */
+void stixctrl_scet_now(STIXCTRL *s, uint32_t *coarse, uint16_t *fine)
+{
+    stixCtrl_scet_s scet = nsToSCET(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                                    s->time_correction_ns);
+
+    *coarse = scet.coarse;
+    *fine = scet.fine;
+}
+
+void stixctrl_set_scet_commit_hook(STIXCTRL *s,
+                                   StixCtrlScetCommitFn fn, void *opaque)
+{
+    s->scet_commit_fn = fn;
+    s->scet_commit_opaque = opaque;
 }
 
 /* Watchdog, from the FSW driver (BSW WDT.c header comment, WDT.c,
@@ -376,6 +397,10 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
                                 / STIX_SUBSEC_PER_SEC;
             stixctrl->time_correction_ns = now -
                 ((int64_t)stixctrl->staged_secs * STIX_NSEC_PER_SEC + new_subns);
+            /* correction 6: the rollover moved; the SPW re-arms */
+            if (stixctrl->scet_commit_fn != NULL) {
+                stixctrl->scet_commit_fn(stixctrl->scet_commit_opaque);
+            }
         }
         trace_stixctrl_scet_write((uint32_t)addr, (uint32_t)value);
     }

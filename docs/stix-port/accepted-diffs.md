@@ -1025,3 +1025,87 @@ flag, so a TC without a data field header never reaches the FSW and
 cannot be used to provoke its TM(1,2) rejection.
 Green: `tc-tcp`, `spw-rx`, `tm-tcp`, and all 29 tests; boot-smoke;
 soak 300 s; checkpatch on the diff: 0 errors, 0 warnings.
+
+## 20. SpW time codes generated at the SCET rollover (baseline: none)
+
+**Baseline:** nothing ever set `status.TO` from a time source; the FSW
+never received a SpW time code. Its `Timing` task saw no code for 60 s,
+set the UNSYNCED flag itself (`IIR_setElapsedTime`) and sent
+TM(5,2) EID 0x542B "time code lost"; the golden's 60 s SCET write is
+that path.
+
+**Model (P2-7, D-J):** QEMU plays the spacecraft OBC — the time master
+on the real mission — so the time codes are generated in QEMU, on
+`QEMU_CLOCK_VIRTUAL`, not by the ground or a bridge:
+- The SPW device holds a `scet-source` QOM link to the CTRL device
+  (wired in `leon3.c` before realize); `timecodes=on` without the link
+  fails realize with `errp`. The SCET is read through the new
+  `stixctrl_scet_now()` accessor (grlib_stix.h), the same formula as
+  the 0xC8 read; the coarse without the UNSYNCED bit is fine for
+  TIMECNT. Correction 7 moved `OBJECT_DECLARE_SIMPLE_TYPE(STIXCTRL,
+  GRLIB_STIXCTRL)` into `grlib_stix.h` so the link is typed.
+- A `QEMU_CLOCK_VIRTUAL` timer fires at the next coarse rollover (the
+  CTRL fine field gives the offset into the running second). On fire:
+  if fine >= 0x1000 the code is **not** emitted and the timer
+  reschedules to the true next rollover (traced) — the skip covers a
+  timer callback that ran more than 62.5 ms late, which is possible
+  without -icount when the main loop is starved; a synchronised FSW
+  would adjust SCET toward such a code (`Timing.c:199-328`). A guest
+  SCET set cannot reach this path: every 0xCC commit re-arms the timer
+  through the hook below. Otherwise, and only when control.TR (bit 11)
+  is set, it latches `time = coarse & 63` (TIMECNT bits 5:0, TCTRL
+  7:6 = 0), sets `status.TO` and raises IRQ 13 when control.TQ (bit 8)
+  is set — gated by control.IE with the D-M latch, like RX and TX.
+  Then it schedules the next rollover. Traces:
+  `stixspw_timecode_emit`, `stixspw_timecode_skip`,
+  `stixspw_timecode_arm`.
+- **The commit hook (correction 6):** after a guest 0xC8/0xCC commit
+  the CTRL calls a registered callback (`stixctrl_set_scet_commit_hook`,
+  internal API in `grlib_stix.h`); the SPW re-arms its timer, so the
+  next code comes at the NEW rollover with the new coarse & 63 — exact
+  after TC(9,129) too.
+- **The `timecodes` property (correction 8):** default on,
+  `object_property_add_bool` in instance_init, so it is settable at
+  run time (`qom-set`) as well as before realize. `false` deletes the
+  timer (a lost time code), `true` re-arms it.
+- **Reset (correction 16):** the timer survives a system reset — QEMU
+  timers are not deleted, and the CTRL keeps its
+  `time_correction_ns`, so the SCET keeps running. The SPW reset also
+  re-arms; that is belt-and-braces (a surviving timer fires at the
+  same rollover either way). TR cleared by the reset suppresses codes
+  until the FSW re-writes control at `SPW_open`.
+
+**tc-smoke extension:** after the corrupt-CRC check it sends
+TC(9,129) coarse 0x10000000 fine 0 (seq 2, the recon's bytes
+`40 02 00 00 1D AC C0 02 00 0B 19 09 81 00 10 00 00 00 00 00 FA 63`)
+and expects TM(1,7) `0x5A1:1:7:1DACC002@3` (the `@3` tightens that
+one expectation to 3 s) plus a later heartbeat whose CUC coarse shows
+the new SCET. The FSW's TM carries the SCET as CUC time in the PUS TM
+data field header: coarse = SP[10:14] big-endian (unit bytes 14:18),
+fine = SP[14:16] — confirmed on the real heartbeat stream (APID 0x5E5,
+type 3 subtype 25, coarse +1 per second); `--expect-cuc 0x5E5:1000000`
+hex-prefix-matches it. The probe self-test pins the offset with the
+real units.
+
+**Expected FSW change:** with a time code at every second, the FSW
+boots "synced", never logs TM(5,2) EID 0x542B "time code lost" at
+60 s, and never performs the 60 s SCET write; the golden UART should
+only lose those time-sync lines — any other diff is a stop condition.
+Gates: see the reviewer's run.
+
+**Evidence:** qtest `/sparc/stix/spw-timecode`: (a) a rollover sets
+`status.TO` with `time & 63 == coarse & 63` and TCTRL 0, IRQ 13
+pending; (b) a TX in between (the spw-tx sequence) does not clear TO,
+a write-1 does; (b2) a rollover with control.IE = 0 sets TO with no
+IRQ and the IE 0->1 write pulses the latch (the `SPW_send` window);
+(b3) with control.TQ = 0, TO set and TIMECNT latched but no IRQ;
+(c) with control.TR = 0 a rollover gives no TO; (d) `qom-set
+timecodes false` silences three rollovers, `true` re-arms; (e) a
+guest SCET commit mid-second (0xC8/0xCC, as `test_ctrl_scet` does it)
+moves the next code to the new rollover with the new coarse & 63
+(correction 6); (f) after `qtest_system_reset` the timer is alive but
+silent while TR = 0, and emits again after the control write. Red on
+the pre-P2-7 binary: the first rollover gave no TO (`status.TO == 0`).
+Green: `spw-timecode`, `ctrl-scet`, `ctrl`, `spw-regs`, `spw-tx`,
+`spw-rx`, `tc-tcp`, and all 30 tests. checkpatch on the diff: 0
+errors, 0 warnings.

@@ -12,6 +12,8 @@
 #ifndef HW_SPARC_GRLIB_STIX_H
 #define HW_SPARC_GRLIB_STIX_H
 
+#include "qom/object.h"
+
 /* STIX FLASH (FTNANDCTRL register emulation) */
 #define TYPE_GRLIB_STIXFLASH "grlib-stixflash"
 
@@ -26,6 +28,30 @@
 
 /* STIX SDRAM controller register stub (model repair commit) */
 #define TYPE_GRLIB_STIXSDRAM "grlib-stixsdram"
+
+/*
+ * The CTRL instance type lives here (correction 7) so the SPW device
+ * can hold a typed scet-source link to it; the struct itself stays in
+ * grlib_stixctrl.c.
+ */
+OBJECT_DECLARE_SIMPLE_TYPE(STIXCTRL, GRLIB_STIXCTRL)
+
+/*
+ * D-J: the SCET the CTRL device would report right now — the same
+ * formula as the 0xC8/0xCC register read, without a guest access.
+ * *coarse is the seconds field without the UNSYNCED status bit.
+ */
+void stixctrl_scet_now(STIXCTRL *s, uint32_t *coarse, uint16_t *fine);
+
+/*
+ * D-J / correction 6: a callback invoked after the guest commits a new
+ * on-board time (the CTRL 0xCC write), so the SPW time-code timer can
+ * re-arm at the moved rollover. Single subscriber: the last
+ * registration replaces the previous one (the machine has one SPW).
+ */
+typedef void (*StixCtrlScetCommitFn)(void *opaque);
+void stixctrl_set_scet_commit_hook(STIXCTRL *s,
+                                   StixCtrlScetCommitFn fn, void *opaque);
 
 /* The IDPU's custom devices were (deliberately, like-for-like with the
  * 2022 model) registered in the AMBA PnP table under the FTMCTRL device

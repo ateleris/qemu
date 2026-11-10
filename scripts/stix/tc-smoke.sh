@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# TC smoke: the end-to-end TC gate (P2-6). Boots the STIX model with the
-# ASW ELF exactly like boot-smoke.sh (same run dir, same port, same
-# one-QEMU guard), sends TC(17,1) seq 0 at ~20 s and expects, within
-# STIX_TC_WINDOW (10 s):
+# TC smoke: the end-to-end TC gate (P2-6/P2-7). Boots the STIX model
+# with the ASW ELF exactly like boot-smoke.sh (same run dir, same port,
+# same one-QEMU guard), sends TC(17,1) seq 0 at ~20 s and expects,
+# within STIX_TC_WINDOW (10 s):
 #   TM(1,1)  on APID 0x5A1 with the application-data prefix 1DACC000
 #   TM(17,2) on APID 0x5A7
 #   TM(1,7)  on APID 0x5A1 with the application-data prefix 1DACC000
 # then sends a TC(17,1) whose CRC trailer is corrupted and expects
-# TM(1,2) on 0x5A1. Expectations key on APID and PUS type/subtype
-# (correction 5), never on the 0x49 SpW header byte (findings F1).
+# TM(1,2) keyed on FID 2, then TC(9,129) (coarse 0x10000000) and
+# expects TM(1,7) for it within 3 s plus a later heartbeat whose CUC
+# coarse (SP[10:14]) shows the new SCET 0x1000000x. Expectations key
+# on APID and PUS type/subtype (correction 5), never on the 0x49 SpW
+# header byte (findings F1).
 #
 # QEMU is stopped at the end; flash.bin is left in place.
 #
@@ -46,6 +49,18 @@ QEMU_BIN="$(realpath -e "$QEMU_BIN_ARG")" || {
 TC0="40 02 00 00 1D AC C0 00 00 05 19 11 01 00 D7 7E"
 TC1BAD="40 02 00 00 1D AC C0 01 00 05 19 11 01 00 12 34"
 
+# TC(9,129) "Accept Time Synchronisation" (FSW-RX §6): coarse
+# 0x10000000, fine 0. seq 2 is free (TC0 = seq 0, the corrupt one =
+# seq 1), so the bytes are exactly the recon's, CRC FA 63 included.
+# The FSW answers TM(1,7) with TCPacketID+SeqCtl 1DACC002 (the @3
+# tightens that expectation's window to 3 s), and its heartbeats then
+# carry the new SCET. The FSW's TM carries the SCET as CUC time in the
+# PUS TM data field header: coarse = SP[10:14] big-endian (unit bytes
+# 14:18), fine = SP[14:16] — real heartbeats tick coarse +1 per second.
+# --expect-cuc hex-prefix-matches the coarse: "1000000" = 0x1000000x,
+# a few seconds after the set.
+TC9="40 02 00 00 1D AC C0 02 00 0B 19 09 81 00 10 00 00 00 00 00 FA 63"
+
 # Integer seconds only: the schedule arithmetic below needs it.
 for v in "$SEND_AT" "$WINDOW" "$DURATION"; do
     case "$v" in
@@ -56,10 +71,12 @@ for v in "$SEND_AT" "$WINDOW" "$DURATION"; do
     esac
 done
 SEND2=$((SEND_AT + WINDOW + 2))
+SEND3=$((SEND2 + WINDOW + 2))
 # the whole schedule must fit the probe's own --seconds window
-if [ "$DURATION" -lt "$((SEND2 + WINDOW + 2))" ]; then
-    echo "STIX_TC_SECONDS ($DURATION) is shorter than the schedule (send2 at ${SEND2}s + window ${WINDOW}s); raising it"
-    DURATION=$((SEND2 + WINDOW + 5))
+if [ "$DURATION" -lt "$((SEND3 + WINDOW + 2))" ]; then
+    echo "STIX_TC_SECONDS ($DURATION) too short for send3 at ${SEND3}s"
+    echo "raising STIX_TC_SECONDS to $((SEND3 + WINDOW + 5))"
+    DURATION=$((SEND3 + WINDOW + 5))
 fi
 
 PROBE_ARGS=(
@@ -70,6 +87,9 @@ PROBE_ARGS=(
     --expect "0x5A1:1:7:1DACC000"
     --send-at "$SEND2" --send-hex "$TC1BAD"
     --expect "0x5A1:1:2:1DACC0010002"
+    --send-at "$SEND3" --send-hex "$TC9"
+    --expect "0x5A1:1:7:1DACC002@3"
+    --expect-cuc "0x5E5:1000000"
 )
 
 if [ "$DRY_RUN" = "--dry-run" ]; then

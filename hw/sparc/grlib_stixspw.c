@@ -4,6 +4,7 @@
 #include "hw/sparc/grlib_stix.h"
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "chardev/char-fe.h"
 #include "qapi/error.h"
 #include "qapi/qapi-types-common.h"
@@ -119,6 +120,15 @@ struct STIXSPW
     uint8_t *rx_queue[SPW_RX_QUEUE_LEN];
     size_t rx_qlen[SPW_RX_QUEUE_LEN];
     uint32_t rx_dropped; /* units dropped when the queue was full */
+
+    /*
+     * D-J: time codes generated at the SCET second rollover. The
+     * scet-source link (set in leon3.c) is the CTRL device the SCET
+     * comes from; timecodes is runtime-settable (qom-set).
+     */
+    STIXCTRL *scet_ctrl;
+    bool timecodes;
+    QEMUTimer *tc_timer;
 
     /*
      * TMTC transport state (D-N); the fds are -1 while the server is
@@ -323,6 +333,87 @@ static void stixspw_rx_retry(STIXSPW *s)
         s->rx_head = (s->rx_head + 1) % SPW_RX_QUEUE_LEN;
         s->rx_count--;
     }
+}
+
+/* D-J: the SCET fine field counts 1/65536 s ticks */
+#define STIXSPW_SUBSEC_PER_SEC 65536LL
+#define STIXSPW_NSEC_PER_SEC 1000000000LL
+
+/*
+ * D-J: arm the time-code timer at the next SCET coarse rollover; the
+ * CTRL's fine field gives the offset into the running second.
+ */
+static void stixspw_tc_arm(STIXSPW *s)
+{
+    uint32_t coarse;
+    uint16_t fine;
+    int64_t now, ns_into;
+
+    /* m3: pre-realize (or timecodes=off) there is nothing to arm */
+    if (!s->timecodes || s->scet_ctrl == NULL || s->tc_timer == NULL) {
+        return;
+    }
+    stixctrl_scet_now(s->scet_ctrl, &coarse, &fine);
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    ns_into = fine * STIXSPW_NSEC_PER_SEC / STIXSPW_SUBSEC_PER_SEC;
+    timer_mod_ns(s->tc_timer, now + STIXSPW_NSEC_PER_SEC - ns_into);
+    trace_stixspw_timecode_arm(coarse, fine,
+                               STIXSPW_NSEC_PER_SEC - ns_into);
+}
+
+/* correction 6: the guest committed a new on-board time (0xCC) */
+static void stixspw_scet_committed(void *opaque)
+{
+    stixspw_tc_arm(opaque);
+}
+
+/*
+ * D-J: the time-code timer fired at a coarse rollover. A code is
+ * emitted only in the first 1/16 s of the new second (fine < 0x1000 —
+ * a mid-second code would drag the synchronised FSW clock,
+ * Timing.c:199-328) and only when control.TR is set; it latches
+ * time = TIMECNT (bits 5:0, TCTRL 7:6 = 0), sets status.TO and raises
+ * IRQ 13 when control.TQ is set, gated by control.IE per D-M.
+ */
+static void stixspw_tc_timer(void *opaque)
+{
+    STIXSPW *s = opaque;
+    uint32_t coarse;
+    uint16_t fine;
+
+    if (!s->timecodes) {
+        return; /* silenced at run time; the property re-arms */
+    }
+
+    stixctrl_scet_now(s->scet_ctrl, &coarse, &fine);
+    if (fine >= 0x1000) {
+        /*
+         * m5: the callback ran more than 62.5 ms late — possible
+         * without -icount when the main loop is starved. A code
+         * emitted now would drag the synchronised FSW clock
+         * (Timing.c:199-328): one second is lost and the re-arm emits
+         * at the next rollover. A guest SCET set cannot reach this
+         * path — every 0xCC commit re-arms through the hook.
+         */
+        trace_stixspw_timecode_skip(coarse, fine);
+        stixspw_tc_arm(s);
+        return;
+    }
+
+    if (s->reg.control & (1u << STIXSPW_CONTROL_TR)) {
+        s->reg.time = coarse & 63u;
+        s->reg.status |= (1u << STIXSPW_STATUS_TO);
+        trace_stixspw_timecode_emit(coarse, s->reg.time);
+        if (s->reg.control & (1u << STIXSPW_CONTROL_TQ)) {
+            if (s->reg.control & (1u << STIXSPW_CONTROL_IE)) {
+                qemu_irq_pulse(s->irq);
+            } else {
+                s->irq_latched = true;
+                trace_stixspw_irq_latched();
+            }
+        }
+    }
+    stixspw_tc_arm(s);
 }
 
 #define STIXSPW_REG_WORDS (sizeof(stixSpwRegs_s) / sizeof(uint32_t))
@@ -555,6 +646,18 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     STIXSPW *STIXSPW = GRLIB_STIXSPW(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    /*
+     * D-J: the time-code source is the CTRL device (the scet-source
+     * link, set in leon3.c before realize). Checked first, so a failed
+     * realize leaks nothing (P2-7 review m2): the TMTC server below
+     * starts only after this point.
+     */
+    if (STIXSPW->timecodes && STIXSPW->scet_ctrl == NULL) {
+        error_setg(errp,
+                   "grlib-stixspw: timecodes=on needs the scet-source link");
+        return;
+    }
+
     sysbus_init_irq(sbd, &STIXSPW->irq);
 
     memory_region_init_io(&STIXSPW->iomem, OBJECT(STIXSPW), &grlib_stixspw_ops, STIXSPW, "STIXSPW", STIXSPW_REG_SIZE);
@@ -581,12 +684,34 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
             return;
         }
     }
+
+    STIXSPW->tc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixspw_tc_timer,
+                                     STIXSPW);
+    if (STIXSPW->timecodes) {
+        stixspw_tc_arm(STIXSPW);
+    }
+    if (STIXSPW->scet_ctrl != NULL) {
+        /*
+         * m1: no link, no hook — timecodes=off with no link must not
+         * dereference NULL
+         */
+        stixctrl_set_scet_commit_hook(STIXSPW->scet_ctrl,
+                                      stixspw_scet_committed, STIXSPW);
+    }
 }
 
 static void grlib_stixspw_unrealize(DeviceState *dev)
 {
     STIXSPW *STIXSPW = GRLIB_STIXSPW(dev);
 
+    if (STIXSPW->scet_ctrl != NULL) {
+        stixctrl_set_scet_commit_hook(STIXSPW->scet_ctrl, NULL, NULL);
+    }
+    if (STIXSPW->tc_timer != NULL) {
+        timer_del(STIXSPW->tc_timer);
+        timer_free(STIXSPW->tc_timer);
+        STIXSPW->tc_timer = NULL;
+    }
     stix_tmtc_cleanup(&STIXSPW->tmtc);
     stixspw_rx_queue_clear(STIXSPW);
 }
@@ -655,6 +780,26 @@ static void grlib_stixspw_set_rx_inject(Object *obj, const char *value,
     stixspw_rx_deliver(s, buf, (int)len);
 }
 
+static bool grlib_stixspw_get_timecodes(Object *obj, Error **errp)
+{
+    return GRLIB_STIXSPW(obj)->timecodes;
+}
+
+static void grlib_stixspw_set_timecodes(Object *obj, bool value, Error **errp)
+{
+    STIXSPW *s = GRLIB_STIXSPW(obj);
+
+    s->timecodes = value;
+    if (!value) {
+        if (s->tc_timer != NULL) {
+            timer_del(s->tc_timer);
+        }
+    } else {
+        /* pre-realize the timer does not exist yet; realize arms */
+        stixspw_tc_arm(s);
+    }
+}
+
 static void grlib_stixspw_instance_init(Object *obj)
 {
     STIXSPW *STIXSPW = GRLIB_STIXSPW(obj);
@@ -662,6 +807,7 @@ static void grlib_stixspw_instance_init(Object *obj)
     /* no fd 0: the transport is off until realize starts it */
     STIXSPW->tmtc.listen_fd = -1;
     STIXSPW->tmtc.client_fd = -1;
+    STIXSPW->timecodes = true;
 
     object_property_add_uint32_ptr(obj, "tm-dropped",
                                    &STIXSPW->tmtc.tm_dropped,
@@ -676,6 +822,13 @@ static void grlib_stixspw_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READ);
     object_property_add_str(obj, "rx-inject", NULL,
                             grlib_stixspw_set_rx_inject);
+    /*
+     * correction 8: object_property_add_bool in instance_init, so it
+     * is settable at run time (qom-set), not only before realize
+     */
+    object_property_add_bool(obj, "timecodes",
+                             grlib_stixspw_get_timecodes,
+                             grlib_stixspw_set_timecodes);
 }
 
 static void grlib_stixspw_reset(DeviceState *d)
@@ -692,11 +845,20 @@ static void grlib_stixspw_reset(DeviceState *d)
     STIXSPW->irq_latched = false;
     stixspw_rx_queue_clear(STIXSPW);
     STIXSPW->rx_index = 0;
+
+    /*
+     * D-J (correction 16): the time-code timer survives a reset — the
+     * SCET keeps running (the CTRL keeps its correction), so re-arm at
+     * the next rollover; the FSW re-writes control at SPW_open.
+     */
+    stixspw_tc_arm(STIXSPW);
 }
 
 static const Property grlib_stixspw_properties[] = {
     DEFINE_PROP_ON_OFF_AUTO("tmtc-server", STIXSPW, tmtc_server, ON_OFF_AUTO_AUTO),
     DEFINE_PROP_UINT32("tmtc-port", STIXSPW, tmtc_port, 0),
+    DEFINE_PROP_LINK("scet-source", STIXSPW, scet_ctrl,
+                     TYPE_GRLIB_STIXCTRL, STIXCTRL *),
 };
 
 static void grlib_stixspw_class_init(ObjectClass *klass, const void *data)

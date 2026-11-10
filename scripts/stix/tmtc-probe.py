@@ -89,17 +89,42 @@ def unit_fields(unit):
     return apid, sp[7], sp[8], sp[off:]
 
 
-class Expect:
+class Expectation:
+    """Base for every expectation kind. Everything run_gate's verdict
+    loop reads (window, ok, __str__) lives here, so a new kind cannot
+    miss it (P2-7 review B1). An optional "@SECONDS" suffix tightens
+    one expectation's window; the group's --window remains the
+    default."""
+
     def __init__(self, spec):
-        parts = spec.split(":", 3)
+        self.full = spec
+        self.window = None
+        body = spec
+        if "@" in spec:
+            body, w = spec.rsplit("@", 1)
+            self.window = float(w)
+        self._parse(body)
+        self.ok = False
+
+    def _parse(self, body):
+        raise NotImplementedError
+
+    def matches(self, unit):
+        raise NotImplementedError
+
+    def __str__(self):
+        return self.full
+
+
+class Expect(Expectation):
+    def _parse(self, body):
+        parts = body.split(":", 3)
         if len(parts) < 3:
-            raise ValueError("expect needs APID:TYPE:SUBTYPE[:DATAHEX]")
-        self.spec = spec
+            raise ValueError("expect needs APID:TYPE:SUBTYPE[:DATAHEX][@S]")
         self.apid = int(parts[0], 0)
         self.ptype = int(parts[1], 0)
         self.subtype = int(parts[2], 0)
         self.data = bytes.fromhex(parts[3]) if len(parts) > 3 else None
-        self.ok = False
 
     def matches(self, unit):
         fields = unit_fields(unit)
@@ -110,8 +135,27 @@ class Expect:
             return False
         return self.data is None or app[:len(self.data)] == self.data
 
-    def __str__(self):
-        return self.spec
+
+class CucExpect(Expectation):
+    """The SCET the FSW carries as CUC time in the PUS TM data field
+    header: coarse = SP[10:14] big-endian (unit bytes 14:18 — the unit
+    starts with the 4-byte SpW header), fine = SP[14:16]. Confirmed on
+    real heartbeats, whose coarse ticks +1 per second. Matches a TM
+    unit with @apid whose coarse hex starts with @prefix — '1000000'
+    matches 0x10000000..0x1000000F, 'a few seconds after the set'."""
+
+    def _parse(self, body):
+        apid, prefix = body.split(":", 1)
+        self.apid = int(apid, 0)
+        self.prefix = prefix.lower()
+
+    def matches(self, unit):
+        fields = unit_fields(unit)
+        if fields is None:
+            return False
+        if fields[0] != self.apid:
+            return False
+        return unit[14:18].hex().startswith(self.prefix)
 
 
 class OpAction(argparse.Action):
@@ -138,6 +182,8 @@ def build_groups(args):
                            "expects": [], "sent": False, "t_sent": None})
         elif op == "--expect":
             groups[-1]["expects"].append(Expect(val))
+        elif op == "--expect-cuc":
+            groups[-1]["expects"].append(CucExpect(val))
     return groups
 
 
@@ -164,10 +210,16 @@ def make_parser():
     ap.add_argument("--send-hex", action=OpAction, metavar="HEX",
                     help="a TC unit to send (repeatable)")
     ap.add_argument("--expect", action=OpAction,
-                    metavar="APID:TYPE:SUBTYPE[:DATAHEX]",
+                    metavar="APID:TYPE:SUBTYPE[:DATAHEX][@SECONDS]",
                     help="a TM expectation, keyed on APID and PUS "
                          "type/subtype plus an optional application-data "
-                         "prefix (repeatable)")
+                         "prefix and an optional per-expectation window "
+                         "(repeatable)")
+    ap.add_argument("--expect-cuc", action=OpAction,
+                    metavar="APID:HEXPREFIX",
+                    help="a TM expectation on the CUC coarse time in the "
+                         "TM data field header (SP[10:14]), hex-prefix "
+                         "match (repeatable)")
     ap.add_argument("--self-test", action="store_true",
                     help="run the framer self-test and exit")
     # B1 of the P2-6 review: ops must exist even when no gate option is
@@ -178,6 +230,31 @@ def make_parser():
 
 def ts():
     return time.strftime("%H:%M:%S")
+
+
+def verdict(groups, group_window, now, t0):
+    """The run_gate verdict computation: (all_matched, failed).
+
+    Factored out so the self-test can run it over a mixed group (the
+    P2-7 review B1): every attribute the loop reads — window, ok,
+    __str__ — must exist on every expectation kind.
+    """
+    all_matched = True
+    failed = []
+    for g in groups:
+        if g["hex"] is not None and not g["sent"]:
+            all_matched = False
+        # m2 of the P2-6 review: the connect-time group binds to t0
+        # with its own window
+        start = g["t_sent"] if g["hex"] is not None else t0
+        ready = g["sent"] if g["hex"] is not None else True
+        for e in g["expects"]:
+            if not e.ok:
+                all_matched = False
+                win = e.window if e.window is not None else group_window
+                if ready and now > start + win:
+                    failed.append(e)
+    return all_matched, failed
 
 
 def run_gate(sock, args, groups):
@@ -227,20 +304,7 @@ def run_gate(sock, args, groups):
                                   f"(unit len={len(unit)})", flush=True)
         # verdicts: all matched -> pass; any deadline passed with an
         # unmatched expectation -> fail
-        all_matched = True
-        failed = []
-        for g in groups:
-            if g["hex"] is not None and not g["sent"]:
-                all_matched = False
-            # m2: the connect-time group binds to t0 with its own window
-            start = g["t_sent"] if g["hex"] is not None else t0
-            ready = g["sent"] if g["hex"] is not None else True
-            due = ready and now > start + args.window
-            for e in g["expects"]:
-                if not e.ok:
-                    all_matched = False
-                    if due:
-                        failed.append(e)
+        all_matched, failed = verdict(groups, args.window, now, t0)
         if all_matched:
             print(f"# all expectations matched (total {total} bytes)")
             return 0
@@ -306,6 +370,69 @@ def self_test():
     # a wrong application-data prefix must not match
     assert not Expect("0x5A1:1:1:1DACC001").matches(tm11)
     assert not Expect("0x5A1:1:2:1DACC0010003").matches(tm12)
+
+    # the @SECONDS suffix overrides one expectation's window
+    ewin = Expect("0x5A1:1:7:1DACC002@3")
+    assert ewin.window == 3.0
+    assert ewin.data == bytes.fromhex("1DACC002")
+    assert Expect("0x5A7:17:2").window is None
+    # __str__ keeps the @ so failure messages show the tightened window
+    assert str(ewin) == "0x5A1:1:7:1DACC002@3"
+
+    # B1 of the P2-7 review: the actual verdict computation over a
+    # MIXED group (Expect, Expect@window, CucExpect) — every attribute
+    # the loop reads must exist on every kind, before and after the
+    # send.
+    mixed = {"hex": "40", "at": 20.0, "sent": False, "t_sent": None,
+             "expects": [Expect("0x5A1:1:1:1DACC000"),
+                         Expect("0x5A1:1:7@3"),
+                         CucExpect("0x5E5:1000000")]}
+    groups = [{"hex": None, "at": None, "expects": []}, mixed]
+    # before the send: nothing can be failed (the group is not ready)
+    allm, failed = verdict(groups, 10.0, 21.0, 0.0)
+    assert allm is False and failed == []
+    mixed["sent"] = True
+    mixed["t_sent"] = 20.0
+    allm, failed = verdict(groups, 10.0, 21.0, 0.0)
+    assert allm is False and failed == []
+    mixed["expects"][0].ok = True
+    mixed["expects"][2].ok = True
+    # the @3 expectation is still pending at +1.5 s: no failure yet
+    allm, failed = verdict(groups, 10.0, 21.5, 0.0)
+    assert allm is False and failed == []
+    # at +4.5 s its own 3 s window has expired even though the group
+    # window is 10 s
+    allm, failed = verdict(groups, 10.0, 24.5, 0.0)
+    assert allm is False and len(failed) == 1
+    assert failed[0].window == 3.0 and str(failed[0]) == "0x5A1:1:7@3"
+    mixed["expects"][1].ok = True
+    allm, failed = verdict(groups, 10.0, 24.5, 0.0)
+    assert allm is True and failed == []
+    # a connect-time expectation fails on its own window from t0 (m2)
+    conn = {"hex": None, "at": None, "sent": False, "t_sent": None,
+            "expects": [Expect("0x5A7:17:2")]}
+    allm, failed = verdict([conn], 10.0, 11.0, 0.0)
+    assert allm is False and failed == [conn["expects"][0]]
+
+    # the CUC coarse the FSW carries in the TM data field header
+    # (SP[10:14]), from the reviewer's real heartbeat stream (APID
+    # 0x5E5, type 3 subtype 25): the coarse ticks +1 per second
+    hb = bytes.fromhex(
+        "490200000de5c000001a1003190e000000013d120400000001"
+        "000000000000000000000000")
+    hb_late = bytes.fromhex(
+        "490200000de5c00e001a1003190e00000010a0530400000010"
+        "000000000000000000000000")
+    assert hb[14:18].hex() == "00000001" and hb_late[14:18].hex() == "00000010"
+    e = CucExpect("0x5E5:1000000")   # 0x10000000 + a few seconds
+    assert not e.matches(hb) and not e.matches(hb_late)
+    # the same heartbeat after the TC(9,129) set: coarse 0x10000003
+    hb_set = bytes.fromhex(
+        "490200000de5c00e001a1003190e" + "10000003" +
+        "a0530400000010000000000000000000000000")
+    assert hb_set[14:18].hex() == "10000003"
+    assert e.matches(hb_set)
+    assert not CucExpect("0x5E7:1000000").matches(hb_set)
 
     # B1 of the P2-6 review: the plain mode (soak.sh, boot-smoke.sh)
     # parses and sets up without gate options and never gates.
