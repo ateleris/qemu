@@ -1341,3 +1341,77 @@ with 0 (and the `hk-adc` property is unknown). Green: `hk-adc`, `ctrl`
 (the READY pin), and the full suite (34 tests). checkpatch on the diff:
 0 errors, 0 warnings.
 
+## 23. NOMINAL gate (baseline: none)
+
+**Purpose:** `scripts/stix/nominal-smoke.sh` is the SAFE →
+CONFIGURATION → NOMINAL gate (P3-2). It boots the model, drives the
+mode changes with TC(236,1) CONF (mode 4), TC(236,6) S20 = 0 and
+TC(236,1) NOM (mode 5), and expects the PUS reports of
+recon-phase3-nominal §4: the connect-time group (TM(5,3) 0x8030 fresh
+flash, the P3-1 boot success 0x0022, FDIR enable 0x14A3, the boot TC20
+timer 0x142E), then CONF → `0021 02 04`, S20 = 0 → TM(1,1)/TM(1,7) (the
+FSW sends two TM(1,7); one is expected, never "exactly one"), NOMINAL →
+`0021 04 05` plus SID2 (0x5A4) with the mode nibble 5, then a
+TC(17,1)/heartbeat health check at 165 s. `--negative` drops the S20=0
+send and passes only when the TC20 fallback is seen — both 0x142E and
+`0021 05 02` (NOMINAL → SAFE), about 30 s after NOMINAL entry; the
+probe does not check their order.
+
+**Probe extensions it relies on** (all self-tested, no socket needed):
+`--hold` (gate mode keeps listening until `--seconds` even after the
+last expectation matched — without it the run exits on the last match,
+which is why plain probing near a mode change once looked like "TM
+stopped"); `--forbid APID:T:S[:DATAHEX]` (the negation of `--expect`,
+attached to the most recent `--send-hex` or to the connect group,
+arming at that group's send — a match before the send is ignored, a
+match after it fails the run with `FORBIDDEN TM: ...`, no `@window`);
+expectations still match in any order within their window.
+
+**The fresh-flash rule:** every run starts from an EMPTY run dir
+(default `/tmp/stix-nominal-run`, override `STIX_NOMINAL_RUN_DIR`) so
+the device creates a new sparse `flash.bin`. Any NOMINAL entry writes a
+flash context (`ContextMgmt_deinit`, `OpModeMgmt.c:317`), so a reused
+flash silently changes every later boot — the S20 value, parameter
+limits and LV/HV defaults drift, and the golden would follow. The run
+dir is canonicalised first (`realpath -m`, which also resolves
+symlinks and relative paths), and anything at or above the two shared
+run dirs `/tmp/stix-uprev-run` and `/tmp/stix-baseline-run` — or `/`
+itself — is refused; the script clears only its own run dir's files,
+by explicit path. Like tc-smoke.sh it does not take the 21000 flock
+itself (the caller must hold it; no script does this for you), and it
+uses the same port (20000+uid) and one-QEMU `ss` guard.
+
+**Expected NOMINAL-entry side effects, not failures:** the 384 IDeF-X
+register-write timeouts on the UART — `XrayDetFDIR.c:731` logs the
+failure and does `res += FSW_ERROR; // LIE: do not return`, so the
+NOMINAL path carries on (the model has no IDeF-X interface); one
+TM(5,2) 0x542C p1 = 1 (no LUTs in flash) — expected but **not** checked
+by the gate: it was seen in the p3probe4 experiment, and the recon
+marks it inferred; LUTMgmt "could not find LUT" messages; and SID2
+reporting LV/HV/SpW **off** in NOMINAL, because POWERSTAT (hkCmdSta
+bits 9:5) stays unmodelled at 0 (D-P3a). The gate counts the 384
+timeouts and prints the number; another count is a `WARN:` line, not a
+failure. The UART must contain "init: SAFE mode" and must not match
+`storing new context[01] failed`.
+
+Exit codes as tc-smoke.sh: 0 pass (or SKIP/dry-run/check-guard), 1 a
+failed expectation, a forbidden TM, a closed connection or a failed
+UART check, 2 environment problem. `--dry-run` prints the QEMU and
+probe command lines and exits 0; `--check-guard` runs only the run-dir
+guard.
+
+**Gate record** (2026-11-10, worktree build at f2e8664506 plus this change, normal ELF, fresh flash per run):
+- **Positive** (`STIX_NOMINAL_RUN_DIR=/tmp/stix-nominal-pos`): PASS.
+  - Boot: 0x0022, 0x8030, 0x14A3 at +13 s, 0x142E at +29 s.
+  - CONF at +50 s: `0021 02 04`.
+  - S20=0 at +60 s: acked.
+  - NOM at +70 s: `0021 04 05` 4 s later.
+  - SID2 `0215` (mode NOMINAL) 60 s after entry.
+  - TC(17,1) at +165 s: fully answered, heartbeat present.
+  - No forbidden TM; 384 IDeF-X timeouts.
+- **Negative** (`--negative`, `/tmp/stix-nominal-neg`): PASS.
+  - NOMINAL entered at 23:20:54, 0x142E at 23:21:21 (27 s later), `0021 05 02` at 23:21:22.
+  - A first negative run at 23:11 gave the same 27 s.
+- **Unchanged:** tc-smoke PASS, boot-smoke PASS (P3-1 golden), probe self-test PASS.
+- **Shared flash:** `/tmp/stix-uprev-run/flash.bin` mtime is still 13:05, i.e. untouched by the gate.
+

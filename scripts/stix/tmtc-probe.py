@@ -12,19 +12,29 @@ length field at SP[4:6]), and header byte 1 must be 0x02 — anything
 else drops one byte (framing resync). TM arrives as one unit per
 packet; TC leaves as one unit per packet.
 
-TC ingress gate (--send-hex with --expect): raw TC units are sent on
-the same connection at their --send-at offsets, and the framed TM
+TC ingress gate (--send-hex/--expect/--forbid): raw TC units are sent
+on the same connection at their --send-at offsets, and the framed TM
 stream is matched against the expectations. An expectation keys on
 APID and PUS type/subtype (SP[7], SP[8] — correction 5), plus an
-optional prefix of the application data (SP[10:]); expectations attach
-to the most recent --send-hex. The probe exits 0 only when every
-expectation matched within --window seconds of its send.
+optional prefix of the application data (SP[10:]); expectations and
+forbids attach to the most recent --send-hex, or to a connect-time
+group when given before any --send-hex. Expectations match in ANY
+order within their window; the run passes when every expectation
+matched within --window seconds of its send — immediately, or at the
+--seconds deadline under --hold. Gate mode without --hold exits on the
+last match, so anything after it (a mode change, a fallback) is not
+watched — that is why plain probing near a mode change once looked
+like "TM stopped". A --forbid is the negation: a matching unit fails
+the run with "FORBIDDEN TM: ...". It arms at its group's send (the
+connect group arms at connect) and stays armed; a match before its
+group's send is ignored. Forbids take no @window suffix.
 
 Usage:
   tmtc-probe.py [--port PORT] [--seconds N]
       logs raw chunks (prints 'NO TM OBSERVED', exits 1 if none)
-  tmtc-probe.py [--port P] [--seconds N] --window W
+  tmtc-probe.py [--port P] [--seconds N] --window W [--hold]
       [--send-at S] --send-hex HEX [--expect APID:TYPE:SUBTYPE[:DATAHEX]]...
+      [--forbid APID:TYPE:SUBTYPE[:DATAHEX]]...
       TC ingress gate
   tmtc-probe.py --self-test
       runs the framer self-test and exits 0/1
@@ -33,6 +43,7 @@ import argparse
 import os
 import socket
 import sys
+import threading
 import time
 
 # D-K: the 4-byte SpW header plus the 6 CCSDS primary-header bytes
@@ -158,6 +169,21 @@ class CucExpect(Expectation):
         return unit[14:18].hex().startswith(self.prefix)
 
 
+class Forbid(Expect):
+    """The negation of an Expect (--forbid, P3-2): a matching TM unit
+    FAILS the run instead of satisfying it. Parsing and matching are
+    Expect's; there is no @window suffix (a forbid arms at its group's
+    send — or at the connect for the connect-time group — and stays
+    armed for the whole run), so one is rejected with a clear error."""
+
+    def __init__(self, spec):
+        if "@" in spec:
+            raise ValueError(
+                "--forbid takes no @window suffix: %s (a forbid arms at "
+                "its group's send and stays armed)" % spec)
+        super().__init__(spec)
+
+
 class OpAction(argparse.Action):
     """Record --send-at/--send-hex/--expect in command-line order, so
     --send-at applies to the following --send-hex and --expect attaches
@@ -171,19 +197,21 @@ class OpAction(argparse.Action):
 
 def build_groups(args):
     """Group the ordered options into send groups (+ a connect-time
-    group for expectations given before any --send-hex)."""
-    groups = [{"at": None, "hex": None, "expects": []}]
+    group for expectations and forbids given before any --send-hex)."""
+    groups = [{"at": None, "hex": None, "expects": [], "forbids": []}]
     current_at = 20.0
     for op, val in args.ops:
         if op == "--send-at":
             current_at = float(val)
         elif op == "--send-hex":
-            groups.append({"at": current_at, "hex": val,
-                           "expects": [], "sent": False, "t_sent": None})
+            groups.append({"at": current_at, "hex": val, "expects": [],
+                           "forbids": [], "sent": False, "t_sent": None})
         elif op == "--expect":
             groups[-1]["expects"].append(Expect(val))
         elif op == "--expect-cuc":
             groups[-1]["expects"].append(CucExpect(val))
+        elif op == "--forbid":
+            groups[-1]["forbids"].append(Forbid(val))
     return groups
 
 
@@ -192,7 +220,8 @@ def setup_mode(args):
     gate=False; gate mode returns the send groups."""
     groups = build_groups(args)
     gate = any(g["hex"] is not None for g in groups) or \
-        any(g["expects"] for g in groups)
+        any(g["expects"] for g in groups) or \
+        any(g["forbids"] for g in groups)
     return groups, gate
 
 
@@ -220,6 +249,18 @@ def make_parser():
                     help="a TM expectation on the CUC coarse time in the "
                          "TM data field header (SP[10:14]), hex-prefix "
                          "match (repeatable)")
+    ap.add_argument("--forbid", action=OpAction,
+                    metavar="APID:TYPE:SUBTYPE[:DATAHEX]",
+                    help="the negation of --expect: a matching TM unit "
+                         "fails the run. Attaches to the most recent "
+                         "--send-hex (or the connect group) and arms at "
+                         "that group's send; a match before the send is "
+                         "ignored. No @window suffix (repeatable)")
+    ap.add_argument("--hold", action="store_true",
+                    help="gate mode: keep listening until --seconds even "
+                         "after every expectation matched, so a later "
+                         "mode change cannot be missed (without it the "
+                         "run exits on the last match)")
     ap.add_argument("--self-test", action="store_true",
                     help="run the framer self-test and exit")
     # B1 of the P2-6 review: ops must exist even when no gate option is
@@ -237,7 +278,8 @@ def verdict(groups, group_window, now, t0):
 
     Factored out so the self-test can run it over a mixed group (the
     P2-7 review B1): every attribute the loop reads — window, ok,
-    __str__ — must exist on every expectation kind.
+    __str__ — must exist on every expectation kind. Forbids are not
+    verdict state: they are checked per unit in match_unit.
     """
     all_matched = True
     failed = []
@@ -257,18 +299,111 @@ def verdict(groups, group_window, now, t0):
     return all_matched, failed
 
 
+def gate_done(all_matched, has_failed, hold, now, t0, seconds):
+    """The run_gate exit rule, factored for the self-test (P3-2).
+
+    Returns 0 (pass), 1 (fail) or None (keep running). A run passes
+    when every expectation matched — immediately, or at the --seconds
+    deadline under --hold, which keeps watching the stream after the
+    last match so a later mode change cannot slip through unseen. It
+    fails as soon as an expectation's window expired (has_failed). A
+    forbidden unit fails the run at match time (match_unit), hold or
+    not.
+    """
+    if has_failed:
+        return 1
+    if not hold and all_matched:
+        return 0
+    if now >= t0 + seconds:
+        return 0 if all_matched else 1
+    return None
+
+
+def match_unit(unit, groups):
+    """One framed TM unit against every ARMED group: expectations it
+    satisfies are marked ok and returned (newly_ok); the first matching
+    forbid is returned (forbidden) and the caller fails the run. A
+    group arms when its TC has been sent; the connect-time group is
+    armed from the start, so its forbids cover the whole run. Factored
+    out of run_gate for the self-test (P3-2)."""
+    fields = unit_fields(unit)
+    if fields is None:
+        return [], None
+    newly_ok = []
+    for g in groups:
+        if g["hex"] is not None and not g["sent"]:
+            continue  # m3/P3-2: its TC has not gone out yet; not armed
+        for e in g["expects"]:
+            if not e.ok and e.matches(unit):
+                e.ok = True
+                newly_ok.append(e)
+    for g in groups:
+        if g["hex"] is not None and not g["sent"]:
+            continue
+        for f in g["forbids"]:
+            if f.matches(unit):
+                return newly_ok, f
+    return newly_ok, None
+
+
+def handle_chunk(chunk, groups, pending):
+    """Frame and match one received chunk: extends @pending, prints the
+    raw line, the TM lines and the newly satisfied expectations, and
+    returns the first forbidden unit the chunk carried (or None).
+    Factored so the send-side drain (review m1) shares the matcher."""
+    pending += chunk
+    print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()}", flush=True)
+    units, _ = frame_units(pending)
+    for unit in units:
+        fields = unit_fields(unit)
+        if fields is None:
+            continue
+        apid, ptype, subtype, _app = fields
+        print(f"{ts()} TM apid=0x{apid:03X} type={ptype} "
+              f"subtype={subtype} len={len(unit)} "
+              f"data={unit[:48].hex()}", flush=True)
+        newly_ok, forbidden = match_unit(unit, groups)
+        for e in newly_ok:
+            print(f"{ts()} EXPECT OK: {e} "
+                  f"(unit len={len(unit)})", flush=True)
+        if forbidden is not None:
+            return forbidden
+    return None
+
+
 def run_gate(sock, args, groups):
-    """The --send-hex/--expect mode: send at the offsets, match the
-    framed TM stream. Returns 0 only when every expectation matched
-    within --window of its send."""
+    """The --send-hex/--expect/--forbid mode: send at the offsets, match
+    the framed TM stream. Returns 0 when every expectation matched
+    within its window — immediately, or at --seconds under --hold; a
+    forbidden unit, an expired expectation or (under --hold) a closed
+    connection returns 1."""
     t0 = time.monotonic()
     pending = bytearray()
     total = 0
+    held = False
     sock.settimeout(0.5)
     while True:
         now = time.monotonic()
         for g in groups:
             if g["hex"] is not None and not g["sent"] and now - t0 >= g["at"]:
+                # review m1: drain what is already buffered BEFORE
+                # marking the group sent — units that arrived earlier
+                # are matched with the group still unarmed, so they
+                # cannot trip its forbids
+                forbidden = None
+                while forbidden is None:
+                    try:
+                        chunk = sock.recv(4096, socket.MSG_DONTWAIT)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    forbidden = handle_chunk(chunk, groups, pending)
+                if forbidden is not None:
+                    print(f"FORBIDDEN TM: {forbidden}", flush=True)
+                    print(f"# total {total} bytes")
+                    return 1
                 payload = bytes.fromhex(g["hex"])
                 sock.sendall(payload)
                 g["sent"] = True
@@ -278,48 +413,52 @@ def run_gate(sock, args, groups):
         try:
             chunk = sock.recv(4096)
         except socket.timeout:
-            chunk = b""
+            chunk = None
         except OSError:
-            chunk = b""
+            chunk = None
         if chunk:
             total += len(chunk)
-            pending += chunk
-            print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()}", flush=True)
-            units, _ = frame_units(pending)
-            for unit in units:
-                fields = unit_fields(unit)
-                if fields is None:
-                    continue
-                apid, ptype, subtype, _app = fields
-                print(f"{ts()} TM apid=0x{apid:03X} type={ptype} "
-                      f"subtype={subtype} len={len(unit)} "
-                      f"data={unit[:48].hex()}", flush=True)
-                for g in groups:
-                    if g["hex"] is not None and not g["sent"]:
-                        continue  # m3: its TC has not gone out yet
-                    for e in g["expects"]:
-                        if not e.ok and e.matches(unit):
-                            e.ok = True
-                            print(f"{ts()} EXPECT OK: {e} "
-                                  f"(unit len={len(unit)})", flush=True)
-        # verdicts: all matched -> pass; any deadline passed with an
-        # unmatched expectation -> fail
-        all_matched, failed = verdict(groups, args.window, now, t0)
-        if all_matched:
-            print(f"# all expectations matched (total {total} bytes)")
-            return 0
-        if failed:
-            for e in failed:
-                print(f"EXPECTATION NOT MATCHED: {e}")
+            forbidden = handle_chunk(chunk, groups, pending)
+            if forbidden is not None:
+                print(f"FORBIDDEN TM: {forbidden}", flush=True)
+                print(f"# total {total} bytes")
+                return 1
+        elif chunk is not None and args.hold:
+            # review m3: a successful recv returning b"" is a closed
+            # connection. Under --hold that must fail the run — the
+            # verdict at the deadline would otherwise silently pass on
+            # a dead stream. WITHOUT --hold the pre-P3-2 behaviour
+            # stays (spin until the deadline): tc-smoke's runs never
+            # see a mid-run close, and its runs end on the last match.
+            print("CONNECTION CLOSED", flush=True)
             print(f"# total {total} bytes")
             return 1
-        if now > t0 + args.seconds:
-            print("EXPECTATION TIMEOUT: not all matched within --seconds")
-            for g in groups:
-                for e in g["expects"]:
-                    if not e.ok:
-                        print(f"EXPECTATION NOT MATCHED: {e}")
+        # verdicts: all matched -> pass (at once, or at the deadline
+        # under --hold); any deadline passed with an unmatched
+        # expectation -> fail
+        all_matched, failed = verdict(groups, args.window, now, t0)
+        rc = gate_done(all_matched, bool(failed), args.hold, now, t0,
+                       args.seconds)
+        if rc == 0:
+            print(f"# all expectations matched (total {total} bytes)")
+            return 0
+        if rc == 1:
+            if failed:
+                for e in failed:
+                    print(f"EXPECTATION NOT MATCHED: {e}")
+            else:
+                print("EXPECTATION TIMEOUT: not all matched within "
+                      "--seconds")
+                for g in groups:
+                    for e in g["expects"]:
+                        if not e.ok:
+                            print(f"EXPECTATION NOT MATCHED: {e}")
+            print(f"# total {total} bytes")
             return 1
+        if all_matched and args.hold and not held:
+            held = True
+            print(f"# all expectations matched; holding until +"
+                  f"{args.seconds:.0f}s (--hold)", flush=True)
         time.sleep(0.05)
 
 
@@ -439,7 +578,8 @@ def self_test():
     plain = make_parser().parse_args(["--port", "21000", "--seconds", "30"])
     groups, gate = setup_mode(plain)
     assert gate is False
-    assert groups == [{"at": None, "hex": None, "expects": []}]
+    assert groups == [{"at": None, "hex": None, "expects": [],
+                       "forbids": []}]
 
     # M1 of the P2-6 review: --send-at is an ordered op, so two sends
     # keep their own offsets.
@@ -453,6 +593,162 @@ def self_test():
     assert [g["at"] for g in sends] == [20.0, 32.0], \
         [g["at"] for g in sends]
     assert [len(g["expects"]) for g in sends] == [1, 1]
+
+    # ---- P3-2: --hold and --forbid (the NOMINAL gate) ----
+    # A forbid reuses Expect's parsing and matching, but an @window
+    # suffix is rejected with a clear error: a forbid arms at its
+    # group's send, there is nothing to tighten.
+    try:
+        Forbid("0x5A7:5:1:00210402@30")
+        raise AssertionError("forbid accepted an @window suffix")
+    except ValueError:
+        pass
+    fb = Forbid("0x5A7:5:1:00210402")
+    assert fb.apid == 0x5A7 and fb.ptype == 5 and fb.subtype == 1
+    assert fb.data == bytes.fromhex("00210402")
+    assert str(fb) == "0x5A7:5:1:00210402"
+    # a data-less forbid matches on APID/type/subtype alone (tm18 is
+    # the tm17 TM(1,7) unit with the subtype byte changed to 8)
+    tm18 = bytearray(tm17)
+    tm18[12] = 0x08
+    assert Forbid("0x5A1:1:8").matches(bytes(tm18))
+    assert not Forbid("0x5A1:1:8").matches(tm17)
+
+    # hand-built TM(5,1) 0021 events on 0x5A7 (data field 10 05 01 00 +
+    # 6 B SCET + EID + params <old> <new> <reason>; recon-phase3 §4)
+    def tm51_unit(seq, eid, params):
+        data = bytes.fromhex("10050100") + bytes(6) + \
+            bytes.fromhex(eid) + bytes.fromhex(params)
+        sp = bytes.fromhex("0DA7") + bytes([0xC0, seq]) + \
+            (len(data) - 1).to_bytes(2, "big") + data
+        return bytes.fromhex("49020000") + sp
+
+    ev_nom_to_safe = tm51_unit(1, "0021", "050202")
+    ev_conf_to_safe = tm51_unit(2, "0021", "040202")
+    assert Expect("0x5A7:5:1:00210502").matches(ev_nom_to_safe)
+    assert Expect("0x5A7:5:1:00210402").matches(ev_conf_to_safe)
+    assert not Expect("0x5A7:5:1:00210502").matches(ev_conf_to_safe)
+
+    # --forbid is an ordered op: it attaches to the most recent
+    # --send-hex, or to the connect group when it comes before any;
+    # --forbid alone is gate mode; --hold parses
+    p = make_parser().parse_args([
+        "--forbid", "0x5A7:5:1:00210402",
+        "--send-at", "50", "--send-hex", "40", "--expect", "0x5A1:1:1",
+        "--forbid", "0x5A7:5:1:00210502",
+        "--hold",
+    ])
+    assert p.hold is True
+    groups, gate = setup_mode(p)
+    assert gate is True
+    assert [len(g["forbids"]) for g in groups] == [1, 1], \
+        [len(g["forbids"]) for g in groups]
+    p2 = make_parser().parse_args(["--forbid", "0x5A1:1:8"])
+    groups, gate = setup_mode(p2)
+    assert gate is True
+    assert len(groups[0]["forbids"]) == 1
+
+    # the factored per-unit match step (what run_gate's read loop
+    # calls), over the two groups
+    gconn = {"hex": None, "at": None, "sent": False, "t_sent": None,
+             "expects": [], "forbids": [Forbid("0x5A7:5:1:00210402")]}
+    gsend = {"hex": "40", "at": 50.0, "sent": False, "t_sent": None,
+             "expects": [Expect("0x5A1:1:1")],
+             "forbids": [Forbid("0x5A7:5:1:00210502")]}
+    groups = [gconn, gsend]
+    # before the send, only the connect group is armed: the NOM->SAFE
+    # event is ignored (the send group's forbid is not armed yet)
+    ok, forb = match_unit(ev_nom_to_safe, groups)
+    assert ok == [] and forb is None
+    # the CONF->SAFE event matches the CONNECT group's armed forbid
+    ok, forb = match_unit(ev_conf_to_safe, groups)
+    assert ok == [] and forb is not None
+    assert str(forb) == "0x5A7:5:1:00210402"
+    # after the send group armed, its own forbid fires; an expectation
+    # the same poll satisfies is still returned as newly ok
+    gsend["sent"] = True
+    gsend["t_sent"] = 50.0
+    ok, forb = match_unit(tm11, groups)
+    assert ok == [gsend["expects"][0]] and forb is None
+    ok, forb = match_unit(ev_nom_to_safe, groups)
+    assert ok == [] and forb is not None
+    assert str(forb) == "0x5A7:5:1:00210502"
+
+    # the exit rule (what run_gate applies per poll): hold keeps the
+    # run alive after the last match, until the deadline
+    assert gate_done(True, False, False, 30.0, 0.0, 60.0) == 0
+    assert gate_done(False, False, False, 30.0, 0.0, 60.0) is None
+    assert gate_done(False, True, False, 30.0, 0.0, 60.0) == 1
+    assert gate_done(True, False, True, 30.0, 0.0, 60.0) is None
+    assert gate_done(True, False, True, 59.9, 0.0, 60.0) is None
+    assert gate_done(True, False, True, 60.0, 0.0, 60.0) == 0
+    assert gate_done(False, False, True, 60.0, 0.0, 60.0) == 1
+    # and a forbid fails a hold run even with everything matched:
+    # gate_done says "keep running", match_unit still reports the unit
+    gsend["expects"][0].ok = True
+    allm, failed = verdict(groups, 20.0, 55.0, 0.0)
+    assert allm is True and failed == []
+    assert gate_done(allm, bool(failed), True, 55.0, 0.0, 60.0) is None
+    ok, forb = match_unit(ev_nom_to_safe, groups)
+    assert forb is not None  # -> run_gate returns 1 with FORBIDDEN TM
+
+    # review m2: run_gate itself, over a socketpair (the peer plays the
+    # model: it reads the probe's TC byte, then writes TM units). Each
+    # case stays under ~2 s.
+    def gate_in_thread(sock, pargs, pgroups):
+        box = {}
+
+        def target():
+            box["rc"] = run_gate(sock, pargs, pgroups)
+
+        th = threading.Thread(target=target)
+        th.start()
+        return th, box
+
+    gate_args = ["--hold", "--seconds", "1", "--window", "1",
+                 "--send-at", "0", "--send-hex", "40",
+                 "--expect", "0x5A1:1:1"]
+
+    # a. a matching unit: rc 0, but only AT the --seconds deadline
+    #    (--hold keeps watching after the last match)
+    pargs = make_parser().parse_args(gate_args)
+    groups, gate = setup_mode(pargs)
+    a, b = socket.socketpair()
+    t_start = time.monotonic()
+    th, box = gate_in_thread(a, pargs, groups)
+    assert b.recv(1) == b"@"            # the probe's TC byte
+    b.sendall(tm11)                     # the matching unit
+    th.join(timeout=3)
+    elapsed = time.monotonic() - t_start
+    assert not th.is_alive()
+    assert box["rc"] == 0
+    assert 0.95 <= elapsed <= 2.0, elapsed
+    b.close()
+
+    # b. a forbidden unit written AFTER the expectation matched: rc 1
+    pargs = make_parser().parse_args(
+        gate_args + ["--forbid", "0x5A7:5:1:00210502"])
+    groups, gate = setup_mode(pargs)
+    a, b = socket.socketpair()
+    th, box = gate_in_thread(a, pargs, groups)
+    assert b.recv(1) == b"@"
+    b.sendall(tm11 + ev_nom_to_safe)    # match, then the forbidden unit
+    th.join(timeout=3)
+    assert not th.is_alive()
+    assert box["rc"] == 1
+    b.close()
+
+    # c. the peer closes while --hold is on: rc 1 (review m3)
+    pargs = make_parser().parse_args(gate_args)
+    groups, gate = setup_mode(pargs)
+    a, b = socket.socketpair()
+    th, box = gate_in_thread(a, pargs, groups)
+    assert b.recv(1) == b"@"
+    b.sendall(tm11)
+    b.close()                           # close under --hold
+    th.join(timeout=3)
+    assert not th.is_alive()
+    assert box["rc"] == 1
 
     print("SELF-TEST: PASS")
     return 0

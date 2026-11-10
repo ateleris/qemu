@@ -108,20 +108,20 @@ snapshot, I re-run red/green and the gates, commit without AI attribution, and f
      - the boot report TM(5,1) `0022…` (P3-1);
      - TM(5,1) 0x14A3 (FDIR enable);
      - TM(5,1) 0x142E (the boot TC20 timer, ~33 s, harmless in SAFE).
-  2. CONF at **≥ 45 s**, i.e. at least 10 s after the 0x142E; 40 s left only 5-8 s of margin.
+  2. CONF at **50 s** (as implemented; at least 10 s after the 0x142E); 40 s left only 5-8 s of margin.
      - Expect TM(1,1), TM(5,1) `00210204`, TM(1,7).
      - Forbid `00210402` from here on.
-  3. TC(236,6) S20=0 at 55 s.
+  3. TC(236,6) S20=0 at 60 s.
      - Expect TM(1,1) and TM(1,7). It sends **two** TM(1,7) (HWConfig.c:1044 plus TcService236.c:213); don't assert exactly one.
-  4. NOMINAL at 65 s.
+  4. NOMINAL at 70 s.
      - Expect TM(1,1), TM(5,1) `00210405`, TM(1,7) within 20 s.
      - Armed forbids from here on:
        - `0x5A7:5:1:00210502`;
        - TM(1,8);
        - TM(5,1) 0x142E;
        - TM(5,3) 0x9449.
-     - Also expect SID2 HK TM(3,25) on 0x5A4 with application data starting `0215` (mode byte at SP[17]). Give it a window `@80` or more, since SID2 comes every 64 s.
-  5. TC(17,1) at 160 s → TM(1,1), TM(17,2), TM(1,7). Also expect a heartbeat (0x5E5) in this window.
+     - Also expect SID2 HK TM(3,25) on 0x5A4 with application data starting `0215` (mode byte at SP[17]). Give it a window `@85` (as implemented), since SID2 comes every 64 s.
+  5. TC(17,1) at 165 s → TM(1,1), TM(17,2), TM(1,7). Also expect a heartbeat (0x5E5) in this window.
   6. `--hold --seconds 190`.
 - UART checks after the run:
   - `init: SAFE mode` is present.
