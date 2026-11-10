@@ -272,6 +272,170 @@ static void test_flash_error_paths(void)
     stix_qtest_cleanup();
 }
 
+/* ---- B2: flash addressing helpers ---- */
+
+/* Full backing-file size: 2 MCMs x 8 chips x 4096 blocks x 64 pages x
+ * 4224 B = 17,716,740,096. Created sparse with ftruncate; sparse holes
+ * read 0x00, so host-side checks compare against written patterns only —
+ * 0xFF is expected only where the device erased. On a filesystem that
+ * does not do sparse files the test skips instead of eating 16.5 GB. */
+#define FLASH_TOTAL_STORAGE 17716740096ULL
+
+static QTestState *flash_qtest_new_sparse(uint64_t size, gchar **path)
+{
+    gchar *tmp = NULL;
+    gchar *port;
+    struct stat st;
+    QTestState *qts;
+    int fd = g_file_open_tmp("stix-flash-sparse-XXXXXX", &tmp, NULL);
+
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, (off_t)size) == 0);
+    g_assert(fstat(fd, &st) == 0);
+    close(fd);
+
+    if ((uint64_t)st.st_blocks * 512 > 1024u * 1024u) {
+        g_unlink(tmp);
+        g_free(tmp);
+        *path = NULL;
+        g_test_skip("filesystem does not create sparse files");
+        return NULL;
+    }
+
+    port = stix_private_tm_port_arg();
+    qts = qtest_initf("-M leon3_generic -global grlib-stixflash.flash-file=%s %s",
+                      tmp, port);
+    g_free(port);
+    *path = tmp;
+    return qts;
+}
+
+/* FSW-style command issue (START_FLASH_OPERATION, Flash.c:81-84, with the
+ * linear address split by SPLIT_ADDRESS, Flash.c:70-73):
+ * pageAddress = chip<<20 | page, cmdSta = FLASHTYPE | mcm<<3 | cmd. */
+static void flash_issue_mcm(QTestState *qts, uint32_t ram, uint32_t chip,
+                            uint32_t page, uint32_t cmd, uint32_t mcm)
+{
+    qtest_writel(qts, FLASH_RAMAD, ram);
+    qtest_writel(qts, FLASH_PAGEAD, (chip << 20) | (page & 0x3ffffu));
+    qtest_writel(qts, FLASH_CMDSTA, FTNAND_FLASHTYPE | (mcm << 3) | cmd);
+}
+
+/* Host-side check: pull one page at offset out of the backing file,
+ * while QEMU is still running. */
+static void flash_pread_page(const gchar *path, uint64_t offset, void *buf)
+{
+    int fd = open(path, O_RDONLY);
+    ssize_t ret;
+
+    g_assert(fd >= 0);
+    ret = pread(fd, buf, FLASH_PAGE_BYTES, (off_t)offset);
+    g_assert_cmpint((int)ret, ==, (int)FLASH_PAGE_BYTES);
+    close(fd);
+}
+
+/* B2: addressing. The baseline computed the file offset as the raw
+ * pageAddress register * 4224: chip c landed at c*2^20 pages*4224 (the
+ * real stride is 2^18 pages), MCM was ignored so FLASH B's control
+ * region aliased exactly onto FLASH A's (MCM1 block 64 == MCM0 block
+ * 64), and the 16.5 GB file truncated to 512 MiB through uint32 ftell.
+ * Chip 0/MCM 0 offsets are page*4224 before and after; the full-size
+ * sparse backing file has holes that read 0x00. */
+static void test_flash_addressing(void)
+{
+    g_autofree uint8_t *pa = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *pb = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *pc = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *pd = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *pff = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    gchar *path = NULL;
+    uint32_t sta;
+
+    memset(pa, 0xAA, FLASH_PAGE_BYTES);
+    memset(pb, 0xBB, FLASH_PAGE_BYTES);
+    memset(pc, 0xCC, FLASH_PAGE_BYTES);
+    memset(pd, 0xDD, FLASH_PAGE_BYTES);
+    memset(pff, 0xFF, FLASH_PAGE_BYTES);
+
+    qts = flash_qtest_new_sparse(FLASH_TOTAL_STORAGE, &path);
+    if (!qts) {
+        return; /* skipped: filesystem does not do sparse files */
+    }
+
+    /* 1. Chip-0 compatibility guard: chip 0/MCM 0 stays page*4224. The
+     *    host pread happens below, before qtest_quit: the page must be
+     *    on disk while QEMU is still running, which is exactly what the
+     *    fflush after every write guarantees. */
+    qtest_memwrite(qts, 0x40000000u, pa, FLASH_PAGE_BYTES);
+    flash_issue_mcm(qts, 0x40000000u, 0, 5, CMD_PAGE_WRITE, 0);
+
+    /* 2. Chip stride: chip 1 begins after chip 0's 4096*64 pages, at
+     *    file offset 1,107,296,256 = 262144*4224. */
+    qtest_memwrite(qts, 0x40000000u, pb, FLASH_PAGE_BYTES);
+    flash_issue_mcm(qts, 0x40000000u, 1, 0, CMD_PAGE_WRITE, 0);
+    flash_pread_page(path, (uint64_t)262144 * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, pb, FLASH_PAGE_BYTES), ==, 0);
+
+    /* 3. MCM separation (the FLASH A/B alias). The same page 4096 on
+     *    MCM0 chip 0 (offset 17,301,504) and MCM1 chip 0 (offset
+     *    8*262144 pages further) must land apart, and the device must
+     *    read MCM0's page back as C: guest RAM still holds D, so only a
+     *    real fetch from the file can produce C. */
+    qtest_memwrite(qts, 0x40000000u, pc, FLASH_PAGE_BYTES);
+    flash_issue_mcm(qts, 0x40000000u, 0, 4096, CMD_PAGE_WRITE, 0);
+    qtest_memwrite(qts, 0x40000000u, pd, FLASH_PAGE_BYTES);
+    flash_issue_mcm(qts, 0x40000000u, 0, 4096, CMD_PAGE_WRITE, 1);
+    flash_pread_page(path, (uint64_t)4096 * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, pc, FLASH_PAGE_BYTES), ==, 0);
+    flash_pread_page(path, ((uint64_t)8 * 262144 + 4096) * FLASH_PAGE_BYTES,
+                     host);
+    g_assert_cmpint(memcmp(host, pd, FLASH_PAGE_BYTES), ==, 0);
+    flash_issue_mcm(qts, 0x40000000u, 0, 4096, CMD_PAGE_READ, 0);
+    qtest_memread(qts, 0x40000000u, host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, pc, FLASH_PAGE_BYTES), ==, 0);
+
+    /* 4. Past the baseline's 512 MiB ftell truncation (guard: green
+     *    since B1's 64-bit file size, red on the 5.2 wrapper): chip 0
+     *    page 130000 lives at 549,120,000. RAM is refilled with B first
+     *    so the read-back proves the device fetched the page. */
+    qtest_memwrite(qts, 0x40000000u, pa, FLASH_PAGE_BYTES);
+    flash_issue_mcm(qts, 0x40000000u, 0, 130000, CMD_PAGE_WRITE, 0);
+    qtest_memwrite(qts, 0x40000000u, pb, FLASH_PAGE_BYTES);
+    flash_issue_mcm(qts, 0x40000000u, 0, 130000, CMD_PAGE_READ, 0);
+    qtest_memread(qts, 0x40000000u, host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, pa, FLASH_PAGE_BYTES), ==, 0);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+
+    /* step 1's host check: still before qtest_quit (the page must be on
+     * disk while QEMU lives - the fflush), and before step 5's erase,
+     * which covers block 0 and therefore wipes page 5. */
+    flash_pread_page(path, (uint64_t)5 * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, pa, FLASH_PAGE_BYTES), ==, 0);
+
+    /* 5. The erase covers the block CONTAINING the commanded page
+     *    (base = page & ~63, 64 pages, never crossing a chip); the FSW
+     *    aligns the page itself before issuing, so the device-side rule
+     *    is defensive. The erase is commanded with page 10, hence block
+     *    0 = pages 0..63: page 63 is erased, page 64 keeps A. */
+    qtest_memwrite(qts, 0x40000000u, pa, FLASH_PAGE_BYTES);
+    flash_issue_mcm(qts, 0x40000000u, 0, 63, CMD_PAGE_WRITE, 0);
+    flash_issue_mcm(qts, 0x40000000u, 0, 64, CMD_PAGE_WRITE, 0);
+    flash_issue_mcm(qts, 0x40000000u, 0, 10, CMD_BLOCK_ERASE, 0);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+    flash_pread_page(path, (uint64_t)63 * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, pff, FLASH_PAGE_BYTES), ==, 0);
+    flash_pread_page(path, (uint64_t)64 * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, pa, FLASH_PAGE_BYTES), ==, 0);
+
+    qtest_quit(qts);
+    g_unlink(path);
+    g_free(path);
+}
+
 /* ---- SPW device (grlib_stixspw) ---- */
 
 #define SPW_BASE       0x80000a00u
@@ -641,6 +805,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/pnp", test_pnp);
         qtest_add_func("/sparc/stix/flash", test_flash);
         qtest_add_func("/sparc/stix/flash-error-paths", test_flash_error_paths);
+        qtest_add_func("/sparc/stix/flash-addressing", test_flash_addressing);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);

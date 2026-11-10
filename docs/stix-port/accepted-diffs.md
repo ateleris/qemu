@@ -205,3 +205,45 @@ truncation. The offset is still the raw pageAddress register x 4224, so
 chip >= 1 no longer wraps into chip 0 but lands at the raw-register
 offset; the correct chip stride (2^18 pages) and the MCM bit follow in
 the next section (B2), which lands together with this one.
+
+## 8. Flash addressing: 64-bit offsets, chip stride, MCM (baseline-inherited defect)
+
+The baseline computed the file offset as the raw pageAddress register x
+4224 in 32-bit math. The FSW issues a linear page address split as
+mcm = addr>>21, chip = addr>>18, page = addr & 0x3FFFF
+(SPLIT_ADDRESS, `BSW_ASW/src/BSW/Flash/Flash.c:70-73`) and encodes it as
+pageAddress = chip<<20 | page, cmdSta bit 3 = mcm (Flash.c:81-84). Three
+defects followed: chip c was placed at c·2^20·4224 instead of the real
+c·2^18·4224 chip stride (misaligned inside chip 0); the MCM bit was
+ignored, so FLASH B's control region aliased exactly onto FLASH A's
+(MCM1 block 64 == MCM0 block 64); and the 16.5 GB file was truncated to
+512 MiB through the uint32 `ftell`, after which reads/erases of chip-0
+pages >= ~127,100 aborted (that truncation is already gone with §7's
+64-bit file size — this section fixes the remaining two).
+
+**Fix:** the offset is now
+`((mcm * 8 + chip) * (4096 * 64) + (page & 0x3FFFF)) * 4224`, computed in
+uint64_t from the already-decoded chip (pageAddress bits 22:20) and MCM
+(cmdSta bit 3). An erase addresses the block CONTAINING the commanded
+page — base = page & ~63, 64 pages, never crossing a chip. The FSW
+driver aligns the page itself before issuing
+(`Flash.c:251-254`, `page &= ~0x3F`; the corrections addendum cites
+:254), so the device-side containing-block rule is defensive, not
+FSW-driven. Every write and erase is `fflush`ed before the completion
+IRQ (no `fsync`), so the host side can observe the page while QEMU is
+still running.
+
+**Chip 0/MCM 0 offsets are bit-for-bit unchanged** (page·4224), so
+existing `flash.bin` content stays valid; behavior for every FSW-issued
+sequence on the full-size file is unchanged except that data now lands
+where the FSW expects it. Evidence: qtest `stix/flash-addressing` on a
+full-size sparse (17,716,740,096 B, holes read 0x00) backing file pins
+chip-0 compatibility (guard), the chip-1 stride at 1,107,296,256, the
+MCM0/MCM1 separation at 17,301,504 vs 8,875,671,552 plus a device-side
+read-back, a write/read past the old 512 MiB truncation point (guard,
+green since §7), and the containing-block erase (commanded with page 10:
+page 63 erased, page 64 preserved). Red shown on the B1 binary: the
+chip-1 write landed at the raw-register offset 4,429,185,024, the MCM1
+write overwrote MCM0's page, and the unaligned erase wiped pages
+10..73. The new tests are expected RED on the 5.2 wrapper (they pin
+B1/B2 behavior the baseline lacks; `flash-error-paths` likewise).

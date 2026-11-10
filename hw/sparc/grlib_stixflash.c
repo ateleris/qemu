@@ -118,6 +118,20 @@ static bool flash_page_beyond_eof(uint64_t position_in_file, off_t file_size)
     return position_in_file + FLASH_PAGE_SIZE > (uint64_t)file_size;
 }
 
+/* File offset of page_in_chip inside the commanded chip/MCM. The FSW's
+ * linear page address is MCM-major, then chip, then page
+ * (SPLIT_ADDRESS, BSW_ASW/src/BSW/Flash/Flash.c:70-73) and is issued as
+ * pageAddress = chip<<20 | page, cmdSta bit 3 = mcm (Flash.c:81-84); the
+ * decode into stixflash->chip / stixflash->mcm already exists in the
+ * write handler. Chip 0/MCM 0 stays bit-for-bit page * 4224, so existing
+ * flash.bin content remains valid. */
+static uint64_t flash_offset(const STIXFLASH *stixflash, uint32_t page_in_chip)
+{
+    return (((uint64_t)stixflash->mcm * FLASH_DEVICES_PER_MCM + stixflash->chip)
+            * (FLASH_BLOCKS_PER_DEVICE * FLASH_PAGENUM_IN_BLOCK)
+            + (page_in_chip & 0x3FFFF)) * FLASH_PAGE_SIZE;
+}
+
 /* Fail the in-flight command: STATUS.FAILED (bit 24) and STATUS.READY
  * (bit 30) set, BUSY (bit 4) clear, write sequence aborted. The FSW's ISR
  * (BSW_ASW/src/BSW/Flash/Flash.c:138-148) waits for the IRQ, then
@@ -169,6 +183,7 @@ static void execute_flash_reset(STIXFLASH *stixflash)
 static bool execute_flash_erase(STIXFLASH *stixflash)
 {
     off_t file_size = flash_file_size(stixflash);
+    uint32_t base_page;
 
     if (file_size < 0) {
         flash_io_error(stixflash, "erase");
@@ -177,10 +192,16 @@ static bool execute_flash_erase(STIXFLASH *stixflash)
 
     memset(stixflash->page_data, 0xFF, FLASH_PAGE_SIZE);
 
+    // erase the block CONTAINING the commanded page (base = page & ~63,
+    // 64 pages, never crossing a chip: base is 64-aligned inside the
+    // 18-bit page field). The FSW aligns the page itself
+    // (Flash.c:251-254), so the device-side rule is defensive.
+    base_page = stixflash->page & ~(uint32_t)(FLASH_PAGENUM_IN_BLOCK - 1);
+
     // iterate through pages in block
     for(uint32_t i = 0; i < FLASH_PAGENUM_IN_BLOCK; i++)
     {
-        uint64_t position_in_file = ((uint64_t)i + stixflash->page_address) * FLASH_PAGE_SIZE;
+        uint64_t position_in_file = flash_offset(stixflash, base_page + i);
 
         // pages past the backing file are skipped: the erase still succeeds
         // and the file is not extended (D-H)
@@ -201,13 +222,20 @@ static bool execute_flash_erase(STIXFLASH *stixflash)
         }
     }
 
+    // push the erased pages out before the completion IRQ
+    if(fflush(stixflash->f) != 0)
+    {
+        flash_io_error(stixflash, "erase");
+        return false;
+    }
+
     qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number.
     return true;
 }
 
 static bool execute_flash_read(STIXFLASH *stixflash)
 {
-    uint64_t position_in_file = (uint64_t)stixflash->page_address * FLASH_PAGE_SIZE;
+    uint64_t position_in_file = flash_offset(stixflash, stixflash->page);
     off_t file_size = flash_file_size(stixflash);
     size_t ret;
 
@@ -245,7 +273,7 @@ static bool execute_flash_read(STIXFLASH *stixflash)
 
 static bool execute_flash_write(STIXFLASH *stixflash)
 {
-    uint64_t position_in_file = (uint64_t)stixflash->page_address * FLASH_PAGE_SIZE;
+    uint64_t position_in_file = flash_offset(stixflash, stixflash->page);
     off_t file_size = flash_file_size(stixflash);
     size_t ret;
 
@@ -272,6 +300,13 @@ static bool execute_flash_write(STIXFLASH *stixflash)
 
     ret = fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
     if (ret != (size_t)FLASH_PAGE_SIZE) {
+        flash_io_error(stixflash, "write");
+        return false;
+    }
+
+    // push the page out before the completion IRQ (no fsync: the guest
+    // must be able to observe its own write from the host side)
+    if (fflush(stixflash->f) != 0) {
         flash_io_error(stixflash, "write");
         return false;
     }
