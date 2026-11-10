@@ -984,6 +984,74 @@ static void test_ctrl_watchdog(void)
     stix_qtest_cleanup();
 }
 
+/* CTRL IRQ output wiring. The baseline connected all five CTRL IRQ outputs
+ * with sysbus_connect_irq(dev, 0, ...): every call rebound the same link,
+ * the last one won, and only output 0 (detectors) stayed connected - to
+ * the ROTB CPU IRQ line 7. Each sysbus IRQ output is exposed over QOM as a
+ * link property "sysbus-irq[i]" (sysbus_init_irq -> qdev_init_gpio_out_
+ * named, hw/core/sysbus.c) whose value is the canonical path of the
+ * destination input pin; IRQMP's inputs are its "unnamed-gpio-in[k]" child
+ * objects (hw/core/gpio.c). The fixed wiring gives outputs 0-4
+ * (detectors, hk, other, edac, rotb) their own IRQMP lines 3-7
+ * (StixIdpu.h IRQ_STIXCTRL_*). */
+static void test_ctrl_irq_lines(void)
+{
+    g_autofree gchar *port = stix_private_tm_port_arg();
+    QTestState *qts = stix_qtest_new_extra(port);
+    QDict *resp;
+    QList *props;
+    const QListEntry *entry;
+    g_autofree gchar *ctrl_path = NULL;
+    g_autofree gchar *irqmp_path = NULL;
+    int i;
+
+    /* find the two devices under /machine/unattached by type, not by the
+     * volatile device[N] names */
+    resp = qtest_qmp(qts,
+                     "{'execute': 'qom-list',"
+                     " 'arguments': {'path': '/machine/unattached'}}");
+    g_assert(qdict_haskey(resp, "return"));
+    props = qobject_to(QList, qdict_get(resp, "return"));
+    g_assert_nonnull(props);
+    QLIST_FOREACH_ENTRY(props, entry) {
+        QDict *prop = qobject_to(QDict, qlist_entry_obj(entry));
+        const char *name = qdict_get_str(prop, "name");
+        const char *type = qdict_get_str(prop, "type");
+
+        if (g_str_equal(type, "child<grlib-stixctrl>")) {
+            g_assert_null(ctrl_path);
+            /* qom-list reports the child name; qom-get/qom-set want the
+             * canonical path, and link values are canonical paths */
+            ctrl_path = g_strdup_printf("/machine/unattached/%s", name);
+        } else if (g_str_equal(type, "child<grlib-irqmp>")) {
+            g_assert_null(irqmp_path);
+            irqmp_path = g_strdup_printf("/machine/unattached/%s", name);
+        }
+    }
+    qobject_unref(resp);
+    g_assert_nonnull(ctrl_path);
+    g_assert_nonnull(irqmp_path);
+
+    for (i = 0; i < 5; i++) {
+        g_autofree gchar *prop = g_strdup_printf("sysbus-irq[%d]", i);
+        g_autofree gchar *want = g_strdup_printf("%s/unnamed-gpio-in[%d]",
+                                                 irqmp_path, 3 + i);
+        const char *got;
+
+        resp = qtest_qmp(qts,
+                         "{'execute': 'qom-get', 'arguments':"
+                         " {'path': %s, 'property': %s}}",
+                         ctrl_path, prop);
+        got = qdict_get_try_str(resp, "return");
+        g_test_message("sysbus-irq[%d]: got '%s' want '%s'", i, got, want);
+        g_assert_cmpstr(got, ==, want);
+        qobject_unref(resp);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 /* GPTIMER prescaler set by the -kernel boot stub (hw/sparc/leon3.c).
  * On the IDPU the boot PROM programs the prescaler for a 1 MHz timer tick
  * at the 20 MHz system clock (reload 19, BSW IIR.h IIR_GPT_PRESCALER) and
@@ -1065,6 +1133,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/ctrl-rotb", test_ctrl_rotb);
         qtest_add_func("/sparc/stix/gptimer-prescaler", test_gptimer_prescaler);
         qtest_add_func("/sparc/stix/ctrl-watchdog", test_ctrl_watchdog);
+        qtest_add_func("/sparc/stix/ctrl-irq-lines", test_ctrl_irq_lines);
     }
 
     return g_test_run();

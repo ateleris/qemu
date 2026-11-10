@@ -173,8 +173,10 @@ cd /tmp/stix-uprev-run && /path/to/build/qemu-system-sparc \
 - APBUART reset value `0xf` is overwritten by the stub's `3` before the
   guest's first instruction; the stub hardcodes GPTIMER scaler 39 (40 MHz)
   while the machine runs 20 MHz.
-- CTRL IRQ wiring: all five outputs connected via `sysbus_connect_irq(dev, 0, ...)`
-  — last-wins to the ROTB CPU IRQ line; CTRL raises no IRQs today.
+- CTRL IRQ wiring: **fixed** (see `accepted-diffs.md` §11) — the baseline
+  connected all five CTRL outputs via `sysbus_connect_irq(dev, 0, ...)`
+  (last-wins to the ROTB CPU IRQ line); they now reach IRQMP lines
+  3/4/5/6/7. Still no CTRL IRQ source until the ROTB path lands.
 - ROTB init passes accidentally: an early BSP write of `~0x4` to `rotbCmdSta`
   leaves READY (bit 3) set, so `RotBuf_init`'s first poll read succeeds.
   `rotbConfig` ends at `0x900` (ENABLE bit 31 never set; the test-mode branch

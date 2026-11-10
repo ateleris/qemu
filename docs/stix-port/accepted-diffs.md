@@ -355,3 +355,32 @@ CHANGE keeps COUNT, RELOAD starts at 63, one cycle per 105 ms, the
 DISABLE/ENABLE freeze, a 1 s feed cadence never expires, no feed resets
 once the count runs out, reset stops it, and FORCE resets at once. It is
 expected red on the 5.2 wrapper.
+
+## 11. CTRL IRQ outputs wired per line (baseline: all on output 0, last-wins)
+
+**Baseline:** `leon3.c` connected all five CTRL IRQ outputs with
+`sysbus_connect_irq(dev, 0, …)`. Each call re-set the same QOM link, so the
+last call won: only output 0 stayed connected, and it pointed at the ROTB
+CPU IRQ line 7 — the detectors output (0) feeding the ROTB line, and
+outputs 1–4 (hk, other, edac, rotb) left unconnected entirely.
+
+**Model:** the first argument becomes `0,1,2,3,4`, matching the outputs'
+realize order (`grlib_stixctrl.c`: detectors, hk, other, edac, rotb), so
+each output reaches its own line: detectors→3, hk→4, other→5, edac→6,
+rotb→7 (`StixIdpu.h` `IRQ_STIXCTRL_*`). The APB PnP entries are unchanged
+(CTRL was always registered with IRQ 3).
+
+**Guest-visible effect: none yet.** CTRL raises no IRQs in this commit;
+the first device to pulse a CTRL output is the ROTB overflow path (A2,
+D-F, line 7). The wiring change only decides *where* such a pulse would
+land, so the FSW boot log is unchanged.
+
+**Evidence:** qtest `/sparc/stix/ctrl-irq-lines`. It lists
+`/machine/unattached` over QMP, finds the CTRL and IRQMP devices by their
+`child<grlib-stixctrl>`/`child<grlib-irqmp>` type fields (no `device[N]`
+hardcoding), and checks for i in 0..4 that `qom-get
+<ctrl>/sysbus-irq[i]` — the QOM link each sysbus IRQ output exposes —
+returns `<irqmp>/unnamed-gpio-in[3+i]`, the canonical path of IRQMP's
+input pin. Red on the pre-fix binary: `[0]` returned
+`…/unnamed-gpio-in[7]`; green after, all five match. It is expected red on
+the 5.2 wrapper.

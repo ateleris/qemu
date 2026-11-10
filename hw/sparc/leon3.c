@@ -446,21 +446,20 @@ static void leon3_generic_hw_init(MachineState *machine)
 
     /* ---- STIX IDPU devices (carried from the baseline model) ---- */
 
-    /* Allocate ctrl. Deliberately preserved baseline bug: all five CTRL
-     * outputs connect via line 0, last-wins to the ROTB CPU IRQ line —
-     * see docs/stix-port/baseline/README.md. */
+    /* Allocate ctrl. IRQ outputs wired per line: detectors/hk/other/edac/
+     * rotb -> IRQMP 3/4/5/6/7 (accepted-diffs.md §11). */
     dev = qdev_new(TYPE_GRLIB_STIXCTRL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIXCTRL_APB_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_DETCTRL));
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,
                        qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_HK));
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 2,
                        qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_OTHERISON));
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 3,
                        qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_EDAC));
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 4,
                        qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_ROTB));
     grlib_apb_pnp_add_entry(apb_pnp, STIXCTRL_APB_BASE, 0xFFF,
                             GRLIB_VENDOR_GAISLER, GRLIB_FTMCTRL_DEV, 0,
