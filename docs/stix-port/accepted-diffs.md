@@ -1091,7 +1091,24 @@ real units.
 boots "synced", never logs TM(5,2) EID 0x542B "time code lost" at
 60 s, and never performs the 60 s SCET write; the golden UART should
 only lose those time-sync lines — any other diff is a stop condition.
-Gates: see the reviewer's run.
+
+Gates (reviewer's run, 2026-11-10, normal ELF): boot-smoke PASS; soak
+600 s PASS; tc-smoke PASS with all six expectations, and no TM(5,2)
+EID 0x542B "time code lost" in its 90 s run:
+
+    EXPECT OK: 0x5A1:1:1:1DACC000 (unit len=24)
+    EXPECT OK: 0x5A7:17:2 (unit len=20)
+    EXPECT OK: 0x5A1:1:7:1DACC000 (unit len=24)
+    EXPECT OK: 0x5A1:1:2:1DACC0010002 (unit len=32)
+    EXPECT OK: 0x5A1:1:7:1DACC002@3 (unit len=24)
+    EXPECT OK: 0x5E5:1000000 (unit len=37)
+
+The UART golden turned out identical after normalization: the
+time-code-lost report is TM, not a console line, so there was no UART
+diff at all. The stdout golden is recaptured: it gains the
+stixspw_timecode_arm/emit events (one code per second) and the ISR's
+extra SPW accesses, and loses the two stixctrl_scet_write events of
+the old 60 s resynchronisation.
 
 **Evidence:** qtest `/sparc/stix/spw-timecode`: (a) a rollover sets
 `status.TO` with `time & 63 == coarse & 63` and TCTRL 0, IRQ 13
