@@ -451,6 +451,9 @@ static void leon3_generic_hw_init(MachineState *machine)
     dev = qdev_new(TYPE_GRLIB_STIXCTRL);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIXCTRL_APB_BASE);
+    /* BLOCK window: the SW view of the ring block at rd (reads) / wr
+     * (TESTMODE writes), one 512 B block (StixIdpu.h STIXCTRL_BLOCK_*) */
+    sysbus_mmio_map(SYS_BUS_DEVICE(dev), 1, STIXCTRL_BLOCK_START);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
                        qdev_get_gpio_in(irqmpdev, IRQ_STIXCTRL_DETCTRL));
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 1,

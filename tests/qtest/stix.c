@@ -1052,6 +1052,332 @@ static void test_ctrl_irq_lines(void)
     stix_qtest_cleanup();
 }
 
+/* ---- CTRL ROTB (A2): ring, FIFO commands, BLOCK window ---- */
+
+#define ROTB_WINDOW       0xE0800000u  /* STIXCTRL_BLOCK_START, 512 B per block */
+#define ROTB_BLOCK_WORDS  128u         /* 512 B / 4 */
+#define ROTB_CMD_GETBLOCK   1u         /* rotbCmdSta COMMAND values */
+#define ROTB_CMD_PUTBLOCK   2u
+#define ROTB_CMD_RESETFIFO  3u
+#define ROTB_STA_READY     (1u << 3)    /* rotbCmdSta bit fields */
+#define ROTB_STA_FULL      (1u << 5)
+#define ROTB_COUNT_SHIFT   7u           /* BLOCKCOUNT, bits 23:7 */
+#define ROTB_COUNT_MASK    0x1FFFFu
+#define ROTB_CFG_ENABLE    (1u << 31)   /* rotbConfig */
+#define ROTB_CFG_TESTMODE  (1u << 13)
+#define ROTB_IRQ_BIT       (1u << 7)    /* IRQ_STIXCTRL_ROTB = 7 */
+
+/* the FSW issues every command as a read-modify-write of rotbCmdSta
+ * (RotBuf.c RotBuf_advancePointer/RotBuf_clear): clear COMMAND, OR the new
+ * one. The device keeps only bits 2:0 of the write, so the BLOCKCOUNT and
+ * READY bits echoed back are ignored. */
+static void rotb_cmd(QTestState *qts, uint32_t cmd)
+{
+    uint32_t v = ctrl_read(qts, CTRL_ROTBCMDSTA);
+
+    ctrl_write(qts, CTRL_ROTBCMDSTA, (v & ~3u) | cmd);
+}
+
+/* BLOCKCOUNT (bits 23:7) of the composed rotbCmdSta read */
+static uint32_t rotb_count(QTestState *qts)
+{
+    return (ctrl_read(qts, CTRL_ROTBCMDSTA) >> ROTB_COUNT_SHIFT) & ROTB_COUNT_MASK;
+}
+
+static uint32_t rotb_full(QTestState *qts)
+{
+    return (ctrl_read(qts, CTRL_ROTBCMDSTA) >> 5) & 1u;
+}
+
+static void rotb_cfg(QTestState *qts, bool enable, bool testmode)
+{
+    ctrl_write(qts, CTRL_ROTBCONFIG,
+               (enable ? ROTB_CFG_ENABLE : 0u) | (testmode ? ROTB_CFG_TESTMODE : 0u));
+}
+
+/* does this QEMU know the rotb-blocks property? The RED run executes
+ * against a pre-A2 binary, where an unknown -global property aborts QEMU
+ * at startup (qdev_prop_set_globals uses &error_fatal) — so pass the
+ * argument only when the model supports it. The ring size does not affect
+ * any RED assertion; without it the default (104448 blocks) is used. */
+static bool rotb_blocks_supported(void)
+{
+    static int supported = -1;
+
+    if (supported < 0) {
+        QTestState *qts = stix_qtest_new_extra(stix_private_tm_port_arg());
+        QDict *resp;
+        QList *props;
+        const QListEntry *entry;
+
+        resp = qtest_qmp(qts,
+                         "{'execute': 'device-list-properties',"
+                         " 'arguments': {'typename': 'grlib-stixctrl'}}");
+        props = qobject_to(QList, qdict_get(resp, "return"));
+        g_assert_nonnull(props);
+        supported = 0;
+        QLIST_FOREACH_ENTRY(props, entry) {
+            QDict *prop = qobject_to(QDict, qlist_entry_obj(entry));
+
+            if (g_str_equal(qdict_get_str(prop, "name"), "rotb-blocks")) {
+                supported = 1;
+                break;
+            }
+        }
+        qobject_unref(resp);
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+    }
+
+    return supported != 0;
+}
+
+/* one test instance: private TM port plus a small ring (the default ring
+ * costs ~53.5 MB of host RAM per instance) */
+static QTestState *rotb_qtest_new(unsigned blocks)
+{
+    g_autofree gchar *port = stix_private_tm_port_arg();
+    g_autofree gchar *extra = NULL;
+
+    if (rotb_blocks_supported()) {
+        extra = g_strdup_printf("%s -global grlib-stixctrl.rotb-blocks=%u",
+                                port, blocks);
+    } else {
+        extra = g_strdup_printf("%s", port);
+    }
+
+    return stix_qtest_new_extra(extra);
+}
+
+/* FIFO pointer arithmetic through the COMMAND field (RotBuf.c
+ * RotBuf_advancePointer/RotBuf_clear; the OpModeMgmt.c SAFE/NOMINAL
+ * switches toggle TESTMODE around them). */
+static void test_rotb_fifo(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+
+    /* ENABLE asserts READY: the FSW's RotBuf_init waits for it */
+    rotb_cfg(qts, true, false);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_ROTBCMDSTA) & ROTB_STA_READY,
+                     ==, ROTB_STA_READY);
+
+    /* RESETFIFO at init: count 0 (the main.c:214 assert condition) */
+    rotb_cmd(qts, ROTB_CMD_RESETFIFO);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    /* TESTMODE: PUTBLOCK advances the write pointer */
+    rotb_cfg(qts, true, true);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 3);
+
+    /* normal mode: GETBLOCK drains */
+    rotb_cfg(qts, true, false);
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    /* GETBLOCK on an empty ring holds */
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    /* PUTBLOCK outside TESTMODE is ignored: in normal mode HW feeds */
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* the BLOCK window shows ring[rd] on reads and ring[wr] on TESTMODE
+ * writes: the FSW fills and reads through RotBuf_dataAddress() =
+ * 0xE0800000 with 32-bit and byte stores (Common.c Volatile_memset) */
+static void test_rotb_window(void)
+{
+    QTestState *qts = rotb_qtest_new(4);
+    uint32_t i;
+    int b;
+
+    rotb_cfg(qts, true, true);
+    qtest_writel(qts, ROTB_WINDOW, 0x11111111u);
+    qtest_writel(qts, ROTB_WINDOW + 4u * 127, 0x22222222u);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+
+    /* window reads show the current read block (rd = 0) */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW), ==, 0x11111111u);
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 4u * 127), ==, 0x22222222u);
+
+    /* byte-wise fill of block 1 */
+    for (b = 0; b < 512; b++) {
+        qtest_writeb(qts, ROTB_WINDOW + b, 0x5A);
+    }
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+
+    /* GETBLOCK moves rd to block 1: every word reads 0x5A5A5A5A and
+     * block 0's markers are gone from view */
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+        g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 4u * i), ==, 0x5A5A5A5Au);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* IRQ 7 rule D-F: reaching capacity sets FULL only; a PUTBLOCK INTO a full
+ * ring is dropped (drop-new) and pulses IRQ 7 once per rejected write.
+ * The FSW fills to exactly cap with IRQ 7 enabled since boot
+ * (HWSelftest.c:510-526, RotAccumulator.c:259-266), so reaching cap must
+ * stay silent. The SW-PUTBLOCK half of the rule is an assumption
+ * (HSWICD unconfirmed). Window stores never pulse (they are not
+ * PUTBLOCKs). */
+static void test_rotb_full_irq(void)
+{
+    QTestState *qts = rotb_qtest_new(4);
+    uint32_t n, i;
+
+    rotb_cfg(qts, true, true);
+    qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    /* fill to exactly cap, block n carrying marker n */
+    for (n = 0; n < 4; n++) {
+        for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+            qtest_writel(qts, ROTB_WINDOW + 4u * i, 0xAA000000u | n);
+        }
+        rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 4);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    /* a window write while full is ignored, with no IRQ */
+    qtest_writel(qts, ROTB_WINDOW, 0xDEADBEEFu);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    /* the 5th PUTBLOCK is rejected: one pulse, count stays 4, the block
+     * is not stored (drop-new) */
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT,
+                     ==, ROTB_IRQ_BIT);
+    g_assert_cmpuint(rotb_count(qts), ==, 4);
+
+    /* drain in normal mode: markers 0,1,2,3 in order; FULL clears on the
+     * first GETBLOCK */
+    rotb_cfg(qts, true, false);
+    for (n = 0; n < 4; n++) {
+        for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+            g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 4u * i),
+                            ==, 0xAA000000u | n);
+        }
+        rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+        g_assert_cmpuint(rotb_full(qts), ==, 0);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    rotb_cmd(qts, ROTB_CMD_RESETFIFO);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* the FSW's own ROTB self-test shape (HWSelftest.c:510-563): fill until
+ * FULL in TESTMODE, then switch to normal mode and drain while comparing
+ * every word. The fill loop is bounded (2*cap + 8): on a broken model
+ * FULL never sets and an unbounded loop would hang instead of failing. */
+static void test_rotb_selftest_shape(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    const uint32_t bound = 2 * 8 + 8;
+    uint32_t n = 0, m = 0, i;
+
+    rotb_cfg(qts, true, true);
+    rotb_cmd(qts, ROTB_CMD_RESETFIFO);
+
+    while (!rotb_full(qts) && n < bound) {
+        for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+            qtest_writel(qts, ROTB_WINDOW + 4u * i, n);
+        }
+        rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+        n++;
+    }
+    /* stopped because FULL, not because of the bound */
+    g_assert_cmpuint(n, ==, 8);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    rotb_cfg(qts, true, false);
+    while (rotb_count(qts) != 0 && m < bound) {
+        for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+            g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 4u * i), ==, m);
+        }
+        rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+        m++;
+    }
+    g_assert_cmpuint(m, ==, 8);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* the EDAC strobe pair (EDAC.c:305-306) with blocks queued: the
+ * strobe-clear write 0xFFFFFFFB carries COMMAND = 3, so the documented
+ * Q7 side effect executes RESETFIFO. Harmless at the FSW's call sites,
+ * which clear the FIFO anyway (RotAccumulator.c:295, HWSelftest.c:569). */
+static void test_rotb_strobe(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    uint32_t i;
+
+    rotb_cfg(qts, true, true);
+    for (i = 0; i < 3; i++) {
+        rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 3);
+
+    /* the FSW's EDACRESET strobe pair, verbatim */
+    ctrl_write(qts, CTRL_ROTBCMDSTA, 0x00000004u);
+    ctrl_write(qts, CTRL_ROTBCMDSTA, 0xFFFFFFFBu);
+
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    g_assert_cmpuint(rotb_full(qts), ==, 0);
+    /* no SECCOUNT (31:24) garbage leaks into the composed read */
+    g_assert_cmpuint(ctrl_read(qts, CTRL_ROTBCMDSTA) & 0xFF000000u, ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* system reset: the ring pointers reset, the ring CONTENT is kept (it is
+ * zeroed only at realize). The FSW issues RESETFIFO at init
+ * (RotBuf.c:78), so it never relies on content across a reset. */
+static void test_rotb_reset(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+
+    rotb_cfg(qts, true, true);
+    qtest_writel(qts, ROTB_WINDOW, 0x12345678u);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    qtest_writel(qts, ROTB_WINDOW, 0x9ABCDEF0u);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 2);
+
+    qtest_system_reset(qts);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    g_assert_cmpuint(rotb_full(qts), ==, 0);
+
+    /* the ring content survived; block 0 is visible again (rd = 0) */
+    rotb_cfg(qts, true, true);
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW), ==, 0x12345678u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 /* GPTIMER prescaler set by the -kernel boot stub (hw/sparc/leon3.c).
  * On the IDPU the boot PROM programs the prescaler for a 1 MHz timer tick
  * at the 20 MHz system clock (reload 19, BSW IIR.h IIR_GPT_PRESCALER) and
@@ -1134,6 +1460,12 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/gptimer-prescaler", test_gptimer_prescaler);
         qtest_add_func("/sparc/stix/ctrl-watchdog", test_ctrl_watchdog);
         qtest_add_func("/sparc/stix/ctrl-irq-lines", test_ctrl_irq_lines);
+        qtest_add_func("/sparc/stix/rotb-fifo", test_rotb_fifo);
+        qtest_add_func("/sparc/stix/rotb-window", test_rotb_window);
+        qtest_add_func("/sparc/stix/rotb-full-irq", test_rotb_full_irq);
+        qtest_add_func("/sparc/stix/rotb-selftest-shape", test_rotb_selftest_shape);
+        qtest_add_func("/sparc/stix/rotb-strobe", test_rotb_strobe);
+        qtest_add_func("/sparc/stix/rotb-reset", test_rotb_reset);
     }
 
     return g_test_run();

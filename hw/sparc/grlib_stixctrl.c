@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/sparc/grlib_stix.h"
@@ -59,6 +60,16 @@ struct STIXCTRL
     bool wdg_running;
     int64_t wdg_base_ns;
     QEMUTimer *wdg_timer;
+    /* ROTB (0x54/0x58, BLOCK window 0xE0800000): device-internal ring
+     * (D-A). rd/wr/count/full are the FIFO state; the ring CONTENT is
+     * zeroed at realize and kept across system resets. */
+    uint32_t rotb_blocks;
+    uint8_t *rotb_ring;
+    uint32_t rotb_rd;
+    uint32_t rotb_wr;
+    uint32_t rotb_count;
+    bool rotb_full;
+    MemoryRegion rotb_block_window;
 };
 
 /*static void grlib_stixctrl_timer_tick(void *opaque)
@@ -170,6 +181,128 @@ static void stixctrl_wdg_write(STIXCTRL *s, uint32_t value)
     trace_stixctrl_watchdog_cmd(cmd, s->wdg_reload, stixctrl_wdg_count(s), s->wdg_running);
 }
 
+/* rotbCmdSta (0x54) is composed on read: the stored COMMAND/EDACRESET
+ * strobe bits (2:0) plus live status — READY follows rotbConfig.ENABLE
+ * (the FSW's RotBuf_init polls it with a fatal timeout), FULL is the ring
+ * state, BLOCKCOUNT (23:7) the block count. DEDETECTED and SECCOUNT read
+ * 0 (no EDAC error model yet). */
+static uint32_t stixctrl_rotb_cmdsta(STIXCTRL *s)
+{
+    uint32_t cfg = ((volatile const uint32_t *)&s->reg)[0x58 / sizeof(uint32_t)];
+    uint32_t sta = ((volatile const uint32_t *)&s->reg)[0x54 / sizeof(uint32_t)];
+
+    return (sta & 0x7u) |
+           (((cfg >> STIXCTRL_ROTBCONFIG_ENABLE) & 1u)
+            << STIXCTRL_ROTBCMDSTA_READY) |
+           ((s->rotb_full ? 1u : 0u) << STIXCTRL_ROTBCMDSTA_FULL) |
+           ((s->rotb_count & STIXCTRL_ROTBCMDSTA_BLOCKCOUNT_MASK)
+            << STIXCTRL_ROTBCMDSTA_BLOCKCOUNT);
+}
+
+/* ROTB FIFO commands, from the FSW driver (RotBuf.c
+ * RotBuf_advancePointer/RotBuf_clear, OpModeMgmt.c mode switches):
+ * GETBLOCK advances the read pointer, PUTBLOCK the write pointer
+ * (TESTMODE only — in normal mode the detectors' HW feeds blocks),
+ * RESETFIFO clears the pointers. They execute on EVERY 0x54 write and
+ * regardless of ENABLE (lenient; visible in the rotb_cmd trace). The FSW
+ * issues each command as a read-modify-write that clears COMMAND first,
+ * so no write re-issues a stale command. The EDAC strobe-clear write
+ * 0xFFFFFFFB carries COMMAND = 3, so it executes RESETFIFO — a
+ * documented side effect (Q7), harmless at the FSW's call sites, which
+ * clear the FIFO anyway. */
+static void stixctrl_rotb_command(STIXCTRL *s, uint32_t cmd)
+{
+    uint32_t cfg = ((volatile const uint32_t *)&s->reg)[0x58 / sizeof(uint32_t)];
+    bool testmode = (cfg >> STIXCTRL_ROTBCONFIG_TESTMODE) & 1u;
+
+    switch (cmd) {
+    case STIXCTRL_ROTBCMDSTA_COMMAND_V_GETBLOCK:
+        if (s->rotb_count > 0) {
+            s->rotb_rd = (s->rotb_rd + 1) % s->rotb_blocks;
+            s->rotb_count--;
+            s->rotb_full = false;
+        }
+        /* else: GETBLOCK on an empty ring holds the pointers */
+        break;
+    case STIXCTRL_ROTBCMDSTA_COMMAND_V_PUTBLOCK:
+        if (!testmode) {
+            trace_stixctrl_rotb_ignored("putblock-not-testmode", 0);
+            break;
+        }
+        if (s->rotb_full) {
+            /* D-F: a PUTBLOCK into a full ring is dropped (drop-new) and
+             * pulses IRQ 7 once per rejected write; reaching capacity
+             * only sets FULL. The SW-PUTBLOCK half of the rule is an
+             * assumption until the HSWICD confirms it. */
+            trace_stixctrl_rotb_overflow(s->rotb_count);
+            qemu_irq_pulse(s->irq_rotb);
+            break;
+        }
+        s->rotb_wr = (s->rotb_wr + 1) % s->rotb_blocks;
+        s->rotb_count++;
+        s->rotb_full = s->rotb_count == s->rotb_blocks;
+        break;
+    case STIXCTRL_ROTBCMDSTA_COMMAND_V_RESETFIFO:
+        s->rotb_rd = s->rotb_wr = s->rotb_count = 0;
+        s->rotb_full = false;
+        break;
+    default: /* COMMAND 0: no-op */
+        break;
+    }
+
+    trace_stixctrl_rotb_cmd(cmd, s->rotb_rd, s->rotb_wr, s->rotb_count,
+                            s->rotb_full);
+}
+
+/* BLOCK window (0xE0800000, one 512 B block): the SW view of the ring.
+ * Reads show the block at the read pointer, in any mode; TESTMODE writes
+ * land in the block at the write pointer. */
+static uint64_t grlib_stixctrl_rotb_read(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    STIXCTRL *s = opaque;
+    hwaddr off = addr & (STIXCTRL_BLOCK_SIZE - 1);
+
+    return ldn_be_p(&s->rotb_ring[s->rotb_rd * STIXCTRL_BLOCK_SIZE + off],
+                    size);
+}
+
+static void grlib_stixctrl_rotb_write(void *opaque, hwaddr addr,
+                                      uint64_t value, unsigned size)
+{
+    STIXCTRL *s = opaque;
+    hwaddr off = addr & (STIXCTRL_BLOCK_SIZE - 1);
+    uint32_t cfg = ((volatile const uint32_t *)&s->reg)[0x58 / sizeof(uint32_t)];
+    bool testmode = (cfg >> STIXCTRL_ROTBCONFIG_TESTMODE) & 1u;
+
+    /* the window is the TESTMODE fill path: stores are ignored while
+     * TESTMODE is off or the ring is full. They are block stores, not
+     * PUTBLOCK commands, so they never pulse IRQ 7 (D-F). */
+    if (!testmode || s->rotb_full) {
+        trace_stixctrl_rotb_ignored(!testmode ? "window-write-not-testmode"
+                                              : "window-write-full",
+                                    (uint32_t)off);
+        return;
+    }
+
+    stn_be_p(&s->rotb_ring[s->rotb_wr * STIXCTRL_BLOCK_SIZE + off], size,
+             value);
+}
+
+static const MemoryRegionOps grlib_stixctrl_rotb_ops = {
+    .read = grlib_stixctrl_rotb_read,
+    .write = grlib_stixctrl_rotb_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
 static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXCTRL *stixctrl = opaque;
@@ -183,7 +316,17 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
     stixctrl->reg.watchDog =
         (stixctrl->wdg_reload << STIXCTRL_WATCHDOG_RELOADVAL) |
         (stixctrl_wdg_count(stixctrl) << STIXCTRL_WATCHDOG_COUNT);
-    
+
+    /* 0x54 is composed live (stixctrl_rotb_cmdsta); the rest is stored */
+    if (addr == 0x54 /* rotbCmdSta */)
+    {
+        uint32_t regval = stixctrl_rotb_cmdsta(stixctrl);
+
+        qemu_printf("CTRL | Read requested: addr = 0x%x, regval = 0x%x\n", (uint32_t)addr, regval);
+
+        return regval;
+    }
+
     uint32_t regval = ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
     qemu_printf("CTRL | Read requested: addr = 0x%x, regval = 0x%x\n", (uint32_t)addr, regval);
@@ -241,40 +384,28 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
         value |= (1u << STIXCTRL_HKADC_READY);
     }
 
-    /* model repair: rotbCmdSta (0x54) writable fields are the COMMAND
-     * bits (1:0) and the EDACRESET strobe (bit 2) only. BLOCKCOUNT
-     * (23:7), SECCOUNT (31:24), READY, FULL and DEDETECTED are read-only
-     * status. The FSW's EDAC counter reset clears its strobe with a
-     * full-register write of ~(1u << 2) = 0xFFFFFFFB (EDAC.c); storing
-     * that raw set BLOCKCOUNT to 131071 and the FSW's HK level check
-     * asserted (HKAcquire.c:325) — a baseline-inherited defect masked
-     * on 5.2 by the SCET abort killing runs ~4 FSW-seconds earlier. */
+    /* rotbCmdSta (0x54): writable fields are COMMAND (1:0) and the
+     * EDACRESET strobe (bit 2); BLOCKCOUNT, SECCOUNT, READY, FULL and
+     * DEDETECTED are read-only status, composed in the read handler
+     * (stixctrl_rotb_cmdsta). The FSW's EDAC counter reset clears its
+     * strobe with a full-register write of ~(1u << 2) = 0xFFFFFFFB
+     * (EDAC.c); the baseline stored that raw and set BLOCKCOUNT to
+     * 131071, so the FSW's HK level check asserted (HKAcquire.c:325) —
+     * masked on 5.2 by the SCET abort killing runs ~4 FSW-seconds
+     * earlier. The strobe-clear write carries COMMAND = 3, so it
+     * executes RESETFIFO (harmless, see stixctrl_rotb_command). */
     if (addr == 0x54 /* rotbCmdSta */)
     {
         value &= 0x7u;
     }
 
-    /* model repair: rotbConfig (0x58) ENABLE gates the rotating buffer;
-     * the FPGA asserts rotbCmdSta.READY (bit 3) once enabled, and the
-     * FSW's RotBuf_init waits for it (timeout is fatal: "Fatal error:
-     * 1" at init). The pre-port model passed this by accident — the
-     * EDAC strobe-clear write 0xFFFFFFFB set READY through the raw
-     * register store, which the 0x54 masking above removed. */
-    if (addr == 0x58 /* rotbConfig */)
+    ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;
+
+    if (addr == 0x54 /* rotbCmdSta */)
     {
-        volatile uint32_t *rotbCmdSta = &((volatile uint32_t *)&stixctrl->reg)[0x54 / 4];
-        if (value & (1u << STIXCTRL_ROTBCONFIG_ENABLE))
-        {
-            *rotbCmdSta |= 1u << STIXCTRL_ROTBCMDSTA_READY;
-        }
-        else
-        {
-            *rotbCmdSta &= ~(1u << STIXCTRL_ROTBCMDSTA_READY);
-        }
+        stixctrl_rotb_command(stixctrl, (uint32_t)value & STIXCTRL_ROTBCMDSTA_COMMAND_MASK);
     }
 
-    ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;
-    
     qemu_printf("CTRL | Write completed addr = 0x%x, new regval = 0x%x\n", (uint32_t)addr, ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)]);
 }
 
@@ -293,6 +424,17 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
     STIXCTRL *STIXCTRL = GRLIB_STIXCTRL(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
 
+    /* BLOCKCOUNT is 17 bits (23:7): the ring holds at most 0x1FFFF blocks
+     * (the default 104448 costs ~53.5 MB of host RAM) */
+    if (STIXCTRL->rotb_blocks == 0 ||
+        STIXCTRL->rotb_blocks > STIXCTRL_ROTBCMDSTA_BLOCKCOUNT_MASK)
+    {
+        error_setg(errp, "rotb-blocks must be 1..%u, not %u",
+                   STIXCTRL_ROTBCMDSTA_BLOCKCOUNT_MASK, STIXCTRL->rotb_blocks);
+        return;
+    }
+    STIXCTRL->rotb_ring = g_malloc0((size_t)STIXCTRL->rotb_blocks * STIXCTRL_BLOCK_SIZE);
+
     sysbus_init_irq(sbd, &STIXCTRL->irq_detectors);
     sysbus_init_irq(sbd, &STIXCTRL->irq_hk);
     sysbus_init_irq(sbd, &STIXCTRL->irq_other);
@@ -302,6 +444,10 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&STIXCTRL->iomem, OBJECT(STIXCTRL), &grlib_stixctrl_ops, STIXCTRL, "stixctrl", STIXCTRL_REG_SIZE);
 
     sysbus_init_mmio(sbd, &STIXCTRL->iomem);
+
+    memory_region_init_io(&STIXCTRL->rotb_block_window, OBJECT(STIXCTRL), &grlib_stixctrl_rotb_ops, STIXCTRL, "stixctrl.rotb-block", STIXCTRL_BLOCK_SIZE);
+
+    sysbus_init_mmio(sbd, &STIXCTRL->rotb_block_window);
 
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 
@@ -326,14 +472,37 @@ static void grlib_stixctrl_reset(DeviceState *d)
     stixctrl->wdg_running = false;
     stixctrl->wdg_count = 0;
     stixctrl->wdg_reload = 0;
+
+    /* the ROTB FIFO pointers reset with the device; the ring CONTENT is
+     * kept (zeroed only at realize). The FSW issues RESETFIFO at init
+     * (RotBuf.c:78), so it never relies on content across a reset. */
+    stixctrl->rotb_rd = 0;
+    stixctrl->rotb_wr = 0;
+    stixctrl->rotb_count = 0;
+    stixctrl->rotb_full = false;
 }
+
+static void grlib_stixctrl_unrealize(DeviceState *dev)
+{
+    STIXCTRL *stixctrl = GRLIB_STIXCTRL(dev);
+
+    g_free(stixctrl->rotb_ring);
+    stixctrl->rotb_ring = NULL;
+}
+
+static const Property grlib_stixctrl_properties[] = {
+    DEFINE_PROP_UINT32("rotb-blocks", STIXCTRL, rotb_blocks,
+                       STIXCTRL_ROTB_MAX_BLOCKS),
+};
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = grlib_stixctrl_realize;
+    dc->unrealize = grlib_stixctrl_unrealize;
     device_class_set_legacy_reset(dc, grlib_stixctrl_reset);
+    device_class_set_props(dc, grlib_stixctrl_properties);
 }
 
 static const TypeInfo grlib_stixctrl_info = {

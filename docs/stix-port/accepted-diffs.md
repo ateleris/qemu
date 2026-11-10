@@ -384,3 +384,73 @@ returns `<irqmp>/unnamed-gpio-in[3+i]`, the canonical path of IRQMP's
 input pin. Red on the pre-fix binary: `[0]` returned
 `…/unnamed-gpio-in[7]`; green after, all five match. It is expected red on
 the 5.2 wrapper.
+
+## 12. ROTB data path modeled (baseline: register store only)
+
+**Baseline:** 0x54 (rotbCmdSta) and 0x58 (rotbConfig) were plain register
+stores (with §5's write masking), and nothing else existed: no FIFO
+state, no ring, no BLOCK window. The FSW's whole rotating-buffer
+machinery — commands, BLOCKCOUNT, FULL, the 0xE0800000 window — read
+zeroes and had no effect.
+
+**Model (A2, D-A device-internal RAM):**
+- **Composed status read.** 0x54 is no longer stored/read raw: the read
+  composes the stored COMMAND/EDACRESET strobe bits (2:0) with live
+  status — READY (bit 3) = rotbConfig.ENABLE, FULL (bit 5) = ring state,
+  BLOCKCOUNT (23:7) = block count. DEDETECTED and SECCOUNT (31:24) read
+  0 (no EDAC error model). The §5 READY emulation in the 0x58 handler is
+  gone; ENABLE is the sole READY source now.
+- **Commands execute on EVERY 0x54 write** (the FSW issues each command
+  as a read-modify-write of 0x54, RotBuf.c:151-167, so no write
+  re-issues a stale command): 1 GETBLOCK advances the read pointer
+  (holds on empty), 2 PUTBLOCK advances the write pointer in TESTMODE
+  only (ignored otherwise — in normal mode HW feeds blocks), 3 RESETFIFO
+  clears the pointers. Commands run regardless of ENABLE (lenient),
+  visible in the `stixctrl_rotb_cmd` trace. Pointers wrap at
+  `rotb-blocks` (new qdev property, uint32, default
+  `STIXCTRL_ROTB_MAX_BLOCKS` = 104448, realize error outside 1..0x1FFFF,
+  the BLOCKCOUNT field width).
+- **IRQ 7 rule (D-F):** reaching capacity sets FULL only. A PUTBLOCK
+  into a full ring is dropped (drop-new) and pulses IRQ 7 once per
+  rejected write. **Assumption:** that a *software* PUTBLOCK raises IRQ 7
+  at all is unconfirmed until the HSWICD (roadmap §3); it is harmless
+  because no FSW path writes into a full ring. The FSW's own fills reach
+  exactly cap with IRQ 7 enabled since boot (HWSelftest.c:510-526,
+  RotAccumulator.c:259-266) and must stay silent — covered by
+  `rotb-full-irq` and `rotb-selftest-shape`.
+- **BLOCK window** (MMIO index 1, mapped at 0xE0800000, one 512 B block,
+  big-endian, 1–4 byte access): reads always show the block at the read
+  pointer; TESTMODE writes land in the block at the write pointer.
+  Window writes while full or outside TESTMODE are ignored (traced,
+  `stixctrl_rotb_ignored`) and **never pulse IRQ 7** — D-F counts
+  rejected PUTBLOCK commands, not stores (the FSW fills a block with
+  hundreds of byte/word stores; pulsing per store would be an IRQ storm).
+- **Q7 side effect, documented:** the EDAC strobe-clear write 0xFFFFFFFB
+  carries COMMAND = 3, so it executes RESETFIFO. Harmless at the FSW's
+  call sites (EDAC.c:305-306 callers), which clear the FIFO anyway
+  (RotAccumulator.c:295, HWSelftest.c:569).
+- **Reset keeps content:** a system reset clears the ring pointers and
+  FULL but not the ring bytes (zeroed only at realize). The FSW issues
+  RESETFIFO at init (RotBuf.c:78), so it never relies on content across
+  a reset.
+- **Host RAM:** ~53.5 MB per default instance (104448 × 512 B, g_malloc0
+  at realize, freed at unrealize). Tests set
+  `-global grlib-stixctrl.rotb-blocks=<4..8>`.
+- **Boot impact to watch (corrections item 11):** BLOCKCOUNT now reports
+  real values, so the FSW's HK level check (HKAcquire.c:325) sees them
+  after the EDAC zero-fill and the self-test. Boot-smoke and a short
+  soak (reviewer-side) must confirm no new UART line; any diff is a
+  stop-and-report.
+
+**Evidence:** qtests `/sparc/stix/rotb-fifo` (pointer arithmetic,
+TESTMODE gate, empty-ring hold), `rotb-window` (markers through rd/wr,
+byte-wise fill), `rotb-full-irq` (silent fill to cap, IRQ 7 on the
+rejected PUTBLOCK, drop-new order, FULL clearing), `rotb-selftest-shape`
+(the FSW fill-until-FULL/drain-compare algorithm, bounded loop),
+`rotb-strobe` (strobe pair with blocks queued: count 3 → 0 via the Q7
+RESETFIFO, no SECCOUNT garbage), `rotb-reset` (pointers reset, content
+kept). All red on the pre-A2 binary at their first data-path assertion
+(count stayed 0, window read 0, selftest fill exhausted its bound at
+n=24); all green after. Existing `/sparc/stix/ctrl-rotb` passes
+unchanged on the composed 0x54 read. All six are expected red on the 5.2
+wrapper.
