@@ -239,6 +239,95 @@ static void ctrl_write(QTestState *qts, uint32_t off, uint32_t val)
     qtest_writel(qts, CTRL_BASE + off, val);
 }
 
+/* ---- CTRL SCET set semantics (review T1, decision D1) ---- */
+
+#define CTRL_LONGTIMERSEC 0xc8u
+#define CTRL_LONGTIMERSUBSEC 0xccu
+#define NSEC_PER_SEC 1000000000LL
+#define SUBSEC_PER_SEC 65536
+
+/* seconds field of 0xC8 = bits 30:0; bit 31 is the UNSYNCED status flag
+ * (Timing.c TIMING_COARSE_UNSYNCED), checked separately. */
+static uint32_t ctrl_sec(QTestState *qts)
+{
+    return ctrl_read(qts, CTRL_LONGTIMERSEC) & 0x7fffffffu;
+}
+
+static uint32_t ctrl_flag(QTestState *qts)
+{
+    return ctrl_read(qts, CTRL_LONGTIMERSEC) >> 31;
+}
+
+static uint32_t ctrl_sub(QTestState *qts)
+{
+    return ctrl_read(qts, CTRL_LONGTIMERSUBSEC) & 0xffffu;
+}
+
+/* tolerance for one read round-trip, in sub-second ticks */
+#define SUBSEC_TOL 1
+
+static void test_ctrl_scet(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    /* 1. the FSW's real write pair (Timing.c timerLostSpWTCsCallback):
+     *    stage 0xC8 = 0x7b | UNSYNCED (bit 31), then commit 0xCC = 0xe0c4.
+     *    Must not abort (red on 5.2: assert(0); red on the first D1 draft:
+     *    the flag bit moved the clock +68 years). */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x8000007bu);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0xe0c4u);
+
+    /* 2. commit lands: time = (staged secs, written subsec); the UNSYNCED
+     *    flag is readable in bit 31 of 0xC8. */
+    g_assert_cmpuint(ctrl_sec(qts), ==, 0x7b);
+    uint32_t sub = ctrl_sub(qts);
+    g_assert_cmpuint(sub, >=, 0xe0c4 - SUBSEC_TOL);
+    g_assert_cmpuint(sub, <=, 0xe0c4 + SUBSEC_TOL);
+    g_assert_cmpuint(ctrl_flag(qts), ==, 1);
+
+    /* 3. a lone 0xC8 write stages only (HSWICD 4.51: the commit happens
+     *    at the SubSec write): running time untouched, flag follows the
+     *    written bit 31. */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 1000);
+    g_assert_cmpuint(ctrl_sec(qts), ==, 0x7b);
+    g_assert_cmpuint(ctrl_flag(qts), ==, 0);
+
+    /* 4. the committed clock free-runs: a 0.5 s step from (0x7b, 0xe0c4)
+     *    lands at (0x7c, 0xe0c4 + 0x8000 - 0x10000 = 0x60c4). */
+    qtest_clock_step(qts, (int64_t)500 * 1000 * 1000);
+    g_assert_cmpuint(ctrl_sec(qts), ==, 0x7c);
+    sub = ctrl_sub(qts);
+    g_assert_cmpuint(sub, >=, 0x60c4 - SUBSEC_TOL);
+    g_assert_cmpuint(sub, <=, 0x60c4 + SUBSEC_TOL);
+
+    /* 5. a fresh commit sets seconds and fraction together. */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 5);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0x8000u);
+    g_assert_cmpuint(ctrl_sec(qts), ==, 5);
+    sub = ctrl_sub(qts);
+    g_assert_cmpuint(sub, >=, 0x8000 - SUBSEC_TOL);
+    g_assert_cmpuint(sub, <=, 0x8000 + SUBSEC_TOL);
+
+    /* 6. large epoch commits cleanly (no wrap, no assert). */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x30000000u);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0);
+    g_assert_cmpuint(ctrl_sec(qts), ==, 0x30000000u);
+
+    /* 7. the clock can be set backwards. */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 10);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0x8000u);
+    g_assert_cmpuint(ctrl_sec(qts), ==, 10);
+
+    /* 8. a flagged commit carries the UNSYNCED bit through. */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x80000001u);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0);
+    g_assert_cmpuint(ctrl_sec(qts), ==, 1);
+    g_assert_cmpuint(ctrl_flag(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void test_ctrl(void)
 {
     QTestState *qts;
@@ -330,6 +419,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/flash", test_flash);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
+        qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);
     }
 
     return g_test_run();
