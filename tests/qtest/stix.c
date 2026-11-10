@@ -410,6 +410,44 @@ static void test_pnp(void)
     stix_qtest_cleanup();
 }
 
+/* ROTB command/status (0x54, review follow-up found by the soak): only
+ * the COMMAND field (bits 1:0) and the EDACRESET strobe (bit 2) are
+ * writable. BLOCKCOUNT (bits 23:7), SECCOUNT (bits 31:24), READY, FULL
+ * and DEDETECTED are read-only status. The FSW's EDAC counter reset
+ * (EDAC.c, E_EDAC_MODULE_ROTBUF) clears its strobe with a full-register
+ * write of ~(1u << 2) = 0xFFFFFFFB; storing that raw made
+ * RotBuf_blocksCount() read 0x1FFFF = 131071 blocks, level 8 > mask 7,
+ * and the next HK report asserted (HKAcquire.c:325) — the soak crash at
+ * ~64 s FSW, masked on the 5.2 baseline by the SCET abort at ~60 s. */
+static void test_ctrl_rotb(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    /* the FSW's EDACRESET strobe pair, verbatim */
+    ctrl_write(qts, 0x54, 0x00000004u);
+    ctrl_write(qts, 0x54, 0xFFFFFFFBu);
+
+    /* no strobe write may leak into read-only status fields */
+    g_assert_cmphex(ctrl_read(qts, 0x54) & ~0x7u, ==, 0);
+
+    /* the FSW's GETBLOCK read-modify-write still lands in COMMAND */
+    ctrl_write(qts, 0x54, 0x1u);
+    g_assert_cmphex(ctrl_read(qts, 0x54) & 0x7u, ==, 0x1u);
+
+    /* rotbConfig ENABLE (bit 31) must assert rotbCmdSta.READY (bit 3):
+     * the FSW's RotBuf_init waits for it and a timeout is fatal
+     * ("Fatal error: 1" at init). This passed by accident before the
+     * masking above — the EDAC strobe-clear write 0xFFFFFFFB set READY
+     * through the raw register store. */
+    ctrl_write(qts, 0x58, 1u << 31);
+    g_assert_cmpuint((ctrl_read(qts, 0x54) >> 3) & 1u, ==, 1u);
+    ctrl_write(qts, 0x58, 0);
+    g_assert_cmpuint((ctrl_read(qts, 0x54) >> 3) & 1u, ==, 0u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -420,6 +458,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);
+        qtest_add_func("/sparc/stix/ctrl-rotb", test_ctrl_rotb);
     }
 
     return g_test_run();

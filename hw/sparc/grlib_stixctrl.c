@@ -140,6 +140,38 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
         value |= (1u << STIXCTRL_HKADC_READY);
     }
 
+    /* model repair: rotbCmdSta (0x54) writable fields are the COMMAND
+     * bits (1:0) and the EDACRESET strobe (bit 2) only. BLOCKCOUNT
+     * (23:7), SECCOUNT (31:24), READY, FULL and DEDETECTED are read-only
+     * status. The FSW's EDAC counter reset clears its strobe with a
+     * full-register write of ~(1u << 2) = 0xFFFFFFFB (EDAC.c); storing
+     * that raw set BLOCKCOUNT to 131071 and the FSW's HK level check
+     * asserted (HKAcquire.c:325) — a baseline-inherited defect masked
+     * on 5.2 by the SCET abort killing runs ~4 FSW-seconds earlier. */
+    if (addr == 0x54 /* rotbCmdSta */)
+    {
+        value &= 0x7u;
+    }
+
+    /* model repair: rotbConfig (0x58) ENABLE gates the rotating buffer;
+     * the FPGA asserts rotbCmdSta.READY (bit 3) once enabled, and the
+     * FSW's RotBuf_init waits for it (timeout is fatal: "Fatal error:
+     * 1" at init). The pre-port model passed this by accident — the
+     * EDAC strobe-clear write 0xFFFFFFFB set READY through the raw
+     * register store, which the 0x54 masking above removed. */
+    if (addr == 0x58 /* rotbConfig */)
+    {
+        volatile uint32_t *rotbCmdSta = &((volatile uint32_t *)&stixctrl->reg)[0x54 / 4];
+        if (value & (1u << STIXCTRL_ROTBCONFIG_ENABLE))
+        {
+            *rotbCmdSta |= 1u << STIXCTRL_ROTBCMDSTA_READY;
+        }
+        else
+        {
+            *rotbCmdSta &= ~(1u << STIXCTRL_ROTBCMDSTA_READY);
+        }
+    }
+
     ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;
     
     qemu_printf("CTRL | Write completed addr = 0x%x, new regval = 0x%x\n", (uint32_t)addr, ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)]);
