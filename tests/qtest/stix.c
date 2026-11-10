@@ -83,7 +83,7 @@ static void flash_issue(QTestState *qts, uint32_t ram, uint32_t page,
  * strips the argument for old-build validation runs. */
 static char *stix_tmp_flash_path;
 
-static QTestState *stix_qtest_new(void)
+static QTestState *stix_qtest_new_extra(const char *extra)
 {
     QTestState *qts;
     gchar *path = NULL;
@@ -103,8 +103,22 @@ static QTestState *stix_qtest_new(void)
     close(fd);
     stix_tmp_flash_path = path;
     qts = qtest_initf("-M leon3_generic "
-                      "-global grlib-stixflash.flash-file=%s", path);
+                      "-global grlib-stixflash.flash-file=%s %s", path, extra);
     return qts;
+}
+
+static QTestState *stix_qtest_new(void)
+{
+    return stix_qtest_new_extra("");
+}
+
+/* -global arg moving the TM server off the default 20000+uid port, so a
+ * test can run beside a live FSW session (Task C will make the server
+ * opt-in under qtest; this stays valid then). */
+static gchar *stix_private_tm_port_arg(void)
+{
+    return g_strdup_printf("-global grlib-stixspw.tmtc-port=%d",
+                           30000 + (int)(getpid() % 20000));
 }
 
 static void stix_qtest_cleanup(void)
@@ -448,6 +462,71 @@ static void test_ctrl_rotb(void)
     stix_qtest_cleanup();
 }
 
+/* GPTIMER prescaler set by the -kernel boot stub (hw/sparc/leon3.c).
+ * On the IDPU the boot PROM programs the prescaler for a 1 MHz timer tick
+ * at the 20 MHz system clock (reload 19, BSW IIR.h IIR_GPT_PRESCALER) and
+ * the FSW never writes it; RTEMS assumes 1 us per timer count. The stub
+ * inherited upstream's 40 MHz value (39), which halved the tick rate: FSW
+ * time ran at ~0.48x wall while the CTRL SCET ran at full rate.
+ *
+ * Unlike the other tests this one executes guest code (TCG): a minimal
+ * ELF that spins at 0x40000000, so the stub runs and jumps to it. TM is
+ * moved to a private port so it cannot collide with a running FSW. */
+#define GPTIMER_SCALER_RELOAD 0x80000304u
+#define GPTIMER0_CONFIG       0x80000318u
+
+static gchar *write_spin_elf(void)
+{
+    static const uint8_t elf[] = {
+        /* ELF32, big-endian, EXEC, EM_SPARC, entry 0x40000000, phoff 52 */
+        0x7f, 'E', 'L', 'F', 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 2, 0, 2, 0, 0, 0, 1, 0x40, 0, 0, 0, 0, 0, 0, 52,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 32, 0, 1, 0, 0,
+        0, 0, 0, 0,
+        /* PT_LOAD: offset 84, vaddr = paddr = 0x40000000, 8 bytes, R+X */
+        0, 0, 0, 1, 0, 0, 0, 84, 0x40, 0, 0, 0, 0x40, 0, 0, 0,
+        0, 0, 0, 8, 0, 0, 0, 8, 0, 0, 0, 5, 0, 0, 0, 4,
+        /* ba . ; nop */
+        0x10, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    };
+    gchar *path = NULL;
+    int fd = g_file_open_tmp("stix-spin-XXXXXX.elf", &path, NULL);
+
+    g_assert(fd >= 0);
+    g_assert(write(fd, elf, sizeof(elf)) == sizeof(elf));
+    close(fd);
+    return path;
+}
+
+static void test_gptimer_prescaler(void)
+{
+    g_autofree gchar *elf = write_spin_elf();
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *port = stix_private_tm_port_arg();
+    QTestState *qts;
+    gint64 deadline;
+
+    if (!qtest_has_accel("tcg")) {
+        g_test_skip("needs TCG to run the boot stub");
+        g_unlink(elf);
+        return;
+    }
+    extra = g_strdup_printf("-accel tcg -kernel %s %s", elf, port);
+    qts = stix_qtest_new_extra(extra);
+
+    /* the stub's last store enables timer 0; the prescaler precedes it */
+    deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (!(qtest_readl(qts, GPTIMER0_CONFIG) & 1u)) {
+        g_assert(g_get_monotonic_time() < deadline);
+        g_usleep(1000);
+    }
+    g_assert_cmpuint(qtest_readl(qts, GPTIMER_SCALER_RELOAD), ==, 19);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(elf);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -459,6 +538,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);
         qtest_add_func("/sparc/stix/ctrl-rotb", test_ctrl_rotb);
+        qtest_add_func("/sparc/stix/gptimer-prescaler", test_gptimer_prescaler);
     }
 
     return g_test_run();

@@ -18,9 +18,8 @@ the stores the baseline knows:
     0x0000000c:  bne  0x84
 
 Everything after the preamble is instruction-identical to the baseline
-head: UART control `= 3` at `0x80000108`, GPTIMER scaler `= 39` at
-`0x80000304` (still hardcoded for 40 MHz against the machine's 20 MHz —
-preserved, and the RTEMS LEON3 BSP reprograms the prescaler at boot), timer
+head: UART control `= 3` at `0x80000108`, GPTIMER scaler at `0x80000304`
+(now `19` instead of the baseline's `39` — see section 6), timer
 counter/config stores, then the jump to the ELF entry.
 
 **Why accepted:** on the single-CPU boot the `bne` is not taken (asr17
@@ -126,3 +125,26 @@ Evidence: qtest `stix/ctrl-rotb` pins both (red shown: readback
 suite 6/6 green; boot smoke PASS (init path restored, golden UART
 match intact). The EEPROM/SDRAM/CACHE EDAC
 resets use read-modify-writes of single bits and are unaffected.
+
+## 6. GPTIMER prescaler from the -kernel boot stub: 19, not 39 (baseline-inherited defect)
+
+The boot stub in `hw/sparc/leon3.c` stood in for the IDPU boot PROM with
+upstream's GPTIMER scaler reload of `39` — a 1 MHz tick for a 40 MHz
+LEON3. The STIX machine runs at 20 MHz (`CPU_CLK`), so the timer ticked at
+500 kHz. This section previously claimed the RTEMS BSP reprograms the
+prescaler at boot; it does not: the BSW expects the boot PROM to have set
+`IIR_GPT_PRESCALER` = 19 (`BSW_ASW/.../IIR.h`) and never writes it.
+
+**Effect:** RTEMS assumes 1 us per timer count, so FSW uptime
+(`Timing_getMainTime`, task periods, timeouts) ran at ~0.48x wall clock
+while the CTRL SCET counter ran at the full rate — two FSW clocks that
+never disagree on hardware. Measured on every soak log: 600 s wall ->
+FSW ~290 s; 1800 s -> FSW 873 s. That ratio is also why the old soak
+gate's false "stall" always appeared at FSW ~4.8 min
+(`2026-11-09-task-b-stall-analysis.md`).
+
+**Fix:** the stub writes `CPU_CLK / 1000000 - 1` (= 19). qtest
+`stix/gptimer-prescaler` boots a spin-loop ELF under TCG and pins the
+value (red shown: `39 == 19`). Boot smoke compares only the boot
+sequence, so the golden stays valid; the steady-state cadence per wall
+second doubles.

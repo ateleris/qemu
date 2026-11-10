@@ -128,8 +128,10 @@ static void write_bootloader(void *ptr, hwaddr kernel_addr)
     p = gen_store_u32(p, 0x80000108, 3);
 
     /* Initialize the TIMER 0                                      */
-    /* *GPTIMER_SCALER_RELOAD = 40 - 1;                            */
-    p = gen_store_u32(p, 0x80000304, 39);
+    /* *GPTIMER_SCALER_RELOAD = CPU_CLK / 1 MHz - 1;               */
+    /* STIX: 1 MHz tick as the IDPU boot PROM sets it (BSW IIR.h    */
+    /* IIR_GPT_PRESCALER = 19); the FSW never reprograms it.        */
+    p = gen_store_u32(p, 0x80000304, CPU_CLK / 1000000 - 1);
     /* *GPTIMER0_COUNTER_RELOAD = 0xFFFE;                          */
     p = gen_store_u32(p, 0x80000314, 0xFFFFFFFE);
     /* *GPTIMER0_CONFIG = GPTIMER_ENABLE | GPTIMER_RESTART;        */
