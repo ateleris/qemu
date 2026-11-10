@@ -129,14 +129,19 @@ struct STIXSPW
 
 static uint8_t buffer[8192];
 
+static void stixspw_rx_deliver(STIXSPW *s, const uint8_t *buf, int len);
+
 /*
- * TC bytes from the TCP transport reach the device here (BQL held).
- * Unit reassembly across recv chunks is P2-6; until then the bytes
- * are traced and dropped, as in the baseline.
+ * A whole TC unit arrived from the TCP transport (D-K framing, BQL
+ * held): hand it to the RX DMA path (P2-5), which applies truncation
+ * and the no-spill queue.
  */
 static void recv_packet_callback(uint8_t *data, int length, void *opaque)
 {
-    trace_stixspw_recv_packet_callback();
+    STIXSPW *stixspw = opaque;
+
+    trace_stixspw_recv_packet_callback(length);
+    stixspw_rx_deliver(stixspw, data, length);
 }
 
 /* The RX descriptors are big-endian words (correction 16) */
@@ -665,6 +670,9 @@ static void grlib_stixspw_instance_init(Object *obj)
                              grlib_stixspw_get_tmtc_connected,
                              NULL);
     object_property_add_uint32_ptr(obj, "rx-dropped", &STIXSPW->rx_dropped,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint32_ptr(obj, "tc-resync",
+                                   &STIXSPW->tmtc.tc_resync,
                                    OBJ_PROP_FLAG_READ);
     object_property_add_str(obj, "rx-inject", NULL,
                             grlib_stixspw_set_rx_inject);

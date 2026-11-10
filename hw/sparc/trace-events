@@ -42,7 +42,7 @@ stixctrl_io_read(uint32_t addr, uint32_t val) "CTRL | Read requested: addr = 0x%
 stixctrl_io_write(uint32_t addr, uint32_t val) "CTRL | Write completed addr = 0x%x, new regval = 0x%x"
 
 # grlib_stixspw.c (STIX)
-stixspw_recv_packet_callback(void) "recv_packet_callback"
+stixspw_recv_packet_callback(int len) "TCP TC callback: %d bytes"
 stixspw_io_read_outside(uint64_t addr) "SPW | Read outside register block: addr = %"PRIu64
 stixspw_io_read(uint64_t addr, uint32_t val) "SPW | Read requested: addr = %"PRIu64", regval = 0x%x"
 stixspw_io_write_outside(uint64_t addr) "SPW | Write outside register block ignored: addr = %"PRIu64
@@ -70,8 +70,10 @@ stixtmtc_accept_failed(void) "accept failed"
 stixtmtc_client_connected(const char *addr, int port) "Client connected from: %s:%d"
 stixtmtc_recv_error(int err) "receive error: %d"
 stixtmtc_client_disconnected(void) "TC client disconnected"
-stixtmtc_tm_send(void) "sending a packet!!!!"
-stixtmtc_socket_closed(void) "Error: socket is closed"
+stixtmtc_tm_send(void) "TM packet handed to the transport"
+stixtmtc_socket_closed(void) "TM dropped: no client"
 stixtmtc_tm_dropped(uint32_t len) "TM packet dropped whole: out-queue full (len=%u)"
 stixtmtc_token_stripped(void) "STIX_CONTROL token stripped"
+stixtmtc_tc_unit(uint32_t len) "TC unit framed: %u bytes"
+stixtmtc_resync(void) "TC framing resync: one byte dropped"
 stixtmtc_listening(int port) "IOTCPSERVER - Server listening on port: %d"

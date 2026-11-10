@@ -2038,19 +2038,43 @@ static bool stix_qom_get_bool(QTestState *qts, const char *path,
     return val;
 }
 
-/* The tm-dropped counter, or -1 when the property is unknown. */
-static int64_t stix_qom_tm_dropped(QTestState *qts, const char *path)
+/* A uint32 counter property, or -1 when the property is unknown. */
+static int64_t stix_qom_counter(QTestState *qts, const char *path,
+                                const char *prop)
 {
     QDict *resp = qtest_qmp(qts,
                             "{'execute': 'qom-get',"
-                            " 'arguments': {'path': %s,"
-                            " 'property': 'tm-dropped'}}",
-                            path);
+                            " 'arguments': {'path': %s, 'property': %s}}",
+                            path, prop);
     QNum *n = qobject_to(QNum, qdict_get(resp, "return"));
     int64_t val = n != NULL ? qnum_get_int(n) : -1;
 
     qobject_unref(resp);
     return val;
+}
+
+/* The tm-dropped counter, or -1 when the property is unknown. */
+static int64_t stix_qom_tm_dropped(QTestState *qts, const char *path)
+{
+    return stix_qom_counter(qts, path, "tm-dropped");
+}
+
+/*
+ * Connect to the TM server without the handshake: for tests that send
+ * the STIX_CONTROL token themselves, split across writes.
+ */
+static int stix_tc_connect(uint16_t port)
+{
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(port),
+    };
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    return fd;
 }
 
 /*
@@ -2474,16 +2498,13 @@ static bool stix_rx_inject(QTestState *qts, const char *path,
 /* The rx-dropped counter, or -1 when the property is unknown. */
 static int64_t stix_qom_rx_dropped(QTestState *qts, const char *path)
 {
-    QDict *resp = qtest_qmp(qts,
-                            "{'execute': 'qom-get',"
-                            " 'arguments': {'path': %s,"
-                            " 'property': 'rx-dropped'}}",
-                            path);
-    QNum *n = qobject_to(QNum, qdict_get(resp, "return"));
-    int64_t val = n != NULL ? qnum_get_int(n) : -1;
+    return stix_qom_counter(qts, path, "rx-dropped");
+}
 
-    qobject_unref(resp);
-    return val;
+/* The TC framing resync counter, or -1 when the property is unknown. */
+static int64_t stix_qom_tc_resync(QTestState *qts, const char *path)
+{
+    return stix_qom_counter(qts, path, "tc-resync");
 }
 
 /*
@@ -2793,6 +2814,150 @@ static void test_spw_rx(void)
     stix_qtest_cleanup();
 }
 
+/*
+ * TC ingress over TCP (P2-6, D-K): after the STIX_CONTROL strip the
+ * stream is framed on the CCSDS length — units of 4 + 7 + BE16(bytes
+ * 8:10), reassembled across recv chunks and handed to the RX DMA
+ * path. seq 0 arrives as token+[2 bytes], [8 bytes], [6 bytes]; then
+ * seq 1, one garbage byte and seq 2 arrive in ONE write (exactly one
+ * resync, counted in the read-only QOM property tc-resync). Before
+ * the third fill the test re-arms desc0 and writes dmaControl with RD
+ * (correction 4). RED on the pre-P2-6 binary: no descriptor is filled
+ * (the bytes were traced and dropped).
+ */
+static void test_tc_tcp(void)
+{
+    static const uint8_t tc0[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x00,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xd7, 0x7e
+    };
+    static const uint8_t tc1[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x01,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0x6f, 0x1f
+    };
+    static const uint8_t tc2[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x02,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xb7, 0x9d
+    };
+    static const char token[] = "STIX_CONTROL";
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    g_autofree uint8_t *got = g_malloc(2 * RX_BUF_STEP);
+    uint8_t w1[14], blob[33];
+    QTestState *qts;
+    gint64 deadline;
+    uint32_t ctrl;
+    int64_t resync;
+    int fd, port;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    stix_rx_setup(qts);
+    memset(got, RX_GUARD, 2 * RX_BUF_STEP);
+    qtest_memwrite(qts, RXBUF_BASE, got, 2 * RX_BUF_STEP);
+
+    fd = stix_tc_connect(port);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+
+    /* seq 0 in three writes, spaced so the chunks arrive apart */
+    memcpy(w1, token, sizeof(token) - 1);
+    memcpy(w1 + sizeof(token) - 1, tc0, 2);
+    g_assert_cmpint(send(fd, w1, sizeof(w1), 0), ==, (int)sizeof(w1));
+    g_usleep(50 * 1000);
+    g_assert_cmpint(send(fd, tc0 + 2, 8, 0), ==, 8);
+    g_usleep(50 * 1000);
+    g_assert_cmpint(send(fd, tc0 + 10, 6, 0), ==, 6);
+
+    /* then seq 1, one garbage byte and seq 2 — all in one write */
+    memcpy(blob, tc1, sizeof(tc1));
+    blob[16] = 0xee;
+    memcpy(blob + 17, tc2, sizeof(tc2));
+    g_assert_cmpint(send(fd, blob, sizeof(blob), 0), ==, (int)sizeof(blob));
+
+    /* bounded wait for the first two fills */
+    deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+    while (g_get_monotonic_time() < deadline &&
+           ((qtest_readl(qts, RXDSC_ADDR) & SPW_RXDSC_EN) ||
+            (qtest_readl(qts, RXDSC_ADDR + 8u) & SPW_RXDSC_EN))) {
+        g_usleep(20 * 1000);
+    }
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE | sizeof(tc0));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc0));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+    ctrl = qtest_readl(qts, RXDSC_ADDR + 8u);
+    g_assert_cmphex(ctrl,
+                    ==, SPW_RXDSC_IE | SPW_RXDSC_WR | sizeof(tc1));
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP, got, sizeof(tc1));
+    g_assert_cmpint(memcmp(got, tc1, sizeof(tc1)), ==, 0);
+
+    /* exactly one resync: the 0xEE garbage byte */
+    resync = stix_qom_tc_resync(qts, path);
+    g_assert_cmpint(resync, ==, 1);
+
+    /*
+     * re-arm desc0 and write dmaControl with RD (correction 4): the
+     * queued seq 2 is delivered into it
+     */
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+    while (g_get_monotonic_time() < deadline &&
+           (qtest_readl(qts, RXDSC_ADDR) & SPW_RXDSC_EN)) {
+        g_usleep(20 * 1000);
+    }
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE | sizeof(tc2));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc2));
+    g_assert_cmpint(memcmp(got, tc2, sizeof(tc2)), ==, 0);
+
+    /* nothing beyond each 16-byte unit was written (m6) */
+    qtest_memread(qts, RXBUF_BASE + 16, got, 1);
+    g_assert_cmpuint(got[0], ==, RX_GUARD);
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP + 16, got, 1);
+    g_assert_cmpuint(got[0], ==, RX_GUARD);
+
+    /*
+     * m6: a disconnect mid-unit discards the partial unit (12 bytes:
+     * the header parsed, the body incomplete); after a reconnect the
+     * next whole unit is delivered — the framing state resets on
+     * close and on accept, and the dropped half causes no resync
+     */
+    g_assert_cmpint(send(fd, tc1, 12, 0), ==, 12);
+    g_usleep(50 * 1000);
+    close(fd);
+    g_assert(stix_wait_tmtc_state(qts, path, false, 10 * G_TIME_SPAN_SECOND));
+    fd = stix_tc_connect(port);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+
+    g_assert_cmpint(send(fd, tc1, sizeof(tc1), 0), ==, (int)sizeof(tc1));
+    /* the selector is at 1 and desc1 is disarmed: queue, then re-arm */
+    stix_rx_arm(qts, 1, true, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+    while (g_get_monotonic_time() < deadline &&
+           (qtest_readl(qts, RXDSC_ADDR + 8u) & SPW_RXDSC_EN)) {
+        g_usleep(20 * 1000);
+    }
+    ctrl = qtest_readl(qts, RXDSC_ADDR + 8u);
+    g_assert_cmphex(ctrl,
+                    ==, SPW_RXDSC_IE | SPW_RXDSC_WR | sizeof(tc1));
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP, got, sizeof(tc1));
+    g_assert_cmpint(memcmp(got, tc1, sizeof(tc1)), ==, 0);
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP + 16, got, 1);
+    g_assert_cmpuint(got[0], ==, RX_GUARD);
+    resync = stix_qom_tc_resync(qts, path);
+    g_assert_cmpint(resync, ==, 1); /* the discarded half: no resync */
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -2832,6 +2997,7 @@ int main(int argc, char **argv)
                        test_tm_stalled_client);
         qtest_add_func("/sparc/stix/tm-reconnect", test_tm_reconnect);
         qtest_add_func("/sparc/stix/spw-rx", test_spw_rx);
+        qtest_add_func("/sparc/stix/tc-tcp", test_tc_tcp);
     }
 
     return g_test_run();

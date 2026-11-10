@@ -9,6 +9,16 @@
 /* TM out-queue bound: packets that do not fit whole are dropped */
 #define TMTC_OUT_QUEUE_SIZE (256u * 1024)
 
+/*
+ * D-K TC framing: a unit is [4-byte SpW header][CCSDS Space Packet],
+ * its length 4 + 7 + BE16(unit[8:10]). A 16-bit packet length makes
+ * 4 + 65542 the largest possible unit.
+ */
+#define TC_UNIT_MAX (4u + 65542u)
+
+/*
+ * Called with one framed TC unit in the main loop (BQL held).
+ */
 typedef void (*StixTmtcRecvFn)(uint8_t *data, int length, void *opaque);
 
 /*
@@ -28,6 +38,11 @@ struct StixTmtc {
     size_t token_len;      /* stream-head bytes seen so far */
     bool token_done;       /* the strip was decided for this connection */
 
+    uint8_t *unit_buf; /* D-K framing buffer, TC_UNIT_MAX bytes */
+    size_t unit_len;   /* bytes accumulated for the pending unit */
+    size_t unit_need;  /* 0 until the CCSDS length is known */
+    uint32_t tc_resync; /* framing resyncs (one dropped byte each) */
+
     uint8_t *out_buf; /* whole-packet TM FIFO, TMTC_OUT_QUEUE_SIZE bytes */
     size_t out_len;   /* bytes queued */
     size_t out_sent;  /* bytes of the queue already on the wire */
@@ -46,10 +61,11 @@ bool init_tmtc_server(StixTmtc *tmtc, StixTmtcRecvFn tc_received, void *opaque,
 
 /*
  * Queue one TM packet for the connected client, all-or-nothing: the
- * wire format is the raw packet with no framing, so a packet that does
- * not fit the out-queue is dropped whole (tm-dropped), and a partial
- * write keeps its remainder at the queue head. With no client the
- * packet is dropped silently (not counted in tm-dropped). Never blocks.
+ * stream carries one D-K unit ([4-byte SpW header][CCSDS packet]) per
+ * packet, back to back, so a packet that does not fit the out-queue is
+ * dropped whole (tm-dropped), and a partial write keeps its remainder
+ * at the queue head. With no client the packet is dropped silently
+ * (not counted in tm-dropped). Never blocks.
  */
 void stix_tmtc_send(StixTmtc *tmtc, const uint8_t *data, int len);
 

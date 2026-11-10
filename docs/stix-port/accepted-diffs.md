@@ -927,3 +927,101 @@ code: the IE=0 inject was delivered at once (ctrl read `0x08000010`
 of being held (`IE|EN`). Green: `spw-rx`, `spw-regs`, `spw-tx`,
 `tm-tcp`, and all 28 tests. checkpatch on the diff: 0 errors,
 0 warnings.
+
+## 19. TC ingress over TCP with CCSDS-length framing (baseline: TCs dropped)
+
+**Baseline:** the TCP callback traced and dropped whatever the socket
+delivered; no TC byte could reach the guest (the dead TSIM path, §18).
+
+**Model (P2-6, D-K):** per connection, after the `STIX_CONTROL` strip,
+the receive path frames the stream into units of
+`[4-byte SpW header][CCSDS Space Packet]`, back to back, with no
+length prefix:
+- the unit length is `4 + 7 + BE16(unit[8:10])` — the CCSDS packet
+  length field at SP[4:6] (the TSIM 8-byte RX prefix stays dropped),
+  and `QEMU_BUILD_BUG_ON(11 + 0xffff > TC_UNIT_MAX)` pins the cap
+  instead of an unreachable runtime branch;
+- units are reassembled across `recv` chunks; a unit is delivered
+  **whole**, never before its full length has arrived;
+- the resync rule: header byte 1 must be 0x02 — anything else drops
+  one byte, counts one in the read-only QOM property `tc-resync` and
+  traces `stixtmtc_resync`, then retries. `tc-resync` counts one per
+  dropped byte and is never reset (like `rx-dropped` and
+  `tm-dropped`);
+- plausibility (P2-6 review m4, this implementer's call: implement):
+  a head whose SP[0] is not CCSDS version 0, type TC with the DFH flag
+  (the FSW rejects anything else, FSW-RX §3.2 checks 2-4) is treated
+  like a bad byte 1 — resync. Without it a stray 0x02 at byte 1 of
+  garbage could lock onto a bogus length and swallow up to 64 KiB of
+  real TCs behind it. It is FSW-safe: a TC failing this check would be
+  rejected by the FSW anyway;
+- each complete unit goes to `stixspw_rx_deliver` (P2-5), which
+  applies truncation, the no-spill queue and the IE-window hold; the
+  device callback runs on the main loop, BQL held;
+- a unit still pending when the connection closes is dropped with the
+  connection (the framing state resets on accept and close);
+- **no socket back-pressure (D-L, review m5):** the transport reads
+  8 KiB per main-loop pass however full the RX path is, and never
+  pushes back. Beyond the 2 armed descriptors plus the 64 queued
+  units, TCs are dropped (counted in `rx-dropped`) while the socket
+  keeps draining — a GS burst of more than ~66 TCs while the FSW is
+  not re-arming loses TCs. Memory stays bounded: one 65546-byte
+  framing buffer plus at most 64 queued units of at most 65546 bytes
+  (≈ 4.2 MiB), since `rx_deliver` copies the whole unit even though
+  only `min(len, dmaMaxRxLength)` is ever DMA'd. Dropping the read
+  interest while the queue is full (and re-arming it from the retry)
+  is a possible later improvement.
+- Traces: `stixtmtc_tc_unit(len)`, `stixtmtc_resync`;
+  `stixspw_recv_packet_callback` now carries the unit length. While
+  the trace file was touched, the two legacy P2-4 texts became "TM
+  packet handed to the transport" and "TM dropped: no client" (P2-4
+  review n4); the event names are unchanged.
+
+**Not changed:** the wire format (D-K, unchanged for
+`scripts/stix/tmtc-probe.py` and `scripts/stix/gs/stix_gs_bridge.py`),
+the TM side, the token-strip rule, P2-5's RX semantics, and the P2-1
+server contract (`tmtc-hermetic`, `tmtc-bind-error` pass unchanged).
+
+**Tests:** qtest `/sparc/stix/tc-tcp` — the token plus TC(17,1) seq 0
+in three writes, then seq 1 + one 0xEE garbage byte + seq 2 in one
+write: desc0 = seq 0 and desc1 = seq 1, byte-exact with lengths 16,
+guard bytes after each 16-byte unit untouched, `tc-resync` = 1 (the
+counter is checked instead of the one resync trace the plan asked
+for — equivalent and stronger), and after a desc0 re-arm plus a
+dmaControl RD write (correction 4) desc0 = seq 2. A disconnect
+mid-unit (12 bytes, header parsed, body incomplete) discards the
+partial unit; after a reconnect the next whole unit is delivered
+byte-exactly and still with `tc-resync` = 1 (review m6). All waits
+bounded. Red on the pre-P2-6 binary: the bounded fill wait expired
+with desc0 still armed (`0x0a000000`) — no descriptor was filled, the
+bytes were traced and dropped. `tmtc-probe.py --self-test` pins the
+framer (split reassembly, the garbage-byte resync, garbage heads and
+tails, the four real FSW TM units from the reviewer's run, the plain
+argparse mode of soak/boot-smoke, and the two-send schedule) and the
+expectation matcher — whose application data starts at **SP[16] for
+TM** (the 10-byte TM data field header, `TMData.h:423`,
+`TMData_DATA_FIELD = 16`, `TM_1.c:29-30`) and at SP[10] for TC
+(P2-6 review B2). The end-to-end gate is `scripts/stix/tc-smoke.sh`:
+boots the normal ELF like boot-smoke, sends TC(17,1) seq 0 at
+`STIX_TC_SEND_AT` (20 s) and expects TM(1,1) `0x5A1:1:1:1DACC000`,
+TM(17,2) `0x5A7:17:2` and TM(1,7) `0x5A1:1:7:1DACC000` within
+`STIX_TC_WINDOW` (10 s), then — after the first window closes — a
+corrupt-CRC TC and TM(1,2) keyed on `0x5A1:1:2:1DACC0010002`
+(TCPacketID+SeqCtl+failureID 2, `TCBuffer.c:336-342`, review M2);
+prints one `TC-SMOKE: PASS`/`FAIL (<which expectation>)`/`ERROR`
+verdict line with exit codes 0/1/2, stops QEMU at the end, supports
+`--dry-run`. tc-smoke on the normal ELF (reviewer's run,
+2026-11-10): `TC-SMOKE: PASS`; TM(1,1), TM(17,2) and TM(1,7) for
+TC(17,1) seq 0 in the same second, and TM(1,2) with FID 2 for the
+corrupt-CRC TC 9 s later:
+
+    EXPECT OK: 0x5A1:1:1:1DACC000 (unit len=24)
+    EXPECT OK: 0x5A7:17:2 (unit len=20)
+    EXPECT OK: 0x5A1:1:7:1DACC000 (unit len=24)
+    EXPECT OK: 0x5A1:1:2:1DACC0010002 (unit len=32)
+
+Known limitation: the TC plausibility check also requires the DFH
+flag, so a TC without a data field header never reaches the FSW and
+cannot be used to provoke its TM(1,2) rejection.
+Green: `tc-tcp`, `spw-rx`, `tm-tcp`, and all 29 tests; boot-smoke;
+soak 300 s; checkpatch on the diff: 0 errors, 0 warnings.

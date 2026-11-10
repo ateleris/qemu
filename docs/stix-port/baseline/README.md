@@ -104,8 +104,15 @@ QTEST_QEMU_BINARY=$PWD/scripts/stix/baseline/qemu-system-sparc-52-wrapper.sh \
 STIX_ASW_ELF=/path/to/ASW_em.elf bash scripts/stix/boot-smoke.sh \
     build/qemu-system-sparc          # add --with-tm for the TM check
 
-# 5. TM probe (raw packets, no TSIM prefix):
+# 5. TM probe (D-K framing since P2-6: [4-byte SpW header][CCSDS packet],
+#    split on the CCSDS length; the raw chunk lines are still printed):
 python3 scripts/stix/tmtc-probe.py --seconds 60
+
+# 6. TC end-to-end gate (P2-6, needs the ASW ELF; boots the model, sends
+#    TC(17,1) seq 0 at ~20 s and expects TM(1,1), TM(17,2), TM(1,7)
+#    within 10 s, then a corrupt-CRC TC and expects TM(1,2)):
+STIX_ASW_ELF=/path/to/ASW_em.elf bash scripts/stix/tc-smoke.sh \
+    build/qemu-system-sparc          # add --dry-run to only print
 ```
 
 Notes:
@@ -116,6 +123,16 @@ Notes:
   Liveness is TM flow: at least one TM chunk in every 60 s slice of the
   window. UART growth is only reported, because with the watchdog modeled
   the normal ELF goes quiet after boot.
+- TC gate: `STIX_ASW_ELF=... bash scripts/stix/tc-smoke.sh build/qemu-system-sparc`.
+  **PASS** means the model accepted the ground's TC(17,1) over TCP, the
+  FSW verified and executed it, and — within `STIX_TC_WINDOW` (10 s) of
+  the send — TM(1,1) arrived on APID 0x5A1 with application data
+  `1DAC C000`, TM(17,2) on 0x5A7, and TM(1,7) on 0x5A1 with `1DAC C000`;
+  afterwards a TC(17,1) with a corrupted CRC trailer was rejected with
+  TM(1,2) on 0x5A1. Expectations key on APID and PUS type/subtype
+  (correction 5), never on the 0x49 SpW header byte (findings F1). QEMU
+  is stopped when the probe finishes; `flash.bin` stays in place.
+  `--dry-run` prints the commands without booting.
 - The wrapper locates the old binary via `STIX_OLD_QEMU`
   (default `/tmp/qemu-stix-baseline/build/sparc-softmmu/qemu-system-sparc`).
 - `qemu-stdout.golden.log` (the `stix*` trace-event stream, captured with
@@ -140,6 +157,7 @@ From Windows the same files are at `\\wsl$\<distro>\tmp\stix-uprev-run\`.
 |---|---|---|---|
 | `soak.sh` | `uart.soak.raw` | `qemu-stdout.soak.log` | `tm.soak-probe.log` |
 | `boot-smoke.sh` | `uart.smoke.raw` (+ `.norm`) | `qemu-stdout.smoke.log` | `tm.smoke.log` (`--with-tm`) |
+| `tc-smoke.sh` | `uart.tc.raw` | `qemu-stdout.tc.log` | `tc.smoke.probe.log` (framed units + expectations) |
 | `capture-golden.sh` | `uart.golden.raw` | `qemu-stdout.golden.log` | — |
 
 All of these are in the run directory. Each run overwrites its own files.
@@ -204,8 +222,10 @@ cd /tmp/stix-uprev-run && /path/to/build/qemu-system-sparc \
 - Expected steady-state guest errors: `HKAcquire *E reference voltage ... out
   of range` (ADC reads 0), `LUTMgmt *E could not find LUT` (empty flash).
   These are part of the golden content, not failures.
-- `tmtc_io_server.c` defines the `"STIX_CONTROL"` token but never checks it;
-  the SPW TC-receive path is a printf stub (TC in cannot reach the guest).
+- The `"STIX_CONTROL"` token and the SPW TC-receive path: **fixed since
+  P2-4/P2-6** (accepted-diffs §17/§19) — the token is stripped per
+  connection and framed TC units reach the guest's RX DMA. This bullet
+  described the baseline only; on the baseline model TC in is still dead.
 - **TM DOES flow** (correcting the earlier "console-only" recollection): the
   model emits real telemetry on TCP 20000+getuid() — raw packets, NO 4-byte
   TSIM length prefix (that framing exists only in the FSW-side
