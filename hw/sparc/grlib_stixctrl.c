@@ -21,12 +21,6 @@ typedef struct
   uint16_t fine;
 } stixCtrl_scet_s;
 
-static uint64_t toMs(uint32_t _coarse, uint16_t _fine)
-{
-	uint64_t fine_millisec = ((uint32_t)_fine * 1000) / 0x10000;
-	return (uint64_t)_coarse * 1000LU + fine_millisec;
-}
-
 /*static uint64_t scetToMs(stixCtrl_scet_s _scet)
 {
 	return toMs(_scet.coarse, _scet.fine);
@@ -46,7 +40,16 @@ struct STIXCTRL
     stixCtrlRegs_s reg;
     //stixCtrl_scet_s reference_t;
     //int64_t reference_time;
-    int64_t time_correction;
+    /* SCET correction in ns: current SCET = QEMU_CLOCK_VIRTUAL - correction.
+     * Signed int64: setting the clock backwards just grows the correction.
+     * (D1, review T1: counter semantics, ns resolution.) */
+    int64_t time_correction_ns;
+    /* SCET set staging (HSWICD 4.51 two-register commit, D1 amended with
+     * Laszlo 2026-11-09): the 0xC8 write STAGES the seconds field and the
+     * UNSYNCED status flag without moving the running time; the 0xCC write
+     * COMMITS (staged seconds, written subsec) as the new on-board time. */
+    uint32_t staged_secs;
+    uint32_t unsynced_flag;
 };
 
 /*static void grlib_stixctrl_timer_tick(void *opaque)
@@ -58,13 +61,19 @@ struct STIXCTRL
     timer_mod_ms(stixctrl->timer, 1);
 }*/
 
-static stixCtrl_scet_s msToSCET(uint64_t ms)
+#define STIX_NSEC_PER_SEC 1000000000LL
+#define STIX_SUBSEC_PER_SEC 65536LL
+
+static stixCtrl_scet_s nsToSCET(int64_t ns)
 {
-	assert(ms / 1000LU <= 0xFFFFFFFF);
+	/* ns >= 0 by construction: the correction is only ever set to
+	 * now - target, and the elapsed time since then is >= 0. */
+	int64_t coarse = ns / STIX_NSEC_PER_SEC;
+	int64_t rem = ns - coarse * STIX_NSEC_PER_SEC;
 	stixCtrl_scet_s scet;
-	
-	scet.coarse = (uint32_t)(ms / 1000LU);
-	scet.fine = (uint16_t)((ms - (uint64_t)scet.coarse * 1000LU) * (uint64_t)0x10000 / 1000LU);
+
+	scet.coarse = (uint32_t)coarse;
+	scet.fine = (uint16_t)(rem * STIX_SUBSEC_PER_SEC / STIX_NSEC_PER_SEC);
 
 	return scet;
 }
@@ -74,8 +83,10 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
     STIXCTRL *stixctrl = opaque;
 
     // update timer constantly // TODO: check if this should only be done on a read of 0xC8 or 0xCC
-    stixCtrl_scet_s scet = msToSCET(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - stixctrl->time_correction);
-    stixctrl->reg.longTimerSec = scet.coarse;
+    stixCtrl_scet_s scet = nsToSCET(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - stixctrl->time_correction_ns);
+    /* bit 31 = UNSYNCED status flag (Timing.c TIMING_COARSE_UNSYNCED);
+     * the FSW reads and checks it (Timing.c:136). */
+    stixctrl->reg.longTimerSec = scet.coarse | (stixctrl->unsynced_flag << 31);
     stixctrl->reg.longTimerSubSec = scet.fine;
     
     uint32_t regval = ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)];
@@ -91,32 +102,35 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
 
     // update the register as per write request
     // mostly automatic, special for timing
-    if(addr == 0xC8 || addr == 0xCC)
+    if (addr == 0xC8 || addr == 0xCC)
     {
-        // have not been testing this yet. Stop when it happens the first time -> timecode and TC9 needed
-        assert(0);
-        stixCtrl_scet_s scet_virtual = msToSCET(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
-        stixCtrl_scet_s scet_corrected = msToSCET(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - stixctrl->time_correction);
-        qemu_printf("Current virtual time: s = %u, ss = %u", scet_virtual.coarse, scet_virtual.fine);
-        qemu_printf("Current corrected time: s = %u, ss = %u", scet_corrected.coarse, scet_corrected.fine);
-
-        uint64_t now = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
-        uint64_t time_correction_s = (stixctrl->time_correction / 1000LU) * 1000LU;
-
-        if(addr == 0xC8)
+        /* SCET set, HSWICD 4.51 two-register commit (review T1; D1 amended
+         * with Laszlo 2026-11-09 after the soak caught the flag bit). The
+         * FSW (IIR.c IIR_setElapsedTime) writes 0xC8 then 0xCC:
+         *  - 0xC8 STAGES the seconds field (bits 30:0) and the UNSYNCED
+         *    status flag (bit 31 = Timing.c TIMING_COARSE_UNSYNCED); the
+         *    running time is NOT touched ("When written SubSec and
+         *    previously stored LongTimerSec.Secs fields will be set as a
+         *    new value of on-board time").
+         *  - 0xCC COMMITS the new on-board time: seconds = staged value,
+         *    sub-seconds = value & 0xFFFF (1/65536 s units). Bits 31:16
+         *    are status and do not affect the time. */
+        if (addr == 0xC8)
         {
-            uint64_t time_correction_ms = time_correction_s - (stixctrl->time_correction / 1000LU) * 1000LU;
-            stixctrl->time_correction = time_correction_ms + (now - toMs(value, 0));
+            stixctrl->staged_secs = value & 0x7FFFFFFFu;
+            stixctrl->unsynced_flag = (uint32_t)(value >> 31) & 1u;
         }
         else
         {
-            stixctrl->time_correction = time_correction_s + (now - toMs(0, value));
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            int64_t new_subns = (int64_t)(value & 0xFFFFu) * STIX_NSEC_PER_SEC
+                                / STIX_SUBSEC_PER_SEC;
+            stixctrl->time_correction_ns = now -
+                ((int64_t)stixctrl->staged_secs * STIX_NSEC_PER_SEC + new_subns);
         }
-
-        scet_corrected = msToSCET(qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) - stixctrl->time_correction);
-        qemu_printf("New corrected time: s = %u, ss = %u", scet_corrected.coarse, scet_corrected.fine);
+        trace_stixctrl_scet_write((uint32_t)addr, (uint32_t)value);
     }
-    
+
     /* model repair: HK ADC conversion completes immediately. The FSW
      * (HK.c) writes a conversion command to hkAdc (0x8c) and polls the
      * READY bit (bit 7) until the conversion is done; the real FPGA
@@ -163,7 +177,13 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
 
 static void grlib_stixctrl_reset(DeviceState *d)
 {
-    // stixctrl *stixctrl = grlib_stixctrl(d);
+    STIXCTRL *stixctrl = GRLIB_STIXCTRL(d);
+
+    /* SCET staging state clears with the device; the running time keeps
+     * its correction (a system reset does not rewind the on-board clock
+     * the FSW has committed). */
+    stixctrl->staged_secs = 0;
+    stixctrl->unsynced_flag = 0;
 }
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)
