@@ -685,19 +685,24 @@ back 0, and any non-dmaControl write destroyed the dmaControl state.
   write-back, no PS, no IRQ, traced as `stixspw_tx_skip_en`); the
   completion sets PS and needs TXDSC_IE **and** dmaControl.TI for the
   IRQ.
-- **D-M (assumption):** control.IE gates every SpW IRQ, unlike stock
-  GRSPW where IE gates only link-error IRQs. An event arriving while
-  IE = 0 is latched (`irq_latched`, new state) and the IRQ is pulsed
-  once on the next IE 0→1 write. The FSW uses IE only as a short
-  critical section around `SPW_send` (SPW.c:707-731), so the IRQ is
-  just deferred. The deferred pulse is unconditional once latched — it
-  does not re-check its cause; the FSW never W1Cs a flag inside the
-  IE=0 window, and the ISR tolerates a no-flag entry. Traces:
-  `stixspw_irq_latched`, `stixspw_irq_deferred`.
+- **D-M (assumption, revised by the P2-5 review):** control.IE gates
+  every SpW IRQ, unlike stock GRSPW where IE gates only link-error
+  IRQs. For TX (and, from P2-7, tick) an event arriving while IE = 0
+  is latched (`irq_latched`) and the IRQ is pulsed once on the next
+  IE 0→1 write. For RX latching is not enough: PR set inside the
+  FSW's `SPW_send` IE=0 window would be eaten by its own
+  `dmaControl |= TE` read-modify-write (W1C, SPW.c:725) before the
+  deferred pulse, and the ISR would skip the unit. A unit arriving
+  while IE = 0 is therefore **not delivered at all** — it waits in
+  the no-spill queue (RD untouched) and the IE 0→1 edge retries the
+  queue before the latched pulse. Invisible to the FSW: the link
+  back-pressures for a few µs. Traces: `stixspw_irq_latched`,
+  `stixspw_irq_deferred`.
 - **Reset handler:** registers go to their power-on values
   (status = 0xA00000, everything else 0) and the latch clears; guest
-  RAM and the TMTC transport (P2-1) are untouched. The RX queue/index
-  of P2-5 will clear here too. This is a behaviour change for warm
+  RAM and the TMTC transport (P2-1) are untouched. The RX queue and
+  the descriptor selector of P2-5 clear here too. This is a
+  behaviour change for warm
   resets: a guest-triggered system reset (the CTRL/watchdog reset
   request) now restores the SPW registers, where the baseline kept
   them. It is FSW-neutral because `SPW_open` runs again after every
@@ -827,3 +832,98 @@ traffic: ~93 % of a core over 3 s, vs 0.0 % with only A; post-fix
 stays out of the suite on purpose. Green: all three TM tests,
 `tmtc-hermetic`, `tmtc-bind-error`, `spw-tx`, `spw-regs`, and all 27
 tests. checkpatch on the diff: 0 errors, 0 warnings.
+
+## 18. SPW RX descriptor DMA with a no-spill queue (baseline: dead TSIM code)
+
+**Baseline:** the whole RX path was dead TSIM code inside
+`recv_packet_callback` (commented out since the qemu port): an 8-byte
+TSIM prefix skip, host-endian dword swaps, `tsim_read/write_cpu_mem`
+and a `length < 8 ? 8` length floor. No unit ever reached guest
+memory; TC bytes were traced and dropped.
+
+**Model (P2-5, FSW-RX §2, D-L):** `stixspw_rx_deliver(s, buf, len)` —
+- The unit is delivered when **control.IE is set**, the descriptor at
+  `dmaRxDescAddr + 8*rx_index` is armed (EN) **and** dmaControl has
+  RE and RD set; the descriptor words are read with big-endian
+  helpers (correction 16). An IE=0 window is the FSW's `SPW_send`
+  critical section: PR set inside it would be eaten by the FSW's own
+  `dmaControl |= TE` read-modify-write (W1C, SPW.c:725) and the
+  deferred ISR would skip the unit (M1 of the P2-5 review), so the
+  unit waits in the queue — **without touching RD**, which is a
+  DMA-channel condition, not a descriptor one — and the IE 0→1 edge
+  retries the queue before the latched TX/event pulse.
+- Delivery DMAs `min(len, dmaMaxRxLength)` bytes to `daddr`, writes
+  ctrl back as `min(len, dmaMaxRxLength) | TR` when truncated
+  (correction 11: the length field is the byte count written, so a
+  300-byte unit gives `252|TR`), keeps WR/IE, clears EN, advances the
+  selector (WR wraps to the table base, and the selector itself wraps
+  at the 128 descriptors of DESCSEL), sets PR, and raises IRQ 13 when
+  RI and the descriptor's IE are set — delivery only happens with
+  control.IE set (see M1), so the pulse is direct.
+- **D-L (no-spill queue):** depth 64, matching the FSW's TC queue
+  (`configFSW.h:172`). A unit that arrives while 64 are pending is
+  dropped whole and counted in the read-only QOM property
+  `rx-dropped`. RD is cleared **only** when a unit is pending on a
+  descriptor condition (correction 10 — `spw-regs`'s `0x181e`
+  read-back stays valid); the queue is retried on every dmaControl
+  write with RD set (the ISR's post-re-arm write, `SPW.c:349-350`)
+  and on the IE 0→1 edge. FIFO order is never jumped. The model is
+  **always no-spill**: NS=0 (spill) is not honoured — the FSW always
+  sets NS (`0x181e`).
+- **Selector:** the descriptor table is `dmaRxDescAddr` masked to its
+  1 KiB alignment (DESCBASEADDR, bits 31:10) with DESCSEL bits 9:3 as
+  the selector (`StixIdpu.h:1451-1456`); a write sets both, and a
+  **read returns `(base & ~0x3ff) | (rx_index << 3)`** — the readback
+  follows GRSPW, where the core exposes the selector in the register.
+  The FSW never reads the register (its only access is the write at
+  SPW.c:545), so the readback is invisible to it. `rx_index` wraps at
+  128. A device reset clears the queue, the selector and the register
+  (power-on value 0, visible in the readback).
+  `rx-dropped` is a lifetime counter, like `tm-dropped`.
+- The dead TSIM code is deleted; `recv_packet_callback` stays as the
+  TCP hook — P2-6 wires its reassembly to `stixspw_rx_deliver`.
+
+**Test path:** the write-only QOM property `rx-inject` (a hex string,
+spaces allowed) delivers one unit per set. It is **qtest-only**: the
+setter refuses with an error unless `qtest_enabled()`, so a real run
+or the boot gates cannot inject, and there is no guest-reachable
+path into it.
+
+**Not changed:** the registers a delivery does not touch, the TX path,
+and the P2-4 transport (`spw-regs`, `spw-tx`, all TM tests pass
+unchanged). No vmstate yet (pre-existing); a future one must carry
+the RX queue (all queued units), `rx_head`, `rx_count`, `rx_index`
+and `irq_latched` besides the P2-4 state, or in-flight TCs are lost
+on migration.
+
+**Evidence:** qtest `/sparc/stix/spw-rx` — two descriptors armed as
+the FSW arms them (`SPW.c:413-434`, `IE|EN`, WR on the last,
+252-byte buffers, `dmaMaxRxLength` 252, control.IE, dmaControl
+`0x181e`), driven with real TC(17,1) packets (FSW-RX §6): (a) unit 1
+lands byte-exact in buffer 0, ctrl = len with EN cleared and IE kept,
+PR set, IRQ 13 pending; (b) unit 2 lands in desc1 and the next unit
+wraps to desc0 only after it is re-armed (queued meanwhile, RD
+cleared); (c) a 300-byte unit gives ctrl `252|TR` and leaves the
+guard after the buffer untouched; (d) with both descriptors unarmed
+there is no guest write at all, RD is cleared, and a re-arm plus an
+RD write delivers; (e) 65 queued units give `rx-dropped` = 1 and the
+first 64 are delivered in order as the descriptors are re-armed;
+(f) **M1 of the P2-5 review**: with control.IE = 0 (the `SPW_send`
+window) a unit is held — no DMA, no ctrl write-back, no PR, RD
+untouched — then the FSW's own sequence runs (a TX, then
+`dmaControl = readl(dmaControl) | TE`), and the IE 0→1 edge delivers
+the unit (ctrl = len, byte-exact, PR set, IRQ 13 pending); plus the
+gates: RI = 0 and descriptor IE = 0 deliver without an IRQ, RE = 0
+queues until RE and RD are written; (g) `qtest_system_reset` clears
+the queue and the selector: the selector is 1 before the reset (a
+unit was delivered into desc0) and shows in the register readback
+(GRSPW DESCSEL, bits 9:3 of `dmaRxDescAddr`); after the reset the
+readback is 0, the base rewrite plus the RD write deliver nothing
+(the queued unit is gone), and a fresh unit lands in desc0
+byte-exactly. Red on the pre-P2-5 binary: `rx-inject refused: Property
+'grlib-stixspw.rx-inject' not found`. Red for M1 on the pre-fix
+code: the IE=0 inject was delivered at once (ctrl read `0x08000010`
+= IE|len with EN already cleared, PR set inside the window) instead
+of being held (`IE|EN`). Green: `spw-rx`, `spw-regs`, `spw-tx`,
+`tm-tcp`, and all 28 tests. checkpatch on the diff: 0 errors,
+0 warnings.

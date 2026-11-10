@@ -2394,6 +2394,405 @@ static void test_tm_reconnect(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P2-5: SPW RX descriptor DMA with a no-spill queue (spw-rx) ---- */
+
+#define SPW_DMARxDesc (SPW_BASE + 0x2cu)
+#define SPW_DMA_RE (1u << 1)
+#define SPW_DMA_RI (1u << 3)
+#define SPW_DMA_PR (1u << 6)
+#define SPW_DMA_RD (1u << 11)
+
+#define SPW_RXDSC_IE (1u << 27)
+#define SPW_RXDSC_WR (1u << 26)
+#define SPW_RXDSC_EN (1u << 25)
+#define SPW_RXDSC_TR (1u << 31)
+
+#define RXDSC_ADDR  0x40003000u  /* 1 KiB-aligned descriptor table */
+#define RXBUF_BASE  0x40004000u
+#define RX_BUF_STEP 252u         /* SPWCONTROL_RX_BUF_SIZE spacing */
+#define RX_MAXLEN   252u
+#define RX_GUARD    0x5au
+
+/*
+ * Arm RX descriptor i the way the FSW does (BSW/SPW/SPW.c:413-434):
+ * ctrl = IE|EN (plus WR on the last one), daddr = base + i*252.
+ * en = false disarms again (the FSW never does that; the tests do).
+ */
+static void stix_rx_arm(QTestState *qts, int i, bool wrap, bool en)
+{
+    uint32_t ctrl = SPW_RXDSC_IE | (en ? SPW_RXDSC_EN : 0) |
+                    (wrap ? SPW_RXDSC_WR : 0);
+
+    qtest_writel(qts, RXDSC_ADDR + 8u * (uint32_t)i, ctrl);
+    qtest_writel(qts, RXDSC_ADDR + 8u * (uint32_t)i + 4u,
+                 RXBUF_BASE + RX_BUF_STEP * (uint32_t)i);
+}
+
+/*
+ * The FSW's whole RX setup: table, 2 descriptors, maxRxLength, IE,
+ * dmaControl
+ */
+static void stix_rx_setup(QTestState *qts)
+{
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR); /* selector -> 0 */
+    stix_rx_arm(qts, 0, false, true);
+    stix_rx_arm(qts, 1, true, true);
+    qtest_writel(qts, SPW_DMAXRX, RX_MAXLEN);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+}
+
+/* qom-set the qtest-only rx-inject property; false when refused. */
+static bool stix_rx_inject(QTestState *qts, const char *path,
+                           const uint8_t *data, size_t len)
+{
+    GString *hex = g_string_new(NULL);
+    QDict *resp;
+    bool ok;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        g_string_append_printf(hex, "%s%02x", i ? " " : "", data[i]);
+    }
+    resp = qtest_qmp(qts,
+                     "{'execute': 'qom-set',"
+                     " 'arguments': {'path': %s, 'property': 'rx-inject',"
+                     " 'value': %s}}",
+                     path, hex->str);
+    ok = qdict_haskey(resp, "return");
+    if (!ok) {
+        QDict *err = qdict_get_qdict(resp, "error");
+
+        g_test_message("rx-inject refused: %s",
+                       err != NULL ? qdict_get_try_str(err, "desc") : "?");
+    }
+    qobject_unref(resp);
+    g_string_free(hex, TRUE);
+    return ok;
+}
+
+/* The rx-dropped counter, or -1 when the property is unknown. */
+static int64_t stix_qom_rx_dropped(QTestState *qts, const char *path)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'rx-dropped'}}",
+                            path);
+    QNum *n = qobject_to(QNum, qdict_get(resp, "return"));
+    int64_t val = n != NULL ? qnum_get_int(n) : -1;
+
+    qobject_unref(resp);
+    return val;
+}
+
+/*
+ * RX descriptor DMA (P2-5, FSW-RX §2): units injected through the
+ * qtest-only rx-inject property are DMA'd into the armed descriptor,
+ * the ctrl word comes back with the length (EN cleared, WR/IE kept),
+ * PR is set and IRQ 13 fires when RI and the descriptor's IE are set
+ * (gated by control.IE per D-M, latched like the TX IRQ). A unit that
+ * finds no armed descriptor, or RE or RD clear, waits in the 64-unit
+ * no-spill queue (D-L) with RD cleared, and is retried on a
+ * dmaControl write with RD — the ISR's post-re-arm write
+ * (BSW/SPW/SPW.c:349-350). A 300-byte unit is truncated to
+ * dmaMaxRxLength with TR (correction 11). RED on the pre-P2-5
+ * binary: rx-inject is unknown.
+ */
+static void test_spw_rx(void)
+{
+    /* real TC(17,1) packets (FSW-RX §6): seq 0, 1 and 2 */
+    static const uint8_t tc0[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x00,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xd7, 0x7e
+    };
+    static const uint8_t tc1[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x01,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0x6f, 0x1f
+    };
+    static const uint8_t tc2[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x02,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xb7, 0x9d
+    };
+    g_autofree gchar *path = NULL;
+    g_autofree uint8_t *big = g_malloc(300);
+    g_autofree uint8_t *got = g_malloc(2 * RX_BUF_STEP);
+    uint8_t small[4];
+    QTestState *qts;
+    gint64 deadline;
+    uint32_t ctrl, dma;
+    int64_t dropped;
+    int i;
+
+    qts = stix_qtest_new_extra("");
+    path = stix_spw_path(qts);
+
+    stix_rx_setup(qts);
+    memset(got, RX_GUARD, 2 * RX_BUF_STEP);
+    qtest_memwrite(qts, RXBUF_BASE, got, 2 * RX_BUF_STEP);
+
+    /* a. unit 1 lands byte-exact in buffer 0; ctrl, PR and IRQ 13 */
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    g_assert(stix_rx_inject(qts, path, tc0, sizeof(tc0)));
+
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc0));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+    qtest_memread(qts, RXBUF_BASE + sizeof(tc0), got, 1);
+    g_assert_cmpuint(got[0], ==, RX_GUARD); /* nothing beyond the unit */
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE | sizeof(tc0));
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR,
+                     ==, SPW_DMA_PR);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+
+    /*
+     * b. unit 2 lands in desc1 (the selector was left at 1 by a);
+     * the next unit wraps to desc0 only after desc0 is re-armed
+     */
+    g_assert(stix_rx_inject(qts, path, tc1, sizeof(tc1)));
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP, got, sizeof(tc1));
+    g_assert_cmpint(memcmp(got, tc1, sizeof(tc1)), ==, 0);
+    ctrl = qtest_readl(qts, RXDSC_ADDR + 8u);
+    g_assert_cmphex(ctrl,
+                    ==, SPW_RXDSC_IE | SPW_RXDSC_WR | sizeof(tc1));
+
+    /* tc2 finds desc0 disarmed: queued, buffer 0 untouched, RD clear */
+    g_assert(stix_rx_inject(qts, path, tc2, sizeof(tc2)));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc0));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, RXDSC_ADDR) & SPW_RXDSC_EN, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_RD,
+                     ==, 0);
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN); /* RD: retry */
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc2));
+    g_assert_cmpint(memcmp(got, tc2, sizeof(tc2)), ==, 0);
+
+    /* c. a 300-byte unit: ctrl = 252|TR, only 252 bytes written */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    stix_rx_arm(qts, 0, false, true); /* desc1 stays disarmed */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    for (i = 0; i < 300; i++) {
+        big[i] = (uint8_t)(i ^ 0x3c);
+    }
+    memset(got, RX_GUARD, 48);
+    qtest_memwrite(qts, RXBUF_BASE + RX_BUF_STEP, got, 48);
+    g_assert(stix_rx_inject(qts, path, big, 300));
+
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE | SPW_RXDSC_TR | RX_MAXLEN);
+    qtest_memread(qts, RXBUF_BASE, got, RX_MAXLEN);
+    g_assert_cmpint(memcmp(got, big, RX_MAXLEN), ==, 0);
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP, got, 48);
+    for (i = 0; i < 48; i++) {
+        g_assert_cmpuint(got[i], ==, RX_GUARD);
+    }
+
+    /*
+     * d. both descriptors unarmed: queued, no guest write, RD cleared
+     * only because a unit is pending (correction 10); a re-arm plus a
+     * dmaControl write with RD delivers it
+     */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    stix_rx_arm(qts, 0, false, false);
+    stix_rx_arm(qts, 1, true, false);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_RD,
+                     ==, SPW_DMA_RD); /* nothing pending: RD kept */
+    memset(got, RX_GUARD, sizeof(tc2));
+    qtest_memwrite(qts, RXBUF_BASE, got, sizeof(tc2));
+    g_assert(stix_rx_inject(qts, path, tc2, sizeof(tc2)));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc2));
+    for (i = 0; i < (int)sizeof(tc2); i++) {
+        g_assert_cmpuint(got[i], ==, RX_GUARD);
+    }
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE); /* no write-back at all */
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_RD,
+                     ==, 0);
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc2));
+    g_assert_cmpint(memcmp(got, tc2, sizeof(tc2)), ==, 0);
+
+    /*
+     * e. 65 queued units: rx-dropped = 1, the first 64 delivered in
+     * order as the descriptors are re-armed
+     */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    stix_rx_arm(qts, 0, false, false);
+    stix_rx_arm(qts, 1, true, false);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    for (i = 0; i < 65; i++) {
+        small[0] = (uint8_t)i;
+        small[1] = 0x55;
+        small[2] = 0xaa;
+        small[3] = 0x33;
+        g_assert(stix_rx_inject(qts, path, small, sizeof(small)));
+    }
+    dropped = stix_qom_rx_dropped(qts, path);
+    g_assert_cmpint(dropped, ==, 1);
+    for (i = 0; i < 64; i++) {
+        uint32_t buf = RXBUF_BASE + RX_BUF_STEP * (uint32_t)(i & 1);
+
+        stix_rx_arm(qts, i & 1, (i & 1) != 0, true);
+        qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+        qtest_memread(qts, buf, got, sizeof(small));
+        g_assert_cmpuint(got[0], ==, (uint8_t)i);
+        g_assert_cmpuint(got[1], ==, 0x55);
+        g_assert_cmpuint(got[2], ==, 0xaa);
+        g_assert_cmpuint(got[3], ==, 0x33);
+    }
+    g_assert_cmpint(stix_qom_rx_dropped(qts, path), ==, 1);
+
+    /*
+     * f. M1 of the P2-5 review: a unit that arrives while
+     * control.IE = 0 — the FSW's SPW_send critical section
+     * (SPW.c:707-731) — is held in the queue, not delivered: PR set
+     * inside the window would be eaten by the FSW's own
+     * `dmaControl |= TE` read-modify-write (W1C, SPW.c:725) and the
+     * deferred ISR would skip it. The IE 0->1 edge delivers the held
+     * unit (PR set, IRQ 13) and then pulses the TX IRQ that the TX in
+     * the same window latched.
+     */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_CONTROL, 0); /* IE clear: the SPW_send window */
+    /*
+     * the FSW's dmaControl value, with the stale PR from the earlier
+     * items W1C-cleared in the same write (a PR-only write would also
+     * clear the latched RD/RE/RI)
+     */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_PR);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    memset(got, RX_GUARD, sizeof(tc0));
+    qtest_memwrite(qts, RXBUF_BASE, got, sizeof(tc0));
+    g_assert(stix_rx_inject(qts, path, tc0, sizeof(tc0)));
+    /* held: no DMA, no ctrl write-back, no PR, RD untouched */
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE | SPW_RXDSC_EN);
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc0));
+    for (i = 0; i < (int)sizeof(tc0); i++) {
+        g_assert_cmpuint(got[i], ==, RX_GUARD);
+    }
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR,
+                     ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_RD,
+                     ==, SPW_DMA_RD);
+
+    /* the FSW's SPW_send: a TX runs, then the |= TE RMW */
+    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN | TXDSC_WR | TXDSC_IE);
+    qtest_writel(qts, TXDSC_ADDR + 4, 0);
+    qtest_writel(qts, TXDSC_ADDR + 8, 8);
+    qtest_writel(qts, TXDSC_ADDR + 12, TXDATA_ADDR);
+    qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
+    dma = qtest_readl(qts, SPW_DMAControl);
+    qtest_writel(qts, SPW_DMAControl, dma | SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PS,
+                     ==, SPW_DMA_PS); /* the TX ran */
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR,
+                     ==, 0); /* still held: PR was never set */
+
+    /* the IE 0->1 edge: the held unit is delivered, IRQ 13 fires */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE | sizeof(tc0));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc0));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR,
+                     ==, SPW_DMA_PR);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, SPW_IRQ_BIT);
+
+    /*
+     * m2 of the P2-5 review: RI and the descriptor's IE only gate the
+     * IRQ (the unit is delivered either way); RE gates the delivery
+     */
+    /* RI = 0: delivered, PR set, no IRQ */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN & ~SPW_DMA_RI);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    g_assert(stix_rx_inject(qts, path, tc1, sizeof(tc1)));
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, SPW_RXDSC_IE | sizeof(tc1));
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR,
+                     ==, SPW_DMA_PR);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, 0);
+
+    /* descriptor IE = 0: delivered, no IRQ, IE not kept */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    qtest_writel(qts, RXDSC_ADDR, SPW_RXDSC_EN); /* armed, no IE */
+    qtest_writel(qts, RXDSC_ADDR + 4, RXBUF_BASE);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    g_assert(stix_rx_inject(qts, path, tc2, sizeof(tc2)));
+    ctrl = qtest_readl(qts, RXDSC_ADDR);
+    g_assert_cmphex(ctrl, ==, sizeof(tc2));
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT,
+                     ==, 0);
+
+    /* RE = 0: queued, delivered after RE and RD are written */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN & ~SPW_DMA_RE);
+    g_assert(stix_rx_inject(qts, path, tc0, sizeof(tc0)));
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_RD,
+                     ==, 0); /* queued on a DMA-channel condition */
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN); /* RE + RD */
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc0));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+
+    /*
+     * g. qtest_system_reset clears the queue and the selector. The
+     * selector is 1 here (the RE sub-case above delivered into
+     * desc0) and shows in the register readback — GRSPW puts the
+     * selector in DESCSEL, bits 9:3 of dmaRxDescAddr. tc1 finds desc1
+     * disarmed and is queued. After the reset the readback is 0 (base
+     * and selector cleared); rewriting the base, re-arming and
+     * writing RD delivers nothing (the queued tc1 is gone), and only
+     * a fresh unit lands in desc0, byte-exactly.
+     */
+    g_assert_cmphex(qtest_readl(qts, SPW_DMARxDesc),
+                    ==, RXDSC_ADDR | (1u << 3)); /* selector is 1 */
+    g_assert(stix_rx_inject(qts, path, tc1, sizeof(tc1))); /* queued */
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_RD,
+                     ==, 0);
+
+    qtest_system_reset(qts);
+    deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+    while (g_get_monotonic_time() < deadline &&
+           qtest_readl(qts, SPW_DMAControl) != 0) {
+        g_usleep(20 * 1000);
+    }
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMARxDesc), ==, 0);
+
+    /* the queue is empty: base, descriptors, RD — and no delivery */
+    qtest_writel(qts, SPW_DMARxDesc, RXDSC_ADDR);
+    stix_rx_arm(qts, 0, false, true);
+    stix_rx_arm(qts, 1, true, true);
+    qtest_writel(qts, SPW_DMAXRX, RX_MAXLEN);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    memset(got, RX_GUARD, sizeof(tc1));
+    qtest_memwrite(qts, RXBUF_BASE, got, sizeof(tc1));
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN); /* RD: retry */
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc1));
+    for (i = 0; i < (int)sizeof(tc1); i++) {
+        g_assert_cmpuint(got[i], ==, RX_GUARD); /* nothing delivered */
+    }
+
+    /* a fresh unit lands in desc0, byte-exactly */
+    g_assert(stix_rx_inject(qts, path, tc0, sizeof(tc0)));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(tc0));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -2432,6 +2831,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/tm-stalled-client",
                        test_tm_stalled_client);
         qtest_add_func("/sparc/stix/tm-reconnect", test_tm_reconnect);
+        qtest_add_func("/sparc/stix/spw-rx", test_spw_rx);
     }
 
     return g_test_run();

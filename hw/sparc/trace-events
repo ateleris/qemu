@@ -58,6 +58,12 @@ stixspw_tx_overflow(void) "error: buffer overwflow"
 stixspw_tx_skip_en(uint32_t ctrl) "TX skipped: TXDSC_EN clear (ctrl=0x%x)"
 stixspw_irq_latched(void) "IRQ event latched: control.IE=0"
 stixspw_irq_deferred(void) "latched IRQ pulsed on control.IE 0->1"
+stixspw_rx_inject(uint32_t len) "rx-inject: %u byte unit"
+stixspw_rx_deliver(uint32_t len, uint32_t ctrl, uint32_t sel) "RX unit delivered: len=%u ctrl=0x%x sel=%u"
+stixspw_rx_queued(uint32_t len, uint32_t pending) "RX unit queued: len=%u pending=%u"
+stixspw_rx_dropped(uint32_t len) "RX unit dropped: no-spill queue full (len=%u)"
+stixspw_rx_truncated(uint32_t len, uint32_t n) "RX unit truncated: %u -> %u bytes"
+stixspw_rx_retry(uint32_t pending) "RX queue retry: pending=%u"
 
 # tmtc_io_server.c (STIX)
 stixtmtc_accept_failed(void) "accept failed"
