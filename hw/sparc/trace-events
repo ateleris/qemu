@@ -20,5 +20,11 @@ leon3_reset_irq(int intno) "Reset CPU IRQ %d"
 int_helper_icache_freeze(void) "Instruction cache: freeze"
 int_helper_dcache_freeze(void) "Data cache: freeze"
 
+# grlib_stixflash.c (STIX)
+stixflash_error(const char *why, uint32_t cmd_sta, uint32_t page_address) "command failed why=%s cmd_sta=0x%x page_address=0x%x"
+stixflash_unmapped_write(uint64_t addr, uint64_t value) "unmapped write addr=0x%"PRIx64" value=0x%"PRIx64""
+stixflash_unmapped_read(uint64_t addr) "unmapped read addr=0x%"PRIx64""
+stixflash_midseq_read(uint64_t addr, uint32_t write_counter) "read mid-sequence addr=0x%"PRIx64" write_counter=%u"
+
 # grlib_stixctrl.c (STIX)
 stixctrl_scet_write(uint32_t addr, uint32_t value) "SCET write addr=0x%x value=0x%x"

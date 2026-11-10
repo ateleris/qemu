@@ -148,3 +148,60 @@ gate's false "stall" always appeared at FSW ~4.8 min
 value (red shown: `39 == 19`). Boot smoke compares only the boot
 sequence, so the golden stays valid; the steady-state cadence per wall
 second doubles.
+
+## 7. Flash controller error contract: STATUS.FAILED instead of abort (baseline asserts)
+
+The baseline flash controller carried 14 `assert`s reachable from guest
+stores (`grlib_stixflash.c` write/read handlers and the three execute
+routines): a register written out of the ram→page→cmd order, a read
+mid-sequence, a read of an offset other than 0, a write past the register
+file, an unknown command (including 4 = `COMMAND_FSM_ACCESS`, which the
+FSW driver defines but never issues), a page operation past EOF, and any
+host I/O short count all **aborted QEMU**. Findings E1.
+
+**New behavior:** every failure ends with the FSW's error contract —
+STATUS.FAILED (bit 24) and STATUS.READY (bit 30) set, BUSY (bit 4)
+cleared, the three-write sequence aborted, one IRQ 1 pulse, and a
+`stixflash_error` trace (`-trace 'stixflash*'`). The FSW's ISR
+(`BSW_ASW/src/BSW/Flash/Flash.c:138-148`) waits for the IRQ, then
+requires BUSY==0 && READY==1 before it reads FAILED, so FAILED always
+travels with READY and the IRQ. Per failure kind:
+
+- Sequence violation (a register written out of order): the command
+  fails; the next correct three-write sequence works normally and its
+  success path clears FAILED.
+- Unknown register offset write: ignored with a trace, no IRQ, no state
+  change. Reads: offset 0 returns cmdSta as before; offsets 4/8 return
+  the stored page/ram address; a read mid-sequence or of an unknown
+  offset is tolerated (traced, no assert).
+- Unknown command: the command fails (`flash_fail`), no abort.
+- Host I/O failures (short fread/fwrite, failed seek): the command
+  fails; one `error_report` per device instance, not per page.
+
+**D-H (backing capacity = file size):** a page is beyond EOF when
+`offset + FLASH_PAGE_SIZE > file_size` (this also fixes the baseline's
+`+ 1` off-by-one, which demanded a phantom extra byte after the last
+complete page). Reads past EOF return an erased page (0xFF) and succeed;
+erases skip the past-EOF pages and succeed without touching the file; a
+write past EOF fails with FAILED and never extends the file. Why: a
+sparse write would leave holes that read 0x00, which the FSW boot scan
+classifies as bad-block markers (`BSW_ASW/src/BSW/Flash/File.c:328`, `badBlockMarker != 0xFF`).
+
+**No change for the FSW:** with a full-size, all-0xFF `flash.bin` every
+FSW-issued sequence (RESET over all 16 chips, in-order ram→page→cmd
+writes, offsets well inside the file) takes exactly the same path as
+before. The FSW only ever checks FAILED for ERASE/WRITE; the read path
+never reads it (`Flash.c:169-171`), consistent with beyond-EOF reads
+succeeding.
+
+Evidence: qtest `stix/flash-error-paths` pins all six failure kinds
+(red shown: SIGABRT `grlib_stixflash.c:240` on the first out-of-order
+PAGEAD write); the existing `stix/flash` and the full suite (8 tests)
+stay green. New tests use a private TM port.
+
+**Addressing (partly):** file positions and the file-size read are now
+64-bit (`fseeko`/`ftello`, `off_t`), which removes the 512 MiB `ftell`
+truncation. The offset is still the raw pageAddress register x 4224, so
+chip >= 1 no longer wraps into chip 0 but lands at the raw-register
+offset; the correct chip stride (2^18 pages) and the MCM bit follow in
+the next section (B2), which lands together with this one.

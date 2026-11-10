@@ -4,6 +4,7 @@
 #include "hw/sparc/grlib_stix.h"
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
+#include "qemu/error-report.h"
 #include "chardev/char-fe.h"
 #include "system/physmem.h"
 #include "qemu/qemu-print.h"
@@ -82,12 +83,67 @@ struct STIXFLASH
 
     uint32_t write_counter; // flash commanding is configured with three writes, this counter keeps track of that
 
+    /* host I/O failures are reported once per device instance, not per
+     * page (a block erase touches 64 pages) */
+    bool io_error_reported;
+
     uint32_t chip;
     uint32_t page;
     uint32_t command;
     uint32_t mcm;
     uint32_t memory_bit_type;
 };
+
+/* ---- error contract: guest-commanded failures never abort QEMU ----
+ *
+ * All file positions are handled with fseeko/ftello and off_t (the FILE *
+ * API itself stays for the realize-time file creation).
+ */
+
+/* Size of the backing file, or -1 if it cannot be determined. */
+static off_t flash_file_size(STIXFLASH *stixflash)
+{
+    if (fseeko(stixflash->f, 0, SEEK_END) != 0) {
+        return -1;
+    }
+    return ftello(stixflash->f);
+}
+
+/* A page is beyond EOF when any of its bytes would land past the end of
+ * the backing file: the file size IS the flash capacity (decision D-H).
+ * This also fixes the baseline's `+ 1` off-by-one, which demanded a
+ * phantom extra byte after the last complete page. */
+static bool flash_page_beyond_eof(uint64_t position_in_file, off_t file_size)
+{
+    return position_in_file + FLASH_PAGE_SIZE > (uint64_t)file_size;
+}
+
+/* Fail the in-flight command: STATUS.FAILED (bit 24) and STATUS.READY
+ * (bit 30) set, BUSY (bit 4) clear, write sequence aborted. The FSW's ISR
+ * (BSW_ASW/src/BSW/Flash/Flash.c:138-148) waits for the IRQ, then
+ * requires BUSY==0 && READY==1 before it reads FAILED, so FAILED always
+ * travels with READY and the IRQ pulse. */
+static void flash_fail(STIXFLASH *stixflash, const char *why)
+{
+    stixflash->cmd_sta |= (1u << ERROR_CODE_FAILED);
+    stixflash->cmd_sta |= (1u << ERROR_CODE_READY);
+    stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
+    stixflash->write_counter = 0;
+    trace_stixflash_error(why, stixflash->cmd_sta, stixflash->page_address);
+    qemu_irq_pulse(stixflash->irq);
+}
+
+/* Host I/O failure (short fread/fwrite, failed seek): fail the command
+ * like any other, but log only once per device instance, not per page. */
+static void flash_io_error(STIXFLASH *stixflash, const char *op)
+{
+    if (!stixflash->io_error_reported) {
+        error_report("stixflash: host I/O error on %s (file %s), failing the command",
+                     op, stixflash->flash_file);
+        stixflash->io_error_reported = true;
+    }
+    flash_fail(stixflash, "host-io");
+}
 
 /*
     Generally, a flash command is prepared by a setup step of the control block and executed with START_FLASH_OPERATION.
@@ -110,58 +166,71 @@ static void execute_flash_reset(STIXFLASH *stixflash)
     stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
 }
 
-static void execute_flash_erase(STIXFLASH *stixflash)
+static bool execute_flash_erase(STIXFLASH *stixflash)
 {
-    uint32_t ret = 0;
-    
-    for(uint32_t i = 0; i < FLASH_PAGE_SIZE; i++ )
-    {
-        stixflash->page_data[i] = 0xFF;
+    off_t file_size = flash_file_size(stixflash);
+
+    if (file_size < 0) {
+        flash_io_error(stixflash, "erase");
+        return false;
     }
 
-    fseek(stixflash->f, 0, SEEK_END);
-
-    uint32_t length = ftell(stixflash->f);
+    memset(stixflash->page_data, 0xFF, FLASH_PAGE_SIZE);
 
     // iterate through pages in block
     for(uint32_t i = 0; i < FLASH_PAGENUM_IN_BLOCK; i++)
     {
-        uint32_t position_in_file = (i + stixflash->page_address) * FLASH_PAGE_SIZE;
+        uint64_t position_in_file = ((uint64_t)i + stixflash->page_address) * FLASH_PAGE_SIZE;
 
-        if(length < (position_in_file + FLASH_PAGE_SIZE + 1)) // TODO: double check
+        // pages past the backing file are skipped: the erase still succeeds
+        // and the file is not extended (D-H)
+        if(flash_page_beyond_eof(position_in_file, file_size))
         {
-            assert(false);
+            continue;
         }
 
-        fseek(stixflash->f, position_in_file, SEEK_SET);
-        ret = fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
-        assert(ret);
-        fseek(stixflash->f, 0, SEEK_END);
+        if(fseeko(stixflash->f, (off_t)position_in_file, SEEK_SET) != 0)
+        {
+            flash_io_error(stixflash, "erase");
+            return false;
+        }
+        if(fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f) != (size_t)FLASH_PAGE_SIZE)
+        {
+            flash_io_error(stixflash, "erase");
+            return false;
+        }
     }
 
-    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number. 
+    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number.
+    return true;
 }
 
-static void execute_flash_read(STIXFLASH *stixflash)
+static bool execute_flash_read(STIXFLASH *stixflash)
 {
-    int32_t ret = 0;
+    uint64_t position_in_file = (uint64_t)stixflash->page_address * FLASH_PAGE_SIZE;
+    off_t file_size = flash_file_size(stixflash);
+    size_t ret;
 
-    fseek(stixflash->f, 0, SEEK_END);
-
-    uint32_t length = ftell(stixflash->f);
-    uint32_t position_in_file = stixflash->page_address * FLASH_PAGE_SIZE;
-
-    if(length < (position_in_file + FLASH_PAGE_SIZE + 1))
-    {
-        assert(false);
+    if (file_size < 0) {
+        flash_io_error(stixflash, "read");
+        return false;
     }
 
-    fseek(stixflash->f, position_in_file, SEEK_SET);
+    // a page past the backing file reads back as an erased page (D-H)
+    if (flash_page_beyond_eof(position_in_file, file_size)) {
+        memset(stixflash->page_data, 0xFF, FLASH_PAGE_SIZE);
+    } else {
+        if (fseeko(stixflash->f, (off_t)position_in_file, SEEK_SET) != 0) {
+            flash_io_error(stixflash, "read");
+            return false;
+        }
 
-    ret = fread(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
-    assert(ret);
-
-    fseek(stixflash->f, 0, SEEK_END);
+        ret = fread(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
+        if (ret != (size_t)FLASH_PAGE_SIZE) {
+            flash_io_error(stixflash, "read");
+            return false;
+        }
+    }
 
     // update the flash register to be not busy anymore
     stixflash->cmd_sta &= ~(1u << FTNANDCTRL_CMDSTA_BUSY);
@@ -170,51 +239,85 @@ static void execute_flash_read(STIXFLASH *stixflash)
     physical_memory_write(stixflash->ram_address, stixflash->page_data, FLASH_PAGE_SIZE);
 
     // need to send out an interrupt that we're done
-    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number. 
+    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number.
+    return true;
 }
 
-static void execute_flash_write(STIXFLASH *stixflash)
+static bool execute_flash_write(STIXFLASH *stixflash)
 {
-    uint32_t ret = 0;
+    uint64_t position_in_file = (uint64_t)stixflash->page_address * FLASH_PAGE_SIZE;
+    off_t file_size = flash_file_size(stixflash);
+    size_t ret;
 
-    fseek(stixflash->f, 0, SEEK_END);
-
-    uint64_t length = ftell(stixflash->f);
-    uint32_t position_in_file = stixflash->page_address * FLASH_PAGE_SIZE;
-
-    if(length < (position_in_file + FLASH_PAGE_SIZE + 1)) //TODO: double check
-    {
-        assert(false);
+    if (file_size < 0) {
+        flash_io_error(stixflash, "write");
+        return false;
     }
 
-    fseek(stixflash->f, position_in_file, SEEK_SET);
-    
+    // a page past the backing file fails the command; the file is never
+    // extended (a hole would read 0x00 = bad-block marker on the next boot
+    // scan, D-H)
+    if (flash_page_beyond_eof(position_in_file, file_size)) {
+        flash_fail(stixflash, "beyond-backing-file");
+        return false;
+    }
+
+    if (fseeko(stixflash->f, (off_t)position_in_file, SEEK_SET) != 0) {
+        flash_io_error(stixflash, "write");
+        return false;
+    }
+
     // the address space of QEMU is NOT FSW; must use wrapper function to translate the address and properly copy the data
     physical_memory_read(stixflash->ram_address, stixflash->page_data, FLASH_PAGE_SIZE);
-    
-    ret = fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
-    assert(ret);
 
-    fseek(stixflash->f, 0, SEEK_END);
+    ret = fwrite(stixflash->page_data, sizeof(uint8_t), FLASH_PAGE_SIZE, stixflash->f);
+    if (ret != (size_t)FLASH_PAGE_SIZE) {
+        flash_io_error(stixflash, "write");
+        return false;
+    }
 
     // need to send out an interrupt that we're done
-    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number. 
+    qemu_irq_pulse(stixflash->irq); //, 1); // NB: needs to be checked if '1' is OK in all cases. There is a comment that for LEON level needs to be equal to IRQ number.
+    return true;
 }
 
 static uint64_t grlib_stixflash_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXFLASH *stixflash = opaque;
+    uint32_t value;
 
     /*
     qemu_printf("FLASH | Read requested: addr = %lu, chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x, command = %u, status = 0x%x\n",
                 addr, stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
     */
 
-    assert(stixflash->write_counter == 0);
+    // reading mid-sequence is tolerated (the FSW never does it): return the
+    // live registers instead of asserting
+    if (stixflash->write_counter != 0) {
+        trace_stixflash_midseq_read(addr, stixflash->write_counter);
+    }
 
-    // it seems read is only used to get the status register
-    assert(addr == 0);
-    return stixflash->cmd_sta;
+    switch (addr)
+    {
+    case FLASH_CMD_STA_ADDRESS:
+        value = stixflash->cmd_sta;
+        break;
+
+    case FLASH_PAGE_ADDRESS:
+        value = stixflash->page_address;
+        break;
+
+    case FLASH_RAM_ADDRESS:
+        value = (uint32_t)stixflash->ram_address;
+        break;
+
+    default:
+        trace_stixflash_unmapped_read(addr);
+        value = 0;
+        break;
+    }
+
+    return value;
 }
 
 static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
@@ -224,7 +327,11 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
     switch (addr)
     {
     case FLASH_CMD_STA_ADDRESS: // update the status register
-        assert(stixflash->write_counter == 2);
+        if (stixflash->write_counter != 2)
+        {
+            flash_fail(stixflash, "sequence");
+            return;
+        }
         stixflash->cmd_sta = (uint32_t)value;
 
         // small workaround, this un-bysies the FLASH; should be updated once we want to have the flash busy
@@ -235,9 +342,13 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
         stixflash->memory_bit_type = (stixflash->cmd_sta >> FTNANDCTRL_CMDSTA_FLASHTYPE) & FTNANDCTRL_CMDSTA_FLASHTYPE_MASK;
         stixflash->write_counter += 1;
         break;
-    
+
     case FLASH_PAGE_ADDRESS: // configure the flash addressing
-        assert(stixflash->write_counter == 1);
+        if (stixflash->write_counter != 1)
+        {
+            flash_fail(stixflash, "sequence");
+            return;
+        }
         stixflash->page_address = (uint32_t)value;
         stixflash->chip = (stixflash->page_address >> FTNANDCTRL_PAGEADDRESS_CHIPADDRESS) & FTNANDCTRL_PAGEADDRESS_CHIPADDRESS_MASK;
         stixflash->page = (stixflash->page_address >> FTNANDCTRL_PAGEADDRESS_PAGEADDRESS) & FTNANDCTRL_PAGEADDRESS_PAGEADDRESS_MASK;
@@ -245,17 +356,26 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
         break;
 
     case FLASH_RAM_ADDRESS: // configure the ram address (write-back?)
-        assert(stixflash->write_counter == 0);
+        if (stixflash->write_counter != 0)
+        {
+            flash_fail(stixflash, "sequence");
+            return;
+        }
         stixflash->ram_address = (uint32_t)value;
         stixflash->write_counter += 1;
         break;
+
     default:
-        assert(false);
+        // unknown register offset: ignore, keep the sequence state intact
+        trace_stixflash_unmapped_write(addr, value);
+        return;
     }
 
     // Separating the last write command out on purpose for legibility
     if (stixflash->write_counter == 3)
     {
+        bool ok = true;
+
         // mock the flash and fpga readiness a bit; while executing the command
         // we are not ready; at the end of this routine, we will be again
         stixflash->cmd_sta &= ~(1u << ERROR_CODE_READY);
@@ -271,29 +391,39 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
             // fake a write protection to the cell we are working on
             stixflash->cmd_sta &= ~(1u << ERROR_CODE_WRPROT);
 
-            execute_flash_erase(stixflash);
+            ok = execute_flash_erase(stixflash);
 
             // un-write-protect the cell
             stixflash->cmd_sta |= (1u << ERROR_CODE_WRPROT);
             break;
-        
+
         case COMMAND_PAGE_READ:
-            execute_flash_read(stixflash);
+            ok = execute_flash_read(stixflash);
             break;
 
         case COMMAND_PAGE_WRITE:
             // fake a write protection to the cell we are working on
             stixflash->cmd_sta &= ~(1u << ERROR_CODE_WRPROT);
-            
-            execute_flash_write(stixflash);
+
+            ok = execute_flash_write(stixflash);
 
             // un-write-protect the cell
             stixflash->cmd_sta |= (1u << ERROR_CODE_WRPROT);
             break;
 
         default:
-            qemu_printf("FLASH | UNKNOWN COMMAND %u\n", stixflash->command);
-            assert(false);
+            // unknown command, incl. COMMAND_FSM_ACCESS (4), which is
+            // defined in the FSW driver (Flash.c:60) but never issued by it
+            flash_fail(stixflash, "command");
+            return;
+        }
+
+        if (!ok)
+        {
+            // flash_fail() already latched FAILED|READY, pulsed the IRQ and
+            // reset the write sequence; the success path below must not run
+            // (it would clear FAILED)
+            return;
         }
 
         // make sure we tell the software that the command finished.
@@ -306,12 +436,10 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
         qemu_printf("FLASH | Write completed: chip = %u, page = %u, mcm = %u, page_address = %u, memory_bit_type = %u, ram_address = 0x%x command = %u, status = 0x%x\n",
                     stixflash->chip, stixflash->page, stixflash->mcm, stixflash->page_address, stixflash->memory_bit_type, (uint32_t)stixflash->ram_address, stixflash->command, stixflash->cmd_sta);
         */
-        
+
         // reset the write counter to 0
         stixflash->write_counter = 0;
     }
-
-    assert(stixflash->write_counter < 4);
 }
 
 static const MemoryRegionOps grlib_stixflash_ops = {

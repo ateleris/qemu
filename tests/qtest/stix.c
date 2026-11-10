@@ -60,6 +60,10 @@ static void stix_pnp_check(QTestState *qts, unsigned index, uint32_t expected)
 
 #define FTNAND_BUSY      (1u << 4)
 #define FTNAND_FLASHTYPE (1u << 7)          /* MEMORY_TYPE_BIT in the FSW driver */
+#define FTNAND_FAILED    (1u << 24)         /* ERROR_CODE_FAILED */
+#define FTNAND_READY     (1u << 30)         /* ERROR_CODE_READY */
+
+#define FLASH_PAGE_BYTES 4224u              /* 4096 data + 128 header */
 
 #define CMD_RESET       0u
 #define CMD_BLOCK_ERASE 1u
@@ -161,6 +165,108 @@ static void test_flash(void)
     qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
     flash_issue(qts, 0x40000000u, 0, CMD_PAGE_READ);
     g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* Error contract (B1): a guest-commanded failure must end in
+ * STATUS.FAILED | STATUS.READY with one IRQ 1 pulse — the FSW's ISR
+ * (Flash.c:138-148) waits for the IRQ, then requires BUSY==0 && READY==1
+ * before it reads FAILED — and never in a QEMU abort (the baseline had 14
+ * guest-reachable asserts in this device). Sequence violations, unknown
+ * commands and unknown-register writes all go through the same
+ * three-register window (ram -> page -> cmd) the FSW driver uses.
+ *
+ * The backing file is the 1 MB all-0xFF temp file, so page 300 (offset
+ * 1,267,200) and the 64-page block at page 320 are past EOF: decision D-H
+ * makes the file size the flash capacity (read -> 0xFF page, erase ->
+ * skipped, write -> FAILED, file never extended). */
+static void test_flash_error_paths(void)
+{
+    g_autofree gchar *port = stix_private_tm_port_arg();
+    g_autofree uint8_t *zeros = g_malloc0(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    uint32_t sta, pending;
+    struct stat st;
+    const uint32_t failed_ready = FTNAND_FAILED | FTNAND_READY;
+
+    qts = stix_qtest_new_extra(port);
+
+    /* 1. Out-of-order PAGEAD write (write_counter == 0; driver order is
+     *    ram -> page -> cmd): sequence violation. FAILED|READY set, BUSY
+     *    clear, IRQ 1 pending, QEMU still alive; the next correct
+     *    three-write sequence clears FAILED again. */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    qtest_writel(qts, FLASH_PAGEAD, 0xdeadbeefu);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & failed_ready, ==, failed_ready);
+    g_assert_cmpuint(sta & FTNAND_BUSY, ==, 0);
+    pending = qtest_readl(qts, IRQMP_PENDING);
+    g_assert_cmpuint(pending & FLASH_IRQ_BIT, ==, FLASH_IRQ_BIT);
+    /* QEMU alive: this read round-trips (an aborted device tears down the
+     * qtest connection and fails the test). */
+    g_assert_cmphex(qtest_readl(qts, FLASH_CMDSTA), ==, sta);
+    flash_issue(qts, 0x40000000u, 0, CMD_RESET);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+
+    /* 2. Undefined command 5, then command 4 = COMMAND_FSM_ACCESS
+     *    (defined in the FSW driver, never issued by it): FAILED + IRQ 1
+     *    each time. */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 0, 5u);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, FTNAND_FAILED);
+    pending = qtest_readl(qts, IRQMP_PENDING);
+    g_assert_cmpuint(pending & FLASH_IRQ_BIT, ==, FLASH_IRQ_BIT);
+
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 0, 4u);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, FTNAND_FAILED);
+    pending = qtest_readl(qts, IRQMP_PENDING);
+    g_assert_cmpuint(pending & FLASH_IRQ_BIT, ==, FLASH_IRQ_BIT);
+
+    /* 3. Register reads: PAGEAD returns the last written page address. A
+     *    write past the register file (offset 0x0C) is ignored: no state
+     *    change, device stays alive (the reads/writes below prove it). */
+    flash_issue(qts, 0x40001000u, 0x123u, CMD_RESET);
+    g_assert_cmpuint(qtest_readl(qts, FLASH_PAGEAD), ==, 0x123u);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    qtest_writel(qts, FLASH_BASE + 0x0cu, 0xa5a5a5a5u);
+    g_assert_cmphex(qtest_readl(qts, FLASH_CMDSTA), ==, sta);
+
+    /* 4. D-H: PAGE_READ past EOF fills the page with 0xFF and succeeds.
+     *    Guest RAM starts zeroed so the write-back is proven. */
+    qtest_memwrite(qts, 0x40000000u, zeros, FLASH_PAGE_BYTES);
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 300, CMD_PAGE_READ);
+    g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+    pending = qtest_readl(qts, IRQMP_PENDING);
+    g_assert_cmpuint(pending & FLASH_IRQ_BIT, ==, FLASH_IRQ_BIT);
+
+    /* 5. D-H: BLOCK_ERASE of a block entirely past EOF succeeds without
+     *    touching the backing file. */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 320, CMD_BLOCK_ERASE);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+    g_assert_cmpint(stat(stix_tmp_flash_path, &st), ==, 0);
+    g_assert_cmpuint(st.st_size, ==, 1024u * 1024u);
+
+    /* 6. D-H: PAGE_WRITE past EOF fails with FAILED + IRQ 1; the file is
+     *    not extended (holes would read 0x00 = bad-block marker). */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    flash_issue(qts, 0x40000000u, 300, CMD_PAGE_WRITE);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, FTNAND_FAILED);
+    pending = qtest_readl(qts, IRQMP_PENDING);
+    g_assert_cmpuint(pending & FLASH_IRQ_BIT, ==, FLASH_IRQ_BIT);
+    g_assert_cmpint(stat(stix_tmp_flash_path, &st), ==, 0);
+    g_assert_cmpuint(st.st_size, ==, 1024u * 1024u);
 
     qtest_quit(qts);
     stix_qtest_cleanup();
@@ -534,6 +640,7 @@ int main(int argc, char **argv)
     if (qtest_has_machine("leon3_generic")) {
         qtest_add_func("/sparc/stix/pnp", test_pnp);
         qtest_add_func("/sparc/stix/flash", test_flash);
+        qtest_add_func("/sparc/stix/flash-error-paths", test_flash_error_paths);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);
