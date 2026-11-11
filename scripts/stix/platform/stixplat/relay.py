@@ -7,8 +7,10 @@ TC:  GS --(bare SP)--> gs_tc --(SpW hdr + SP)--> QEMU's qemu_tc
 The relay is transparent: the bytes reach the GS unchanged and in
 arrival order. Every TM is one line of tm.jsonl and one `tm` record.
 A GS TC while the link is down or STIX is off is dropped and logged
-(gs_tc_during_link_down = "drop"), or held and delivered when the link
-comes back ("hold", the model's old behaviour).
+(gs.tc_during_link_down = "drop"), or held and delivered when the link
+comes back ("hold", the model's old behaviour): at most gs.hold_max
+(default 32, below the FSW's 64-unit queue), each drop beyond it
+logged, and the queue is dropped (logged) at power off and at boot.
 """
 
 import json
@@ -34,6 +36,7 @@ class Relay:
         self.dests = [(h, int(port)) for h, port in
                       (d.rsplit(":", 1) for d in cfg["gs"]["tm_dests"])]
         self.policy = cfg["gs"]["tc_during_link_down"]
+        self.hold_max = cfg["gs"]["hold_max"]
         self.held = []
         self.tm_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.tm_sock.bind(("127.0.0.1", p["qemu_tm"]))
@@ -115,9 +118,18 @@ class Relay:
         info = _tc_info(sp)
         if why is not None:
             if self.policy == "hold":
-                self.held.append((sp, source, path))
-                self.log.emit(source, "tc", path, dict(
-                    info, delivered=False, held=True, why=why))
+                with self.lock:
+                    room = len(self.held) < self.hold_max
+                    if room:
+                        self.held.append((sp, source, path))
+                if room:
+                    self.log.emit(source, "tc", path, dict(
+                        info, delivered=False, held=True, why=why))
+                else:
+                    self.log.emit(source, "tc", path, dict(
+                        info, delivered=False, dropped=True,
+                        why="%s, and the hold queue is full (%d)"
+                        % (why, self.hold_max)))
             else:
                 self.log.emit(source, "tc", path, dict(
                     info, delivered=False, dropped=True, why=why))
@@ -127,9 +139,19 @@ class Relay:
         return True
 
     def release_held(self):
-        held, self.held = self.held, []
+        with self.lock:
+            held, self.held = self.held, []
         for sp, source, path in held:
             self.gs_tc(sp, source=source, path=path)
+
+    def drop_held(self, why):
+        """At power off and boot: held TCs belong to a gone boot."""
+        with self.lock:
+            held, self.held = self.held, []
+        if held:
+            self.log.emit("ctl", "tc", "tc.gs.held", {
+                "dropped": len(held), "why": why,
+                "seqs": [(_tc_info(sp).get("seq")) for sp, _, _ in held]})
 
     def send_unit(self, unit):
         self.out.sendto(unit, self.qemu_tc)

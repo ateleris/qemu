@@ -126,9 +126,11 @@ class Platform:
             self.keepalive.on_boot()
             self.timesync.on_boot()
         elif event == "boot":
+            self.relay.drop_held("boot")
             self.keepalive.on_boot()
             self.timesync.on_boot()
         elif event == "off":
+            self.relay.drop_held("off")
             self.keepalive.on_off()
             self.timesync.on_off()
 

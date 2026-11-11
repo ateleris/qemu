@@ -1291,6 +1291,55 @@ def t_relay(env):
         ctl.shutdown()
 
 
+def t_hold_queue(env):
+    """SF5: the hold queue is capped (below the FSW's 64-unit queue),
+    with every drop logged, and is dropped (logged) at power off and at
+    boot, so stale TCs never reach a new boot."""
+    ctl = env.controller(gs={"tc_during_link_down": "hold", "hold_max": 3},
+                         timesync={"autostart": "off"})
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    gs_tc = ("127.0.0.1", ctl.cfg["ports"]["gs_tc"])
+    try:
+        check(config_mod.load()["gs"]["hold_max"] == 32, "default 32")
+        raises(config_mod.ConfigError, config_mod.load,
+               text="[gs]\nhold_max = 65\n")
+        raises(config_mod.ConfigError, config_mod.load,
+               text="[gs]\nhold_max = 0\n")
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        ctl.command("platform.spw.link", {"state": "down"})
+        for i in range(5):
+            snd.sendto(tcbuild.tc_packet(0x5AC, i, 17, 1), gs_tc)
+
+        def gs_recs():
+            return [r.obj["data"] for r in ctl.log.since(0)
+                    if r.kind == "tc" and r.obj["path"] == "tc.gs"]
+        wait_for(lambda: len(gs_recs()) == 5, what="5 tc records")
+        held = [d for d in gs_recs() if d.get("held")]
+        full = [d for d in gs_recs() if d.get("dropped")]
+        check(len(ctl.plat.relay.held) == 3 and len(held) == 3 and
+              len(full) == 2 and all("full" in d["why"] for d in full),
+              "cap 3: %d held, %r" % (len(ctl.plat.relay.held), full))
+        ctl.command("platform.power.off", {})
+        flush = [r.obj["data"] for r in ctl.log.since(0)
+                 if r.obj["path"] == "tc.gs.held"]
+        check(not ctl.plat.relay.held and len(flush) == 1 and
+              flush[0]["dropped"] == 3 and flush[0]["why"] == "off",
+              "dropped at off: %r" % flush)
+        # TCs held while off are dropped at the boot
+        snd.sendto(tcbuild.tc_packet(0x5AC, 9, 17, 1), gs_tc)
+        wait_for(lambda: len(ctl.plat.relay.held) == 1, what="held off")
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        flush = [r.obj["data"] for r in ctl.log.since(0)
+                 if r.obj["path"] == "tc.gs.held"]
+        check(not ctl.plat.relay.held and flush[-1]["why"] == "boot" and
+              flush[-1]["seqs"] == [9], "dropped at boot: %r" % flush)
+    finally:
+        snd.close()
+        ctl.shutdown()
+
+
 def t_platform_tcs(env):
     """D-PLa + R2: platform TCs are services 9 and 20 from source 14;
     TC(9,129) waits while a sync is pending; tc.gs.send is gated."""
@@ -1820,6 +1869,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("keep-alive: aggregate log", t_keepalive_log),
          ("keep-alive: rx trace filter", t_keepalive_trace),
          ("TM relay + TC proxy", t_relay),
+         ("hold queue (SF5)", t_hold_queue),
          ("platform TCs (9/20, R2)", t_platform_tcs),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),

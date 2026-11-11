@@ -34,6 +34,8 @@ DEFAULTS = {
     # D-PLg/D-PLa: the GS side of the relay and the proxy
     "gs": {"tm_dests": ["127.0.0.1:21501"], "bind": "127.0.0.1",
            "tc_during_link_down": "drop",   # "drop" | "hold"
+           # "hold": at most this many TCs (the FSW queues 64), SF5
+           "hold_max": 32,
            "emulation": "auto",    # tc.gs.send: "auto" (run mode) | on | off
            "emulation_source": 121},
     # D-PLe: a TC(20,128) every 125 ms (user decision), configurable
@@ -122,6 +124,8 @@ def _check(cfg):
             raise ConfigError("gs.tm_dests entry %r is not host:port" % d)
     if not 0.125 <= cfg["keepalive"]["period_s"] <= 3600:
         raise ConfigError("keepalive.period_s is 0.125..3600")
+    if not 1 <= cfg["gs"]["hold_max"] <= 64:
+        raise ConfigError("gs.hold_max is 1..64 (the FSW queues 64 TCs)")
     if cfg["keepalive"]["summary_every"] < 1:
         raise ConfigError("keepalive.summary_every must be >= 1")
     if cfg["clock"]["snapshot_s"] < 0:
