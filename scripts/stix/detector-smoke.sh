@@ -699,7 +699,8 @@ SKIPPED_FIRST="$(grep -c 'Skipped first Det data chunk' uart.detector.txt \
 # ... and no error from the chunk path, the archive or the filesystem on
 # the fresh flash (the FSW TRACE_TAGs of RotAccumulator.c,
 # RotAccuCompactor.c, ArchiveManager.c and MemoryMgmt/)
-CHUNK_TAGS='Archive|RotAccuComp|RotAccumulator|FS|FSapi|MemStream|MemCommon|FIFO'
+CHUNK_TAGS='Archive|RotAccuComp|RotAccumulator|FS|FSapi|MemStream'
+CHUNK_TAGS="$CHUNK_TAGS|MemCommon|FIFO"
 CHUNK_ERR="$(grep -E "^[[:space:]]*[0-9:.]+ +($CHUNK_TAGS) +\\*E" \
     uart.detector.txt | grep -v 'Skipped first Det data chunk' | head -3 ||
     true)"
