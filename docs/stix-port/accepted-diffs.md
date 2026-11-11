@@ -3228,3 +3228,63 @@ Re-run, each under the 21000 flock in fresh `/tmp/stix-d4r-*` dirs:
 - `NOMINAL-SMOKE: PASS`
 - checkpatch: 0/0 apart from the missing Signed-off-by
 - suite (qt.sh all): 62 of 62 ok, exit 0
+
+## 41. Gate ports: slots for parallel gate runs (baseline: one global lock)
+
+Plan: `2026-11-11-gateports-plan.md`. Four tracks (tc, platform, elut,
+att) can run their gates at the same time without the global 21000 lock.
+
+- **Slots** (`scripts/stix/lib/slot.sh`). A slot is one lock file, one
+  port band and one run-dir suffix; holding the lock owns all three.
+  - Slot k: ports `B = 20000+uid+100k` .. `B+99`, lock
+    `/tmp/stix-qtest-<B>.lock`. B+0 is the TMTC port, B+1/B+2 are
+    reserved for UDP TM/TC, B+3..B+99 are the qtest suite's.
+  - Slot 0 (21000) is legacy, manual and 5.2-wrapper use only. `auto`
+    takes slots 1..`STIX_SLOTS` (default 3) and refuses a count whose
+    bands reach the GS ports (21500-21502; N <= 4 at uid 1000). The CPU
+    cap is N auto runs + 1 legacy run.
+  - In slot mode a gate passes `-global grlib-stixspw.tmtc-port=B`, gives
+    the probe `--port B`, runs in `<run dir>-s<k>` and appends `slot=k
+    busy=<other held slots> load=<1 min loadavg>` to its verdict lines.
+    `busy` is read from `/proc/locks` without taking any lock.
+  - The helper never retries a gate (D-G6). A FAIL with busy > 0 is
+    rerun alone, by hand; if it then passes, it is a load flake: record it
+    here and lower `STIX_SLOTS`.
+  - **New gate scripts copy the pattern**: `. lib/slot.sh;
+    stix_slot_setup; RUN_DIR="$(stix_slot_dir "$RUN_DIR")"` at the
+    `TMTC_PORT=` line, `"${STIX_SLOT_QEMU_ARGS[@]}"` in each QEMU
+    invocation, `${STIX_SLOT_TAG}` on each verdict line, and
+    `stix_flash_private` after `cd "$RUN_DIR"` for a gate that boots the
+    shared master.
+- **Legacy mode is byte-identical** on the QEMU command line, the probe
+  argv, the verdict lines and capture-golden's recorded flags
+  (`scripts/stix/tests/test-gate-slots.sh` compares them with the
+  pre-change scripts). The one addition is the disk guard: every gate,
+  legacy included, exits 2 before QEMU when `df /mnt/c` shows less than
+  `STIX_DISK_MIN_GB` (3) GB free (the WSL VHDX lives on C: and never
+  shrinks).
+- **The master flash is not copied in legacy mode.** Measured: SAFE boots
+  on the already-booted master issue no page write or erase (mtime fixed
+  since 2026-11-10 13:05:54, 32 blocks). Slot mode boots private sparse
+  copies (`cp --sparse=always`, refreshed per run, under a shared flock
+  on `.flash.lock`; refused when the master is missing, the copy
+  allocates >= 64 MB or its size differs) as insurance against future
+  writers. capture-golden.sh refuses slot mode and holds `.flash.lock`
+  exclusively. On PASS a slot-mode gate deletes its flash copy (and
+  nominal-smoke its trace log); FAIL/ERROR keep everything.
+- An explicit `STIX_RUN_DIR` / `STIX_NOMINAL_RUN_DIR` /
+  `STIX_FAULT_RUN_DIR` also gets the `-s<k>` suffix in slot mode, so two
+  auto runs with the same setting cannot share a dir. The nominal/fault
+  run-dir guard runs on the suffixed path.
+- `tmtc-hermetic` holds an ephemeral port (`tmtc-port=<held>`): the
+  `tmtc-port=0` default path is no longer exercised by it. On the 5.2
+  baseline it SKIPs explicitly (no `tmtc-port` property).
+- Suite QEMU ports come from the slot band B+3..B+99 when a slot is held
+  (`STIX_PORT_BASE` = B, exported by `scripts/stix/qt.sh`). Without a
+  slot, the old ephemeral release-then-bind window remains.
+- `scripts/stix/qt.sh --baseline` runs the 5.2 wrapper in slot 0 from
+  `/tmp/stix-qt-baseline` with a sparse copy of the master: the wrapper
+  strips `flash-file`, and the 5.2 model writes a full 16.5 GB flash.bin
+  into a CWD that has none.
+- Leaked `/tmp/stix-flash-*` qtest files multiply with parallel suites
+  (small, out of scope).

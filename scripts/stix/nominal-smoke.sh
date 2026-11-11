@@ -41,8 +41,10 @@
 # registers of XrayDetFDIR_resetASICregistersToDefault. R3 also gets
 # the RCR state-0 write (RateCtrl.c:575), so it counts 64 here.
 #
-# Like tc-smoke.sh this script does NOT take the /tmp/stix-qtest-21000
-# flock itself; the caller must hold it (no script does this for you).
+# In legacy mode (STIX_PORT_BASE unset) this script, like tc-smoke.sh,
+# does NOT take the /tmp/stix-qtest-21000 flock (slot 0) itself; the
+# caller must hold it. With STIX_PORT_BASE=auto or a slot number it takes
+# its own slot (scripts/stix/lib/slot.sh) and needs no outside lock.
 #
 # Usage: nominal-smoke.sh <qemu-binary> [--negative] [--dry-run]
 #                          [--check-guard]

@@ -79,8 +79,10 @@
 # (0x14A3, the first two TC(236,10) acks — their 5 s windows expire
 # before the run ends — and the QMP connect) still passed.
 #
-# Like tc-smoke.sh this script does NOT take the /tmp/stix-qtest-21000
-# flock itself; the caller must hold it (no script does this for you).
+# In legacy mode (STIX_PORT_BASE unset) this script, like tc-smoke.sh,
+# does NOT take the /tmp/stix-qtest-21000 flock (slot 0) itself; the
+# caller must hold it. With STIX_PORT_BASE=auto or a slot number it takes
+# its own slot (scripts/stix/lib/slot.sh) and needs no outside lock.
 #
 # Usage: fault-smoke.sh <qemu-binary> [--negative] [--dry-run]
 #                        [--check-guard]

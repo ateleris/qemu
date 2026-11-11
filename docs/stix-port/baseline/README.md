@@ -63,16 +63,48 @@ REPAIRED old model.
     `LIMIT_FS_SIZE=32` build without `DEBUG_PRINT`, which has no UART output
     at all, so boot-smoke fails with "no UART output".
 - The TMTC server binds `IO_TCP_SERVER_BASE_PORT + getuid()` = **21000**
-  (uid 1000), not the 2221 constant in `tmtc_io_server.h`.
+  (uid 1000), not the 2221 constant in `tmtc_io_server.h`, unless
+  `grlib-stixspw.tmtc-port` says otherwise (slot mode, below).
 - Since P2-1 (`accepted-diffs.md` §14) the ported model starts **no TM
   server when the qtest harness drives QEMU**
-  (`grlib-stixspw.tmtc-server=auto`), so the qtest suite needs no port
-  lock against itself — except `/sparc/stix/tmtc-hermetic`, which holds
-  20000+uid in LISTEN while it runs. So don't run the qtests at the same
-  moment as a boot gate or a live-FSW QEMU. The boot gates
-  (`boot-smoke.sh`, `soak.sh`, `tc-smoke.sh`) and the 5.2-wrapper run
-  (step 3) still use the lock: the 5.2 device always binds 21000 and has
-  no `tmtc-server` property.
+  (`grlib-stixspw.tmtc-server=auto`). Since the gate-ports track
+  (`accepted-diffs.md` §41) `/sparc/stix/tmtc-hermetic` holds an
+  ephemeral port instead of 21000, so the suite binds no fixed port.
+- **Parallel runs: slots** (`scripts/stix/lib/slot.sh`, §41). A slot is
+  one lock file, one port band and one run-dir suffix; holding the lock
+  owns all three. Slot k uses ports `20000+uid+100k` .. `+99` (B+0 the
+  TMTC port, B+1/B+2 reserved for UDP TM/TC, B+3..B+99 the suite's
+  QEMU-bound ports) and the lock `/tmp/stix-qtest-<B>.lock`.
+  - **Legacy (`STIX_PORT_BASE` unset):** port 21000, the default run
+    dirs, the QEMU command line unchanged. The caller holds slot 0's lock
+    by convention: `flock /tmp/stix-qtest-21000.lock <gate> ...`. No
+    script takes it itself.
+  - **Slot 0 is reserved** for legacy, manual and 5.2-wrapper runs (the
+    5.2 device always binds 21000). `auto` never takes it.
+  - **`STIX_PORT_BASE=auto`:** the first free slot in 1..`STIX_SLOTS`
+    (default 3; counts reaching the GS ports 21500-21502 are refused),
+    waiting up to `STIX_SLOT_WAIT` s (1800). A number k >= 1 takes exactly
+    slot k or exits 2. The gate passes `-global
+    grlib-stixspw.tmtc-port=B`, runs in `<run dir>-s<k>` (for example
+    `/tmp/stix-uprev-run-s1`; an explicit `STIX_*RUN_DIR` gets the suffix
+    too) and appends `slot=k busy=<other held slots> load=<1 min>` to its
+    verdict lines. The CPU cap is N slot runs plus one legacy run.
+  - **Slot mode never opens the shared flash.** boot-smoke, soak and
+    tc-smoke boot a private `cp --sparse=always` copy of
+    `/tmp/stix-uprev-run/flash.bin` (refreshed every run, under a shared
+    `flock` on `/tmp/stix-uprev-run/.flash.lock`; refused when the master
+    is missing, when the copy allocates 64 MB or more, or when its size
+    differs). Legacy mode still boots the master in place: today's SAFE
+    gates do not write it. capture-golden.sh, the master's only writer,
+    refuses slot mode and holds that lock exclusively.
+  - On PASS a slot-mode gate deletes its `flash.bin` (and nominal-smoke
+    its trace log); a FAIL or ERROR keeps everything.
+  - **Disk guard, every mode:** a gate exits 2 before starting QEMU when
+    `df /mnt/c` (the Windows disk behind the WSL VHDX, which never
+    shrinks) shows less than `STIX_DISK_MIN_GB` (3) GB free.
+  - The qtest suite: `scripts/stix/qt.sh [test-name]` builds, takes a
+    slot and runs the suite or one test; `scripts/stix/qt.sh --baseline`
+    runs the 5.2 wrapper in slot 0 (see step 3).
 - Capture uses `-display none -monitor none -serial file:` so guest UART and
   QEMU prints never mix.
 
@@ -88,16 +120,18 @@ docs alone (paths assume this repo; the ASW ELF path is overridden with
 
 # 2. Device regression suite against the NEW build (from any CWD - the
 #    qtest passes -global grlib-stixflash.flash-file=<temp file> so no
-#    flash.bin is created in the CWD):
-QTEST_QEMU_BINARY=$PWD/build/qemu-system-sparc build/tests/qtest/stix
+#    flash.bin is created in the CWD). qt.sh builds and takes a slot:
+scripts/stix/qt.sh                 # or: scripts/stix/qt.sh <test-name>
 
 # 3. Device regression suite against the OLD repaired 5.2 baseline (the
 #    wrapper bridges v11.1 libqtest args to 5.2 and strips the flash-file
 #    override, which the 5.2 device lacks):
 git worktree add /tmp/qemu-stix-baseline stix-emul-repairs   # see build-old.sh
 bash scripts/stix/baseline/build-old.sh                       # ~5 min, Docker
-QTEST_QEMU_BINARY=$PWD/scripts/stix/baseline/qemu-system-sparc-52-wrapper.sh \
-    build/tests/qtest/stix
+#    Slot 0 (the 5.2 device binds 21000), run in /tmp/stix-qt-baseline
+#    with a sparse copy of the master flash: the 5.2 model would write a
+#    full 16.5 GB flash.bin into a CWD that has none.
+scripts/stix/qt.sh --baseline      # tmtc-hermetic SKIPs there (no tmtc-port)
 
 # 4. Boot smoke against either build (needs the ASW ELF; skips politely
 #    without it; compares the boot sequence against the golden):
@@ -126,8 +160,8 @@ python3 scripts/stix/idefx-trace-check.py --self-test # verification runs
 
 Notes:
 - `flash.bin` lives in `/tmp/stix-uprev-run/` (sparse, see the run rules).
-  Gate scripts run there and never delete it. The qtests use their own temp
-  files.
+  Legacy gate runs use it there and never delete it; slot-mode runs use a
+  private copy in their `-s<k>` dir. The qtests use their own temp files.
 - Long gate: `STIX_ASW_ELF=... bash scripts/stix/soak.sh build/qemu-system-sparc 600`.
   Liveness is TM flow: at least one TM chunk in every 60 s slice of the
   window. UART growth is only reported, because with the watchdog modeled

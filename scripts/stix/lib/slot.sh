@@ -182,12 +182,17 @@ stix_slot_dir() { # dir
     fi
 }
 
-# Slot mode only: refresh ./flash.bin as a private sparse copy of the
-# master. The master must exist (a missing one would make QEMU create a
-# fresh flash and take the first-boot write path). The copy must stay
-# sparse: allocated < STIX_FLASH_MAX_ALLOC_KB and apparent == master's.
+# Slot mode only: refresh ./flash.bin as a private copy of the master.
 stix_flash_private() {
     [ "$STIX_SLOT_MODE" -eq 1 ] || return 0
+    stix_flash_copy
+}
+
+# Refresh ./flash.bin as a private sparse copy of the master. The master
+# must exist (a missing one would make QEMU create a fresh flash and take
+# the first-boot write path). The copy must stay sparse: allocated <
+# STIX_FLASH_MAX_ALLOC_KB and apparent == master's.
+stix_flash_copy() {
     local master="${STIX_FLASH_MASTER:-/tmp/stix-uprev-run/flash.bin}"
     local max_kb="${STIX_FLASH_MAX_ALLOC_KB:-65536}" alloc size msize
     if [ ! -f "$master" ]; then

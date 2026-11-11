@@ -342,6 +342,61 @@ check "cleanup: FAIL keeps everything" $? "$(ls "$WORK/run")"
 [ -e "$WORK/run/flash.bin" ]
 check "cleanup: a legacy PASS keeps everything" $? "$(ls "$WORK/run")"
 
+# --- scripts/stix/qt.sh with a fake build and a fake suite ---
+QT="$REPO_ROOT/scripts/stix/qt.sh"
+# the fake suite reports what it sees: its slot base, whether that slot's
+# lock (slot 0's outside a slot) is held, the QEMU binary and the CWD
+{
+    echo '#!/bin/sh'
+    echo "l=\"$LOCKS/stix-qtest-\${STIX_PORT_BASE:-$UIDB}.lock\""
+    echo 'if flock -n "$l" true; then held=free; else held=held; fi'
+    echo 'echo "ok 1 base=${STIX_PORT_BASE:-unset} lock=$held" \'
+    echo '    "qemu=$(basename "$QTEST_QEMU_BINARY") cwd=$(pwd) args=$*"'
+    echo '[ ! -e flash.bin ] || echo "ok 2 flash=$(stat -c %s flash.bin)"'
+} > "$WORK/fake-suite"
+chmod +x "$WORK/fake-suite"
+qt() { # args... -> qt.sh with the fake build and suite
+    env -u STIX_PORT_BASE STIX_SLOT_LOCK_DIR="$LOCKS" \
+        STIX_QT_MAKE="${STIX_QT_MAKE:-true}" \
+        STIX_QT_SUITE="$WORK/fake-suite" STIX_FLASH_MASTER="$M" \
+        STIX_QT_BASELINE_DIR="$WORK/qt-base" bash "$QT" "$@" 2>&1
+}
+out="$(qt)"
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "^slot: 1 base $B1\$" &&
+    echo "$out" | grep -q "^ok 1 base=$B1 lock=held qemu=qemu-system-sparc " &&
+    echo "$out" | grep -q "^exit=0 slot=1 busy=0 load="
+check "qt.sh: the suite runs in slot 1 with STIX_PORT_BASE exported" $? \
+    "rc=$rc: $out"
+out="$(qt flash-error-paths)"
+echo "$out" | grep -q "args=--tap -p /sparc/sparc/stix/flash-error-paths\$" &&
+    echo "$out" | grep -q "lock=held"
+check "qt.sh <test>: one test, also under a slot" $? "$out"
+hold 1
+hold 2
+hold 3
+out="$(STIX_SLOT_WAIT=1 qt)"
+rc=$?
+[ "$rc" -eq 2 ] && ! echo "$out" | grep -q "^ok"
+check "qt.sh: no free slot => exit 2, the suite does not run" $? \
+    "rc=$rc: $out"
+release_all
+out="$(qt --baseline)"
+rc=$?
+[ "$rc" -eq 0 ] &&
+    echo "$out" | grep -q "^slot: 0 base $UIDB (5.2 baseline)" &&
+    echo "$out" | grep -q "^ok 1 base=unset lock=held" &&
+    echo "$out" | grep -q "qemu=qemu-system-sparc-52-wrapper.sh" &&
+    echo "$out" | grep -q "cwd=$WORK/qt-base " &&
+    echo "$out" | grep -q "^ok 2 flash=8388608\$" &&
+    [ "$(du -k "$WORK/qt-base/flash.bin" | cut -f1)" -lt 1024 ]
+check "qt.sh --baseline: slot 0, the wrapper, a sparse flash in its dir" $? \
+    "rc=$rc: $out"
+out="$(STIX_QT_MAKE=false qt)"
+rc=$?
+[ "$rc" -eq 3 ] && echo "$out" | grep -q "BUILD FAILED"
+check "qt.sh: a failed build => exit 3" $? "rc=$rc: $out"
+
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
