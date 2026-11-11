@@ -1,5 +1,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
+#include "qapi/visitor.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/sparc/grlib_stix.h"
@@ -13,6 +15,9 @@
 
 #include "trace.h"
 #include "qom/object.h"
+
+/* HK ADC channels: hkAdc ADDR is 7 bits (STIXCTRL_HKADC_ADDR_MASK) */
+#define STIXCTRL_HK_CHANNELS (STIXCTRL_HKADC_ADDR_MASK + 1)
 
 #define STIXCTRL_REG_SIZE sizeof(stixCtrlRegs_s) /* Size of memory mapped registers */ // TODO: Set to right size
 
@@ -93,7 +98,27 @@ struct STIXCTRL
      * dropped; when false it is plain storage (legacy, A/B comparison).
      */
     bool powerstat;
+    /*
+     * P4-2 (D-P4a/b): runtime HK ADC overrides, one per channel, set
+     * over QMP as adc-inject[N]. STIXCTRL_ADC_INJECT_NONE = no override;
+     * otherwise a raw 12-bit value that replaces the channel's reading.
+     * Runtime-only: set over QMP after start-up (the reset at machine
+     * start clears a -global value), and consulted only with hk-adc=on.
+     * Cleared on device reset.
+     */
+    uint32_t adc_inject[STIXCTRL_HK_CHANNELS];
 };
+
+#define STIXCTRL_ADC_INJECT_NONE 0xFFFFFFFFu
+
+static void stixctrl_adc_inject_clear(STIXCTRL *s)
+{
+    uint32_t ch;
+
+    for (ch = 0; ch < STIXCTRL_HK_CHANNELS; ch++) {
+        s->adc_inject[ch] = STIXCTRL_ADC_INJECT_NONE;
+    }
+}
 
 /*static void grlib_stixctrl_timer_tick(void *opaque)
 {
@@ -355,7 +380,7 @@ static const MemoryRegionOps grlib_stixctrl_rotb_ops = {
  * on (HKMonitor.c:357-370); since P4-1 it does (stixctrl_hkcmdsta), and
  * the "on" values here pass those checks.
  */
-static const uint16_t stixctrl_hk_adc_table[128] = {
+static const uint16_t stixctrl_hk_adc_table[STIXCTRL_HK_CHANNELS] = {
     [0] = 700,   /* DPU_1V5_C, 162..2185 */
     [1] = 800,   /* DPU_2V5_C, 0..1991 */
     [2] = 1009,  /* DPU_3V3_C, 132..4037 */
@@ -412,9 +437,16 @@ static const uint16_t stixctrl_hk_adc_table[128] = {
  */
 static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
 {
-    uint32_t cmdsta = s->reg.hkCmdSta;
-    uint32_t spwen = (cmdsta >> STIXCTRL_HKCMDSTA_SPWEN) &
-                     STIXCTRL_HKCMDSTA_SPWEN_MASK;
+    uint32_t cmdsta;
+    uint32_t spwen;
+
+    /* P4-2: an injection beats the table and the state overrides */
+    if (s->adc_inject[ch] != STIXCTRL_ADC_INJECT_NONE) {
+        return s->adc_inject[ch];
+    }
+
+    cmdsta = s->reg.hkCmdSta;
+    spwen = (cmdsta >> STIXCTRL_HKCMDSTA_SPWEN) & STIXCTRL_HKCMDSTA_SPWEN_MASK;
 
     switch (ch) {
     case STIXCTRL_HKADC_ADDR_V_HK_DPU_SPW_C: /* 3 */
@@ -732,6 +764,13 @@ static void grlib_stixctrl_reset(DeviceState *d)
      * NOT cleared here: they are plain RAM, zeroed at power-on only, and
      * their contents survive system reset (D-G) — the FSW's BRAM keeps
      * the reboot-persistent state (WDT UNCHANGED_STORAGE, MemBram). */
+
+    /*
+     * P4-2 (D-P4b): injections clear with the device, so a reboot is
+     * deterministic and a bad SPW*_V cannot break the SpW init after a
+     * watchdog reset
+     */
+    stixctrl_adc_inject_clear(stixctrl);
 }
 
 static void grlib_stixctrl_unrealize(DeviceState *dev)
@@ -742,12 +781,61 @@ static void grlib_stixctrl_unrealize(DeviceState *dev)
     stixctrl->rotb_ring = NULL;
 }
 
+/*
+ * P4-2 (D-P4a): adc-inject[N] accessors, one class property per
+ * channel; the channel number is the property's opaque. A setter (not
+ * a plain uint32 pointer property) so the value is range-checked and
+ * traced, and so the HK protection comparator can run on a set (P4-4).
+ */
+static void stixctrl_adc_inject_get(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    STIXCTRL *s = GRLIB_STIXCTRL(obj);
+    uint32_t value = s->adc_inject[GPOINTER_TO_UINT(opaque)];
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void stixctrl_adc_inject_set(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    STIXCTRL *s = GRLIB_STIXCTRL(obj);
+    uint32_t ch = GPOINTER_TO_UINT(opaque);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    /* reject rather than mask, so a typo in a script is an error */
+    if (value != STIXCTRL_ADC_INJECT_NONE &&
+        value > STIXCTRL_HKADC_VAL_MASK) {
+        error_setg(errp, "%s: %u is not a 12-bit ADC value "
+                   "(0..%u, or %u to clear)", name, value,
+                   STIXCTRL_HKADC_VAL_MASK, STIXCTRL_ADC_INJECT_NONE);
+        return;
+    }
+    s->adc_inject[ch] = value;
+    if (value == STIXCTRL_ADC_INJECT_NONE) {
+        trace_stixctrl_adc_inject_clear(ch);
+    } else {
+        trace_stixctrl_adc_inject_set(ch, value);
+    }
+}
+
 static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_UINT32("rotb-blocks", STIXCTRL, rotb_blocks,
                        STIXCTRL_ROTB_MAX_BLOCKS),
     DEFINE_PROP_BOOL("hk-adc", STIXCTRL, hk_adc, true),
     DEFINE_PROP_BOOL("powerstat", STIXCTRL, powerstat, true),
 };
+
+/* no injection from the moment the object exists (not only at realize) */
+static void grlib_stixctrl_instance_init(Object *obj)
+{
+    stixctrl_adc_inject_clear(GRLIB_STIXCTRL(obj));
+}
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)
 {
@@ -757,12 +845,25 @@ static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)
     dc->unrealize = grlib_stixctrl_unrealize;
     device_class_set_legacy_reset(dc, grlib_stixctrl_reset);
     device_class_set_props(dc, grlib_stixctrl_properties);
+
+    for (uint32_t ch = 0; ch < STIXCTRL_HK_CHANNELS; ch++) {
+        g_autofree char *name = g_strdup_printf("adc-inject[%u]", ch);
+
+        object_class_property_add(klass, name, "uint32", &uint32_type_info,
+                                  stixctrl_adc_inject_get,
+                                  stixctrl_adc_inject_set,
+                                  NULL, GUINT_TO_POINTER(ch));
+        object_class_property_set_description(klass, name,
+            "HK ADC override for this channel: raw 0..4095, "
+            "4294967295 = none (runtime, needs hk-adc=on)");
+    }
 }
 
 static const TypeInfo grlib_stixctrl_info = {
     .name = TYPE_GRLIB_STIXCTRL,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STIXCTRL),
+    .instance_init = grlib_stixctrl_instance_init,
     .class_init = grlib_stixctrl_class_init,
 };
 

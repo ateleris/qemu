@@ -450,6 +450,13 @@ static void leon3_generic_hw_init(MachineState *machine)
      * rotb -> IRQMP 3/4/5/6/7 (accepted-diffs.md §11). */
     dev = qdev_new(TYPE_GRLIB_STIXCTRL);
     ctrl = dev; /* D-J: the SPW's scet-source link */
+    /*
+     * P4-2 (D-P4a): a fixed QOM path, /machine/stixctrl, for the fault
+     * injection properties (adc-inject[N]) and for tests; unnamed it
+     * would be a /machine/unattached/device[N] that moves with the
+     * device order
+     */
+    object_property_add_child(OBJECT(machine), "stixctrl", OBJECT(dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, STIXCTRL_APB_BASE);
     /* BLOCK window: the SW view of the ring block at rd (reads) / wr
@@ -492,6 +499,8 @@ static void leon3_generic_hw_init(MachineState *machine)
 
     /* Allocate SpW */
     dev = qdev_new(TYPE_GRLIB_STIXSPW);
+    /* P4-2 (D-P4a): fixed QOM path /machine/stixspw (timecodes, link-down) */
+    object_property_add_child(OBJECT(machine), "stixspw", OBJECT(dev));
     /* D-J: the SPW generates its time codes from the CTRL SCET */
     object_property_set_link(OBJECT(dev), "scet-source", OBJECT(ctrl),
                              &error_abort);

@@ -378,7 +378,8 @@ land, so the FSW boot log is unchanged.
 **Evidence:** qtest `/sparc/stix/ctrl-irq-lines`. It lists
 `/machine/unattached` over QMP, finds the CTRL and IRQMP devices by their
 `child<grlib-stixctrl>`/`child<grlib-irqmp>` type fields (no `device[N]`
-hardcoding), and checks for i in 0..4 that `qom-get
+hardcoding; since §26 the CTRL is at the fixed path `/machine/stixctrl`
+and only the IRQMP is found by type), and checks for i in 0..4 that `qom-get
 <ctrl>/sysbus-irq[i]` — the QOM link each sysbus IRQ output exposes —
 returns `<irqmp>/unnamed-gpio-in[3+i]`, the canonical path of IRQMP's
 input pin. Red on the pre-fix binary: `[0]` returned
@@ -1524,3 +1525,56 @@ untouched.
 **Known gap:** reset does not clear `hkCmdSta` (pre-existing). After a
 watchdog reset POWERSTAT therefore reports the old supplies on until the
 BSW rewrites the register.
+
+## 26. HK ADC injection over QMP; fixed QOM paths (baseline: none)
+
+**Baseline:** there was no way to change an HK reading while the guest
+runs. stixctrl and stixspw were unnamed `/machine/unattached/device[N]`
+children, so tests had to find them by a type scan.
+
+**Model (P4-2, D-P4a/b):**
+- stixctrl has 128 class properties `adc-inject[0]`..`adc-inject[127]`
+  (uint32), one per hkAdc channel.
+  - `0xFFFFFFFF` means no override and is the default.
+  - Any value from 0 to 0xFFF replaces that channel's reading at the next
+    conversion. It beats both the nominal table and the state overrides
+    (§22).
+  - Other values are rejected with a QMP error, not masked, so a typo in
+    a script fails loudly.
+  - Set and clear are traced (`stixctrl_adc_inject_*`).
+- A device reset (a system reset, including the watchdog's) clears every
+  injection. A reboot is therefore deterministic, and a stale SPW*_V
+  injection cannot break SpW init after a reset.
+- Injection is runtime-only, over QMP. The reset at machine start clears a
+  `-global ...adc-inject[N]=X`. With `hk-adc=off` the legacy path (VAL 0)
+  ignores injections.
+- Clearing needs the literal 4294967295: `-1` is rejected by the uint32
+  visitor.
+- leon3.c adds the devices as `/machine/stixctrl` and `/machine/stixspw`.
+  The qtests `ctrl-irq-lines` and the SPW path helper use them now.
+
+**Use** (QMP socket, for example `-qmp unix:<run dir>/qmp.sock,server=on,wait=off`):
+
+    {"execute": "qom-set", "arguments": {"path": "/machine/stixctrl",
+     "property": "adc-inject[24]", "value": 1800}}
+    {"execute": "qom-set", "arguments": {"path": "/machine/stixctrl",
+     "property": "adc-inject[24]", "value": 4294967295}}
+
+On the gate ELF every HK limit is 0..0xFFF, so an injection alone never
+trips a software check. Tighten the limit first with TC(236,10), and only
+after TM(5,1) 0x14A3 (§27).
+
+**Tests:** `/sparc/stix/adc-inject` covers:
+- all 128 channels start at 0xFFFFFFFF;
+- an injected value reads back while its neighbours are unchanged;
+- an injection beats the SPW_C state override;
+- 0 and 0xFFF are accepted;
+- 0x1000 and 0xFFFFFFFE are rejected and the value is kept;
+- clearing restores the nominal value;
+- clearing SPW_C brings its state override back (1830);
+- `-1` is rejected;
+- `qtest_system_reset` clears all 128 injections;
+- there is no `adc-inject[128]`.
+
+`ctrl-irq-lines` asserts that stixctrl is no longer under
+/machine/unattached. Both failed on the pre-P4-2 binary.

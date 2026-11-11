@@ -1095,8 +1095,12 @@ static void test_ctrl_irq_lines(void)
     g_autofree gchar *irqmp_path = NULL;
     int i;
 
-    /* find the two devices under /machine/unattached by type, not by the
-     * volatile device[N] names */
+    /*
+     * P4-2: the controller has the fixed path /machine/stixctrl; the
+     * IRQMP is still found under /machine/unattached by type, not by the
+     * volatile device[N] names
+     */
+    ctrl_path = g_strdup("/machine/stixctrl");
     resp = qtest_qmp(qts,
                      "{'execute': 'qom-list',"
                      " 'arguments': {'path': '/machine/unattached'}}");
@@ -1108,12 +1112,11 @@ static void test_ctrl_irq_lines(void)
         const char *name = qdict_get_str(prop, "name");
         const char *type = qdict_get_str(prop, "type");
 
-        if (g_str_equal(type, "child<grlib-stixctrl>")) {
-            g_assert_null(ctrl_path);
+        /* the controller is no longer an unattached child */
+        g_assert_false(g_str_equal(type, "child<grlib-stixctrl>"));
+        if (g_str_equal(type, "child<grlib-irqmp>")) {
             /* qom-list reports the child name; qom-get/qom-set want the
              * canonical path, and link values are canonical paths */
-            ctrl_path = g_strdup_printf("/machine/unattached/%s", name);
-        } else if (g_str_equal(type, "child<grlib-irqmp>")) {
             g_assert_null(irqmp_path);
             irqmp_path = g_strdup_printf("/machine/unattached/%s", name);
         }
@@ -1996,33 +1999,22 @@ static void test_spw_regs(void)
 /* ---- P2-4: TMTC transport on the main loop, non-blocking TM ---- */
 
 /*
- * Find the SPW device's QOM path: it is realized without an id, so it
- * lives under /machine/unattached (correction 16: find it by a type
- * scan).
+ * The SPW device's QOM path. Since P4-2 (D-P4a) leon3.c adds it as the
+ * fixed child /machine/stixspw (before that it was an unattached
+ * device[N], found by a type scan). Check the type, so a wrong object
+ * at that path cannot pass.
  */
 static gchar *stix_spw_path(QTestState *qts)
 {
     QDict *resp = qtest_qmp(qts,
-                            "{'execute': 'qom-list',"
-                            " 'arguments': {'path': '/machine/unattached'}}");
-    QList *list;
-    const QListEntry *e;
-    gchar *path = NULL;
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': '/machine/stixspw',"
+                            " 'property': 'type'}}");
 
-    list = qdict_get_qlist(resp, "return");
-    g_assert_nonnull(list);
-    QLIST_FOREACH_ENTRY(list, e) {
-        QDict *item = qobject_to(QDict, qlist_entry_obj(e));
-
-        if (strstr(qdict_get_str(item, "type"), "grlib-stixspw")) {
-            path = g_strdup_printf("/machine/unattached/%s",
-                                   qdict_get_str(item, "name"));
-            break;
-        }
-    }
+    g_assert(qdict_haskey(resp, "return"));
+    g_assert_cmpstr(qdict_get_str(resp, "return"), ==, "grlib-stixspw");
     qobject_unref(resp);
-    g_assert_nonnull(path);
-    return path;
+    return g_strdup("/machine/stixspw");
 }
 
 /*
@@ -3918,6 +3910,123 @@ static void test_powerstat(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P4-2: HK ADC injection over QMP (adc-inject[N]) ---- */
+
+#define ADC_INJECT_NONE 0xFFFFFFFFu
+#define HK_CHANNELS     128u /* hkAdc ADDR is 7 bits */
+
+/* qom-set adc-inject[ch]; true on success, false on a QMP error */
+static bool adc_inject_set(QTestState *qts, uint32_t ch, uint32_t val)
+{
+    g_autofree gchar *name = g_strdup_printf("adc-inject[%u]", ch);
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': '/machine/stixctrl',"
+                            " 'property': %s, 'value': %u}}", name, val);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+static uint32_t adc_inject_get(QTestState *qts, uint32_t ch)
+{
+    g_autofree gchar *name = g_strdup_printf("adc-inject[%u]", ch);
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': '/machine/stixctrl',"
+                            " 'property': %s}}", name);
+    uint32_t val;
+
+    g_assert(qdict_haskey(resp, "return"));
+    val = (uint32_t)qdict_get_int(resp, "return");
+    qobject_unref(resp);
+    return val;
+}
+
+/*
+ * P4-2 (D-P4a/b): adc-inject[0..127] on /machine/stixctrl override one
+ * HK ADC channel at run time. 0xFFFFFFFF = no override (default); any
+ * other value outside 0..0xFFF is rejected; an injection beats both the
+ * nominal table and the state overrides; a device reset clears all.
+ * RED on the pre-P4-2 binary: /machine/stixctrl does not exist.
+ */
+static void test_adc_inject(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t ch;
+
+    /* every channel starts without an override */
+    for (ch = 0; ch < HK_CHANNELS; ch++) {
+        g_assert_cmphex(adc_inject_get(qts, ch), ==, ADC_INJECT_NONE);
+    }
+
+    /* an injection replaces the nominal value; the others are unchanged */
+    g_assert_true(adc_inject_set(qts, 24, 1800));
+    g_assert_cmphex(adc_inject_get(qts, 24), ==, 1800);
+    hk_check(qts, 24, 1800);
+    hk_check(qts, 28, 3413);
+    hk_check(qts, 44, 3958);
+
+    /* it beats the state overrides (SPW_C follows SPWEN otherwise) */
+    ctrl_write(qts, CTRL_HKCMDSTA, 3u << 3);
+    hk_check(qts, 3, 1830);
+    g_assert_true(adc_inject_set(qts, 3, 777));
+    hk_check(qts, 3, 777);
+    /* clearing brings the state override back */
+    g_assert_true(adc_inject_set(qts, 3, ADC_INJECT_NONE));
+    hk_check(qts, 3, 1830);
+    g_assert_true(adc_inject_set(qts, 3, 777));
+    ctrl_write(qts, CTRL_HKCMDSTA, 0);
+    hk_check(qts, 3, 777);
+
+    /* the range ends are accepted */
+    g_assert_true(adc_inject_set(qts, 40, 0));
+    hk_check(qts, 40, 0);
+    g_assert_true(adc_inject_set(qts, 40, 0xFFF));
+    hk_check(qts, 40, 0xFFF);
+
+    /* out of range is an error and leaves the old value */
+    g_assert_false(adc_inject_set(qts, 40, 0x1000));
+    g_assert_false(adc_inject_set(qts, 40, 0xFFFFFFFEu));
+    {
+        /* -1 is not "none": clearing needs the literal 4294967295 */
+        QDict *resp = qtest_qmp(qts,
+                                "{'execute': 'qom-set',"
+                                " 'arguments': {'path': '/machine/stixctrl',"
+                                " 'property': 'adc-inject[40]',"
+                                " 'value': -1}}");
+        g_assert(qdict_haskey(resp, "error"));
+        qobject_unref(resp);
+    }
+    g_assert_cmphex(adc_inject_get(qts, 40), ==, 0xFFF);
+    hk_check(qts, 40, 0xFFF);
+
+    /* clearing restores the nominal value */
+    g_assert_true(adc_inject_set(qts, 40, ADC_INJECT_NONE));
+    hk_check(qts, 40, 2300);
+
+    /* a reset clears every injection */
+    qtest_system_reset(qts);
+    for (ch = 0; ch < HK_CHANNELS; ch++) {
+        g_assert_cmphex(adc_inject_get(qts, ch), ==, ADC_INJECT_NONE);
+    }
+    hk_check(qts, 24, 2048);
+
+    /* there is no channel 128 */
+    {
+        QDict *resp = qtest_qmp(qts,
+                                "{'execute': 'qom-get',"
+                                " 'arguments': {'path': '/machine/stixctrl',"
+                                " 'property': 'adc-inject[128]'}}");
+        g_assert(qdict_haskey(resp, "error"));
+        qobject_unref(resp);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -3970,6 +4079,7 @@ int main(int argc, char **argv)
                        test_spw_udp_host_error);
         qtest_add_func("/sparc/stix/hk-adc", test_hk_adc);
         qtest_add_func("/sparc/stix/powerstat", test_powerstat);
+        qtest_add_func("/sparc/stix/adc-inject", test_adc_inject);
     }
 
     return g_test_run();

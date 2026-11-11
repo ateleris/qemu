@@ -40,6 +40,8 @@ stixctrl_rotb_overflow(uint32_t count) "rotb overflow: block dropped, count=%u"
 stixctrl_rotb_ignored(const char *what, uint32_t off) "rotb ignored %s (off=0x%x)"
 stixctrl_io_read(uint32_t addr, uint32_t val) "CTRL | Read requested: addr = 0x%x, regval = 0x%x"
 stixctrl_io_write(uint32_t addr, uint32_t val) "CTRL | Write completed addr = 0x%x, new regval = 0x%x"
+stixctrl_adc_inject_set(uint32_t ch, uint32_t val) "adc-inject[%u] = %u"
+stixctrl_adc_inject_clear(uint32_t ch) "adc-inject[%u] cleared"
 
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"
