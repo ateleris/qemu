@@ -434,7 +434,7 @@ These change what the track can deliver. Read them first.
 - **D-Af: the ATT_C current (HK ADC channel 8).**
   - **Layering, on top of PL-2a's split.** `_truth` and the presented
     wrapper are the platform's names:
-    - `stixctrl_hk_value_truth(ch 8)` = `stix_att_att_c_truth()` (the
+    - `stixctrl_hk_truth(ch 8)` = `stix_att_att_c_truth()` (the
       physics below);
     - the presented wrapper: if `adc-inject[8]` is set it wins (forcing);
       otherwise it returns `stix_att_att_c_presented()`, which applies the
@@ -1119,3 +1119,8 @@ is kept outside the repo. Each row below says where the item is folded.
 | Q10 SKIP convention | decided: exit 77; SKIP listed separately from PASS | A-4; Commits preamble; A-5 |
 
 Q1-Q6 remain open for the user (see "Open questions for the user").
+
+## Note from the platform PL-1/PL-2 implementation review (2026-11-11)
+
+- The PL-2a split landed as `stixctrl_hk_truth()` (true value) and `stixctrl_hk_value()` (presented value); this plan now uses those names.
+- The platform `hw-state` getter calls both functions for every HK table channel on every controller poll (2-20 Hz). The attenuator truth/presented functions (`stix_att_hk_att_c()` and the 0x5C state) must therefore be **strictly pure**: no lazy state advance that changes later results, no trace event, no IRQ. Compute the lazy state as a function of `QEMU_CLOCK_VIRTUAL`, so an extra read changes nothing. Add a qtest that reads hw-state many times during a move and checks the move timing and the trace are unchanged.
