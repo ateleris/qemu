@@ -41,6 +41,9 @@ DEFAULTS = {
                   "autostart": "first_tm",    # "first_tm" | "boot" | "off"
                   # one summary record per N sends (80 = 10 s at 125 ms)
                   "summary_every": 80},
+    # B2: the automatic TC(9,129) once per boot (user decision:
+    # "automatic, configurable"); "first_tm" | "boot" | "off"
+    "timesync": {"autostart": "first_tm"},
     "faults": {"catalogue": ""},              # "" = the v1 catalogue
     # bind: loopback only, unless container = true (PL-7: inside a
     # container that is published on 127.0.0.1 only, D-PLj)
@@ -70,6 +73,7 @@ CHOICES = {
     ("gs", "tc_during_link_down"): ("drop", "hold"),
     ("gs", "emulation"): ("auto", "on", "off"),
     ("keepalive", "autostart"): ("first_tm", "boot", "off"),
+    ("timesync", "autostart"): ("first_tm", "boot", "off"),
 }
 
 

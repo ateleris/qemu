@@ -1174,11 +1174,73 @@ def t_keepalive_trace(env):
         ctl.shutdown()
 
 
+def _tc9s(sock, wait=1.5):
+    """The TC(9,129) units that reach QEMU's TC port within @wait s."""
+    out = []
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        sock.settimeout(max(0.01, end - time.monotonic()))
+        try:
+            u = sock.recvfrom(4096)[0]
+        except socket.timeout:
+            break
+        p = tcbuild.parse_tc(u[4:])
+        if p and p[2:4] == (9, 129):
+            out.append(u)
+    return out
+
+
+def t_timesync_auto(env):
+    """B2: the automatic time sync, once per boot (also after a guest
+    reset), logged; autostart = first_tm | boot | off."""
+    for mode in ("first_tm", "boot", "off"):
+        ctl = env.controller(timesync={"autostart": mode},
+                             keepalive={"enabled": False})
+        qemu_tc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        qemu_tc.bind(("127.0.0.1", ctl.cfg["ports"]["qemu_tc"]))
+        snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tm = ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"])
+        try:
+            ctl.command("platform.power.on", {})
+            ctl.command("platform.power.boot", {})
+            got = _tc9s(qemu_tc, 0.8)
+            check(len(got) == (1 if mode == "boot" else 0),
+                  "%s: %d syncs at boot before any TM" % (mode, len(got)))
+            for i in range(3):
+                snd.sendto(_tm_unit(0x5A7, 5, 1, b"\x00\x22", seq=i), tm)
+            got = _tc9s(qemu_tc)
+            check(len(got) == (1 if mode == "first_tm" else 0),
+                  "%s: %d syncs after the first TMs" % (mode, len(got)))
+            autos = [r.obj["data"] for r in ctl.log.since(0)
+                     if r.obj["path"] == "platform.timesync.auto"]
+            check(len(autos) == (0 if mode == "off" else 1) and
+                  all(a["trigger"] == mode for a in autos),
+                  "%s: auto records %r" % (mode, autos))
+            if mode == "off":
+                continue
+            # free the slot (no FSW here to answer), then a warm reset
+            ts = ctl.plat.timesync
+            with ts.lock:
+                if ts.pending:
+                    ts._verdict(ts.pending, "timeout", "the test")
+            ctl.power.qmp.execute("x-fake-guest-reset")
+            wait_for(lambda: _power_recs(ctl, "guest_reset"), what="reset")
+            snd.sendto(_tm_unit(0x5A7, 5, 1, b"\x00\x22", seq=9), tm)
+            got = _tc9s(qemu_tc)
+            check(len(got) == 1, "%s: %d syncs after a guest reset"
+                  % (mode, len(got)))
+        finally:
+            qemu_tc.close()
+            snd.close()
+            ctl.shutdown()
+
+
 def t_relay(env):
     """D-PLg: the relay is byte-identical, one tm.jsonl line per TM; the
     proxy adds the SpW header; a GS TC while the link is down is dropped
     and logged (or held)."""
-    ctl = env.controller(gs={"tc_during_link_down": "drop"})
+    ctl = env.controller(gs={"tc_during_link_down": "drop"},
+                         timesync={"autostart": "off"})
     gs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     gs.bind(("127.0.0.1", 0))
     gs.settimeout(2)
@@ -1648,6 +1710,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("time sync window (D-PLd)", t_timesync_window),
          ("time sync verdicts", t_timesync_verdicts),
          ("time sync reserve + re-check", t_timesync_reserve),
+         ("time sync autostart (B2)", t_timesync_auto),
          ("keep-alive pacing", t_keepalive),
          ("keep-alive: no drift", t_keepalive_drift),
          ("keep-alive: aggregate log", t_keepalive_log),

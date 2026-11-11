@@ -52,7 +52,7 @@ def plan_send(obt):
 
 class TimeSync:
     def __init__(self, clock, log, read_obt, send_unit, can_send,
-                 next_seq, wall=time.monotonic):
+                 next_seq, wall=time.monotonic, autostart="off"):
         self.clock = clock
         self.log = log
         self.read_obt = read_obt     # -> (obt, bench time of the read)
@@ -64,6 +64,38 @@ class TimeSync:
         self.pending = None
         self.awaiting_hb = None
         self.history = []
+        self.autostart = autostart
+        self.auto_armed = False
+
+    # -- the automatic sync (B2), once per boot ---------------------------------
+    def on_boot(self):
+        """A boot or a guest reset: arm the automatic sync; "boot"
+        sends it now, "first_tm" at the first TM."""
+        with self.lock:
+            self.auto_armed = self.autostart != "off"
+            now = self.autostart == "boot"
+            if now:
+                self.auto_armed = False
+        if now:
+            self._auto("boot")
+
+    def on_off(self):
+        with self.lock:
+            self.auto_armed = False
+
+    def _auto(self, trigger):
+        def run():
+            data = {"trigger": trigger}
+            try:
+                data.update(self.send(), ok=True)
+            except VerbError as e:
+                data.update(ok=False, status=e.status, error=str(e))
+            except Exception as e:      # QMP gone (a power-off race)
+                data.update(ok=False, error="%s: %s" % (type(e).__name__,
+                                                        e))
+            self.log.emit("ctl", "log", "platform.timesync.auto", data)
+        threading.Thread(target=run, name="timesync-auto",
+                         daemon=True).start()
 
     def _busy(self):
         """Under self.lock: None, or why another TC(9,129) must wait."""
@@ -176,6 +208,11 @@ class TimeSync:
     def on_tm(self, unit, dec):
         if dec is None:
             return
+        if self.auto_armed and self.autostart == "first_tm":
+            with self.lock:
+                fire, self.auto_armed = self.auto_armed, False
+            if fire:
+                self._auto("first_tm")
         with self.lock:
             p = self.pending
             if p is not None and not p.get("preparing") and \

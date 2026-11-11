@@ -406,6 +406,12 @@ bench**.
   - TM(1,8) 48035, 48034 or 48041 is a failure;
   - the `stixspw_timecode_emit` traces (QEMU stderr) confirm the TIMECNT
     of each code.
+- **Automatic (user decision: "automatic, configurable", PL-4 review
+  B2):** `[timesync] autostart = "first_tm" | "boot" | "off"`, default
+  `first_tm`: one sync per boot, also after a warm guest reset, at the
+  first TM (or at `cont` with "boot"), logged as
+  `platform.timesync.auto` and verified like a manual one. link-smoke
+  checks it gives verdict ok with no manual send.
 - **As built (PL-4 review SF1-SF3, SF7):**
   - after a wait the OBT is read again and the 0.5 s rule re-applied
     (an OBT jump while waiting means another wait, at most 3);

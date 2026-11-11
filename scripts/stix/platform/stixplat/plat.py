@@ -42,7 +42,8 @@ class Platform:
                                    self.relay.send_unit, self.can_send)
         self.timesync = TimeSync(self.clock, self.log, self.read_obt,
                                  self.relay.send_unit, self.can_send,
-                                 self._next_seq14)
+                                 self._next_seq14,
+                                 autostart=cfg["timesync"]["autostart"])
         self.forcing = Forcing(self.log, self.qmp)
         self.faults = faults_mod.Faults(
             faults_mod.load(cfg["faults"]["catalogue"] or None),
@@ -123,10 +124,13 @@ class Platform:
                 self._q().qom_set(STIXSPW, "link-down", True)
             self.forcing.reapply("warm guest reset")
             self.keepalive.on_boot()
+            self.timesync.on_boot()
         elif event == "boot":
             self.keepalive.on_boot()
+            self.timesync.on_boot()
         elif event == "off":
             self.keepalive.on_off()
+            self.timesync.on_off()
 
     # -- verbs ----------------------------------------------------------------
     def register(self, d):

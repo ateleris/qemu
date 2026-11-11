@@ -7,6 +7,7 @@
 # TM/TC 21526/21527, GS TC 21528, the fake GS on 21531; run dir
 # /tmp/stix-plat/link-smoke (a fresh sparse flash made by QEMU). Checks:
 #   boot: the boot report TM (EID 0x0022) reaches the fake GS
+#   the automatic time sync at the first TM: verdict ok, no manual send
 #   proxy: TC(17,1) from the fake GS gives TM(1,1), TM(17,2), TM(1,7)
 #   keep-alive: no 0x142E for 90 s; paused 40 s mid-run, still none (a
 #     sanity check: the FSW timer freezes too); off: 0x142E within 40 s
@@ -226,7 +227,28 @@ def main(gs, ctl):
     gs.wait(m0, lambda d: eid(d, 0x0022), 50, "the boot report (EID 0x0022)")
     ok("boot: the boot report TM (EID 0x0022) reached the fake GS")
     gs.wait(m0, lambda d: eid(d, 0x14A3), 60, "FDIR enabled (EID 0x14A3)")
-    t_first_tm = gs.since(0)[0][0]
+    sim_first_tm = records("tm")[0]["sim_time"]
+
+    # -- the automatic time sync (B2): no manual send ----------------------
+    auto = v = None
+    end = time.monotonic() + 30
+    while time.monotonic() < end and v is None:
+        autos = records("log", "platform.timesync.auto")
+        if autos:
+            auto = autos[0]["data"]
+            check(auto["ok"] and auto["trigger"] == "first_tm",
+                  "auto sync %r" % auto)
+            for e in records("expect", "platform.timesync"):
+                if e["data"]["seq"] == auto["seq"]:
+                    v = e["data"]
+        time.sleep(0.2)
+    check(v is not None, "no verdict for the auto sync %r" % auto)
+    check(v["verdict"] == "ok" and v["ordering"] == "ok" and not v["raw"],
+          "auto sync verdict %r" % v)
+    check(not records("cmd", "platform.timesync.send"),
+          "a manual send before the auto check")
+    ok("auto time sync at the first TM: verdict ok (%.3f s), no manual "
+       "send" % v["diff_s"])
 
     # -- proxy: TC(17,1) from the fake GS ------------------------------
     m = gs.mark()
@@ -249,12 +271,12 @@ def main(gs, ctl):
     st = status()["platform"]["keepalive"]
     check(st["started"] and st["sent"] > 0, "keep-alive not running %r" % st)
     m_ka = 0
-    while time.monotonic() - t_first_tm < 50:
+    while sim_now() - sim_first_tm < 50 * NS:
         time.sleep(0.5)
     cmd("sim.pause")
     time.sleep(40)
     cmd("sim.resume")
-    while time.monotonic() - t_first_tm < 90 + 40:
+    while sim_now() - sim_first_tm < 90 * NS:
         time.sleep(0.5)
     bad = [d for _, d, _ in gs.since(m_ka) if d and eid(d, 0x142E)]
     check(not bad, "0x142E with the keep-alive on")
