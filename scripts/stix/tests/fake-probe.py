@@ -6,6 +6,11 @@ that is set, prints "# connected", then one chunk line in the probe's
 format ("HH:MM:SS +NNNNB <hex>", the header byte 0x49) every 0.5 s.
 It exits 0 after FAKE_PROBE_SECONDS (default 2) and prints the probe's
 "# total" summary on exit or on SIGTERM.
+
+FAKE_PROBE_LINES names a file whose lines are printed right after the
+connect line, "%T" replaced by the current HH:MM:SS (canned EXPECT OK
+lines). FAKE_PROBE_DUMP names a file copied to the path of the probe's
+--dump-apid APID:PATH argument (a canned packet dump).
 """
 import os
 import signal
@@ -25,6 +30,17 @@ def done(*_):
 
 signal.signal(signal.SIGTERM, done)
 print("# connected (fake probe)", flush=True)
+lines_file = os.environ.get("FAKE_PROBE_LINES")
+if lines_file:
+    with open(lines_file) as f:
+        for line in f:
+            print(line.rstrip("\n").replace("%T", time.strftime("%H:%M:%S")),
+                  flush=True)
+dump_file = os.environ.get("FAKE_PROBE_DUMP")
+if dump_file and "--dump-apid" in sys.argv:
+    dump_path = sys.argv[sys.argv.index("--dump-apid") + 1].split(":", 1)[1]
+    with open(dump_file) as src, open(dump_path, "a") as dst:
+        dst.write(src.read())
 end = time.monotonic() + float(os.environ.get("FAKE_PROBE_SECONDS", "2"))
 while time.monotonic() < end:
     print(f"{time.strftime('%H:%M:%S')} +{37:4d}B 49" + "ab" * 36,

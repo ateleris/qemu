@@ -585,10 +585,12 @@ Deviations from the plan:
 - `stix.c` gained one small helper (`stix_slot_band_base`, using
   `qemu_strtol`) next to the two `stix_free_*` bodies, and the now unused
   `TMTC_BASE_PORT` define was removed.
-- **G-2b is minimal** (the D-4 implementer is extending detector-smoke):
-  port, run dir and the `-global` line only. TODO after D-4: the
-  `${STIX_SLOT_TAG}` verdict tags and `stix_slot_cleanup` (flash.bin,
-  idefx.trace) on PASS.
+- **G-2b came in two steps** (the D-4 implementer was extending
+  detector-smoke): first the port, run dir and `-global` line only; after
+  D-4 (9c7bd11322) the `${STIX_SLOT_TAG}` verdict tags, the slot-mode
+  PASS cleanup (flash.bin, idefx.trace) and the --flare modes through the
+  same slot args. With it came per-mode run dirs and the kept FAIL dir
+  (accepted-diffs §41).
 
 Gate results on the tip:
 - G-a: test-slot 42/42, test-gate-slots 26/26, test-boot-smoke 5/5,

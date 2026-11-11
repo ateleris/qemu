@@ -82,8 +82,11 @@
 # command words at all (a missing trace FAILS the negative). Every
 # other check must pass.
 #
-# Like tc-smoke.sh this script does NOT take the /tmp/stix-qtest-21000
-# flock itself; the caller must hold it (no script does this for you).
+# In legacy mode (STIX_PORT_BASE unset) this script, like tc-smoke.sh,
+# does NOT take the /tmp/stix-qtest-21000 flock itself; the caller must
+# hold it. With STIX_PORT_BASE=auto or a slot number it takes a slot
+# (scripts/stix/lib/slot.sh) in every mode, --flare included: the slot's
+# TMTC port, <run dir>-s<k>, and slot=k busy= load= on the verdict.
 #
 # Usage: detector-smoke.sh <qemu-binary> [--flare] [--negative]
 #                           [--dry-run] [--check-guard]
@@ -92,6 +95,12 @@
 #                           Canonicalised, then anything at or above
 #                           /tmp/stix-uprev-run or /tmp/stix-baseline-run
 #                           (or /) is refused, as in nominal-smoke.sh.
+#                           Each mode adds its suffix (-neg, -flare,
+#                           -flareneg; none for the positive), then slot
+#                           mode -s<k>. A run that did not PASS leaves
+#                           .unfinished; the next run moves that dir aside
+#                           to <dir>.fail-<date>-<pid>, never reusing it.
+#   STIX_TMTC_PROBE         the probe script (tests substitute a fake)
 #                           The QMP socket is <run dir>/qmp.sock and its
 #                           path must stay under 108 bytes.
 #   STIX_DETECTOR_SECONDS   the probe's --seconds (default 240, >= 235:
@@ -137,7 +146,7 @@ ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_DETECTOR_RUN_DIR:-/tmp/stix-detector-run}"
 DURATION="${STIX_DETECTOR_SECONDS:-240}"
-PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
+PROBE="${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}"
 QLCHECK="$REPO_ROOT/scripts/stix/ql-check.py"
 TRACECHECK="$REPO_ROOT/scripts/stix/idefx-trace-check.py"
 # Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
@@ -151,12 +160,12 @@ if [ "$DRY_RUN" -eq 1 ] || [ "$CHECK_GUARD" -eq 1 ] ||
 else
     stix_slot_setup
 fi
-RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 
 # The run-dir guard of nominal-smoke.sh (review M1 there): canonical
 # first (realpath -m resolves a trailing slash, //, /., a symlink or a
 # relative path), then refuse the two shared run dirs, anything inside
-# them, any parent of them, and /.
+# them, any parent of them, and /. Checked on the given dir and on the
+# final one (with the mode and slot suffixes).
 RUN_DIR="$(realpath -m -- "$RUN_DIR")"
 SHARED_UPREV="$(realpath -m -- /tmp/stix-uprev-run)"
 SHARED_BASE="$(realpath -m -- /tmp/stix-baseline-run)"
@@ -166,19 +175,32 @@ refuse_run_dir() {
     echo "own empty run dir away from the shared ones"
     exit 2
 }
+guard_shared() {
+    local shared
+    for shared in "$SHARED_UPREV" "$SHARED_BASE"; do
+        case "$RUN_DIR" in
+            "$shared" | "$shared"/*)
+                refuse_run_dir "it is $shared or inside it" ;;
+        esac
+        case "$shared" in
+            "$RUN_DIR"/*)
+                refuse_run_dir "it is a parent of $shared" ;;
+        esac
+    done
+}
 if [ "$RUN_DIR" = "/" ]; then
     refuse_run_dir "it is the root directory"
 fi
-for shared in "$SHARED_UPREV" "$SHARED_BASE"; do
-    case "$RUN_DIR" in
-        "$shared" | "$shared"/*)
-            refuse_run_dir "it is $shared or inside it" ;;
-    esac
-    case "$shared" in
-        "$RUN_DIR"/*)
-            refuse_run_dir "it is a parent of $shared" ;;
-    esac
-done
+guard_shared
+# Every mode has its own run dir, in legacy and slot mode: a later mode
+# must never overwrite an earlier mode's evidence (a --negative FAIL was
+# once lost to the next mode's run).
+MODE_SFX=""
+[ "$NEGATIVE" -eq 1 ] && MODE_SFX="-neg"
+[ "$FLARE" -eq 1 ] && MODE_SFX="-flare"
+[ "$FLARE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-flareneg"
+RUN_DIR="$(stix_slot_dir "$RUN_DIR$MODE_SFX")"
+guard_shared
 QMP_SOCK="$RUN_DIR/qmp.sock"
 # sun_path is 108 bytes including the NUL
 if [ "${#QMP_SOCK}" -ge 108 ]; then
@@ -326,12 +348,21 @@ fi
 }
 
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
-    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?"
+    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance" \
+        "running?${STIX_SLOT_TAG}"
     exit 2
 fi
 
+# A run that did not PASS leaves .unfinished behind; its dir is moved
+# aside, never reused, so its evidence survives any later run.
+if [ -e "$RUN_DIR/.unfinished" ]; then
+    KEPT="$RUN_DIR.fail-$(date +%Y%m%d-%H%M%S)-$$"
+    mv -T -- "$RUN_DIR" "$KEPT"
+    echo "detector-smoke: kept the unfinished run's dir as $KEPT"
+fi
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
+touch .unfinished
 # Fresh flash every run: clear only this run dir's own files, by
 # explicit path (the shared run dirs are refused above), then pre-create
 # an empty sparse flash.bin of the full size, so QEMU never creates one
@@ -394,28 +425,49 @@ set -e
 # line is always the last thing the gate prints.
 if [ "$QEMU_ALIVE" -ne 0 ]; then
     tail -5 qemu-stdout.detector.log
-    echo "DETECTOR-SMOKE: ERROR (QEMU died or never started; qemu rc=$QEMU_RC)"
+    echo "DETECTOR-SMOKE: ERROR (QEMU died or never started;" \
+        "qemu rc=$QEMU_RC)${STIX_SLOT_TAG}"
     exit 2
 fi
 if [ "$PROBE_RC" -eq 124 ]; then
     tail -5 detector.probe.log
-    echo "DETECTOR-SMOKE: ERROR (the probe hit its own timeout)"
+    echo "DETECTOR-SMOKE: ERROR (the probe hit its own timeout)${STIX_SLOT_TAG}"
     exit 2
 fi
 if [ "$PROBE_RC" -eq 2 ]; then
     tail -5 detector.probe.log
-    echo "DETECTOR-SMOKE: ERROR (the probe rejected its arguments)"
+    echo "DETECTOR-SMOKE: ERROR (the probe rejected its" \
+        "arguments)${STIX_SLOT_TAG}"
     exit 2
 fi
 if grep -q "could not connect" detector.probe.log 2>/dev/null; then
     tail -5 detector.probe.log
-    echo "DETECTOR-SMOKE: ERROR (the probe never connected; QEMU rc=$QEMU_RC)"
+    echo "DETECTOR-SMOKE: ERROR (the probe never connected;" \
+        "QEMU rc=$QEMU_RC)${STIX_SLOT_TAG}"
     exit 2
 fi
 
 # Every check below runs and records its name in FAILED, so the report
-# is complete and --negative can compare the set.
+# is complete and --negative can compare the set. The QL checks also
+# record why in WHY_QL, which the verdict line repeats: the first
+# ql-check mismatch (and how many more), or its FAIL / ERROR line.
 FAILED=()
+WHY_QL=""
+ql_why() { # ql-check log -> one line
+    local first n
+    first="$(grep -m1 '^QL-CHECK MISMATCH: ' "$1" | cut -d' ' -f3-)" || true
+    n="$(grep -c '^QL-CHECK MISMATCH: ' "$1")" || true
+    if [ -n "$first" ]; then
+        [ "$n" -gt 1 ] && first="$first (+$((n - 1)) more)"
+        echo "$first"
+    else
+        grep -m1 -E '^QL-CHECK: (FAIL|ERROR)' "$1" | cut -d' ' -f2- ||
+            echo "no ql-check verdict"
+    fi
+}
+add_why() { # check why
+    WHY_QL="$WHY_QL; $1: $2"
+}
 
 # 1. the probe (TM expectations and forbids)
 if [ "$PROBE_RC" -ne 0 ]; then
@@ -469,9 +521,11 @@ if [ -z "$NOM_SECONDS" ]; then
     echo "CHECK ql: FAIL (no NOMINAL window: 0021 04 05 or 0021 05 04" \
         "not seen)"
     FAILED+=(ql)
+    add_why ql "no NOMINAL window"
 elif [ ! -s ql.dump.hex ]; then
     echo "CHECK ql: FAIL (no 0x5DC packet dumped)"
     FAILED+=(ql)
+    add_why ql "no 0x5DC packet dumped"
 else
     set +e
     python3 "$QLCHECK" ql.dump.hex --samples \
@@ -482,8 +536,10 @@ else
     if [ "$QL_RC" -eq 0 ]; then
         echo "CHECK ql: ok ($(wc -l < ql.dump.hex) packets in ql.dump.hex)"
     else
-        echo "CHECK ql: FAIL (ql-check rc=$QL_RC; see ql.check.log)"
+        echo "CHECK ql: FAIL ($(ql_why ql.check.log); ql-check" \
+            "rc=$QL_RC; see ql.check.log)"
         FAILED+=(ql)
+        add_why ql "$(ql_why ql.check.log)"
     fi
 fi
 
@@ -497,6 +553,7 @@ if [ "$FLARE" -eq 1 ]; then
         echo "CHECK ql-contrast: FAIL (no NOMINAL window, no dump, or" \
             "not exactly two det-flare QMP sends: ${#QMP_HMS[@]})"
         FAILED+=(ql-contrast)
+        add_why ql-contrast "no window, no dump or ${#QMP_HMS[@]} QMP sends"
     else
         read -r FLARE_ON_S FLARE_OFF_S < <(python3 -c '
 import sys
@@ -518,9 +575,10 @@ print(*((s(a) - t0) % 86400 for a in sys.argv[2:]))
         if [ "$QLC_RC" -eq 0 ]; then
             echo "CHECK ql-contrast: ok"
         else
-            echo "CHECK ql-contrast: FAIL (ql-check rc=$QLC_RC; see" \
-                "ql.contrast.log)"
+            echo "CHECK ql-contrast: FAIL ($(ql_why ql.contrast.log);" \
+                "ql-check rc=$QLC_RC; see ql.contrast.log)"
             FAILED+=(ql-contrast)
+            add_why ql-contrast "$(ql_why ql.contrast.log)"
         fi
     fi
 fi
@@ -597,17 +655,24 @@ else
 fi
 
 GOT="${FAILED[*]:-}"
+# PASS: the run dir may be reused; in slot mode drop the flash copy and
+# the trace (legacy keeps everything)
+pass_cleanup() {
+    rm -f .unfinished
+    stix_slot_cleanup 0 flash.bin idefx.trace
+}
 if [ "$FLARE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
     # PASS only when the missing flip is all that fails: the LC
     # contrast check; the sky, probe, UART and trace checks must pass.
     if [ "$GOT" = "ql-contrast" ]; then
         echo "DETECTOR-SMOKE (flare negative): PASS (failed exactly as" \
             "planned: no flare switch, no LC contrast; everything else" \
-            "passed)"
+            "passed)${STIX_SLOT_TAG}"
+        pass_cleanup
         exit 0
     fi
     echo "DETECTOR-SMOKE (flare negative): FAIL (failed checks:" \
-        "'${GOT}', want 'ql-contrast')"
+        "'${GOT}', want 'ql-contrast'$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
 if [ "$NEGATIVE" -eq 1 ]; then
@@ -622,20 +687,22 @@ if [ "$NEGATIVE" -eq 1 ]; then
         echo "DETECTOR-SMOKE (negative): PASS (failed exactly as planned:" \
             "$IDEFX_W write timeouts, $IDEFX_R read failures =" \
             "$((IDEFX_R / 12)) verification runs, no IDeF-X command" \
-            "words at all; the trace is empty)"
+            "words at all; the trace is empty)${STIX_SLOT_TAG}"
+        pass_cleanup
         exit 0
     fi
     echo "DETECTOR-SMOKE (negative): FAIL (failed checks: '${GOT}'," \
         "want '$WANT' with 384 write timeouts and 12 x >= 3 read" \
-        "failures; got $IDEFX_W and $IDEFX_R)"
+        "failures; got $IDEFX_W and $IDEFX_R$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
 # the D-3 positive keeps its verdict wording; --flare names its mode
 TAG="DETECTOR-SMOKE"
 [ "$FLARE" -eq 1 ] && TAG="DETECTOR-SMOKE ($MODE)"
 if [ -n "$GOT" ]; then
-    echo "$TAG: FAIL (failed checks: $GOT)"
+    echo "$TAG: FAIL (failed checks: $GOT$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
-echo "$TAG: PASS"
+echo "$TAG: PASS${STIX_SLOT_TAG}"
+pass_cleanup
 exit 0

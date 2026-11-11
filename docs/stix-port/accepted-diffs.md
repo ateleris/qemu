@@ -3296,6 +3296,16 @@ att) can run their gates at the same time without the global 21000 lock.
   fail there spuriously. By default it runs only
   `STIX_QT_BASELINE_TESTS` (`tmtc-hermetic`); `--full` runs the whole
   suite anyway.
+- **detector-smoke keeps every mode's evidence.** Each mode has its own
+  run dir: `<dir>` (positive), `<dir>-neg`, `<dir>-flare`,
+  `<dir>-flareneg`, then `-s<k>` in slot mode (for example
+  `/tmp/stix-detector-run-flare-s2`). A run writes `.unfinished` and removes it only on PASS; the
+  next run of that mode moves an unfinished dir aside to
+  `<dir>.fail-<date>-<pid>` instead of reusing it (a D-4 gate run lost a
+  --negative `ql` FAIL that way: the next mode overwrote it). A failed
+  `ql` / `ql-contrast` check names its first ql-check mismatch (and how
+  many more) in the CHECK line and in the verdict. No ql tolerance
+  changed.
 - **Fresh-flash gates pre-create flash.bin.** nominal-, fault- and
   detector-smoke delete flash.bin per run and then
   `truncate -s 17716740096 flash.bin`, in legacy and slot mode, so no

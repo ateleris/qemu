@@ -8,8 +8,9 @@
 #
 # Legacy mode (STIX_PORT_BASE unset) must stay byte-identical: each gate
 # is also run from the pre-change scripts at STIX_LEGACY_REF (default
-# 2721343939, the gate-ports base after D-3), extracted with git archive, and the
-# QEMU argv, probe argv and output are compared. Without that commit the
+# 9c7bd11322, the gate-ports base after D-4), extracted with git archive,
+# and the QEMU argv, probe argv and output are compared (detector-smoke's
+# per-mode run dir suffix mapped back). Without that commit the
 # identity cases are skipped (reported, not failed). Bump the ref when a
 # later commit changes a gate's legacy command line on purpose.
 #
@@ -27,7 +28,7 @@ FPROBE="$S/tests/fake-probe.py"
 # listener, so these fake-QEMU cases pass while another track's real QEMU
 # holds 20000+uid (nothing here binds a port).
 export PATH="$REPO_ROOT/scripts/stix/tests/stub-bin:$PATH"
-REF="${STIX_LEGACY_REF:-2721343939}"
+REF="${STIX_LEGACY_REF:-9c7bd11322}"
 UIDB=$((20000 + $(id -u)))
 B1=$((UIDB + 100))
 PASS=0
@@ -89,7 +90,9 @@ legacy_dry() { # script args...: old vs new --dry-run output
     local sc="$1" o n
     shift
     o="$(bash "$OLD/scripts/stix/$sc" "$FAKE" "$@" 2>&1 | sed "s#$OLD#$REPO_ROOT#g")"
-    n="$(bash "$S/$sc" "$FAKE" "$@" 2>&1)"
+    # detector-smoke's per-mode run dir (-neg) is the one intended change
+    n="$(bash "$S/$sc" "$FAKE" "$@" 2>&1 |
+        sed 's#/tmp/stix-detector-run-neg\([/ ]\)#/tmp/stix-detector-run\1#g')"
     [ "$o" = "$n" ] && [ -n "$n" ]
     check "legacy: $sc $* identical to $REF" $? \
         "$(diff <(echo "$o") <(echo "$n") | head -5)"
@@ -412,6 +415,78 @@ rc=$?
 [ "$rc" -eq 2 ] && echo "$out" | grep -q "disk guard"
 check "peek: a real nominal run still runs the disk guard" $? "rc=$rc: $out"
 for p in "${PEEKH[@]}"; do kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
+
+# --- detector-smoke: per-mode run dirs, slot args in every mode (G-2b) ---
+# each mode has its own run dir (-neg, -flare, -flareneg), legacy and slot
+for m in "--negative:-neg" "--flare:-flare" "--flare --negative:-flareneg" \
+    ":"; do
+    args="${m%%:*}"
+    sfx="${m#*:}"
+    # shellcheck disable=SC2086 # $args is a list of flags
+    out="$(bash "$S/detector-smoke.sh" "$FAKE" $args --dry-run 2>&1)"
+    echo "$out" | grep -q "^(cd /tmp/stix-detector-run$sfx && timeout "
+    check "detector legacy '${args:-positive}': /tmp/stix-detector-run$sfx" \
+        $? "$out"
+    # shellcheck disable=SC2086
+    out="$(slotenv STIX_DETECTOR_RUN_DIR="$W/det" bash "$S/detector-smoke.sh" \
+        "$FAKE" $args --dry-run 2>&1)"
+    echo "$out" | grep -q "^(cd $W/det$sfx-s1 && timeout " &&
+        echo "$out" | grep -q -- "-global grlib-stixspw.tmtc-port=$B1 " &&
+        echo "$out" | grep -q -- "unix:$W/det$sfx-s1/qmp.sock" &&
+        echo "$out" | grep -q "^python3 -u .* --port $B1 "
+    check "detector slot '${args:-positive}': -s1 dir, -global, --port" $? \
+        "$out"
+done
+out="$(slotenv STIX_DETECTOR_RUN_DIR="$W/det" bash "$S/detector-smoke.sh" \
+    "$FAKE" --flare --dry-run 2>&1)"
+echo "$out" | grep -q -- "--qmp $W/det-flare-s1/qmp.sock "
+check "detector slot --flare: the probe's QMP socket is the slot's" $? "$out"
+
+# a fake run to the verdict: canned probe lines (T_nom = T_exit, no TM
+# failure) and a one-packet QL dump that the real ql-check rejects
+{
+    echo '%T EXPECT OK: 0x5A7:5:1:00210405@10'
+    echo '%T EXPECT OK: 0x5A7:5:1:00210504@10'
+} > "$W/det.lines"
+echo 0ddcc000001a101506000000000000002200000001000000270002000000000000 \
+    > "$W/det.dump"
+detrun() { # args...: a fake detector-smoke run in slot 1
+    slotenv STIX_DETECTOR_RUN_DIR="$W/dr" STIX_TMTC_PROBE="$FPROBE" \
+        FAKE_PROBE_LINES="$W/det.lines" FAKE_PROBE_DUMP="$W/det.dump" \
+        FAKE_QEMU_RUN_SECONDS=10 bash "$S/detector-smoke.sh" "$FAKE" "$@" 2>&1
+}
+out="$(detrun --negative)"
+rc=$?
+last="$(echo "$out" | tail -1)"
+[ "$rc" -eq 1 ] &&
+    echo "$last" | grep -q "^DETECTOR-SMOKE (negative): FAIL .*slot=1 busy=" &&
+    echo "$last" |
+        grep -Eq "ql: SSID 30: 0 products, want 1 \(\+[0-9]+ more\)" &&
+    echo "$out" | grep -q "^CHECK ql: FAIL (SSID 30: 0 products, want 1" &&
+    [ -e "$W/dr-neg-s1/flash.bin" ] && [ -e "$W/dr-neg-s1/ql.check.log" ]
+check "detector FAIL: slot tag, the ql mismatch in the verdict, dir kept" $? \
+    "rc=$rc: $out"
+echo first > "$W/dr-neg-s1/marker"
+out="$(detrun --negative)"
+rc=$?
+moved="$(ls -d "$W"/dr-neg-s1.fail-* 2>/dev/null | head -1)"
+[ "$rc" -eq 1 ] && [ -n "$moved" ] && [ "$(cat "$moved/marker")" = first ] &&
+    [ ! -e "$W/dr-neg-s1/marker" ] &&
+    echo "$out" | grep -q "kept the unfinished run's dir as $moved"
+check "detector: a failed run's dir is moved aside, never reused" $? \
+    "rc=$rc moved=$moved: $out"
+out="$(detrun --flare)"
+[ ! -e "$W/dr-neg-s1/ql.contrast.log" ] && [ -e "$W/dr-flare-s1/ql.check.log" ]
+check "detector: --flare runs in its own dir, not the negative's" $? \
+    "$(ls "$W/dr-neg-s1" "$W/dr-flare-s1")"
+out="$(STIX_DETECTOR_RUN_DIR="$W/drl" STIX_TMTC_PROBE="$FPROBE" \
+    FAKE_PROBE_LINES="$W/det.lines" FAKE_PROBE_DUMP="$W/det.dump" \
+    FAKE_QEMU_RUN_SECONDS=10 bash "$S/detector-smoke.sh" "$FAKE" 2>&1)"
+last="$(echo "$out" | tail -1)"
+echo "$last" |
+    grep -q "^DETECTOR-SMOKE: FAIL (failed checks: ql .*; ql: SSID" &&
+    ! echo "$last" | grep -q "slot="
+check "detector legacy FAIL: the ql mismatch named, no slot tag" $? "$out"
 
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"
