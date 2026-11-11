@@ -145,7 +145,9 @@ tag), as in the fault catalogue. The runner is `stixplat/scenario.py`.
 - **Timing**: `at` counts from T0, the sim time after the step that runs
   `platform.power.boot` (else the end of setup); `after` counts from the
   previous step that runs in this variant. All timeouts and windows are
-  sim (bench) time, so a frozen bench does not time out.
+  sim (bench) time, so a frozen bench does not time out. The boot step's
+  own checks arm at the step, before the boot verb, so their windows
+  start a little before T0 (the boot's QMP round trip).
 - **Checks** arm before the step's verb runs, so a reaction that comes
   back during the verb is not lost: `await_tm` (a probe spec with
   `@timeout` or `{tm, timeout_s}`), `await_event` (`{eid, data,
@@ -153,13 +155,24 @@ tag), as in the fault catalogue. The runner is `stixplat/scenario.py`.
   `await_state` (`{path, eq|ne|lt|gt|within|in_set|changed|stable_for,
   timeout_s}`), `assert_no_tm`, `assert_no_event` (armed to the end or
   for `for_s`), `assert_silence` (`{after_s, for_s}`: no TM unit),
-  `expect_cuc` (`{apid, within_s|outside_s, timeout_s}`: the APID's next
-  CUC against the platform OBT). `assert_consistent` is an error until
-  PL-8.
+  `expect_cuc` (`{apid, within_s|outside_s, timeout_s, offset_s,
+  mod_s}`: the APID's next CUC minus the platform OBT minus `offset_s`,
+  taken modulo `mod_s` into [-mod_s/2, mod_s/2) when given).
+  `assert_consistent` is an error until PL-8.
+- **Every variant needs a check**: a variant whose steps arm none is a
+  scenario error, not a vacuous pass. Each negative-heavy gate variant
+  also ends on a positive liveness check (a heartbeat), so a dead QEMU
+  or TM path cannot pass it.
 - **Variants**: `variants` names them; a step with `variants` (globs)
   runs only in those. `config` and `variant_config` may set a small
   whitelist (`scenario.CONFIG_ALLOWED`); anything else is a scenario
   error.
+- **Infrastructure**: a power-off that no step's verb caused (QEMU
+  exited), a 409 from a step verb while the bench is off, a 5xx, and in
+  run mode the wall-clock ceiling (3 x `duration_s` + 120 s, monotonic)
+  abort the variant as infra (exit 3). A 409 from a step verb on a
+  powered bench is the step's fail. The teardown's `platform.power.off`
+  on a bench already off is not an error.
 - **Verdicts**: pass, fail, timeout (a check), error. Each check and
   step is logged as an `expect` record on `scenario.<name>.s<i>`, the
   end on `scenario.<name>`, with the seq range as evidence.
@@ -169,13 +182,17 @@ scenario dir; 409 while one runs) and `scenario.abort`; `/status` shows
 `scenario`.
 
 `mode = "run"` (`stixplat.py --config c.toml --scenario f.json
-[--variant glob]`): every scenario is validated first, then each variant
+[--variant glob]`): every scenario is validated first (including its
+verb names, against `stixplat/verbs.py`), then each variant
 runs in its own controller, QEMU and fresh run dir
 `<run_root>/runs/<stamp>-<name>[.<variant>]/`. Reports:
 `<run_root>/reports/<stamp>/` with `<name>.json` (the result), the log
 slice `<name>.jsonl`, `summary.json` and `summary.txt`. Exit 0 all
 pass, 1 a fail, 2 a scenario/config error, 3 infrastructure (the worst
-wins). Retention runs at the end.
+wins). Whatever happens in a variant, its bench is powered off and its
+controller closed before the next. SIGTERM aborts the running variant
+as infra, runs no other and still writes the reports (a second SIGTERM
+stops at once). Retention runs at the end.
 
 The gate scenarios: `gate-spw-link` (nominal, fault_no_recovery,
 fault_with_recovery), `gate-keepalive` (the NOMINAL-entry re-arm, R1),

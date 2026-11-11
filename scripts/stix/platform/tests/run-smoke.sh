@@ -4,7 +4,7 @@
 # 21536/21537, GS TC 21538, relayed TM to 21541 (nobody listens); run root
 # /tmp/stix-plat/run-smoke. Checks:
 #   1. run mode over the gate scenarios (gate-spw-link x3, gate-keepalive,
-#      gate-timesync x2) exits 0 and every run's report says pass
+#      gate-timesync x3) exits 0 and every run's report says pass
 #   2. gate-negative alone exits 1, with exactly one failed check: the
 #      await_event 142d of the step before the clear
 # STIX_RUN_SMOKE_LONG=1 adds the optional gate-timecode-loss to 1.
@@ -50,17 +50,23 @@ if [ "${STIX_RUN_SMOKE_LONG:-0}" = 1 ]; then
     GATES+=(--scenario gate-timecode-loss.json)
 fi
 
-latest() { ls -1d "$ROOT"/reports/*/ | sort | tail -n 1; }
+# the newest report dir, or "" (no failing pipeline under set -e)
+latest() {
+    local d
+    d="$(ls -1d "$ROOT"/reports/*/ 2>/dev/null | sort | tail -n 1)" || true
+    printf '%s' "$d"
+}
 
 fail=0
 rc=0
 python3 "$PLAT" --config "$CFG" "${GATES[@]}" || rc=$?
 REP1="$(latest)"
+[ -n "$REP1" ] || { echo "FAIL gates: no report (exit $rc)"; exit 1; }
 python3 - "$REP1" "$rc" <<'PYEOF' || fail=1
 import json, sys
 s = json.load(open(sys.argv[1] + "summary.json"))
 bad = [r["name"] for r in s["runs"] if r["verdict"] != "pass"]
-ok = sys.argv[2] == "0" and s["exit"] == 0 and len(s["runs"]) >= 6 \
+ok = sys.argv[2] == "0" and s["exit"] == 0 and len(s["runs"]) >= 7 \
     and not bad
 print("%s gates: exit %s, %d runs, not passed: %s"
       % ("ok  " if ok else "FAIL", sys.argv[2], len(s["runs"]), bad))
@@ -70,7 +76,10 @@ PYEOF
 rc=0
 python3 "$PLAT" --config "$CFG" --scenario gate-negative.json || rc=$?
 REP2="$(latest)"
-[ "$REP2" != "$REP1" ] || { echo "FAIL negative: no new report"; exit 1; }
+if [ -z "$REP2" ] || [ "$REP2" = "$REP1" ]; then
+    echo "FAIL negative: no new report (exit $rc)"
+    exit 1
+fi
 python3 - "$REP2" "$rc" <<'PYEOF' || fail=1
 import json, sys
 r = json.load(open(sys.argv[1] + "gate-negative.json"))

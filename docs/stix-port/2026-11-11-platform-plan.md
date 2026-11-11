@@ -2049,19 +2049,28 @@ defaults that the user can override.
     at +75; 0x142E is forbidden until +102 and awaited by +115. First
     live run: NOMINAL entered at +78.4, 0x142E at +109.1 (30.7 s after
     the entry, 44 s after the last TC(20,128)), then 0021 05 02;
-  - `gate-timesync`: **the two variants are not told apart yet.** In
-    the first live run both had the same pre-sync heartbeat (CUC coarse
-    0x28 at +40.6 s, the FSW counting from 0, not synced bit clear), no
-    0x1429 in either before the TC(9,129), and an exact CUC after it
-    (-1 ms in both). The FSW does not take the time from the codes
-    before a TC(9,129), so "no 0x1429" and "far before" hold in both
-    variants; the scenario passes as the plan asks but only shows that
-    a mismatched epoch does not break the D-PLd sync. Open question
-    for the review: what `mismatch` should observe;
+  - `gate-timesync` (review S6): the variants are told apart by
+    (CUC - OBT) mod 64 s before the TC(9,129), `expect_cuc` with
+    `mod_s: 64` and `offset_s`. The FSW counts from 0 and moves toward a
+    code's TIMECNT only for a shift between 62.5 ms and 4 s, by the
+    median of 5 samples (Timing.c:224-322, ParamMgmtDef.h:541-544).
+    `aligned` ~0, `mismatch` (epoch & 63 = 32: refused) ~32 and no
+    0x1429, `drift2` (epoch & 63 = 2: corrected) ~0 where an uncorrected
+    clock would be -2. Live RED with the expectations swapped (aligned
+    expects 32, mismatch 0, drift2 -2): all three fail, 31.999, 31.999
+    and 1.998 s off;
   - `gate-timecode-loss` is in run-smoke only with
     `STIX_RUN_SMOKE_LONG=1`;
   - a self-test filter that matches no case now FAILs (it passed with
     nothing run).
+- **PL-5 review fixes** are on top: B1 (a Runner exception is infra,
+  the bench always goes off), S1 (an unexpected power-off is infra), S2
+  (a late heartbeat in the variants that end in silence or forbids;
+  `fault_no_recovery` clears the link at +98, after its window, to see
+  one), S3 (the monotonic wall-clock ceiling), S4 (the verb registry
+  `stixplat/verbs.py`), S5 (a variant without a check is an error), S6
+  (above), N1-N7. Not done: a live QEMU-killed run (S1 is tested with
+  the scripted world and the self-test's run-mode cases).
 - **TODO (on the rebase onto gate-ports):** move
   `scripts/stix/platform/tests/core-smoke.sh`, `link-smoke.sh` and
   `run-smoke.sh` to the gate slot scheme (`scripts/stix/lib/slot.sh`: a

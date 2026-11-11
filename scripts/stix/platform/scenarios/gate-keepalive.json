@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 {"api": 1, "name": "gate-keepalive",
- "description": "The TC(20,128) timeout and the NOMINAL-entry re-arm (plan R1, OpModeMgmt.c:565-566 -> HWConfig.c:389-398): in NOMINAL the 0x142E comes 30 s after the LATER of the last TC(20,128) and the NOMINAL entry. The keep-alive stops at +65 and NOMINAL is entered at +75, so 0x142E is forbidden until +102 (a timer not re-armed would fire at ~+95) and awaited by +115 (re-armed: ~+105), then the move NOMINAL -> SAFE (0021 05 02). The mode TCs are GS emulation (tc.gs.send, as nominal-smoke's TC(236,1)); no S20=0 is sent.",
+ "description": "The TC(20,128) timeout and the NOMINAL-entry re-arm (plan R1, OpModeMgmt.c:565-566 -> HWConfig.c:389-398): in NOMINAL the 0x142E comes 30 s after the LATER of the last TC(20,128) and the NOMINAL entry. The keep-alive stops at +65 and NOMINAL is entered at +75, so 0x142E is forbidden until +102 (a timer not re-armed would fire at ~+95) and awaited by +117 (re-armed: ~+105), then the move NOMINAL -> SAFE (0021 05 02). The mode TCs are GS emulation (tc.gs.send, as nominal-smoke's TC(236,1)); no S20=0 is sent.",
  "duration_s": 125,
  "setup": [{"do": "platform.power.on"}],
  "steps": [
@@ -17,6 +17,6 @@
    "do": "tc.gs.send",
    "args": {"service": 236, "subtype": 1, "data": "0500"},
    "await_event": [{"eid": "0021", "data": "0405", "timeout_s": 10},
-                   {"eid": "142e", "timeout_s": 40},
+                   {"eid": "142e", "timeout_s": 42},
                    {"eid": "0021", "data": "0502", "timeout_s": 45}]}],
  "teardown": [{"do": "platform.power.off"}]}

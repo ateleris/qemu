@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 {"api": 1, "name": "gate-negative",
- "description": "Proof the runner detects a missing reaction: 0x142D (link restored) is awaited 5 s while the link is still down, before the clear. This scenario must FAIL with exactly that one expectation unmatched (run-smoke checks it).",
+ "description": "Proof the runner detects a missing reaction: 0x142D (link restored) is awaited 5 s while the link is still down, before the clear. This scenario must FAIL with exactly that one expectation unmatched (run-smoke checks it); the heartbeat after the clear shows the bench was alive, so the failure is the FSW's (the link was down), not the bench's.",
  "duration_s": 90,
  "setup": [{"do": "platform.power.on"}],
  "steps": [
@@ -11,5 +11,6 @@
   {"at": 62, "name": "142D before the clear (must time out)",
    "await_event": [{"eid": "142d", "data": "00", "timeout_s": 5}]},
   {"at": 80, "name": "link up", "do": "fault.clear",
-   "args": {"id": "spw.link.disconnect"}}],
+   "args": {"id": "spw.link.disconnect"},
+   "await_tm": [{"tm": "0x5E5:3:25", "timeout_s": 10}]}],
  "teardown": [{"do": "platform.power.off"}]}
