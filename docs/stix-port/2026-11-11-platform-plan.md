@@ -1981,8 +1981,9 @@ defaults that the user can override.
     second boot at its end, so the first boot's boot report is checked
     with the link up.
 - **TODO (on the rebase onto gate-ports):** move
-  `scripts/stix/platform/tests/core-smoke.sh` to the gate slot scheme
-  (`scripts/stix/lib/slot.sh`: a slot run dir, slot ports, the shared
-  slot lock) instead of its fixed 2152x ports and
-  `/tmp/stix-plat/core-smoke`. gate-ports is not merged yet (PL-3 review
+  `scripts/stix/platform/tests/core-smoke.sh` and `link-smoke.sh` to the
+  gate slot scheme (`scripts/stix/lib/slot.sh`: a slot run dir, slot
+  ports, the shared slot lock) instead of their fixed ports (core-smoke
+  21520-21522; link-smoke 21525-21528 and the fake GS on 21531) and
+  `/tmp/stix-plat/core-smoke`, `/tmp/stix-plat/link-smoke`. gate-ports is not merged yet (PL-3 review
   S7).
