@@ -112,6 +112,20 @@ def t_config(env):
                 '[power]\ncycle_boots = 1\n', 'mode = \n',
                 '[qemu]\nobt_epoch = 281474976710656\n'):
         raises(config_mod.ConfigError, config_mod.load, text=bad)
+    # S6: a non-loopback bind needs [api] container = true (PL-7)
+    raises(config_mod.ConfigError, config_mod.load,
+           text='[api]\nbind = "0.0.0.0"\n')
+    c = config_mod.load(text='[api]\nbind = "0.0.0.0"\ncontainer = true\n')
+    check(c["api"]["bind"] == "0.0.0.0", "container bind")
+    for b in ("127.0.0.1", "::1", "localhost"):
+        config_mod.load(overrides={"api": {"bind": b}})
+    # a comma would split QEMU's -chardev / -global option strings
+    for bad in ('[run_dir]\npath = "/tmp/stix-plat/a,b"\n',
+                '[qemu]\nelf = "/x/a,append=off.elf"\n',
+                '[qemu]\nbinary = "/x/q,emu"\n'):
+        raises(config_mod.ConfigError, config_mod.load, text=bad)
+    raises(rundir.RunDirError, core_mod.Controller, config_mod.load(),
+           run_dir=os.path.join(env.tmp, "x,y"))
     c = config_mod.load(text="[power]\noff_time_s = 3\n")
     check(c["power"]["off_time_s"] == 3.0, "int for a float key")
 
@@ -772,6 +786,17 @@ def t_filter(env):
         st, _, body = _http(port, "POST", "/api/v1/cmd/log.mark",
                             body=b'{"text": "hello"}', headers=post)
         check(st == 200 and json.loads(body)["ok"], "live POST")
+        for body in (b'{"text": "x", "data": {"a": NaN}}',
+                     b'{"text": "x", "data": {"a": Infinity}}',
+                     b'{"text": "x", "data": {"a": -Infinity}}'):
+            st, _, b2 = _http(port, "POST", "/api/v1/cmd/log.mark",
+                              body=body, headers=post)
+            check(st == 400, "NaN/Infinity accepted: %d %r" % (st, b2))
+        raises(ValueError, ctl.log.emit, "api", "log", "x",
+               {"v": float("nan")})
+        for cl in ("-5", "abc", "1e3"):
+            st = _raw_post(port, cl)
+            check(st == 400, "Content-Length %r -> %r" % (cl, st))
         st, _, _ = _http(port, "DELETE", "/api/v1/status")
         check(st == 405, "DELETE")
         st, _, body = _http(port, "GET", "/api/v1/log?since=0&kinds=log")
@@ -786,6 +811,23 @@ def t_filter(env):
         srv.shutdown()
         srv.server_close()
         ctl.shutdown()
+
+
+def _raw_post(port, content_length):
+    """A POST with a hand-written Content-Length; the status (or None
+    for a dropped connection)."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.sendall(("POST /api/v1/cmd/log.mark HTTP/1.1\r\nHost: localhost\r\n"
+               "Content-Type: application/json\r\nX-Stix-Platform: 1\r\n"
+               "Content-Length: %s\r\nConnection: close\r\n\r\n{}"
+               % content_length).encode())
+    try:
+        data = s.recv(4096)
+    except OSError:
+        data = b""
+    s.close()
+    m = re.match(rb"HTTP/1\.[01] (\d+)", data)
+    return int(m.group(1)) if m else None
 
 
 def _sse_read(port, headers, n_events, path="/api/v1/stream",

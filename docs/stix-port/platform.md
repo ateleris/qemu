@@ -84,7 +84,15 @@ There is no authentication, so the controller is localhost-only:
   refused;
 - a POST needs `application/json` and `X-Stix-Platform: 1`;
 - there are no CORS headers;
-- the QMP socket is in the run dir with mode 0600.
+- the QMP socket is in the run dir with mode 0600;
+- `[api] bind` must be loopback (`127.0.0.1`, `::1` or `localhost`).
+  Any other address is refused unless `[api] container = true`, which is
+  only for the container of PL-7. That container is published on
+  127.0.0.1 only;
+- request bodies are strict JSON: `NaN` and `Infinity` are refused, and
+  a malformed or negative `Content-Length` gives 400;
+- a comma in the run dir, the ELF or the binary path is refused, because
+  it would split QEMU's option strings.
 
 ## The run dir
 

@@ -33,6 +33,9 @@ def guard(path):
     """Refuse the gates' run dirs, their slot copies and anything inside
     them, on the path as given and after resolving symlinks; also /."""
     real = os.path.realpath(path)
+    if "," in real:
+        raise RunDirError("run dir %s has a comma, which would split "
+                          "QEMU's option strings" % path)
     shared = [os.path.realpath(d) for d in SHARED]
     for p in (os.path.normpath(os.path.abspath(path)), real):
         if p == "/":

@@ -54,7 +54,9 @@ class Record:
         self.seq = obj["seq"]
         self.kind = obj["kind"]
         self.topic = topic_of(obj["kind"])
-        self.line = json.dumps(obj, separators=(",", ":"), sort_keys=False)
+        # strict JSON: NaN/Infinity would break every other reader
+        self.line = json.dumps(obj, separators=(",", ":"), sort_keys=False,
+                               allow_nan=False)
 
 
 class RecordLog:

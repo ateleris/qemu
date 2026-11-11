@@ -30,7 +30,9 @@ DEFAULTS = {
         "qemu_tm": 21511,   # QEMU sends TM here (the controller binds it)
         "qemu_tc": 21512,   # QEMU binds TC here (127.0.0.1)
     },
-    "api": {"bind": "127.0.0.1"},
+    # bind: loopback only, unless container = true (PL-7: inside a
+    # container that is published on 127.0.0.1 only, D-PLj)
+    "api": {"bind": "127.0.0.1", "container": False},
     "power": {"off_time_s": 2.0, "cycle_boots": True,
               "quit_timeout_s": 5.0, "qmp_timeout_s": 5.0,
               "kill_grace_s": 2.0},
@@ -50,6 +52,9 @@ CHOICES = {
     ("qemu", "on_guest_reset"): ("warm", "cold", "halt"),
     ("retention", "keep_flash"): ("failed", "never", "always"),
 }
+
+
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 
 class ConfigError(Exception):
@@ -90,6 +95,17 @@ def _check(cfg):
         raise ConfigError("qemu.obt_epoch is wider than the 48-bit CUC")
     if cfg["clock"]["snapshot_s"] < 0:
         raise ConfigError("clock.snapshot_s < 0")
+    if cfg["api"]["bind"] not in LOOPBACK and not cfg["api"]["container"]:
+        raise ConfigError("api.bind = %r is not loopback; there is no "
+                          "authentication (D-PLj). Only a container "
+                          "published on 127.0.0.1 may bind it, with "
+                          "[api] container = true" % cfg["api"]["bind"])
+    for key, v in (("run_dir.path", cfg["run_dir"]["path"]),
+                   ("qemu.elf", cfg["qemu"]["elf"]),
+                   ("qemu.binary", cfg["qemu"]["binary"])):
+        if "," in v:
+            raise ConfigError("%s %r has a comma, which would split "
+                              "QEMU's option strings" % (key, v))
     if cfg["power"]["off_time_s"] < 0:
         raise ConfigError("power.off_time_s < 0")
     for k in ("sample_hz", "state_hz"):

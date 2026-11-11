@@ -44,6 +44,21 @@ def sse_frame(rec):
             % (rec.seq, rec.topic, rec.line)).encode()
 
 
+def _no_constant(name):
+    raise ValueError("%s is not JSON" % name)
+
+
+def content_length(headers):
+    """The body length; None for a malformed or negative header."""
+    v = headers.get("Content-Length")
+    if v is None:
+        return 0
+    v = v.strip()
+    if not v.isdigit():
+        return None
+    return int(v)
+
+
 def parse_last_id(value):
     try:
         return int(value)
@@ -77,8 +92,8 @@ class Handler(BaseHTTPRequestHandler):
         bad = filter_request(method, self.headers)
         if bad is not None:
             # drain a body so the connection stays sane
-            n = int(self.headers.get("Content-Length") or 0)
-            if 0 < n <= 1 << 20:
+            n = content_length(self.headers)
+            if n is not None and 0 < n <= 1 << 20:
                 self.rfile.read(n)
             self._err(*bad)
             return False
@@ -171,7 +186,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         url = urllib.parse.urlsplit(self.path)
         path = url.path.rstrip("/")
-        n = int(self.headers.get("Content-Length") or 0)
+        n = content_length(self.headers)
+        if n is None:
+            self.close_connection = True
+            return self._err(400, "bad Content-Length")
         if n > 1 << 20:
             return self._err(413, "body too large")
         raw = self.rfile.read(n) if n else b"{}"
@@ -179,7 +197,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(404, "no such endpoint")
         verb = path[len(PREFIX + "/cmd/"):]
         try:
-            args = json.loads(raw.decode() or "{}")
+            args = json.loads(raw.decode() or "{}",
+                              parse_constant=_no_constant)
         except ValueError as e:
             return self._err(400, "bad JSON: %s" % e)
         try:
