@@ -12,6 +12,7 @@ exactly. The serialised line is built once; the same bytes go to
 log.jsonl, the in-memory ring and every SSE subscriber.
 """
 
+import collections
 import datetime
 import gzip
 import json
@@ -70,7 +71,7 @@ class RecordLog:
         self.ring_size = ring
         self.max_bytes = max_bytes
         self.max_files = max_files
-        self.ring = []
+        self.ring = collections.deque()   # contiguous seqs, oldest left
         self.seq = 0
         self.cond = threading.Condition()
         self.fh = None
@@ -100,8 +101,8 @@ class RecordLog:
                 self.fh.flush()
                 self._maybe_rotate()
             self.ring.append(rec)
-            if len(self.ring) > self.ring_size:
-                del self.ring[:len(self.ring) - self.ring_size]
+            while len(self.ring) > self.ring_size:
+                self.ring.popleft()
             self.cond.notify_all()
             return rec
 
@@ -126,9 +127,16 @@ class RecordLog:
     def since(self, seq, kinds=None, topics=None):
         """The records after @seq still in the ring (filtered)."""
         with self.cond:
-            return [r for r in self.ring if r.seq > seq and
-                    (kinds is None or r.kind in kinds) and
-                    (topics is None or r.topic in topics)]
+            # seqs are contiguous: walk back from the newest only as far
+            # as needed (no full scan under the lock)
+            out = []
+            for r in reversed(self.ring):
+                if r.seq <= seq:
+                    break
+                out.append(r)
+        out.reverse()
+        return [r for r in out if (kinds is None or r.kind in kinds) and
+                (topics is None or r.topic in topics)]
 
     def oldest_seq(self):
         with self.cond:

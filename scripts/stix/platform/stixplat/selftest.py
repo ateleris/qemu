@@ -788,7 +788,8 @@ def t_filter(env):
         ctl.shutdown()
 
 
-def _sse_read(port, headers, n_events, path="/api/v1/stream"):
+def _sse_read(port, headers, n_events, path="/api/v1/stream",
+              after_connect=None):
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     req = "GET %s HTTP/1.1\r\nHost: localhost\r\n" % path
     for k, v in headers.items():
@@ -798,13 +799,20 @@ def _sse_read(port, headers, n_events, path="/api/v1/stream"):
     events = []
     end = time.monotonic() + 5
     while len(events) < n_events and time.monotonic() < end:
-        chunk = s.recv(65536)
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            break
         if not chunk:
             break
         buf += chunk
         head, _, rest = buf.partition(b"\r\n\r\n")
         if not rest:
             continue
+        if after_connect is not None:
+            time.sleep(0.2)        # the handler is waiting for records
+            after_connect()
+            after_connect = None
         events = [e for e in rest.split(b"\n\n")[:-1]
                   if e.startswith(b"id:") or e.startswith(b"event: gap")]
     s.close()
@@ -840,6 +848,19 @@ def t_sse(env):
             ctl.log.emit("ctl", "log", "fill", {})
         head, evs3 = _sse_read(port, {"Last-Event-ID": "1"}, 1)
         check(evs3 and evs3[0].startswith(b"event: gap"), "gap event")
+
+        def burst():
+            # more records than the ring holds arrive while the stream
+            # waits: the live stream must say so (S4)
+            with ctl.log.cond:
+                for i in range(10):
+                    ctl.log.emit("ctl", "log", "burst", {})
+        head, evs4 = _sse_read(port, {}, 4, after_connect=burst)
+        check(evs4 and evs4[0].startswith(b"event: gap"),
+              "mid-stream gap event: %r" % evs4[:2])
+        ids = [int(re.match(rb"id: (\d+)", e).group(1)) for e in evs4[1:]]
+        check(ids == list(range(ids[0], ids[0] + len(ids))) and
+              ids[-1] == ctl.log.seq, "after the gap: %r" % ids)
     finally:
         srv.shutdown()
         srv.server_close()

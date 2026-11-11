@@ -138,14 +138,18 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         try:
             self.wfile.write(b"retry: 1000\n\n")
-            oldest = log.oldest_seq()
-            if last + 1 < oldest:
-                # the ring no longer holds the resume point
-                self.wfile.write(("event: gap\ndata: %s\n\n" % json.dumps(
-                    {"from": last + 1, "to": oldest - 1})).encode())
             self.wfile.flush()
             while not self.ctl.stopping.is_set():
+                # on every round (S4): records the ring dropped before
+                # this client read them are announced, never skipped
+                # silently. since() returns a contiguous tail taken under
+                # one lock, so its first seq tells the gap atomically.
                 recs = log.since(last)
+                if recs and recs[0].seq > last + 1:
+                    self.wfile.write(("event: gap\ndata: %s\n\n"
+                                      % json.dumps({"from": last + 1,
+                                                    "to": recs[0].seq - 1}))
+                                     .encode())
                 for r in recs:
                     last = r.seq
                     if topics is None or r.topic in topics:
