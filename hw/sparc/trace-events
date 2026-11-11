@@ -46,6 +46,12 @@ stixctrl_hk_prot_trip(uint32_t sel, uint32_t ch, uint32_t val, uint32_t thr, int
 stixctrl_hk_prot_unlock(uint32_t value, int unlocked) "unlockingReg write 0x%x: unlocked=%d"
 stixctrl_hk_prot_locked(uint32_t sel, uint32_t value, uint32_t now) "hkProtConfig[%u] locked: write 0x%x applies only a ProtEn set, now 0x%x"
 
+# stix_det.c (STIX detector controller)
+stixdet_fsm_strobe(uint32_t strobes, int enable, uint32_t active_ql_bank, int ql_ready) "fsmCmd strobes=0x%x enable=%d active_ql_bank=%u ql_ready=%d"
+stixdet_ql_swap(uint32_t done_ql_bank, uint32_t active_ql_bank, uint32_t ql_int_time, int irq) "QL swap: ql_bank %u finished, ql_bank %u active, ql_int_time=%u irq=%d"
+stixdet_tick_arm(int armed, int64_t deadline_ns) "tick armed=%d deadline_ns=%" PRId64
+stixdet_ro_write_dropped(uint32_t addr, uint32_t value) "CTRL | Write dropped (read-only) addr = 0x%x, value = 0x%x"
+
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"
 stixspw_io_read_outside(uint64_t addr) "SPW | Read outside register block: addr = %"PRIu64

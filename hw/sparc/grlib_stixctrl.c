@@ -12,6 +12,7 @@
 #include "qemu/timer.h"
 #include "system/runstate.h"
 #include "StixIdpu.h"
+#include "stix_det.h"
 
 #include "trace.h"
 #include "qom/object.h"
@@ -123,6 +124,11 @@ struct STIXCTRL
      * protected hkProtConfig field
      */
     bool hk_prot_unlocked;
+    /*
+     * Detector plan D-1 (D-Da): the detector controller (0x00-0x4C, the
+     * QL tick and IRQ 3) lives in stix_det.c; its registers stay in reg
+     */
+    StixDetState det;
 };
 
 #define STIXCTRL_ADC_INJECT_NONE 0xFFFFFFFFu
@@ -723,6 +729,14 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 
         return regval;
     }
+    /* D-1: 0x00-0x4C (detector controller), composed in stix_det.c */
+    if (stix_det_owns(&stixctrl->det, addr)) {
+        uint32_t regval = stix_det_read(&stixctrl->det, addr);
+
+        trace_stixctrl_io_read((uint32_t)addr, regval);
+
+        return regval;
+    }
 
     uint32_t regval = ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
@@ -771,6 +785,23 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
                                     stixctrl->reg.hkProtConfig[line]);
             return;
         }
+    }
+
+    /*
+     * D-1: the detector controller (0x00-0x4C). After the hk-prot block,
+     * so these writes spend an unlock token like any other.
+     */
+    if (stix_det_owns(&stixctrl->det, addr)) {
+        /*
+         * the stored value, as below (fsmCmd keeps only its config); a
+         * dropped read-only write traces stixdet_ro_write_dropped instead
+         */
+        if (stix_det_write(&stixctrl->det, addr, (uint32_t)value)) {
+            trace_stixctrl_io_write((uint32_t)addr,
+                                    ((uint32_t *)&stixctrl->reg)
+                                    [(uint32_t)addr / sizeof(uint32_t)]);
+        }
+        return;
     }
 
     if (addr == 0xD4 /* watchDog */)
@@ -946,6 +977,10 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
 
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 
+    stix_det_realize(&STIXCTRL->det, &STIXCTRL->reg, &STIXCTRL->sram,
+                     &STIXCTRL->lvar, &STIXCTRL->ltrg,
+                     &STIXCTRL->irq_detectors);
+
     //STIXCTRL->reference_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     //STIXCTRL->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, grlib_stixctrl_timer_tick, STIXCTRL);
     //timer_mod(STIXCTRL->timer, 1);
@@ -996,6 +1031,12 @@ static void grlib_stixctrl_reset(DeviceState *d)
     if (stixctrl->hk_prot) {
         stixctrl_hk_prot_reset(stixctrl);
     }
+
+    /*
+     * D-1 (D-Dh): the detector registers 0x00-0x4C take explicit reset
+     * values and the QL tick stops; det-model=off leaves them alone
+     */
+    stix_det_reset(&stixctrl->det);
 }
 
 static void grlib_stixctrl_unrealize(DeviceState *dev)
@@ -1004,6 +1045,7 @@ static void grlib_stixctrl_unrealize(DeviceState *dev)
 
     g_free(stixctrl->rotb_ring);
     stixctrl->rotb_ring = NULL;
+    stix_det_unrealize(&stixctrl->det);
 }
 
 /*
@@ -1060,6 +1102,8 @@ static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_BOOL("hk-adc", STIXCTRL, hk_adc, true),
     DEFINE_PROP_BOOL("powerstat", STIXCTRL, powerstat, true),
     DEFINE_PROP_BOOL("hk-prot", STIXCTRL, hk_prot, true),
+    /* D-1 (D-Db): off keeps 0x00-0x4C plain storage, never reset */
+    DEFINE_PROP_BOOL("det-model", STIXCTRL, det.model, true),
 };
 
 /* no injection from the moment the object exists (not only at realize) */

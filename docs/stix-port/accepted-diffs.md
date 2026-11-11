@@ -2079,3 +2079,333 @@ injection".
 - **The HW protection thresholds are document values** (D-P4d, §28).
   The FSW never writes the eight non-SPW thresholds in SAFE, so the code
   cannot confirm the ICD reset values.
+
+## 31. Detector FSM, QL bank switch and IRQ 3 (baseline: plain storage)
+
+**Baseline:** CTRL stored 0x00-0x4C (ideFxCmdSta .. fsmCalRes) as plain
+registers. The fsmCmd strobes stayed stored, so the FSW's boot writes
+`fsmCmd |= bit` read back 0x2, 0x1002 and 0x1802. fsmSta never moved.
+No timer ran, `irq_detectors` (IRQMP line 3) was never raised, and the
+FSW's QL chain (`detISR`, the QL task, RCR, light curves, background,
+variance, spectra, flare detection) was dead code. A device reset left
+every one of these registers as it was.
+
+Detector plan D-1 (`docs/stix-port/2026-11-11-detector-plan.md`,
+decisions D-Da, D-Dc, D-Dd, D-Dh, D-Dj). FSW paths below are in the ASW
+tree; BSW `Detectors.c` is `BSW_ASW/src/BSW/Detectors/Detectors.c`.
+
+**Code layout (D-Da):** a new compilation unit `hw/sparc/stix_det.c` with
+the internal header `stix_det.h`. It is not a QOM device.
+- `StixDetState` is embedded in `STIXCTRL` as `det`.
+- `grlib_stixctrl.c` delegates APB 0x00-0x4C to `stix_det_read` and
+  `stix_det_write`, after the hk-prot block, so a detector write still
+  spends an unlock token (§28). Realize, unrealize and reset call into it.
+- The registers stay in `s->reg`, the one source of truth. DET_C
+  (`stixctrl_hk_value`, §22) still reads `s->reg.idefxConfig`.
+  `StixDetState` holds only the derived and internal state.
+- **Deviation from D-Da's wording:** the functions take the
+  `StixDetState` pointer, not the `STIXCTRL` pointer. `struct STIXCTRL`
+  is private to `grlib_stixctrl.c`. So `stix_det_realize` binds the
+  state to the controller's register file, its SRAM, LVAR and LTRG
+  regions and `irq_detectors`. This keeps the struct private and leaves
+  `include/hw/sparc/grlib_stix.h` unchanged.
+- Property `det-model` (bool, default on). With it off, 0x00-0x4C stay
+  plain storage and are never reset, which is the pre-D-1 model (A/B
+  comparison and rollback, like `hk-adc`).
+
+**Model (D-Dc):**
+- **fsmCmd (0x14):**
+  - Bits 31:16 (CalTq) and 12:9 (FifoIrqEn, QlIrqEn, CalIrqEn,
+    ActiveTlut) are stored and read back.
+  - Bits 8:0 are strobes. They act on the write and read 0. Reserved
+    bits 15:13 and 4:3 read 0.
+  - The FSW sets every strobe with `fsmCmd |= bit` (`Detectors.c:136,
+    186, 1093-1124, 1198-1201`). A stored ClearEnable would therefore
+    fire again on every later read-modify-write, such as the ISR's
+    QlClear.
+- **The strobes:**
+  - SetEnable 0 → 1 sets Enable and starts the 100 ms tick. A **fresh
+    enable**, one that finds the period at tick 0 (the first after a
+    device reset, or after a Reset while disabled), also zeroes the
+    active bank (see the lifecycle).
+  - ClearEnable clears Enable and stops the tick. It wins when both are
+    in one write, and it freezes everything else: QlReady, ActiveQl,
+    SUMCNT and the banks stay as they are [I].
+  - Reset clears QlReady and SUMCNT and restarts the QL period: the tick
+    is re-phased to Reset + 100 ms (only while enabled; a Reset while
+    disabled only restarts the period count) and QlIntTime is
+    re-latched. ActiveQl
+    and the banks are kept [I]. The FSW always issues SetEnable and then
+    Reset (`OpModeMgmt.c:669-672`), and it clears its own `detQLReady`
+    at Reset (`Detectors.c:1125`), so the choice is not FSW-visible.
+  - QlClear clears QlReady.
+  - SetCalEnable sets CalEnable. Calibration never completes (a known
+    limit), and only a device reset clears CalEnable.
+  - CalClear and OverflowClear are accepted, but the status they clear
+    never sets: there is no calibration and no FIFO model, so CalReady
+    and QueueOverflow read 0.
+- **fsmSta (0x18)** is read-only and composed live: Enable (bit 0),
+  ActiveQl (3:2), QlReady (5) and CalEnable (7). QueueOverflow (1),
+  ActiveNominal (4, D-5) and CalReady (6) read 0.
+- **Other read-only registers:**
+  - fsmEvents (0x30) reads SUMCNT. It is always 0 until D-4 adds a count
+    source.
+  - fsmResult1/2, fsmCalCount and fsmCalRes read 0 (the FSW never reads
+    fsmResult1/2).
+  - Writes to all of these, and to fsmSta, are dropped. They trace
+    `stixdet_ro_write_dropped` instead of `stixctrl_io_write`.
+- **testPulseCmdSta (0x10):** Busy (bit 16) reads 1, which is idle
+  (active low, `Detectors.c:966-971`). QuarterSeu (31:28) reads 0, so the
+  ISR's SEU branch (`Detectors.c:217`) never runs. The other bits are
+  stored. The TSIM I/O model forces Busy = 1 in the same way.
+- **ideFxCmdSta (0x00):** stays plain storage in D-1 (see Deviations).
+
+**Model (D-Dd):**
+- **The tick.** A `QEMU_CLOCK_VIRTUAL` timer of 100 ms runs only while
+  Enable = 1. Its deadlines are absolute (each one is the previous plus
+  100 ms), so it does not drift.
+- **The QL period.** A period is QlIntTime + 1 ticks: 4 s with the FSW
+  default of 39 (ICD (N+1)×0.1 s; Doc vs code 11 of the plan).
+- **The latch.** QlIntTime is latched at the start of each period: at
+  the swap, at Reset, and at a SetEnable 0 → 1 that finds the period at
+  tick 0. A mid-period TC change therefore takes effect at the next
+  period [D, RP-0067].
+- **LVAR.** Tick k (0-based) of the period writes its count to LVAR slot
+  k of the active bank while k ≤ 39, clamped to 16 bits.
+  - The count is 0 until D-4. It is a per-tick accumulator, written to
+    the slot at the end of the tick, which equals "zeroed on activation,
+    then added to".
+  - Later ticks of a longer period are dropped (QlIntTime is 16 bits).
+    The hardware behaviour is undocumented, so this is a model choice.
+  - It keeps every write inside each bank's 0xA0 bytes. The WDT
+    `UNCHANGED_STORAGE` (0xE02000A8, `WDT.c:74`) and MemBram
+    (0xE02003C0, §13) share the LVAR region.
+- **The bank lifecycle**, defined once:
+  - While a bank is active, only its LVAR slots are written, one per
+    tick (above).
+  - **At the swap:**
+    1. The finished bank b's **LACC (0x6000) and LTRG (0x40)** are
+       written in full from the shadow. In tier 0 the shadow is all
+       zeros. Its LVAR is **not** rewritten, because it holds the
+       per-tick slots.
+    2. ActiveQl becomes (b + 1) & 3, and that bank is **zeroed on
+       activation**: LACC 0x6000, LTRG 0x40 and LVAR 0xA0 only.
+    3. QlReady is set, and `qemu_irq_pulse(irq_detectors)` fires if
+       QlIrqEn (fsmCmd bit 11) is set.
+    4. Bank b is not touched again until it becomes active again, three
+       swaps later. The FSW reads it after the IRQ as bank
+       (ActiveQl − 1) mod 4 (`Detectors.c:144-166`).
+  - **On a fresh enable** the active bank is zeroed the same way, so no
+    RAM from before a watchdog reset leaks into a QL period. D-4 and D-6
+    rely on this. A non-fresh enable (mid-period, after ClearEnable)
+    keeps the bank: ClearEnable freezes.
+  - Every zeroing is followed by `memory_region_set_dirty`, and stays
+    within each bank's LACC, LTRG and LVAR 0xA0 bytes.
+- **"Zero on activation"** stands in for RotbCtrl's read-and-clear
+  (plan, Doc vs code 6). An immediate clear after the swap would hand
+  the FSW zeros.
+- **Why Enable gates the tick:** the FSW consumes QL only in NOMINAL. It
+  clears Enable in SAFE and CONF (`OpModeMgmt.c:128, 258`), so the SAFE
+  gates see no tick and no IRQ 3. The docs do not say whether the
+  FPGA's 100 ms counter runs with Enable = 0; nothing in the FSW
+  depends on it.
+
+**Reset (D-Dh), with `det-model=on`:**
+- Explicit values for 0x00-0x4C: testPulseCmdSta = Busy, every other
+  register 0. Before D-1 a reset left them all in place. Now the fsmCmd
+  config bits, idefxConfig (quarter power, enables, SeuIrqEn), ReadMode,
+  WriteMask, fsmQlConfig, the masks and the integration parameters do
+  not survive a watchdog reboot.
+- The tick stops, and Enable, QlReady, CalEnable, ActiveQl, SUMCNT, the
+  period counter and the latched QlIntTime clear.
+- The RAM banks are kept (they survive a reset, §13).
+- No vmstate, as for the rest of stixctrl (§30).
+
+**Re-entrancy (D-Dj, the §29 lesson):**
+- The tick writes the banks only through `memory_region_get_ram_ptr`,
+  each write followed by `memory_region_set_dirty`. It never uses
+  `address_space_*`.
+- Its only other output is `qemu_irq_pulse`. No MMIO dispatch happens
+  from timer context, so the device's re-entrancy guard is not needed
+  there.
+- The MMIO path (the strobes) never writes guest RAM.
+- There are no QMP setters in D-1.
+
+**Deviations:**
+- **ideFxCmdSta resets to 0, not D-Dh's 0x80000000.** CmdReady without
+  the IDeF-X register store is the §24 trap: read-back returns zeros,
+  and the ASIC verification then ignores every ASIC for good. The plan
+  itself requires CmdReady and the store to land in one commit (D-2).
+  So D-1 keeps 0 (the power-on value the trace golden shows), and D-2
+  changes the reset value together with the store. `det-reg-reset`
+  asserts 0 for now.
+- CalReady and QueueOverflow never set, and calibration never completes
+  (known limits, plan "TC-driven procedures stay unmodelled").
+- ActiveNominal reads 0 until D-5 (no nominal integration yet).
+
+**FSW-visible notes (review, 2026-11-11):**
+- **The ISR can spend the unlock token.** The IRQ 3 ISR's fsmCmd write
+  (QlClear) is a CTRL write. It spends the hk-prot unlock token if it
+  lands between HK.c's token write and its protected hkProtConfig store
+  (HK.c:213-214, :240-241). The protected write is then dropped. This
+  is hardware-faithful ("one write cycle", §28), nearly unreachable
+  under TCG, and accepted. `det-token-spend` pins the rule.
+- **THS/TPG can stall QL for about 1.8 h.** `XRayADCsCtrl_THS_setup`
+  plus Reset can latch a QlIntTime of 0xFFFF. That value outlives
+  THS_cleanup, because no Reset or 0 → 1 edge follows it, so the
+  current period runs 65536 ticks (about 1.8 h) before the restored
+  QlIntTime is latched. This follows RP-0067's latch rule and is
+  FSW-visible. Later gates that run THS or TPG must expect it.
+
+**Doc vs code** (the code wins; the plan's numbering):
+- 2: four QL banks (FSW and ICD), not TN-0041's "double buffered".
+- 6: a bank is cleared when it becomes active again, not by RotbCtrl
+  right after the swap.
+- 11: the period is (N+1)×100 ms.
+- Doc vs code 1 (CmdReady wording) applies from D-2.
+
+**Traces:**
+- `stixdet_fsm_strobe(strobes, enable, active_ql_bank, ql_ready)`, on
+  every fsmCmd write with a strobe;
+- `stixdet_ql_swap(done_ql_bank, active_ql_bank, ql_int_time, irq)`;
+- `stixdet_tick_arm(armed, deadline_ns)`, only at start, re-phase and
+  stop, not per tick;
+- `stixdet_ro_write_dropped(addr, value)`, for a write to a read-only
+  detector register.
+
+**Tests** (RED first on 784ee6c9f4, then green):
+- `det-fsm-strobes`:
+  - strobes read 0, reserved bits read 0, config round-trips;
+  - a `|=` RMW does not re-fire ClearEnable;
+  - ClearEnable wins over SetEnable;
+  - Reset clears QlReady and SUMCNT, keeps Enable and ActiveQl, and
+    restarts the period;
+  - ClearEnable freezes;
+  - QlClear clears QlReady;
+  - the read-only registers ignore writes;
+  - SetCalEnable sets CalEnable.
+  - RED: `fsmCmd` read back `0x1234fe19` (the strobe and reserved bits
+    were stored).
+- `det-ql-swap`:
+  - QlIntTime 39: no swap at 3.9 s; ActiveQl 1 and QlReady at 4 s;
+  - four swaps wrap to 0;
+  - a mid-period change to 9 applies at the next period, after which
+    the period is 1 s;
+  - Enable = 0 means no swap.
+  - RED: QlReady stayed 0.
+- `det-ql-irq`:
+  - IRQMP pending bit 3 sets at a swap only with QlIrqEn;
+  - no pulse between swaps;
+  - QlClear clears QlReady;
+  - clearing QlIrqEn stops the pulses.
+  - RED: QlReady stayed 0.
+- `det-ql-banks`:
+  - a fresh-enable pass with QlIntTime 9: a pattern in the active bank 0
+    before the first enable is zeroed by the enable; after the first swap,
+    LVAR slots 10..39 of the finished bank are still zero (the period
+    writes only slots 0..9). The pass runs on a fresh instance and again
+    after a `system_reset`;
+  - a non-fresh enable (mid-period, after ClearEnable) keeps an LVAR
+    marker;
+  - garbage in all four banks and sentinels in every gap: LVAR
+    0xA0-0xFF of each stride, LACC 0x6000-0x7FFF of each stride, 16 B
+    just below LACC0 and 16 B past the LACC3 stride. LTRG3 ends at the
+    end of the 0x100 ltrg region, so there is no LTRG word past it;
+  - after a swap the finished bank and the new active bank are zero,
+    and the other two are untouched;
+  - a marker written into bank (ActiveQl − 1) & 3 survives two swaps
+    and is zeroed on the third;
+  - run with QlIntTime 39 and 99; afterwards every sentinel, including
+    0xE02000A8 and 0xE02003C0, is unchanged.
+  - RED: ActiveQl stayed 0. With only the enable-time zeroing removed:
+    `0x5717e000 == 0x00000000` at 0xE0180000.
+- `det-testpulse`:
+  - Busy = 1 and QuarterSeu = 0, also after a write of 0xF0000000 or
+    0xFFFFFFFF (which reads 0x0FFFFFFF);
+  - the other bits are stored.
+  - RED: read 0.
+- `det-reg-reset`:
+  - every register 0x00-0x4C is written with 0xFFFFFFFF (DET_C reads
+    320), the FSM is started with QlIrqEn, then `system_reset`;
+  - afterwards the D-Dh values read back, DET_C is 20, and there is no
+    swap and no IRQ 3 within 5 s.
+  - RED: reg 0x00 read 0xffffffff after the reset.
+- `det-model-off`:
+  - plain storage (fsmCmd 0xFFFFFFFF, fsmSta writable,
+    testPulseCmdSta 0);
+  - no tick and no IRQ;
+  - the registers survive a reset.
+  - RED: the property is unknown.
+- `det-token-spend`: an unlock token, then an fsmCmd write, then an
+  hkProtConfig[4] threshold write; the threshold stays at 546.
+- `ahb-windows`, `bram-persist` and `hk-adc` are unchanged and green.
+- The full suite is 47 ok.
+
+**Goldens:**
+- `uart.golden.log`: unchanged. boot-smoke PASS, and the normalized UART
+  of the capture run is identical to the golden.
+- `qemu-stdout.golden.log`: regenerated with `capture-golden.sh` on the
+  normal ELF in the shared run dir (§22), from a scratch out-dir, so
+  that only this file was copied in. The D-1 changes:
+  - The boot fsmCmd writes now trace as stored 0x0, 0x0, 0x1000 and
+    0x1800, where they were 0x2, 0x2, 0x1002 and 0x1802.
+  - One `stixdet_fsm_strobe strobes=0x2 enable=0` line is new (the SAFE
+    ClearEnable).
+  - No tick, swap or IRQ appears, because SAFE never sets Enable.
+  - The 16000 `addr = 0x0` polls are unchanged (D-2 removes them).
+- The committed trace golden was last regenerated at P4-1. The new
+  capture therefore also folds in the P4-4 hk-prot lines (the
+  `hkProtConfig` reset thresholds and the `stixctrl_hk_prot_unlock`
+  lines), plus the usual timing noise (SCET sub-seconds, time-code arm
+  offsets, SpW dump words).
+- The capture script needs an absolute QEMU path, because it changes
+  into the run dir. A relative path fails silently: it leaves an 88-byte
+  trace log and copies a stale UART file.
+
+**Gate record** (2026-11-11, worktree `stix-uprev-tc` at 784ee6c9f4
+plus this change, normal ELF, under the 21000 flock):
+- boot-smoke (`/tmp/stix-uprev-run`): PASS (normalized UART matches the
+  golden).
+- **nominal-smoke positive** (`/tmp/stix-d1-nominal`, fresh flash): PASS,
+  3 min 4 s.
+  - 384 `XrayDetFDIR.c:731` IDeF-X timeouts, as expected.
+  - [L] confirmed: no TM(21,6) 0x5DC in the run. QL TM stays queued
+    while NOMINAL lasts.
+  - The set of UART message types (numbers masked, the 731 lines
+    excluded) is the same as in the earlier Phase 4 nominal runs.
+- **nominal-smoke `--negative`** (same dir, wiped by the script): PASS.
+  - NOMINAL lasted about 28 s: `0021 04 05` at 14:33:46, then `142E`
+    and `0021 05 02` at 14:34:14.
+  - [L] confirmed: four TM(21,6) 0x5DC packets come at once after
+    `0021 05 02`, each unsegmented (sequence flags 3). They are SSID 33,
+    30, 31 and 34, in that order.
+  - Their start times are the NOMINAL entry (coarse 0x4A).
+  - Sample counts: SSID 30 has N = 7 per band (int time 39, detector
+    mask 0xFFFFFCFF, pixel mask 0x0FFF, 5 bands), SSID 33 has 7 values,
+    SSID 31 has 3 samples (int time 79, i.e. 8 s), SSID 34 has 7
+    triples.
+  - The visible content is zero. The probe log keeps only a 48-byte
+    prefix, so later bytes were not checked.
+  - **No SSID 32**, as the plan predicted for a NOMINAL shorter than
+    32 s.
+  - This is the first live proof of the chain: IRQ 3, the ISR, the QL
+    task and the flush on the NOMINAL → SAFE path (`OpModeMgmt.c:171`,
+    the same deinit as CONF). Not forbidden; recorded.
+- **fault-smoke positive** (`/tmp/stix-d1-fault`, fresh flash):
+  PASS. Every
+  expectation matched as before:
+  - `14a3`;
+  - the TC(17,1) and limit pairs with 0x9449 and 0x9434 TM(5,4);
+  - [L] DET_C: `9434 05 0258 0222` (the threshold is still 546) at
+    +85 s;
+  - `542B`, `1429`, `5435 48` and `142D 00`.
+  - No 0x5DC TM. The register reset changes nothing visible: the boot
+    writes quarter power 0 anyway, and DET_C stays 20 in SAFE.
+- **After the review fixes** (fresh-enable zeroing, the dropped-write
+  trace, `det-token-spend`):
+  - the full suite is 47 ok and checkpatch is clean;
+  - boot-smoke PASS (the normalized UART matches the golden);
+  - the trace golden is not regenerated: SAFE never enables, and the
+    boot writes no read-only detector register.
+- The shared flash mtimes are unchanged: `/tmp/stix-uprev-run`
+  2026-11-10 13:05:54 and `/tmp/stix-baseline-run` 2026-11-09 15:30:10.

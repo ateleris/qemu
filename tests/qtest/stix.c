@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest.h"
 #include "qobject/qbool.h"
 #include "qobject/qnum.h"
@@ -4665,6 +4666,590 @@ static void test_spw_link_down_reentry(void)
     stix_qtest_cleanup();
 }
 
+/* ---- Detector FSM, QL swap and IRQ 3 (detector plan D-1, tier 0) ---- */
+
+#define CTRL_IDEFXCMDSTA     0x00u
+#define CTRL_TESTPULSECMDSTA 0x10u
+#define CTRL_FSMCMD          0x14u
+#define CTRL_FSMSTA          0x18u
+#define CTRL_FSMQLCONFIG     0x20u
+#define CTRL_FSMEVENTS       0x30u
+#define CTRL_FSMRESULT1      0x3cu
+#define CTRL_FSMRESULT2      0x40u
+#define CTRL_FSMCALCOUNT     0x48u
+#define CTRL_FSMCALRES       0x4cu
+#define CTRL_DET_LAST        0x4cu
+
+/* fsmCmd (StixIdpu.h:785-825): strobes 8:0, configuration 12:9, 31:16 */
+#define FSMCMD_SETENABLE     (1u << 0)
+#define FSMCMD_CLEARENABLE   (1u << 1)
+#define FSMCMD_RESET         (1u << 2)
+#define FSMCMD_SETCALENABLE  (1u << 5)
+#define FSMCMD_CALCLEAR      (1u << 6)
+#define FSMCMD_QLCLEAR       (1u << 7)
+#define FSMCMD_OVERFLOWCLEAR (1u << 8)
+#define FSMCMD_QLIRQEN       (1u << 11)
+#define FSMCMD_FIFOIRQEN     (1u << 12)
+#define FSMCMD_CONFIG_MASK   0xFFFF1E00u
+
+/* fsmSta (StixIdpu.h:890-912) */
+#define FSMSTA_ENABLE        (1u << 0)
+#define FSMSTA_ACTIVEQL(v)   (((v) >> 2) & 3u)
+#define FSMSTA_QLREADY       (1u << 5)
+#define FSMSTA_CALENABLE     (1u << 7)
+
+#define TESTPULSE_BUSY       (1u << 16)
+
+#define DET_IRQ_BIT          (1u << 3) /* IRQ_STIXCTRL_DETCTRL = 3 */
+#define DET_TICK_NS          (100 * 1000 * 1000LL)
+
+/*
+ * QL banks (StixIdpu.h:262-340): LACC n at 0xE0180000 + n * 0x8000
+ * (0x6000 used), LTRG n at 0xE0400000 + n * 0x40, LVAR n at
+ * 0xE0200000 + n * 0x100 (0xA0 used: 40 slots of u32)
+ */
+#define QL_LACC(n)           (0xE0180000u + (n) * 0x8000u)
+#define QL_LACC_SIZE         0x6000u
+#define QL_LTRG(n)           (0xE0400000u + (n) * 0x40u)
+#define QL_LTRG_SIZE         0x40u
+#define QL_LVAR(n)           (0xE0200000u + (n) * 0x100u)
+#define QL_LVAR_SIZE         0xA0u
+
+static uint32_t det_sta(QTestState *qts)
+{
+    return ctrl_read(qts, CTRL_FSMSTA);
+}
+
+/* the FSW's strobe idiom: fsmCmd |= bit (Detectors.c:1093-1124) */
+static void det_cmd_or(QTestState *qts, uint32_t bits)
+{
+    ctrl_write(qts, CTRL_FSMCMD, ctrl_read(qts, CTRL_FSMCMD) | bits);
+}
+
+/* NOMINAL entry order (OpModeMgmt.c:669-672): SetEnable, then Reset */
+static void det_start(QTestState *qts, uint32_t ql_int_time)
+{
+    ctrl_write(qts, CTRL_FSMQLCONFIG, ql_int_time << 16);
+    det_cmd_or(qts, FSMCMD_SETENABLE);
+    det_cmd_or(qts, FSMCMD_RESET);
+}
+
+static void det_step_ticks(QTestState *qts, int64_t ticks)
+{
+    qtest_clock_step(qts, ticks * DET_TICK_NS);
+}
+
+static bool det_irq_pending(QTestState *qts)
+{
+    return qtest_readl(qts, IRQMP_PENDING) & DET_IRQ_BIT;
+}
+
+/*
+ * D-Dc: fsmCmd bits 8:0 are strobes that act on the write and read 0;
+ * the configuration bits round-trip; reserved bits read 0. SetEnable /
+ * ClearEnable (wins, freezes), Reset (QlReady and SUMCNT cleared,
+ * ActiveQl kept), QlClear; fsmSta, fsmEvents and the result registers
+ * are read-only. RED on the pre-D-1 binary: fsmCmd stores the strobes.
+ */
+static void test_det_fsm_strobes(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t sta;
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, 0);
+    g_assert_cmphex(det_sta(qts), ==, 0);
+
+    /* config bits round-trip; strobes and reserved 15:13, 4:3 read 0 */
+    ctrl_write(qts, CTRL_FSMCMD, 0x1234FE18u | FSMCMD_SETENABLE);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, 0x12341E00u);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+
+    /* a |= RMW of another strobe does not re-fire an earlier one */
+    det_cmd_or(qts, FSMCMD_CLEARENABLE);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, 0);
+    det_cmd_or(qts, FSMCMD_SETENABLE);
+    det_cmd_or(qts, FSMCMD_QLCLEAR);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, 0x12341E00u);
+
+    /* ClearEnable wins over SetEnable in the same write */
+    ctrl_write(qts, CTRL_FSMCMD, FSMCMD_SETENABLE | FSMCMD_CLEARENABLE);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, 0);
+
+    /* 1 s QL period; one swap sets QlReady */
+    det_start(qts, 9);
+    det_step_ticks(qts, 10);
+    sta = det_sta(qts);
+    g_assert_cmphex(sta & FSMSTA_QLREADY, ==, FSMSTA_QLREADY);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(sta), ==, 1);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+
+    /*
+     * Reset clears QlReady and SUMCNT, keeps Enable and ActiveQl, and
+     * restarts the period: the next swap is a full period later
+     */
+    det_step_ticks(qts, 5);
+    det_cmd_or(qts, FSMCMD_RESET);
+    sta = det_sta(qts);
+    g_assert_cmphex(sta & FSMSTA_QLREADY, ==, 0);
+    g_assert_cmphex(sta & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(sta), ==, 1);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+    det_step_ticks(qts, 9);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    det_step_ticks(qts, 1);
+    sta = det_sta(qts);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(sta), ==, 2);
+    g_assert_cmphex(sta & FSMSTA_QLREADY, ==, FSMSTA_QLREADY);
+
+    /* ClearEnable freezes: QlReady, ActiveQl stay; no swap while off */
+    det_cmd_or(qts, FSMCMD_CLEARENABLE);
+    det_step_ticks(qts, 50);
+    sta = det_sta(qts);
+    g_assert_cmphex(sta & FSMSTA_ENABLE, ==, 0);
+    g_assert_cmphex(sta & FSMSTA_QLREADY, ==, FSMSTA_QLREADY);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(sta), ==, 2);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+
+    /* QlClear clears QlReady */
+    det_cmd_or(qts, FSMCMD_QLCLEAR);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, 0);
+
+    /* read-only registers ignore writes; results read 0 */
+    ctrl_write(qts, CTRL_FSMSTA, 0xFFFFFFFFu);
+    g_assert_cmphex(det_sta(qts), ==, 2u << 2);
+    ctrl_write(qts, CTRL_FSMEVENTS, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+    ctrl_write(qts, CTRL_FSMRESULT1, 0xFFFFFFFFu);
+    ctrl_write(qts, CTRL_FSMRESULT2, 0xFFFFFFFFu);
+    ctrl_write(qts, CTRL_FSMCALCOUNT, 0xFFFFFFFFu);
+    ctrl_write(qts, CTRL_FSMCALRES, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMRESULT1), ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMRESULT2), ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCALCOUNT), ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCALRES), ==, 0);
+
+    /* SetCalEnable sets CalEnable (calibration never completes) */
+    det_cmd_or(qts, FSMCMD_SETCALENABLE | FSMCMD_CALCLEAR |
+               FSMCMD_OVERFLOWCLEAR);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_CALENABLE, ==, FSMSTA_CALENABLE);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-Dd: the QL bank switches every (QlIntTime + 1) x 100 ms while
+ * Enable = 1, cycling ActiveQl 0..3; QlIntTime is latched at the start
+ * of each period. RED on the pre-D-1 binary: ActiveQl never moves.
+ */
+static void test_det_ql_swap(void)
+{
+    QTestState *qts = stix_qtest_new();
+    int n;
+
+    det_start(qts, 39);
+    det_step_ticks(qts, 39);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, 0);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 0);
+    det_step_ticks(qts, 1);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, FSMSTA_QLREADY);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+
+    /* four swaps wrap to 0 */
+    for (n = 2; n <= 4; n++) {
+        det_step_ticks(qts, 39);
+        g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, (n - 1) & 3);
+        det_step_ticks(qts, 1);
+        g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, n & 3);
+    }
+
+    /* a mid-period change applies at the next period */
+    det_step_ticks(qts, 20);
+    ctrl_write(qts, CTRL_FSMQLCONFIG, 9u << 16);
+    det_step_ticks(qts, 19);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 0);
+    det_step_ticks(qts, 1);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+
+    /* QlIntTime = 9 gives a 1 s period */
+    det_step_ticks(qts, 9);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    det_step_ticks(qts, 1);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+
+    /* Enable = 0: no swap */
+    det_cmd_or(qts, FSMCMD_CLEARENABLE);
+    det_step_ticks(qts, 100);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-Dd: each swap pulses IRQ 3 (IRQMP pending bit 3) only with
+ * QlIrqEn; no pulse without a swap; QlClear clears QlReady.
+ */
+static void test_det_ql_irq(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+    det_start(qts, 9);
+    det_step_ticks(qts, 10);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, FSMSTA_QLREADY);
+    g_assert_false(det_irq_pending(qts));
+
+    /* Detectors_init sets QlIrqEn (Detectors.c:315-327) */
+    det_cmd_or(qts, FSMCMD_QLIRQEN | FSMCMD_FIFOIRQEN);
+    det_cmd_or(qts, FSMCMD_QLCLEAR);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, 0);
+    det_step_ticks(qts, 9);
+    g_assert_false(det_irq_pending(qts));
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, 0);
+    det_step_ticks(qts, 1);
+    g_assert_true(det_irq_pending(qts));
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, FSMSTA_QLREADY);
+
+    /* the ISR's end: QlClear, then the IRQMP clear (Detectors.c:233) */
+    det_cmd_or(qts, FSMCMD_QLCLEAR);
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_QLREADY, ==, 0);
+    det_step_ticks(qts, 9);
+    g_assert_false(det_irq_pending(qts));
+    det_step_ticks(qts, 1);
+    g_assert_true(det_irq_pending(qts));
+
+    /* QlIrqEn cleared again: swaps without a pulse */
+    ctrl_write(qts, CTRL_FSMCMD,
+               ctrl_read(qts, CTRL_FSMCMD) & ~FSMCMD_QLIRQEN);
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+    det_step_ticks(qts, 30);
+    g_assert_false(det_irq_pending(qts));
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* bulk fill / check of big-endian u32 words (qtest_memwrite/memread) */
+static void det_fill(QTestState *qts, uint32_t addr, uint32_t len,
+                     uint32_t val)
+{
+    g_autofree uint8_t *buf = g_malloc(len);
+    uint32_t off;
+
+    for (off = 0; off < len; off += 4) {
+        stl_be_p(buf + off, val);
+    }
+    qtest_memwrite(qts, addr, buf, len);
+}
+
+static void det_expect(QTestState *qts, uint32_t addr, uint32_t len,
+                       uint32_t val)
+{
+    g_autofree uint8_t *buf = g_malloc(len);
+    uint32_t off;
+
+    qtest_memread(qts, addr, buf, len);
+    for (off = 0; off < len; off += 4) {
+        uint32_t got = (uint32_t)ldl_be_p(buf + off);
+
+        if (got != val) {
+            g_test_message("at 0x%08x", addr + off);
+        }
+        g_assert_cmphex(got, ==, val);
+    }
+}
+
+/* every byte outside the four banks' used parts keeps its sentinel */
+#define DET_SENTINEL 0xA5A55A5Au
+/* just below LACC0 (the ELUT's last words) and past the LACC3 stride */
+#define DET_BELOW_LACC0 (QL_LACC(0) - 0x10u)
+#define DET_PAST_LACC3  QL_LACC(4)
+
+static void det_fill_gaps(QTestState *qts)
+{
+    uint32_t n;
+
+    /*
+     * LTRG3 ends at the end of the 0x100 ltrg region, so there is no
+     * LTRG word past it to guard
+     */
+    det_fill(qts, DET_BELOW_LACC0, 0x10u, DET_SENTINEL);
+    det_fill(qts, DET_PAST_LACC3, 0x10u, DET_SENTINEL);
+
+    for (n = 0; n < 4; n++) {
+        det_fill(qts, QL_LVAR(n) + QL_LVAR_SIZE, 0x100u - QL_LVAR_SIZE,
+                 DET_SENTINEL);
+        det_fill(qts, QL_LACC(n) + QL_LACC_SIZE, 0x8000u - QL_LACC_SIZE,
+                 DET_SENTINEL);
+    }
+}
+
+static void det_expect_gaps(QTestState *qts)
+{
+    uint32_t n;
+
+    det_expect(qts, DET_BELOW_LACC0, 0x10u, DET_SENTINEL);
+    det_expect(qts, DET_PAST_LACC3, 0x10u, DET_SENTINEL);
+
+    for (n = 0; n < 4; n++) {
+        det_expect(qts, QL_LVAR(n) + QL_LVAR_SIZE, 0x100u - QL_LVAR_SIZE,
+                   DET_SENTINEL);
+        det_expect(qts, QL_LACC(n) + QL_LACC_SIZE, 0x8000u - QL_LACC_SIZE,
+                   DET_SENTINEL);
+    }
+}
+
+static void det_expect_bank(QTestState *qts, uint32_t n, uint32_t val)
+{
+    det_expect(qts, QL_LACC(n), QL_LACC_SIZE, val);
+    det_expect(qts, QL_LTRG(n), QL_LTRG_SIZE, val);
+    det_expect(qts, QL_LVAR(n), QL_LVAR_SIZE, val);
+}
+
+static void det_bank_lifecycle(QTestState *qts, uint32_t ql_int_time)
+{
+    int64_t period = ql_int_time + 1;
+    uint32_t n;
+
+    /* garbage in all four banks, sentinels in the gaps */
+    for (n = 0; n < 4; n++) {
+        det_fill(qts, QL_LACC(n), QL_LACC_SIZE, 0x11110000u | n);
+        det_fill(qts, QL_LTRG(n), QL_LTRG_SIZE, 0x22220000u | n);
+        det_fill(qts, QL_LVAR(n), QL_LVAR_SIZE, 0x33330000u | n);
+    }
+    det_fill_gaps(qts);
+
+    ctrl_write(qts, CTRL_FSMQLCONFIG, ql_int_time << 16);
+    det_cmd_or(qts, FSMCMD_RESET);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 0);
+
+    det_step_ticks(qts, period);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    /*
+     * the finished bank 0 is written in full (zeros: no count source),
+     * the newly active bank 1 is zeroed, banks 2 and 3 are untouched
+     */
+    det_expect_bank(qts, 0, 0);
+    det_expect_bank(qts, 1, 0);
+    det_expect(qts, QL_LACC(2), QL_LACC_SIZE, 0x11110002u);
+    det_expect(qts, QL_LVAR(3), QL_LVAR_SIZE, 0x33330003u);
+
+    /* a marker in the finished bank (ActiveQl - 1) & 3 = 0 */
+    det_fill(qts, QL_LACC(0), QL_LACC_SIZE, 0xCAFE0000u);
+    det_fill(qts, QL_LTRG(0), QL_LTRG_SIZE, 0xCAFE0001u);
+    det_fill(qts, QL_LVAR(0), QL_LVAR_SIZE, 0xCAFE0002u);
+
+    /* it survives the next two swaps */
+    det_step_ticks(qts, period);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+    det_step_ticks(qts, period);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 3);
+    det_expect(qts, QL_LACC(0), QL_LACC_SIZE, 0xCAFE0000u);
+    det_expect(qts, QL_LTRG(0), QL_LTRG_SIZE, 0xCAFE0001u);
+    det_expect(qts, QL_LVAR(0), QL_LVAR_SIZE, 0xCAFE0002u);
+
+    /* and is zeroed on the third, when bank 0 becomes active again */
+    det_step_ticks(qts, period - 1);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 3);
+    det_expect(qts, QL_LACC(0), QL_LACC_SIZE, 0xCAFE0000u);
+    det_step_ticks(qts, 1);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 0);
+    det_expect_bank(qts, 0, 0);
+
+    /* WDT UNCHANGED_STORAGE, MemBram and every other gap byte unchanged */
+    det_expect_gaps(qts);
+    g_assert_cmphex(qtest_readl(qts, AHB_UNCHANGED), ==, DET_SENTINEL);
+    g_assert_cmphex(qtest_readl(qts, AHB_MEMBRAM), ==, DET_SENTINEL);
+}
+
+static void det_fill_bank(QTestState *qts, uint32_t n, uint32_t val)
+{
+    det_fill(qts, QL_LACC(n), QL_LACC_SIZE, val);
+    det_fill(qts, QL_LTRG(n), QL_LTRG_SIZE, val);
+    det_fill(qts, QL_LVAR(n), QL_LVAR_SIZE, val);
+}
+
+/*
+ * A fresh enable (SetEnable 0 -> 1 at the start of a period, e.g. the
+ * first one after a device reset) zeroes the active bank 0, so stale RAM
+ * (here: from before the reset) cannot leak into a QL period. With
+ * QlIntTime 9 the period writes only LVAR slots 0..9; slots 10..39 of
+ * the finished bank are zero only because of that enable-time zeroing.
+ * Four periods wrap ActiveQl back to 0.
+ */
+static void det_fresh_enable(QTestState *qts)
+{
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 0);
+    det_fill_bank(qts, 0, 0x5717E000u);
+    det_fill_gaps(qts);
+
+    ctrl_write(qts, CTRL_FSMQLCONFIG, 9u << 16);
+    det_cmd_or(qts, FSMCMD_SETENABLE);
+    det_expect_bank(qts, 0, 0);
+
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    det_expect_bank(qts, 0, 0);
+    det_step_ticks(qts, 30);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 0);
+    det_expect_gaps(qts);
+}
+
+/*
+ * D-Dd bank lifecycle: at a swap the finished bank's LACC and LTRG are
+ * written in full, the newly active one zeroed (LVAR 0xA0 only); LVAR is
+ * written per tick; after the swap the model leaves the finished bank
+ * alone until it is active again, three swaps later. A fresh enable
+ * zeroes the active bank. QlIntTime 9, 39 and 99 (a period longer than
+ * the 40 LVAR slots) leave the WDT storage (0xE02000A8), MemBram
+ * (0xE02003C0) and the words around the LACC banks intact.
+ */
+static void test_det_ql_banks(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    det_fresh_enable(qts);
+    det_bank_lifecycle(qts, 39);
+    det_bank_lifecycle(qts, 99);
+
+    /* a non-fresh enable (mid-period, after ClearEnable) keeps the bank */
+    det_step_ticks(qts, 5);
+    det_cmd_or(qts, FSMCMD_CLEARENABLE);
+    qtest_writel(qts, QL_LVAR(0), 0x00C0FFEEu);
+    det_cmd_or(qts, FSMCMD_SETENABLE);
+    g_assert_cmphex(qtest_readl(qts, QL_LVAR(0)), ==, 0x00C0FFEEu);
+
+    /* the first enable after a (watchdog) reset is fresh again */
+    qtest_system_reset(qts);
+    det_fresh_enable(qts);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * A detector register write spends the hk-prot unlock token like any
+ * CTRL write (§28): token, fsmCmd write, then the protected
+ * hkProtConfig write stays locked.
+ */
+static void test_det_token_spend(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    ctrl_write(qts, CTRL_UNLOCKINGREG, HK_PROT_UNLOCK);
+    ctrl_write(qts, CTRL_FSMCMD, FSMCMD_QLCLEAR);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 100);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==,
+                     hk_prot_reset_thr[HK_PROT_DET]);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-Dc: testPulseCmdSta Busy (bit 16, active low: 1 = idle,
+ * Detectors.c:966-971) reads 1 and QuarterSeu (31:28) reads 0, so the
+ * ISR's SEU branch never runs; the other bits are stored.
+ */
+static void test_det_testpulse(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, TESTPULSE_BUSY);
+    ctrl_write(qts, CTRL_TESTPULSECMDSTA, 0xF0000000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, TESTPULSE_BUSY);
+    ctrl_write(qts, CTRL_TESTPULSECMDSTA, 0x0000FFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, 0x0001FFFFu);
+    ctrl_write(qts, CTRL_TESTPULSECMDSTA, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, TESTPULSE_BUSY);
+    ctrl_write(qts, CTRL_TESTPULSECMDSTA, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, 0x0FFFFFFFu);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-Dh: a device reset writes explicit reset values for 0x00-0x4C
+ * (testPulseCmdSta Busy, all others 0; ideFxCmdSta stays 0 until D-2
+ * lands CmdReady together with the IDeF-X store, §24) and stops the
+ * tick. HK DET_C follows the cleared quarter power. RED on the pre-D-1
+ * binary: the registers survive the reset.
+ */
+static void test_det_reg_reset(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t off;
+
+    for (off = 0; off <= CTRL_DET_LAST; off += 4) {
+        ctrl_write(qts, off, 0xFFFFFFFFu);
+    }
+    hk_check(qts, 4, 20 + 4 * 75);
+    det_start(qts, 9);
+    det_cmd_or(qts, FSMCMD_QLIRQEN);
+    det_step_ticks(qts, 5);
+
+    qtest_system_reset(qts);
+
+    for (off = 0; off <= CTRL_DET_LAST; off += 4) {
+        uint32_t want = off == CTRL_TESTPULSECMDSTA ? TESTPULSE_BUSY : 0;
+
+        g_test_message("reg 0x%02x", off);
+        g_assert_cmphex(ctrl_read(qts, off), ==, want);
+    }
+    hk_check(qts, 4, 20);
+
+    /* the tick stopped with the reset: no swap and no IRQ 3 later */
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+    det_step_ticks(qts, 50);
+    g_assert_cmphex(det_sta(qts), ==, 0);
+    g_assert_false(det_irq_pending(qts));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-model=off keeps the legacy model: 0x00-0x4C are plain storage,
+ * nothing ticks, and the registers survive a reset.
+ */
+static void test_det_model_off(void)
+{
+    QTestState *qts =
+        stix_qtest_new_extra("-global grlib-stixctrl.det-model=off");
+
+    ctrl_write(qts, CTRL_FSMQLCONFIG, 9u << 16);
+    ctrl_write(qts, CTRL_FSMCMD, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMSTA), ==, 0);
+    ctrl_write(qts, CTRL_FSMSTA, 0x5u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMSTA), ==, 0x5u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, 0);
+    ctrl_write(qts, CTRL_TESTPULSECMDSTA, 0xF0000000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, 0xF0000000u);
+    ctrl_write(qts, CTRL_IDEFXCMDSTA, 0x12345u);
+
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+    det_step_ticks(qts, 50);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMSTA), ==, 0x5u);
+    g_assert_false(det_irq_pending(qts));
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMSTA), ==, 0x5u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, 0x12345u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMQLCONFIG), ==, 9u << 16);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -4722,6 +5307,14 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/spw-link-down", test_spw_link_down);
         qtest_add_func("/sparc/stix/spw-link-down-reentry",
                        test_spw_link_down_reentry);
+        qtest_add_func("/sparc/stix/det-fsm-strobes", test_det_fsm_strobes);
+        qtest_add_func("/sparc/stix/det-ql-swap", test_det_ql_swap);
+        qtest_add_func("/sparc/stix/det-ql-irq", test_det_ql_irq);
+        qtest_add_func("/sparc/stix/det-ql-banks", test_det_ql_banks);
+        qtest_add_func("/sparc/stix/det-testpulse", test_det_testpulse);
+        qtest_add_func("/sparc/stix/det-reg-reset", test_det_reg_reset);
+        qtest_add_func("/sparc/stix/det-model-off", test_det_model_off);
+        qtest_add_func("/sparc/stix/det-token-spend", test_det_token_spend);
     }
 
     return g_test_run();
