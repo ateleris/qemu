@@ -866,68 +866,167 @@ def t_timesync_window(env):
     now, tgt, wait = timesync.plan_send((0x10000005 << 16) | 0xC000)
     check(not now and abs(wait - 300_000_000) < 1_000_000,
           "late in the second: wait for the rollover + 50 ms (%r)" % wait)
-    t = [0.0]
-    clk = SimClock(mono_fn=lambda: t[0])
-    clk.process_started()
-    clk.resumed()
-    clk.sample(0)
-    sent = []
-    obt = {"v": (0x10000005 << 16) | 0xC000}
-    lg = log_mod.RecordLog(None, clk.now)
-    ts = timesync.TimeSync(clk, lg, lambda cached=False: (obt["v"],
-                                                          clk.exact_sim()),
-                           sent.append, lambda: None, iter(range(9)).__next__)
+    rig = _TsRig((0x10000005 << 16) | 0xC000)
 
     def advance():
         time.sleep(0.05)
-        t[0] = 0.35
-        obt["v"] = (0x10000006 << 16) | 0x0CCC     # 50 ms past rollover
-        clk.sample(350_000_000)
-        clk.run_due()
+        rig.t[0] = 0.35
+        rig.obt["v"] = (0x10000006 << 16) | 0x0CCC  # 50 ms past rollover
+        rig.clk.sample(350_000_000)
+        rig.clk.run_due()
     threading.Thread(target=advance).start()
-    r = ts.send()
-    check(r["waited"] and r["coarse"] == 0x10000007 and len(sent) == 1,
+    r = rig.ts.send()
+    check(r["waited"] and r["coarse"] == 0x10000007 and len(rig.sent) == 1,
           "after the wait: the new coarse + 1 (%r)" % r)
-    check(tcbuild.parse_tc(sent[0][4:])[2:4] == (9, 129), "a TC(9,129)")
-    e = raises(VerbError, ts.send)
+    check(tcbuild.parse_tc(rig.sent[0][4:])[2:4] == (9, 129), "a TC(9,129)")
+    e = raises(VerbError, rig.ts.send)
     check(e.status == 409 and "pending" in str(e), "R2: one in flight")
-    clk.sample(3_400_000_000)
-    clk.run_due()
-    check(ts.busy() is None and ts.history[-1]["verdict"] == "timeout",
-          "3 s without TM(1,7): timeout")
-    obt["v"] = (0x10000010 << 16) | 0x1000
-    r = ts.send(coarse=0x10000020)
+    rig.clk.sample(3_400_000_000)
+    rig.clk.run_due()
+    check(rig.ts.busy() is None and rig.ts.history[-1]["verdict"] ==
+          "timeout", "3 s without TM(1,7): timeout")
+    rig.obt["v"] = (0x10000010 << 16) | 0x1000
+    r = rig.ts.send(coarse=0x10000020)
     check(r["warning"] and "TIMECNT" in r["warning"], "explicit coarse warn")
-    # TM(1,8) 48035 for it
-    tm18 = _tm_unit(0x5A1, 1, 8, bytes.fromhex("1dac") +
-                    (0xC000 | r["seq"]).to_bytes(2, "big") +
-                    (48035).to_bytes(2, "big"))
-    ts.on_tm(tm18, decode.decode(tm18))
-    check(ts.history[-1]["verdict"] == "fail" and "48035" in
-          ts.history[-1]["why"], "TM(1,8) 48035 fails")
-    # TM(1,7), then a heartbeat matching the OBT
-    obt["v"] = (0x10000030 << 16) | 0x1000
-    r = ts.send()
-    tm17 = _tm_unit(0x5A1, 1, 7, bytes.fromhex("1dac") +
-                    (0xC000 | r["seq"]).to_bytes(2, "big"))
-    ts.on_tm(tm17, decode.decode(tm17))
-    hb = _tm_unit(0x5E5, 3, 25, b"\x04", cuc=obt["v"])
-    ts.on_tm(hb, decode.decode(hb))
-    last = ts.history[-1]
-    check(last["verdict"] in ("ok", "late_apply") and abs(last["diff_s"])
-          < 0.3, "heartbeat check %r" % last)
-    obt["v"] = (0x10000040 << 16) | 0x1000
-    r = ts.send()
-    tm17 = _tm_unit(0x5A1, 1, 7, bytes.fromhex("1dac") +
-                    (0xC000 | r["seq"]).to_bytes(2, "big"))
-    ts.on_tm(tm17, decode.decode(tm17))
-    hb = _tm_unit(0x5E5, 3, 25, b"\x04", cuc=obt["v"] - (5 << 16))
-    ts.on_tm(hb, decode.decode(hb))
-    check(ts.history[-1]["verdict"] == "fail", "5 s off fails")
+    rig.ack(r["seq"], 8, fid=48035)
+    check(rig.ts.history[-1]["verdict"] == "fail" and "48035" in
+          rig.ts.history[-1]["why"], "TM(1,8) 48035 fails")
 
 
-def _tm_unit(apid, ptype, sub, app, cuc=0, seq=0):
-    body = bytes((0x10, ptype, sub, 0)) + cuc.to_bytes(6, "big") + app
+class _TsRig:
+    """A TimeSync with a scripted OBT and bench time, and helpers that
+    feed it real-shaped TM and trace records."""
+
+    def __init__(self, obt):
+        self.t = [0.0]
+        self.clk = SimClock(mono_fn=lambda: self.t[0])
+        self.clk.process_started()
+        self.clk.resumed()
+        self.clk.sample(0)
+        self.sent = []
+        self.obt = {"v": obt}
+        self.lg = log_mod.RecordLog(None, self.clk.now)
+        self.ts = timesync.TimeSync(
+            self.clk, self.lg,
+            lambda cached=False: (self.obt["v"], self.clk.exact_sim()),
+            self.sent.append, lambda: None, iter(range(99)).__next__)
+
+    def trace(self, name, fmt, *a):
+        self.lg.emit("qemu", "log", "trace." + name,
+                     {"line": "1234@1762886400.123456:%s %s" % (name,
+                                                                fmt % a)})
+
+    def rx(self, n):
+        self.trace("stixspw_rx_deliver",
+                   "RX unit delivered: len=%u ctrl=0x%x sel=%u "
+                   "vclock_ns=%d", n, 0x8000 | n, 3, 5)
+
+    def emit(self, coarse):
+        self.trace("stixspw_timecode_emit",
+                   "time code emitted: coarse=0x%08x timecnt=%u", coarse,
+                   coarse & 63)
+
+    def ack(self, seq, sub, fid=None, dest=14):
+        app = bytes.fromhex("1dac") + (0xC000 | seq).to_bytes(2, "big")
+        if fid is not None:
+            app += fid.to_bytes(2, "big")
+        u = _tm_unit(0x5A1, 1, sub, app, dest=dest)
+        self.ts.on_tm(u, decode.decode(u))
+
+    def heartbeat(self, cuc):
+        u = _tm_unit(0x5E5, 3, 25, b"\x04", cuc=cuc, dest=14)
+        self.ts.on_tm(u, decode.decode(u))
+
+    def sync(self, ordering="ok", tc20s=2, hb_off_s=0.0):
+        """A full sync: the trace records in the given order, TM(1,7),
+        then a heartbeat hb_off_s away from the OBT."""
+        self.obt["v"] += 20 << 16
+        self.obt["v"] &= ~0xFFFF
+        r = self.ts.send()
+        for _ in range(tc20s):
+            self.rx(252)                    # TC20s interleave
+        if ordering == "ok":
+            self.rx(22)
+            self.emit(r["coarse"])
+        else:
+            self.emit(r["coarse"])
+            self.rx(22)
+        self.rx(252)
+        self.ack(r["seq"], 7)
+        self.heartbeat(self.obt["v"] + int(hb_off_s * 65536))
+        return r, self.ts.history[-1]
+
+
+def t_timesync_verdicts(env):
+    """SF1/SF2/SF7: the exact verdicts. Real-shaped trace records with
+    interleaved TC20 RX deliveries; a 1 s-off CUC is late_apply; an ack
+    to another destination is not ours."""
+    rig = _TsRig(0x10000000 << 16)
+    r, v = rig.sync()
+    check(v["verdict"] == "ok" and v["ordering"] == "ok" and
+          abs(v["diff_s"]) < 0.01, "a clean sync: %r" % v)
+    r, v = rig.sync(ordering="late")
+    check(v["verdict"] == "late_apply" and v["ordering"] == "late",
+          "the TC9 RX after the applying emit (TC20 RX before it): %r" % v)
+    r, v = rig.sync(hb_off_s=-1.0)
+    check(v["verdict"] == "late_apply" and "1 s" in v["why"],
+          "a CUC 1 s behind is late_apply: %r" % v)
+    r, v = rig.sync(hb_off_s=0.4)
+    check(v["verdict"] == "fail", "0.4 s off fails: %r" % v)
+    r, v = rig.sync(hb_off_s=0.2)
+    check(v["verdict"] == "ok", "0.2 s off is within 0.25 s: %r" % v)
+    # an ack with dest != 14 (another source's TC with the same seq)
+    rig.obt["v"] += 20 << 16
+    rig.obt["v"] &= ~0xFFFF
+    r = rig.ts.send()
+    rig.ack(r["seq"], 7, dest=0)
+    check(rig.ts.busy() is not None, "a dest 0 TM(1,7) cleared the sync")
+    rig.ack(r["seq"], 8, fid=48035, dest=0)
+    check(rig.ts.busy() is not None, "a dest 0 TM(1,8) failed the sync")
+    rig.ack(r["seq"], 7)
+    check(rig.ts.busy() is None, "the dest 14 TM(1,7) is ours")
+
+
+def t_timesync_reserve(env):
+    """NITs: the wait re-checks the 0.5 s rule, and a sync being prepared
+    already counts as pending (the verb runs outside the dispatcher
+    lock)."""
+    rig = _TsRig((0x10000005 << 16) | 0xC000)
+    errs = []
+
+    def second():
+        time.sleep(0.03)
+        try:
+            rig.ts.send()
+        except VerbError as e:
+            errs.append(e)
+
+    def advance():
+        time.sleep(0.08)
+        # the OBT jumped while waiting: 0.9 s into the second again
+        rig.t[0] = 0.35
+        rig.obt["v"] = (0x10000009 << 16) | 0xE666
+        rig.clk.sample(350_000_000)
+        rig.clk.run_due()
+        time.sleep(0.05)
+        rig.t[0] = 0.6
+        rig.obt["v"] = (0x1000000A << 16) | 0x0CCC
+        rig.clk.sample(600_000_000)
+        rig.clk.run_due()
+    ths = [threading.Thread(target=f) for f in (second, advance)]
+    for th in ths:
+        th.start()
+    r = rig.ts.send()
+    for th in ths:
+        th.join()
+    check(r["coarse"] == 0x1000000B, "the re-check after an OBT jump "
+          "waited for the next rollover: 0x%08X" % r["coarse"])
+    check(len(errs) == 1 and errs[0].status == 409,
+          "a send while one is being prepared: %r" % errs)
+
+
+def _tm_unit(apid, ptype, sub, app, cuc=0, seq=0, dest=0):
+    body = bytes((0x10, ptype, sub, dest)) + cuc.to_bytes(6, "big") + app
     sp = (0x0800 | apid).to_bytes(2, "big") + \
         (0xC000 | seq).to_bytes(2, "big") + \
         (len(body) - 1).to_bytes(2, "big") + body
@@ -1154,10 +1253,6 @@ def t_platform_tcs(env):
         k = tcbuild.tc20_128(1)
         cmd("tc.platform.send", {"hex": k.hex()})
         check(qemu_tc.recvfrom(4096)[0] == tcbuild.unit(k), "TC20 sent")
-        bad = bytearray(tcbuild.tc9_129(7, 0x10000000))
-        bad[-1] ^= 0xFF                 # a malformed (bad CRC) variant
-        cmd("tc.platform.send", {"hex": bytes(bad).hex()})
-        qemu_tc.recvfrom(4096)
         r = cmd("platform.timesync.send", {})
         qemu_tc.recvfrom(4096)
         e = raises(VerbError, cmd, "tc.platform.send",
@@ -1166,6 +1261,22 @@ def t_platform_tcs(env):
               "R2: raw TC(9,129) while a sync is pending: %s" % e)
         e = raises(VerbError, cmd, "platform.timesync.send", {})
         check(e.status == 409, "second timesync.send: 409")
+        # SF3: a raw TC(9,129) is a sync in flight like timesync.send
+        ts = ctl.plat.timesync
+        with ts.lock:
+            ts._verdict(ts.pending, "timeout", "the test clears it")
+        bad = bytearray(tcbuild.tc9_129(7, 0x10000000))
+        bad[-1] ^= 0xFF                 # a malformed (bad CRC) variant
+        cmd("tc.platform.send", {"hex": bytes(bad).hex()})
+        qemu_tc.recvfrom(4096)
+        check(ts.busy() is not None and ts.pending["seq"] == 7 and
+              ts.pending["raw"], "the raw TC(9,129) is pending: %r"
+              % ts.pending)
+        e = raises(VerbError, cmd, "platform.timesync.send", {})
+        check(e.status == 409, "timesync.send after a raw TC(9,129): %s"
+              % e)
+        check(ctl.dispatcher.verbs["platform.timesync.send"]["locked"] is
+              False, "timesync.send holds the dispatcher lock")
         e = raises(VerbError, cmd, "tc.gs.send", {"service": 17,
                                                    "subtype": 1})
         check(e.status == 403, "tc.gs.send gated in interactive mode")
@@ -1535,6 +1646,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("tcbuild: CRC + smoke TCs", t_tcbuild),
          ("decoder on real units", t_decode),
          ("time sync window (D-PLd)", t_timesync_window),
+         ("time sync verdicts", t_timesync_verdicts),
+         ("time sync reserve + re-check", t_timesync_reserve),
          ("keep-alive pacing", t_keepalive),
          ("keep-alive: no drift", t_keepalive_drift),
          ("keep-alive: aggregate log", t_keepalive_log),

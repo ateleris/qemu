@@ -406,6 +406,19 @@ bench**.
   - TM(1,8) 48035, 48034 or 48041 is a failure;
   - the `stixspw_timecode_emit` traces (QEMU stderr) confirm the TIMECNT
     of each code.
+- **As built (PL-4 review SF1-SF3, SF7):**
+  - after a wait the OBT is read again and the 0.5 s rule re-applied
+    (an OBT jump while waiting means another wait, at most 3);
+  - a raw TC(9,129) through `tc.platform.send` is a sync in flight like
+    the verb's, verified the same way;
+  - only a TM(1,7)/TM(1,8) to destination 14 with the TC's packet id
+    and seq counts;
+  - the ordering uses the `stixspw_rx_deliver` of this TC's unit,
+    matched on its length (22 bytes with the SpW header, which QEMU
+    always delivers), so an interleaved TC20 (252) cannot stand in;
+  - the verb runs outside the dispatcher's one-command lock (it may
+    wait ~0.5 s of bench time; `sim.resume` must not queue behind it),
+    and reserves the in-flight slot atomically.
 - **The residual race:** if the main loop starves past the window, or the
   TC queues behind a slow GS TC, the sync applies one code late, and the
   FSW median-corrects it in 5 codes. The exact-time check and the

@@ -65,11 +65,16 @@ class Dispatcher:
         self.verbs = {}
         self.lock = threading.Lock()   # one command at a time
 
-    def add(self, name, handler, args=None, doc="", enabled=None):
+    def add(self, name, handler, args=None, doc="", enabled=None,
+            locked=True):
         """@enabled() -> None or a reason string why the verb is refused
-        (403) in this configuration."""
+        (403) in this configuration. @locked = False runs the handler
+        outside the one-command-at-a-time lock: for a verb that waits on
+        bench time (timesync.send), so sim.resume is not blocked behind
+        it; such a handler does its own locking."""
         self.verbs[name] = {"handler": handler, "args": args or {},
-                            "doc": doc, "enabled": enabled}
+                            "doc": doc, "enabled": enabled,
+                            "locked": locked}
 
     def describe(self):
         """GET /api/v1/verbs: the vocabulary with arg schemas."""
@@ -98,7 +103,10 @@ class Dispatcher:
                 why = v["enabled"]()
                 if why is not None:
                     raise VerbError(403, why)
-            with self.lock:
+            if v["locked"]:
+                with self.lock:
+                    res = v["handler"](**args)
+            else:
                 res = v["handler"](**args)
         except VerbError as e:
             self.log.emit(source, "result", verb,

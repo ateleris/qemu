@@ -5,17 +5,23 @@ The FSW applies the time at the next time code, so the TC's
 coarse & 63 must equal that code's TIMECNT. The controller reads the
 OBT (coarse and fine atomically); with >= 0.5 s to the rollover it
 sends coarse + 1 now, otherwise it waits on bench time for the
-rollover + 50 ms and sends the new coarse + 1. That leaves >= 0.5 s for
-UDP, RX DMA and the TC task, inside the FSW's 2 s wait.
+rollover + 50 ms, reads the OBT again and applies the same rule (an OBT
+jump while waiting means another wait). That leaves >= 0.5 s for UDP,
+RX DMA and the TC task, inside the FSW's 2 s wait.
 
-One sync in flight (review R2): another TC(9,129), from this verb or
-tc.platform.send, gets 409 until the first one's TM(1,7)/TM(1,8)
-arrives or 3 s of bench time pass.
+One sync in flight (review R2): a sync being prepared or sent, from
+this verb or a raw TC(9,129) through tc.platform.send, makes another
+one get 409 until its TM(1,7)/TM(1,8) to destination 14 arrives or 3 s
+of bench time pass. The verb runs outside the dispatcher lock (it may
+wait ~0.5 s of bench time), so the reservation is taken atomically.
 
 The verification is an `expect` record: TM(1,7) within 3 s, then the
 first heartbeat's 48-bit CUC against the OBT at its arrival (within
-0.25 s + a relay allowance, bit 31 clear). A TM(1,8) (48035, 48034,
-48041) is a failure.
+0.25 s + a relay allowance, bit 31 clear), and the ordering: the RX
+delivery of this TC's unit (matched on its length, so an interleaved
+TC20 or GS TC cannot stand in) before the emit whose TIMECNT is
+coarse & 63. A CUC exactly 1 s off, or the wrong order, is
+`late_apply`; a TM(1,8) (48035, 48034, 48041) is a failure.
 """
 
 import re
@@ -31,6 +37,8 @@ TC_PACKET_ID = 0x1800 | tcbuild.APID_TC     # TC, sec hdr, APID 0x5AC
 TOL_CUC = int(0.25 * CUC_S)
 RELAY_ALLOW_CUC = int(0.05 * CUC_S)
 EMIT_RE = re.compile(r"timecnt=(\d+)")
+RX_LEN_RE = re.compile(r"\blen=(\d+)")
+MAX_WAITS = 3
 
 
 def plan_send(obt):
@@ -57,67 +65,112 @@ class TimeSync:
         self.awaiting_hb = None
         self.history = []
 
+    def _busy(self):
+        """Under self.lock: None, or why another TC(9,129) must wait."""
+        p = self.pending
+        if p is None:
+            return None
+        if p.get("preparing"):
+            return "a TC(9,129) is being prepared (pending)"
+        if self.clock.exact_sim() - p["sent_sim"] >= 3 * NS:
+            self._verdict(p, "timeout", "no TM(1,7)/TM(1,8) in 3 s")
+            return None
+        return ("a TC(9,129) (seq %d, coarse 0x%08X) is pending"
+                % (p["seq"], p["coarse"]))
+
     def busy(self):
-        """None, or why another TC(9,129) must wait (409)."""
         with self.lock:
-            p = self.pending
-            if p is None:
-                return None
-            if self.clock.exact_sim() - p["sent_sim"] >= 3 * NS:
-                self._verdict(p, "timeout", "no TM(1,7)/TM(1,8) in 3 s")
-                return None
-            return ("a TC(9,129) (seq %d, coarse 0x%08X) is pending"
-                    % (p["seq"], p["coarse"]))
+            return self._busy()
+
+    def _reserve(self):
+        with self.lock:
+            why = self._busy()
+            if why is not None:
+                raise VerbError(409, why)
+            self.pending = {"preparing": True}
+
+    def _unreserve(self):
+        with self.lock:
+            if self.pending is not None and self.pending.get("preparing"):
+                self.pending = None
 
     def send(self, coarse="auto", wait_timeout_s=10.0):
         why = self.can_send()
         if why is not None:
             raise VerbError(409, "time sync: %s" % why)
-        why = self.busy()
-        if why is not None:
-            raise VerbError(409, why)
-        obt, _ = self.read_obt()
-        now, target, wait_ns = plan_send(obt)
-        if not now:
-            target = self._wait_rollover(wait_ns, wait_timeout_s)
-        warn = None
-        if coarse != "auto":
-            if not isinstance(coarse, int) or not 0 <= coarse < 1 << 32:
-                raise VerbError(400, "coarse must be \"auto\" or a u32")
-            if coarse & 63 != target & 63:
-                warn = ("coarse & 63 = %d but the next code's TIMECNT is %d"
-                        % (coarse & 63, target & 63))
-            target = coarse
-        seq = self.next_seq()
-        pkt = tcbuild.tc9_129(seq, target)
-        with self.lock:
-            self.send_unit(tcbuild.unit(pkt))
-            sent = self.clock.exact_sim()
-            self.pending = {"seq": seq, "coarse": target, "sent_sim": sent,
-                            "log_seq": self.log.seq}
-        rec = self.log.emit("ctl", "tc", "platform.timesync",
-                            {"service": 9, "subtype": 129, "seq": seq,
-                             "coarse": target, "obt_read": obt,
-                             "waited": not now, "warning": warn,
-                             "source": tcbuild.SOURCE_PLATFORM})
-        with self.lock:
-            if self.pending is not None and self.pending["seq"] == seq:
-                self.pending["tc_rec"] = rec.seq
-        self.clock.after(3 * NS, self.busy)
-        return {"seq": seq, "coarse": target, "waited": not now,
+        if coarse != "auto" and (isinstance(coarse, bool) or
+                                 not isinstance(coarse, int) or
+                                 not 0 <= coarse < 1 << 32):
+            raise VerbError(400, "coarse must be \"auto\" or a u32")
+        self._reserve()
+        try:
+            obt, target, waited = self._target(wait_timeout_s)
+            warn = None
+            if coarse != "auto":
+                if coarse & 63 != target & 63:
+                    warn = ("coarse & 63 = %d but the next code's TIMECNT "
+                            "is %d" % (coarse & 63, target & 63))
+                target = coarse
+            seq = self.next_seq()
+            unit = tcbuild.unit(tcbuild.tc9_129(seq, target))
+            self._sent(unit, seq, target, raw=False, extra={
+                "obt_read": obt, "waited": waited, "warning": warn})
+        except BaseException:
+            self._unreserve()
+            raise
+        return {"seq": seq, "coarse": target, "waited": waited,
                 "warning": warn}
 
-    def _wait_rollover(self, wait_ns, timeout_s):
-        done = threading.Event()
-        self.clock.after(wait_ns, done.set)
+    def send_raw(self, sp):
+        """SF3: a raw TC(9,129) from tc.platform.send is a sync in
+        flight exactly like send(), verified the same way."""
+        p = tcbuild.parse_tc(sp)
+        coarse = int.from_bytes(sp[10:14], "big") if len(sp) >= 14 else 0
+        self._reserve()
+        try:
+            self._sent(tcbuild.unit(sp), p[1] if p else None, coarse,
+                       raw=True, extra={"crc_ok": p[6] if p else False})
+        except BaseException:
+            self._unreserve()
+            raise
+
+    def _target(self, timeout_s):
+        """(OBT read, target coarse, waited): wait while the 0.5 s rule
+        says so, re-checking after each wait."""
+        waited = False
         end = self.wall() + timeout_s
-        while not done.is_set():
-            if self.wall() >= end:
-                raise VerbError(409, "time sync: no rollover within %.0f s "
-                                "of wall time (paused?)" % timeout_s)
-            done.wait(0.02)
-        obt, _ = self.read_obt()
-        return ((obt >> 16) + 1) & 0xFFFFFFFF
+        for _ in range(MAX_WAITS):
+            obt, _ = self.read_obt()
+            now, target, wait_ns = plan_send(obt)
+            if now:
+                return obt, target, waited
+            waited = True
+            done = threading.Event()
+            self.clock.after(wait_ns, done.set)
+            while not done.is_set():
+                if self.wall() >= end:
+                    raise VerbError(409, "time sync: no rollover within "
+                                    "%.0f s of wall time (paused?)"
+                                    % timeout_s)
+                done.wait(0.02)
+        raise VerbError(409, "time sync: the OBT kept landing in the last "
+                        "0.5 s of a second (%d waits)" % MAX_WAITS)
+
+    def _sent(self, unit, seq, coarse, raw, extra):
+        with self.lock:
+            self.send_unit(unit)
+            sent = self.clock.exact_sim()
+            self.pending = {"seq": seq, "coarse": coarse, "sent_sim": sent,
+                            "log_seq": self.log.seq, "rx_len": len(unit),
+                            "raw": raw}
+        data = {"service": 9, "subtype": 129, "seq": seq, "coarse": coarse,
+                "raw": raw, "source": tcbuild.SOURCE_PLATFORM}
+        data.update(extra)
+        rec = self.log.emit("ctl", "tc", "platform.timesync", data)
+        with self.lock:
+            if self.pending is not None and self.pending.get("seq") == seq:
+                self.pending["tc_rec"] = rec.seq
+        self.clock.after(3 * NS, self.busy)
 
     # -- verification ---------------------------------------------------------
     def on_tm(self, unit, dec):
@@ -125,10 +178,11 @@ class TimeSync:
             return
         with self.lock:
             p = self.pending
-            if p is not None and dec["type"] == 1 and \
+            if p is not None and not p.get("preparing") and \
+                    dec["type"] == 1 and dec["subtype"] in (7, 8) and \
+                    dec["dest"] == tcbuild.SOURCE_PLATFORM and \
                     dec.get("tc", {}).get("packet_id") == TC_PACKET_ID and \
-                    dec["tc"]["seq"] == p["seq"] and \
-                    dec["subtype"] in (7, 8):
+                    dec["tc"]["seq"] == p["seq"]:
                 if dec["subtype"] == 8:
                     self._verdict(p, "fail", "TM(1,8) FID %s (%s)"
                                   % (dec.get("fid"), dec.get("fid_name")))
@@ -149,12 +203,13 @@ class TimeSync:
         cuc = dec["cuc"]
         diff = cuc - obt_now
         ordering = self._ordering(p)
+        tol = TOL_CUC + RELAY_ALLOW_CUC
         if dec["unsynced"]:
             verdict, why = "fail", "heartbeat bit 31 (unsynced) is set"
-        elif abs(diff) <= TOL_CUC + RELAY_ALLOW_CUC:
+        elif abs(diff) <= tol:
             verdict, why = ("ok", None) if ordering != "late" else \
                 ("late_apply", "the applying code came before the TC")
-        elif abs(abs(diff) - CUC_S) <= TOL_CUC + RELAY_ALLOW_CUC:
+        elif abs(abs(diff) - CUC_S) <= tol:
             verdict, why = "late_apply", "the CUC is 1 s off the OBT"
         else:
             verdict, why = "fail", "the CUC is %.3f s off the OBT" % (
@@ -163,17 +218,20 @@ class TimeSync:
                       diff_s=diff / CUC_S, ordering=ordering)
 
     def _ordering(self, p):
-        """The RX delivery of the TC unit before the emit whose TIMECNT
-        is coarse & 63 (both traces, in stderr order)."""
+        """The RX delivery of this TC's unit (its length) before the
+        emit whose TIMECNT is coarse & 63 (both traces, in stderr
+        order)."""
         rx = emit = None
         for r in self.log.since(p.get("log_seq", 0)):
             path = r.obj["path"]
+            line = r.obj["data"].get("line", "")
             if path == "trace.stixspw_rx_deliver" and rx is None:
-                rx = r.seq
-            elif path == "trace.stixspw_timecode_emit":
-                m = EMIT_RE.search(r.obj["data"].get("line", ""))
-                if m and int(m.group(1)) == p["coarse"] & 63 and \
-                        emit is None:
+                m = RX_LEN_RE.search(line)
+                if m and int(m.group(1)) == p["rx_len"]:
+                    rx = r.seq
+            elif path == "trace.stixspw_timecode_emit" and emit is None:
+                m = EMIT_RE.search(line)
+                if m and int(m.group(1)) == p["coarse"] & 63:
                     emit = r.seq
         if rx is None or emit is None:
             return "unknown"
@@ -183,7 +241,8 @@ class TimeSync:
         if p is self.pending:
             self.pending = None
         data = {"what": "timesync", "seq": p["seq"], "coarse": p["coarse"],
-                "verdict": verdict, "ok": verdict == "ok", "why": why}
+                "raw": p.get("raw", False), "verdict": verdict,
+                "ok": verdict == "ok", "why": why}
         data.update(extra)
         self.history.append(data)
         self.log.emit("ctl", "expect", "platform.timesync", data)
@@ -192,4 +251,3 @@ class TimeSync:
         with self.lock:
             return {"pending": dict(self.pending) if self.pending else None,
                     "last": self.history[-1] if self.history else None}
-

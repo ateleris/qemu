@@ -154,7 +154,8 @@ class Platform:
               args={"coarse": {"type": ["string", "integer"],
                                "default": "auto"}},
               doc="TC(9,129) timed to the next code (D-PLd); 409 while "
-                  "one is pending")
+                  "one is pending",
+              locked=False)
         d.add("platform.keepalive.set", self.v_keepalive,
               args={"enabled": {"type": "boolean"},
                     "period_s": {"type": "number", "min": 0.125,
@@ -256,10 +257,10 @@ class Platform:
         if why is not None:
             raise VerbError(409, why)
         if (svc, sub) == (9, 129):
-            busy = self.timesync.busy()
-            if busy is not None:
-                raise VerbError(409, busy)
-        self.relay.send_unit(tcbuild.unit(sp))
+            # SF3: pending exactly like timesync.send (409 while busy)
+            self.timesync.send_raw(sp)
+        else:
+            self.relay.send_unit(tcbuild.unit(sp))
         p = tcbuild.parse_tc(sp)
         self.log.emit("ctl", "tc", "tc.platform.send",
                       {"hex": sp.hex(), "service": svc, "subtype": sub,
