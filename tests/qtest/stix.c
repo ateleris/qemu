@@ -79,14 +79,47 @@ static void stix_pnp_check(QTestState *qts, unsigned index, uint32_t expected)
 #define CMD_PAGE_READ   2u
 #define CMD_PAGE_WRITE  3u
 
+/*
+ * Flash latency plan D-F6 defaults (tread-us/tprog-us/tbers-us) and the
+ * switch the latency qtests pass (the default stays off until F-3).
+ */
+#define FLASH_TREAD_US  130
+#define FLASH_TPROG_US  300
+#define FLASH_TBERS_US  1500
+#define FLASH_LATENCY_ON "-global grlib-stixflash.latency=on"
+
+static void flash_step_us(QTestState *qts, int64_t us)
+{
+    qtest_clock_step(qts, us * 1000);
+}
+
+/*
+ * F-2: let a command complete under either latency default: step the
+ * virtual clock past the longest op (block erase) plus 1 us. With
+ * latency off every op has already completed inline and this only moves
+ * the clock.
+ */
+static void flash_wait(QTestState *qts)
+{
+    flash_step_us(qts, FLASH_TBERS_US + 1);
+}
+
 /* Driver register order: ram address, page address, cmd/sta. The device
  * asserts this exact write_counter sequence (0 -> 1 -> 2 -> execute). */
-static void flash_issue(QTestState *qts, uint32_t ram, uint32_t page,
-                        uint32_t cmd)
+static void flash_issue_nowait(QTestState *qts, uint32_t ram, uint32_t page,
+                               uint32_t cmd)
 {
     qtest_writel(qts, FLASH_RAMAD, ram);
     qtest_writel(qts, FLASH_PAGEAD, page);
     qtest_writel(qts, FLASH_CMDSTA, FTNAND_FLASHTYPE | cmd);
+}
+
+/* issue and wait for the completion (flash_wait) */
+static void flash_issue(QTestState *qts, uint32_t ram, uint32_t page,
+                        uint32_t cmd)
+{
+    flash_issue_nowait(qts, ram, page, cmd);
+    flash_wait(qts);
 }
 
 /* Common qtest setup: pass -global grlib-stixflash.flash-file=<small temp
@@ -467,6 +500,7 @@ static void flash_issue_mcm(QTestState *qts, uint32_t ram, uint32_t chip,
     qtest_writel(qts, FLASH_RAMAD, ram);
     qtest_writel(qts, FLASH_PAGEAD, (chip << 20) | (page & 0x3ffffu));
     qtest_writel(qts, FLASH_CMDSTA, FTNAND_FLASHTYPE | (mcm << 3) | cmd);
+    flash_wait(qts);
 }
 
 /* Host-side check: pull one page at offset out of the backing file,
@@ -8348,6 +8382,446 @@ static void stix_platform_register(void)
                    test_plat_review_extras);
 }
 
+/* ---- F-2: NAND op latency (flash latency plan D-F1..D-F6, D-F9) ---- */
+
+#define FLASH_QOM_PATH "/machine/stixflash"
+#define FLASH_RAM_A    0x40000000u
+#define FLASH_RAM_B    0x40002000u
+
+static bool flash_irq_pending(QTestState *qts)
+{
+    return (qtest_readl(qts, IRQMP_PENDING) & FLASH_IRQ_BIT) != 0;
+}
+
+static void flash_irq_clear(QTestState *qts)
+{
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+}
+
+static void flash_ram_fill(QTestState *qts, uint32_t addr, uint8_t byte)
+{
+    g_autofree uint8_t *buf = g_malloc(FLASH_PAGE_BYTES);
+
+    memset(buf, byte, FLASH_PAGE_BYTES);
+    qtest_memwrite(qts, addr, buf, FLASH_PAGE_BYTES);
+}
+
+static void flash_assert_busy(QTestState *qts)
+{
+    uint32_t sta = qtest_readl(qts, FLASH_CMDSTA);
+
+    g_assert_cmpuint(sta & FTNAND_BUSY, ==, FTNAND_BUSY);
+    g_assert_cmpuint(sta & (FTNAND_READY | FTNAND_FAILED), ==, 0);
+}
+
+static void flash_assert_done_ok(QTestState *qts)
+{
+    uint32_t sta = qtest_readl(qts, FLASH_CMDSTA);
+
+    g_assert_cmpuint(sta & FTNAND_BUSY, ==, 0);
+    g_assert_cmpuint(sta & (FTNAND_READY | FTNAND_FAILED), ==, FTNAND_READY);
+}
+
+/*
+ * "Exactly one IRQ": the IRQMP pending bit is a latch, so after it was
+ * seen and cleared, nothing may set it again for a long while.
+ */
+static void flash_assert_no_more_irq(QTestState *qts)
+{
+    flash_irq_clear(qts);
+    flash_step_us(qts, 10 * 1000);
+    g_assert_false(flash_irq_pending(qts));
+}
+
+/*
+ * /sparc/stix/flash-latency-read: a page read keeps BUSY set for
+ * tread-us; data, status and the IRQ arrive together at the deadline.
+ */
+static void test_flash_latency_read(void)
+{
+    QTestState *qts = stix_qtest_new_extra(FLASH_LATENCY_ON);
+
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0);
+
+    flash_step_us(qts, FLASH_TREAD_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0);
+
+    flash_step_us(qts, 2);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A + FLASH_PAGE_BYTES - 4),
+                    ==, 0xffffffffu);
+    flash_assert_no_more_irq(qts);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-read"),
+                    ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-latency-prog: a program samples guest RAM at issue
+ * (D-F2) and reaches the file only at completion.
+ */
+static void test_flash_latency_prog(void)
+{
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *z0 = g_malloc0(FLASH_PAGE_BYTES);
+    QTestState *qts = stix_qtest_new_extra(FLASH_LATENCY_ON);
+    size_t i;
+
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0x5Au);
+    }
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 5, CMD_PAGE_WRITE);
+    flash_assert_busy(qts);
+
+    /* the buffer changes after issue: the file must get P, not this */
+    flash_ram_fill(qts, FLASH_RAM_A, 0x11);
+
+    flash_step_us(qts, FLASH_TPROG_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    /* the file is unchanged (an erased page is a host hole, 0x00) */
+    flash_pread_page(stix_tmp_flash_path, 5ULL * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, z0, FLASH_PAGE_BYTES), ==, 0);
+
+    flash_step_us(qts, 2);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    flash_pread_page(stix_tmp_flash_path, 5ULL * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+    flash_assert_no_more_irq(qts);
+
+    /* and the guest reads back the issue-time image */
+    flash_ram_fill(qts, FLASH_RAM_B, 0x00);
+    flash_issue(qts, FLASH_RAM_B, 5, CMD_PAGE_READ);
+    qtest_memread(qts, FLASH_RAM_B, host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-prog"),
+                    ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* /sparc/stix/flash-latency-erase: erased only at tbers-us, one IRQ. */
+static void test_flash_latency_erase(void)
+{
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *z0 = g_malloc0(FLASH_PAGE_BYTES);
+    QTestState *qts = stix_qtest_new_extra(FLASH_LATENCY_ON);
+    size_t i;
+
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0xC3u);
+    }
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, 3, CMD_PAGE_WRITE);
+
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 3, CMD_BLOCK_ERASE);
+    flash_assert_busy(qts);
+    flash_step_us(qts, FLASH_TBERS_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    flash_pread_page(stix_tmp_flash_path, 3ULL * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+    flash_step_us(qts, 2);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    flash_pread_page(stix_tmp_flash_path, 3ULL * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, z0, FLASH_PAGE_BYTES), ==, 0);
+    flash_assert_no_more_irq(qts);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-erase"),
+                    ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-latency-abort (D-F4, review R1): a RESET aborts a
+ * pending op cleanly; a completion that lands between Flash_reset's
+ * RAMAD/PAGEAD writes and its RESET cmdSta must not fail the RESET.
+ */
+static void test_flash_latency_abort(void)
+{
+    QTestState *qts = stix_qtest_new_extra(FLASH_LATENCY_ON);
+    uint32_t sta;
+
+    /* (a) Flash_reset (Flash.c:192-231) during a pending read */
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_assert_busy(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_RESET);
+    flash_assert_done_ok(qts);
+    flash_step_us(qts, FLASH_TREAD_US + 100);
+    g_assert_false(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-abort"),
+                    ==, 1);
+
+    /* (b) the op completes between RAMAD/PAGEAD and the RESET cmdSta */
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    qtest_writel(qts, FLASH_RAMAD, FLASH_RAM_A);
+    qtest_writel(qts, FLASH_PAGEAD, 0);
+    flash_step_us(qts, FLASH_TREAD_US + 1);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+    flash_irq_clear(qts);
+    qtest_writel(qts, FLASH_CMDSTA, FTNAND_FLASHTYPE | CMD_RESET);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+    g_assert_cmpuint(sta & (FTNAND_BUSY | FTNAND_READY), ==, FTNAND_READY);
+    g_assert_false(flash_irq_pending(qts));
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-abort"),
+                    ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-latency-busy-reject (D-F4, review R2): while an op
+ * is pending, a second command is dropped and a sequence error sets no
+ * status and pulses no IRQ; the op in flight completes on its own terms.
+ */
+static void test_flash_latency_busy_reject(void)
+{
+    QTestState *qts = stix_qtest_new_extra(FLASH_LATENCY_ON);
+
+    /* (a) a READ issued during a pending READ is dropped */
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_ram_fill(qts, FLASH_RAM_B, 0x00);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_issue_nowait(qts, FLASH_RAM_B, 1, CMD_PAGE_READ);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    /* RAMAD/PAGEAD writes while busy are accepted as registers */
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAMAD), ==, FLASH_RAM_B);
+    flash_step_us(qts, FLASH_TREAD_US + 1);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_B), ==, 0);
+    flash_assert_no_more_irq(qts);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-read"),
+                    ==, 1);
+
+    /* (b) out-of-order cmdSta and PAGEAD writes during a pending op */
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    qtest_writel(qts, FLASH_CMDSTA, FTNAND_FLASHTYPE | CMD_PAGE_READ);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    qtest_writel(qts, FLASH_PAGEAD, 0x10u);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    flash_step_us(qts, FLASH_TREAD_US + 1);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+    flash_assert_no_more_irq(qts);
+
+    /* the sequence state is clean again: a fresh op runs */
+    flash_issue(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-latency-dma-guard (D-F3, review R4): the read DMA
+ * from the timer runs under the device's re-entrancy guard, like the
+ * SPW's out-of-MMIO DMA (a83fe9a3a5). A ramAddress inside the flash's
+ * own window is refused and the op completes FAILED | READY with the
+ * IRQ. The page is programmed to an all-zero guest image first, so the
+ * 4,224 B run-on into EEPROM/SPW/SDRAM-ctrl writes only zeros.
+ *
+ * The witnesses of the guard are RAMAD == FLASH_BASE after completion
+ * (without the guard the page's zeros land in the flash registers and
+ * RAMAD reads 0) and the follow-up flash_issue (the sequence state is
+ * intact). FAILED | READY alone is not one: the run-on past the window
+ * also fails the DMA. A program from the flash's own window is refused
+ * at issue, when the RAM sample is taken (D-F2/D-F3): it completes
+ * FAILED | READY and leaves the page in the file untouched.
+ */
+static void test_flash_latency_dma_guard(void)
+{
+    QTestState *qts = stix_qtest_new_extra(FLASH_LATENCY_ON);
+    uint32_t sta;
+
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_issue(qts, FLASH_RAM_A, 7, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_BASE, 7, CMD_PAGE_READ);
+    flash_assert_busy(qts);
+    flash_step_us(qts, FLASH_TREAD_US + 1);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_BUSY, ==, 0);
+    g_assert_cmpuint(sta & (FTNAND_FAILED | FTNAND_READY), ==,
+                     FTNAND_FAILED | FTNAND_READY);
+    g_assert_true(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAMAD), ==, FLASH_BASE);
+    flash_assert_no_more_irq(qts);
+
+    /* QEMU is up and the device usable */
+    flash_issue(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+
+    /* a program from the flash's own window: the sample is refused */
+    {
+        g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+        g_autofree uint8_t *z0 = g_malloc0(FLASH_PAGE_BYTES);
+
+        flash_irq_clear(qts);
+        flash_issue_nowait(qts, FLASH_BASE, 8, CMD_PAGE_WRITE);
+        flash_assert_busy(qts);
+        flash_step_us(qts, FLASH_TPROG_US + 1);
+        sta = qtest_readl(qts, FLASH_CMDSTA);
+        g_assert_cmpuint(sta & FTNAND_BUSY, ==, 0);
+        g_assert_cmpuint(sta & (FTNAND_FAILED | FTNAND_READY), ==,
+                         FTNAND_FAILED | FTNAND_READY);
+        g_assert_true(flash_irq_pending(qts));
+        /* nothing written: the erased page is still a host hole */
+        flash_pread_page(stix_tmp_flash_path, 8ULL * FLASH_PAGE_BYTES, host);
+        g_assert_cmpint(memcmp(host, z0, FLASH_PAGE_BYTES), ==, 0);
+        flash_assert_no_more_irq(qts);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+#define FLASH_TEST_PROP_ENV "STIX_TEST_FLASH_PROP"
+
+/*
+ * g_test_trap_subprocess child: start QEMU with latency on and one more
+ * -global (FLASH_TEST_PROP_ENV), then quit; the parent checks whether
+ * realize failed and what QEMU printed
+ */
+static void test_flash_latency_props_subprocess(void)
+{
+    const char *flash = g_getenv(TMTC_TEST_FLASH_ENV);
+    const char *prop = g_getenv(FLASH_TEST_PROP_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(flash);
+    g_assert_nonnull(prop);
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s "
+                      FLASH_LATENCY_ON " -global grlib-stixflash.%s",
+                      flash, prop);
+    qtest_quit(qts);
+}
+
+static void flash_props_trap(const char *prop, bool ok, const char *pat)
+{
+    g_autofree gchar *sub = stix_test_path("flash-latency-props/subprocess");
+
+    g_setenv(FLASH_TEST_PROP_ENV, prop, TRUE);
+    g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+    if (ok) {
+        g_test_trap_assert_passed();
+    } else {
+        g_test_trap_assert_failed();
+    }
+    if (pat) {
+        g_test_trap_assert_stderr(pat);
+    } else {
+        g_test_trap_assert_stderr_unmatched("*stixflash*");
+    }
+}
+
+/*
+ * /sparc/stix/flash-latency-props (D-F6): each latency property is
+ * validated at realize. 40,000 us is accepted; 40,001 fails realize,
+ * naming the FSW's 50 ms timeout; 1-19 us warn that the op may not
+ * block the caller. 0 makes that op type complete inline while the
+ * others keep their latency.
+ */
+static void test_flash_latency_props(void)
+{
+    g_autofree gchar *path = NULL;
+    int fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+    QTestState *qts;
+
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+    close(fd);
+    g_setenv(TMTC_TEST_FLASH_ENV, path, TRUE);
+    flash_props_trap("tread-us=40001", false, "*tread-us=40001*50 ms*");
+    flash_props_trap("tprog-us=40001", false, "*tprog-us=40001*50 ms*");
+    flash_props_trap("tbers-us=40001", false, "*tbers-us=40001*50 ms*");
+    flash_props_trap("tread-us=40000", true, NULL);
+    flash_props_trap("tbers-us=40000", true, NULL);
+    flash_props_trap("tread-us=19", true, "*warning*tread-us=19 us*");
+    flash_props_trap("tprog-us=1", true, "*warning*tprog-us=1 us*");
+    flash_props_trap("tread-us=20", true, NULL);
+    g_unlink(path);
+
+    qts = stix_qtest_new_extra(FLASH_LATENCY_ON
+                               " -global grlib-stixflash.tread-us=0");
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+    /* a program still takes tprog-us */
+    flash_issue_nowait(qts, FLASH_RAM_A, 9, CMD_PAGE_WRITE);
+    flash_assert_busy(qts);
+    flash_wait(qts);
+    flash_assert_done_ok(qts);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-latency-system-reset (D-F4): a system reset during
+ * a pending op drops it: no IRQ, no DMA afterwards, cmdSta 0.
+ */
+static void test_flash_latency_system_reset(void)
+{
+    QTestState *qts = stix_qtest_new_extra(FLASH_LATENCY_ON);
+
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_assert_busy(qts);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, FLASH_CMDSTA), ==, 0);
+    flash_irq_clear(qts);
+    flash_step_us(qts, 10 * 1000);
+    g_assert_false(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -8360,6 +8834,24 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/flash-storage", test_flash_storage);
         qtest_add_func("/sparc/stix/flash-reset-state",
                        test_flash_reset_state);
+        qtest_add_func("/sparc/stix/flash-latency-read",
+                       test_flash_latency_read);
+        qtest_add_func("/sparc/stix/flash-latency-prog",
+                       test_flash_latency_prog);
+        qtest_add_func("/sparc/stix/flash-latency-erase",
+                       test_flash_latency_erase);
+        qtest_add_func("/sparc/stix/flash-latency-abort",
+                       test_flash_latency_abort);
+        qtest_add_func("/sparc/stix/flash-latency-busy-reject",
+                       test_flash_latency_busy_reject);
+        qtest_add_func("/sparc/stix/flash-latency-dma-guard",
+                       test_flash_latency_dma_guard);
+        qtest_add_func("/sparc/stix/flash-latency-props/subprocess",
+                       test_flash_latency_props_subprocess);
+        qtest_add_func("/sparc/stix/flash-latency-props",
+                       test_flash_latency_props);
+        qtest_add_func("/sparc/stix/flash-latency-system-reset",
+                       test_flash_latency_system_reset);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);

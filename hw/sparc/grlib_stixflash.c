@@ -4,10 +4,13 @@
 #include "hw/sparc/grlib_stix.h"
 #include "hw/core/sysbus.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "chardev/char-fe.h"
 #include "system/physmem.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "StixIdpu.h"
 
 #if defined(CONFIG_FALLOCATE_PUNCH_HOLE)
@@ -68,6 +71,15 @@
 /* DEFINES TAKEN FROM stixIoConstants.h */
 #define FLASH_PAGENUM_IN_BLOCK 64
 
+/*
+ * D-F6: a latency must stay well below the FSW's 50 ms page/erase
+ * timeouts (FILESYSTEM_PAGE_READ_TIMEOUT & co., configFSW.h:336-338);
+ * below 20 us the IRQ may beat the FSW's rtems_event_receive and the
+ * op no longer blocks the calling task.
+ */
+#define STIXFLASH_LATENCY_MAX_US  40000u
+#define STIXFLASH_LATENCY_WARN_US 20u
+
 OBJECT_DECLARE_SIMPLE_TYPE(STIXFLASH, GRLIB_STIXFLASH)
 
 /*
@@ -85,6 +97,8 @@ typedef struct StixFlashOp {
     uint32_t page;
     uint32_t page_address;  /* the PAGEAD value at issue, for traces */
     hwaddr ram_address;
+    /* a program's RAM sample at issue was refused (D-F3) */
+    bool sample_failed;
 } StixFlashOp;
 
 struct STIXFLASH
@@ -123,6 +137,20 @@ struct STIXFLASH
 
     /* the latched command (D-F1); page_data holds its page image */
     StixFlashOp op;
+
+    /* D-F6 properties: off = every op completes inline */
+    bool latency;
+    uint32_t tread_us;
+    uint32_t tprog_us;
+    uint32_t tbers_us;
+    /* completion timer (QEMU_CLOCK_VIRTUAL), created last in realize */
+    QEMUTimer *timer;
+
+    /* D-F9 read-only counters */
+    uint64_t ops_read;
+    uint64_t ops_prog;
+    uint64_t ops_erase;
+    uint64_t ops_abort;
 };
 
 /* ---- error contract: guest-commanded failures never abort QEMU ----
@@ -174,6 +202,28 @@ static void flash_invert_page(uint8_t *buf)
     for (i = 0; i < (size_t)FLASH_PAGE_SIZE; i++) {
         buf[i] ^= 0xFFu;
     }
+}
+
+/*
+ * D-F3: the read DMA at a timer completion runs outside any MMIO
+ * dispatch, so it engages the device's re-entrancy guard itself, as
+ * stixspw_guard_enter/exit do (grlib_stixspw.c, fix a83fe9a3a5). A
+ * ramAddress inside this device's MMIO is then refused by memory.c
+ * (MEMTX_ACCESS_ERROR), exactly as on the inline path, where memory.c
+ * has engaged the guard for the cmdSta write already.
+ */
+static bool stixflash_guard_enter(STIXFLASH *s)
+{
+    MemReentrancyGuard *g = &DEVICE(s)->mem_reentrancy_guard;
+    bool was = g->engaged_in_io;
+
+    g->engaged_in_io = true;
+    return was;
+}
+
+static void stixflash_guard_exit(STIXFLASH *s, bool was)
+{
+    DEVICE(s)->mem_reentrancy_guard.engaged_in_io = was;
 }
 
 /*
@@ -352,9 +402,23 @@ static const char *execute_flash_read(STIXFLASH *stixflash)
         }
     }
 
-    /* guest physical address: QEMU's address space, not the FSW's view */
-    physical_memory_write(op->ram_address, stixflash->page_data,
-                          FLASH_PAGE_SIZE);
+    /*
+     * D-F2/D-F3: the data lands in guest RAM at completion, under the
+     * re-entrancy guard; a refused or failed DMA fails the command
+     */
+    {
+        bool was = stixflash_guard_enter(stixflash);
+        MemTxResult r = address_space_write(&address_space_memory,
+                                            op->ram_address,
+                                            MEMTXATTRS_UNSPECIFIED,
+                                            stixflash->page_data,
+                                            FLASH_PAGE_SIZE);
+
+        stixflash_guard_exit(stixflash, was);
+        if (r != MEMTX_OK) {
+            return "dma";
+        }
+    }
 
     return NULL;
 }
@@ -370,6 +434,11 @@ static const char *execute_flash_write(STIXFLASH *stixflash)
 
     if (file_size < 0) {
         return flash_io_error(stixflash, "write");
+    }
+
+    /* D-F3: the RAM sample at issue was refused: nothing is written */
+    if (op->sample_failed) {
+        return "dma";
     }
 
     // a page past the backing file fails the command; the file is never
@@ -441,7 +510,62 @@ static void stixflash_complete(STIXFLASH *stixflash)
         stixflash->cmd_sta |= (1u << ERROR_CODE_READY);
         stixflash->cmd_sta &= ~(1u << ERROR_CODE_FAILED);
     }
+    trace_stixflash_op_done(op->cmd, op->page_address, stixflash->cmd_sta);
     qemu_irq_pulse(stixflash->irq);
+}
+
+static void stixflash_timer_cb(void *opaque)
+{
+    STIXFLASH *stixflash = opaque;
+
+    if (stixflash->op.pending) {
+        stixflash_complete(stixflash);
+    }
+}
+
+/* D-F4: drop the pending op: no IRQ, no DMA, nothing committed */
+static void stixflash_abort(STIXFLASH *stixflash)
+{
+    timer_del(stixflash->timer);
+    stixflash->op.pending = false;
+    stixflash->ops_abort++;
+    trace_stixflash_op_abort(stixflash->op.cmd);
+}
+
+/* D-F6: the op's latency in us; 0 = complete inline */
+static uint32_t stixflash_delay_us(const STIXFLASH *stixflash, uint32_t cmd)
+{
+    if (!stixflash->latency) {
+        return 0;
+    }
+    switch (cmd) {
+    case COMMAND_PAGE_READ:
+        return stixflash->tread_us;
+    case COMMAND_PAGE_WRITE:
+        return stixflash->tprog_us;
+    case COMMAND_BLOCK_ERASE:
+        return stixflash->tbers_us;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * A write out of the RAMAD -> PAGEAD -> cmdSta order. With no op
+ * pending it fails at once (FAILED | READY, IRQ), as before. While an
+ * op is in flight (D-F4, review R2) it only restarts the sequence:
+ * FAILED/READY and an IRQ would land on the op in flight, and the FSW's
+ * ISR (Flash.c:132-174) would credit them to it.
+ */
+static void stixflash_sequence_error(STIXFLASH *stixflash)
+{
+    if (stixflash->op.pending) {
+        stixflash->write_counter = 0;
+        trace_stixflash_error("sequence", stixflash->cmd_sta,
+                              stixflash->page_address);
+        return;
+    }
+    flash_fail(stixflash, "sequence");
 }
 
 /*
@@ -454,8 +578,25 @@ static void stixflash_complete(STIXFLASH *stixflash)
 static void stixflash_issue(STIXFLASH *stixflash, uint32_t value)
 {
     StixFlashOp *op = &stixflash->op;
+    uint32_t cmd = (value >> FTNANDCTRL_CMDSTA_COMMAND) &
+                   FTNANDCTRL_CMDSTA_COMMAND_MASK;
+    uint32_t delay_us;
 
     stixflash->write_counter = 0;
+
+    /*
+     * D-F4 (review R2): the busy decision comes before any register
+     * change. A RESET aborts the op in flight; any other command is
+     * dropped and leaves the pending op's status alone.
+     */
+    if (op->pending) {
+        if (cmd != COMMAND_RESET) {
+            trace_stixflash_busy_reject(cmd);
+            return;
+        }
+        stixflash_abort(stixflash);
+    }
+
     stixflash->cmd_sta = value;
     /* WRPROT (bit 31) is 1 = not write protected, at all times (D-F5) */
     stixflash->cmd_sta |= (1u << ERROR_CODE_WRPROT);
@@ -494,19 +635,43 @@ static void stixflash_issue(STIXFLASH *stixflash, uint32_t value)
     op->page = stixflash->page;
     op->page_address = stixflash->page_address;
     op->ram_address = stixflash->ram_address;
+    op->sample_failed = false;
 
     /* in flight: BUSY set, READY and FAILED clear (D-F5) */
     stixflash->cmd_sta |= (1u << FTNANDCTRL_CMDSTA_BUSY);
     stixflash->cmd_sta &= ~(1u << ERROR_CODE_READY);
     stixflash->cmd_sta &= ~(1u << ERROR_CODE_FAILED);
 
-    if (op->cmd == COMMAND_PAGE_WRITE) {
-        /* guest physical address: QEMU's address space */
-        physical_memory_read(op->ram_address, stixflash->page_data,
-                             FLASH_PAGE_SIZE);
+    delay_us = stixflash_delay_us(stixflash, op->cmd);
+    trace_stixflash_op_start(op->cmd, op->mcm, op->chip, op->page, delay_us);
+
+    switch (op->cmd) {
+    case COMMAND_PAGE_READ:
+        stixflash->ops_read++;
+        break;
+    case COMMAND_PAGE_WRITE:
+        /*
+         * D-F2: the page leaves guest RAM at issue, inside this MMIO
+         * write, where memory.c holds the re-entrancy guard (D-F3)
+         */
+        stixflash->ops_prog++;
+        op->sample_failed =
+            address_space_read(&address_space_memory, op->ram_address,
+                               MEMTXATTRS_UNSPECIFIED, stixflash->page_data,
+                               FLASH_PAGE_SIZE) != MEMTX_OK;
+        break;
+    default:
+        stixflash->ops_erase++;
+        break;
     }
 
-    stixflash_complete(stixflash);
+    if (delay_us == 0) {
+        stixflash_complete(stixflash);
+    } else {
+        timer_mod(stixflash->timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  (int64_t)delay_us * SCALE_US);
+    }
 }
 
 static uint64_t grlib_stixflash_read(void *opaque, hwaddr addr, unsigned size)
@@ -557,7 +722,7 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
     case FLASH_CMD_STA_ADDRESS: /* the third write issues the command */
         if (stixflash->write_counter != 2)
         {
-            flash_fail(stixflash, "sequence");
+            stixflash_sequence_error(stixflash);
             return;
         }
         stixflash_issue(stixflash, (uint32_t)value);
@@ -566,7 +731,7 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
     case FLASH_PAGE_ADDRESS: // configure the flash addressing
         if (stixflash->write_counter != 1)
         {
-            flash_fail(stixflash, "sequence");
+            stixflash_sequence_error(stixflash);
             return;
         }
         stixflash->page_address = (uint32_t)value;
@@ -578,7 +743,7 @@ static void grlib_stixflash_write(void *opaque, hwaddr addr, uint64_t value, uns
     case FLASH_RAM_ADDRESS: // configure the ram address (write-back?)
         if (stixflash->write_counter != 0)
         {
-            flash_fail(stixflash, "sequence");
+            stixflash_sequence_error(stixflash);
             return;
         }
         stixflash->ram_address = (uint32_t)value;
@@ -680,10 +845,34 @@ static bool init_and_load_flash_file(STIXFLASH *stixflash, Error **errp)
     return true;
 }
 
+/* D-F6: validate one latency property at realize */
+static bool stixflash_check_latency(const char *name, uint32_t us,
+                                    Error **errp)
+{
+    if (us > STIXFLASH_LATENCY_MAX_US) {
+        error_setg(errp, "stixflash: %s=%" PRIu32 " exceeds %u us; the FSW "
+                   "times flash ops out after 50 ms", name, us,
+                   STIXFLASH_LATENCY_MAX_US);
+        return false;
+    }
+    if (us != 0 && us < STIXFLASH_LATENCY_WARN_US) {
+        warn_report("stixflash: %s=%" PRIu32 " us is shorter than the FSW's "
+                    "issue-to-wait path; ops may not block the caller",
+                    name, us);
+    }
+    return true;
+}
+
 static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
 {
     STIXFLASH *stixflash = GRLIB_STIXFLASH(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    if (!stixflash_check_latency("tread-us", stixflash->tread_us, errp) ||
+        !stixflash_check_latency("tprog-us", stixflash->tprog_us, errp) ||
+        !stixflash_check_latency("tbers-us", stixflash->tbers_us, errp)) {
+        return;
+    }
 
     sysbus_init_irq(sbd, &stixflash->irq);
 
@@ -699,16 +888,22 @@ static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
     }
 
     /*
-     * D-F4: the op state is set up last, after the backing file opened
-     * (realize can fail above); no op is pending yet
+     * D-F4: the op state and its timer are set up last, after the
+     * backing file opened (realize can fail above); no op is pending yet
      */
     stixflash->op.pending = false;
+    stixflash->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixflash_timer_cb,
+                                    stixflash);
 }
 
 static void grlib_stixflash_unrealize(DeviceState *dev)
 {
     STIXFLASH *stixflash = GRLIB_STIXFLASH(dev);
 
+    if (stixflash->timer) {
+        timer_free(stixflash->timer);
+        stixflash->timer = NULL;
+    }
     stixflash->op.pending = false;
     if (stixflash->f) {
         fclose(stixflash->f);
@@ -724,6 +919,9 @@ static void grlib_stixflash_reset(DeviceState *d)
 {
     STIXFLASH *stixflash = GRLIB_STIXFLASH(d);
 
+    if (stixflash->timer) {
+        timer_del(stixflash->timer);
+    }
     stixflash->op.pending = false;
     stixflash->write_counter = 0;
     stixflash->cmd_sta = 0;
@@ -733,7 +931,28 @@ static void grlib_stixflash_reset(DeviceState *d)
 static const Property grlib_stixflash_properties[] = {
     DEFINE_PROP_STRING("flash-file", STIXFLASH, flash_file),
     DEFINE_PROP_BOOL("inverted-storage", STIXFLASH, inverted_storage, true),
+    /* D-F6/D-F7: off until F-3 flips the default */
+    DEFINE_PROP_BOOL("latency", STIXFLASH, latency, false),
+    /* [A] datasheet-typical K9F8G08X0M timings incl. the page transfer */
+    DEFINE_PROP_UINT32("tread-us", STIXFLASH, tread_us, 130),
+    DEFINE_PROP_UINT32("tprog-us", STIXFLASH, tprog_us, 300),
+    DEFINE_PROP_UINT32("tbers-us", STIXFLASH, tbers_us, 1500),
 };
+
+/* D-F9: read-only op counters */
+static void grlib_stixflash_instance_init(Object *obj)
+{
+    STIXFLASH *stixflash = GRLIB_STIXFLASH(obj);
+
+    object_property_add_uint64_ptr(obj, "ops-read", &stixflash->ops_read,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "ops-prog", &stixflash->ops_prog,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "ops-erase", &stixflash->ops_erase,
+                                   OBJ_PROP_FLAG_READ);
+    object_property_add_uint64_ptr(obj, "ops-abort", &stixflash->ops_abort,
+                                   OBJ_PROP_FLAG_READ);
+}
 
 static void grlib_stixflash_class_init(ObjectClass *klass, const void *data)
 {
@@ -749,6 +968,7 @@ static const TypeInfo grlib_stixflash_info = {
     .name = TYPE_GRLIB_STIXFLASH,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(STIXFLASH),
+    .instance_init = grlib_stixflash_instance_init,
     .class_init = grlib_stixflash_class_init,
 };
 

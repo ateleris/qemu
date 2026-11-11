@@ -30,6 +30,10 @@ stixflash_punch_fallback(int err) "punch-hole erase unavailable or failed (err=%
 stixflash_page_size(uint64_t size) "page size: %"PRIu64
 stixflash_file(const char *path) "using flash file %s"
 stixflash_file_size(int64_t size) "backing file size %"PRId64
+stixflash_op_start(uint32_t cmd, uint32_t mcm, uint32_t chip, uint32_t page, uint32_t delay_us) "op start cmd=%u mcm=%u chip=%u page=0x%x delay_us=%u"
+stixflash_op_done(uint32_t cmd, uint32_t page_address, uint32_t cmd_sta) "op done cmd=%u page_address=0x%x cmd_sta=0x%x"
+stixflash_op_abort(uint32_t cmd) "op aborted by RESET cmd=%u"
+stixflash_busy_reject(uint32_t cmd) "command dropped while busy cmd=%u"
 
 # grlib_stixctrl.c (STIX)
 stixctrl_scet_write(uint32_t addr, uint32_t value) "SCET write addr=0x%x value=0x%x"

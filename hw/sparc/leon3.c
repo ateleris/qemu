@@ -489,6 +489,8 @@ static void leon3_generic_hw_init(MachineState *machine)
 
     /* Allocate flash */
     dev = qdev_new(TYPE_GRLIB_STIXFLASH);
+    /* flash latency plan D-F9: fixed QOM path /machine/stixflash */
+    object_property_add_child(OBJECT(machine), "stixflash", OBJECT(dev));
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, FLASH_APB_BASE);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
