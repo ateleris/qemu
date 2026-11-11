@@ -3451,6 +3451,97 @@ marks):
 
 **Gate record:** pending; no run from this worktree is recorded yet.
 
+## 40. Flight ELUT load (baseline: none)
+
+Plan: `2026-11-11-elut-plan.md` (E-1..E-3). Scripts and docs only: no
+model change, no golden change. The ELUT section of `ground-station.md`
+has the index-space table, the recipe and the template flash.
+
+- **The tool** (`scripts/stix/elut-upload.py`, stdlib only) turns the
+  flight CSV into 96 TC(237,7) (4 rows each, 226 B units, length field
+  0x00D7) plus TC(237,8) (`03 | lut_id`), with CRC-16/CCITT-FALSE, and
+  checks a pmemsave dump of the FPGA ELUT (`val[pix][fpga_det][adc]`,
+  1 572 864 B at 0xE0000000). `check-dump` replays applyELUT literally
+  through `subcol = utils_subcolIdFromFpgaId[fpga_det]`, runs an
+  independent oracle from the CSV edges, and first proves its own
+  sensitivity on the CSV (identity table 348 differing rows,
+  wrong-direction table 276, exactly as predicted; else exit 2).
+- **B0 = 0, B32 = 0** (user decision 2026-11-11): B[1..31] are the CSV
+  edges, so ebin 0 covers `adc` 0..e[0]−1 and ebin 31 covers
+  e[30]..4095; nothing is unassigned. The ops value of the lowest
+  boundary is unknown here.
+- **The gate** (`scripts/stix/elut-smoke.sh`, optional, SKIP 77 without
+  `STIX_ELUT_CSV` or the ELF) boots twice on one fresh private flash
+  (an empty sparse `flash.bin`, as §41's fresh-flash gates):
+  - run 1 (235 s): connect 0x8030/0x0022/0x14A3; CONF at 35, S20 = 0
+    at 40, dump r1-pre at 45; 96 × TC(237,7) at 50 + 0.75 k, each
+    TM(1,1)@5 and TM(1,7)@5; TC(237,8) LUT ID 1 at 127, TM(1,7)@38;
+    dump r1-apply at 170; NOMINAL at 175 (`0021 04 05`@45, TM(1,7)@45,
+    `542c01`@45; forbid `542c03`, `0021 05 02`, 0x142E, 0x9449); dump
+    r1-nominal at 225. TM(1,2)/TM(1,8) forbidden for the whole run;
+  - run 2 (110 s), a new QEMU process on the same flash, no TC(237,7):
+    0x8030 forbidden; CONF, S20, dump r2-pre at 45, NOMINAL at 50,
+    dump r2-nominal at 100;
+  - dumps: r1-pre and r2-pre constant 0, the other three PASS. UART run
+    1: `could not find LUT (type=3, id=0` present, 4 × `problem erasing
+    LUT type=3` (the first store), no write/read/apply/context-store
+    errors. UART run 2: `could not find LUT (type=1` present, **no**
+    `could not find LUT (type=3` and no `problem reading LUT (type=3`.
+  - **The persistence proof is run 2**, not r1-nominal: a failed flash
+    load leaves the RAM table untouched (LUTMgmt.c:1140), so r1-nominal
+    would pass even then. In a new process RAM `ELUT[]` is zero and only
+    `load_lut` can fill it.
+- **The first live attempt used a sparse copy of the master flash**
+  (`/tmp/stix-uprev-run/flash.bin`) and failed at +50 s: no 0x8030. The
+  master holds a context. The gate now pre-creates an empty sparse
+  flash; a context-free start is what makes run 2's forbidden 0x8030
+  prove the context run 1 stored.
+- **0x542C:** p1 = 1 (T1LUT, no temperature LUT) came once at every
+  NOMINAL entry of both runs and stays; loading the ELUT does not remove
+  it. The ELUT apply error would be p1 = 3 (`542c03`), forbidden; `542c01`
+  is now expected as its positive control.
+- **Run 2 boot:** no 0x142E (the boot TC20 timer) was seen; the context
+  carries S20 = 0. Neither expected nor forbidden at connect.
+- **FSW behaviour, confirmed live by `--negative`:** without TC(237,8)
+  the upload is not stored, but a NOMINAL entry on a flash with no ELUT
+  file for the current ID applies it anyway: `load_lut(3, 0)` misses and
+  keeps RAM, then applyELUT writes it (r1-nominal PASS, r1-apply still
+  0). After a reboot the RAM table is zero and the NOMINAL entry writes
+  all 31 (r2-nominal constant 31); `could not find LUT (type=3, id=0`
+  is logged. With a file for the current ID the reload would overwrite
+  an unapplied upload instead.
+- **FSW observation, not modelled:** `fill_table` and `fill_buffer`
+  walk 16 896 packed entries over the 25 344-B ELUT table
+  (LUTMgmt.c:635-652 and :722-745 at STIX-FSW 600a7a72), i.e. 8 448 B past
+  `ELUT[]` into `Tmno` (the sky LUT, next in the baseline ELF). Harmless
+  here: no sky LUT, `Tmno` all zero; flight behaves the same.
+- **Apply time:** in QEMU, TC(237,8) to its TM(1,7) took 0.05 s (apply,
+  4 flash copies, ID set); the NOMINAL entry including the ELUT re-apply
+  3.35 s (monotonic, from the probe's `[m=]` stamps). The ICD's flight
+  figure is about 2 minutes; QEMU's SRAM and flash are much faster than
+  the flight FPGA path, so no timing conclusion carries over.
+- **SpW RX:** the 226-B units are the largest TCs ever sent; the
+  `stixspw_rx_truncated` trace stayed silent (QEMU runs with it on).
+- **Disk:** the seeded flash allocates 148 KiB (apparent 16.5 GiB); the
+  `--save-template` copy 144 KiB. Slot mode deletes the dumps, flash and
+  QEMU logs on PASS.
+- **Caveats:** a seeded flash or template has a context (no 0x8030 at
+  boot), so it must not be used for gates that expect one; on the
+  flight ELUT a DSS replay (baseline about `adc` 2000) lands almost
+  entirely in ebin 30/31 (plan "DSS replay caveat"). No gate proves
+  that the CSV column `Detector` is `subcol` (0-based); the GSW reader
+  `stx_read_elut.pro`, stixpy and the ICD say so, and the user
+  confirmed it. If it were `fpga_det`, every gate would still pass.
+
+**Gate record** (2026-11-11, worktree `stix-uprev-elut` on f9853b57d0,
+normal ELF, slot 3, `elut_table_20260529.csv` sha256 919d9055…21ccf2):
+- positive with `--save-template`: PASS (`slot=3 busy=0`);
+- `--negative`: PASS (`slot=3 busy=0`);
+- positive on the E-2 commit (2e9a588e8e): PASS (`slot=3 busy=0`; apply 0.06 s, NOMINAL entry 3.38 s);
+- host tests: `test-elut-upload.sh` 27/27 (with `STIX_FSW_SRC`),
+  `test-elut-smoke.sh` 44/44, the tool's self-test and the probe
+  self-test PASS.
+
 ## 41. Gate ports: slots for parallel gate runs (baseline: one global lock)
 
 Plan: `2026-11-11-gateports-plan.md`. Four tracks (tc, platform, elut,

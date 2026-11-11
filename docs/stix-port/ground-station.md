@@ -351,6 +351,159 @@ Never use `/tmp/stix-uprev-run` (the golden run dir) or
   Before P4-1 it read 0, so LV/HV/SpW showed off in every mode;
 - one TM(5,2) 0x542C (no LUTs in flash) is also expected at entry.
 
+## Energy LUT (ELUT)
+
+The FSW bins each event's raw ADC value into one of 32 science energy
+bins through the FPGA energy LUT. A fresh flash has none: at NOMINAL
+entry the FSW applies an all-zero RAM table, which puts every ADC value
+into bin 31. The flight ELUT can be uploaded by TC and stored in the
+flash, like on the spacecraft. Plan: `2026-11-11-elut-plan.md`; gate
+record: `accepted-diffs.md` §40.
+
+### Index spaces
+
+Detector and pixel numbers differ between the CSV, the TC and the FPGA.
+The tool and gate name the space in every variable and option.
+
+| Name | Space | Range | Where |
+|---|---|---|---|
+| `subcol` | sub-collimator = ICD detector index (number − 1) | 0-31 | CSV column `Detector` (0-based); first index of the FSW RAM table `ELUT[subcol][pix][33]` |
+| `det_id_1based` | ICD detector number = `subcol` + 1 | 1-32 | TC(237,7) "Detector ID"; the FSW subtracts 1 |
+| `fpga_det` | FPGA detector | 0-31 | dimension 1 of the FPGA ELUT `val[pix][fpga_det][adc]` at 0xE0000000 |
+| `pix` | Caliste pixel | 0-11 | CSV column `Pixel`; TC "Pixel ID"; dimension 0 of both tables |
+| `ebin` | science energy bin | 0-31 (32 = unassigned) | the FPGA ELUT value |
+| `adc` | raw 12-bit ADC value | 0-4095 | dimension 2 of the FPGA ELUT; the CSV edges |
+
+The chain:
+
+```
+CSV row (Pixel = pix p, Detector = subcol d, edges e[0..30])
+  -> TC(237,7) structure: det_id_1based = d + 1, pix = p, B[0..32]
+  -> FSW RAM ELUT[d][p][0..32]
+  -> at apply, for each fpga_det f: d = utils_subcolIdFromFpgaId[f]
+       FPGA val[p][f][adc] = the ebin of adc under B[] of row (d, p)
+```
+
+`fpga_det` → `subcol` is **not** the identity: only 0, 1 and 4 map to
+themselves. An identity table would mis-bin 29 of 32 detectors, the
+reversed table 23. The checker proves on every run that it can see both
+mistakes.
+
+**Boundaries: B0 = 0 and B32 = 0** (user decision 2026-11-11). B[1..31]
+are the CSV's 31 edges. So bin 0 covers `adc` 0..e[0]−1, bin 31 covers
+e[30]..4095, and no ADC value is unassigned. The ops value of the lowest
+boundary is not known here.
+
+**Residual risk.** No gate can prove that the CSV column `Detector`
+means `subcol`. The GSW reader (`stx_read_elut.pro`, `DET_ID 0-31`),
+stixpy and the ICD say it does, and the user confirmed "0 = first
+detector, 31 = last". If it were `fpga_det`, every gate would still pass
+and 29 detectors would be mis-binned.
+
+### Picking the CSV
+
+The flight tables are in `STIX-CONF/elut/` (read-only). Pick by file
+name or by the validity dates in `elut_index.csv`, **never by its index
+column**: index 17 is used twice. The table current since 2026-06-15 is
+`elut_table_20260529.csv`. The tool reads the file by path only and never
+copies it.
+
+### Recipe
+
+The gate does everything and leaves a seeded flash:
+
+```bash
+# slot mode (any free slot; the slot dir's flash.bin is deleted on PASS,
+# so keep it with --save-template; the target's directory must exist)
+mkdir -p /tmp/stix-elut-template
+STIX_PORT_BASE=auto \
+STIX_ELUT_CSV=$HOME/dev/STIX-CONF/elut/elut_table_20260529.csv \
+    scripts/stix/elut-smoke.sh build/qemu-system-sparc \
+    --save-template /tmp/stix-elut-template/flash.bin
+
+# legacy mode: hold the 21000 lock yourself; the seeded flash stays in
+# /tmp/stix-elut-run until the next elut-smoke run
+flock /tmp/stix-qtest-21000.lock env STIX_ELUT_CSV=... \
+    scripts/stix/elut-smoke.sh build/qemu-system-sparc
+```
+
+Without `STIX_ELUT_CSV` (or the ELF) the gate prints `SKIP:` and exits
+77. It takes about 6 minutes: two boots, 235 s and 110 s of probe time.
+
+By hand, in CONFIGURATION (after the NOMINAL recipe's steps 1-3):
+
+```bash
+python3 scripts/stix/elut-upload.py encode --csv <CSV> --lut-id 1 \
+    --emit hex     # 96 TC(237,7) units, then the TC(237,8) unit
+```
+
+Send the units in order, one every 0.75 s or slower, and wait for each
+TM(1,7) before the next. Then send TC(237,8) and wait for its TM(1,7):
+the FPGA is written and 4 flash copies are stored. **Then enter NOMINAL
+once**: the LUT ID lives in the RAM context until a NOMINAL entry stores
+it, and without that a reboot loads LUT ID 0 again. `--emit probe-args`
+prints the same sequence as `tmtc-probe.py` arguments, with the ack
+expectations.
+
+The FSW accepts both TCs only in CONFIGURATION or MAINTENANCE.
+
+### What success looks like
+
+- every TC(237,7) and the TC(237,8): TM(1,1) and TM(1,7), never TM(1,8);
+- the TC(237,8) TM(1,7) comes after the apply and the store;
+- at the NOMINAL entry: `0021 04 05` and TM(1,7), no TM(5,2) `542c03`
+  (ELUT apply error). The TM(5,2) 0x542C with p1 = 1 (no temperature
+  LUT) still comes once per boot: it is not about the ELUT;
+- the UART of the upload boot: `could not find LUT (type=3, id=0` at
+  boot and four `problem erasing LUT type=3 … expected for the first
+  time` at the store (no file to delete yet). These are expected;
+- the UART of every later boot: **no** `could not find LUT (type=3`,
+  and no TM(5,3) 0x8030 (the flash holds a context);
+- the FPGA ELUT (QMP `pmemsave` of 1 572 864 bytes at 0xE0000000) passes
+  `elut-upload.py check-dump --csv <CSV> --dump FILE`. Before any
+  NOMINAL entry in a boot it is all 0 (power-on RAM): the FSW writes the
+  FPGA ELUT at the CONF → NOMINAL entry, not at boot.
+
+### Template flash
+
+A seeded flash (ELUT ID 1 and a context) can be reused as a template.
+
+- **Preferred:** `elut-smoke.sh --save-template PATH`. It copies after
+  the PASS and before any cleanup, refuses an existing target, a target
+  under `/mnt/` or on a filesystem that keeps no holes, and checks the
+  copy (apparent size equal, allocated < 64 MiB).
+- **By hand, with QEMU stopped:**
+
+  ```bash
+  timeout 30 cp --sparse=always /tmp/stix-elut-run/flash.bin \
+      /tmp/stix-elut-template/flash.bin
+  ls -lh /tmp/stix-elut-template/flash.bin  # apparent: 16.5 GiB
+  du -h  /tmp/stix-elut-template/flash.bin  # allocated: about 150 KiB
+  ```
+
+  Only to an ext4 path under `/tmp`, never under `/mnt/`.
+- **Never overwrite an existing flash.** `/tmp/stix-gs-run/flash.bin`
+  (the `STIX_GS_RUN_DIR` default of `run-qemu-gs.sh`) is your GS state:
+  move it aside first. To use a template, copy it (sparse) into a new
+  `STIX_GS_RUN_DIR`.
+- **Warning: a non-sparse copy is 16.5 GiB and fills the host disk**
+  (about 13 GB usable on C:; WSL's `df /` misleads, look at
+  `df -h /mnt/c`). Never a plain `cp`, `rsync` without `-S`, `tar`
+  without `-S`, or a copy from the Windows side.
+- A template has a context: no 0x8030 at boot, and the context's
+  settings (S20 = 0 after the gate) apply. Gates that expect 0x8030
+  make their own fresh flash and never use it.
+
+### DSS replay caveat
+
+The DSS `.dssevs` events sit on a baseline of about `adc` 2000, with
+lines at 2182-3820. The flight ELUT has 150 keV at `adc` 2223-2303, so
+**on an ELUT-loaded flash a DSS replay lands almost entirely in bins
+30/31**, outside the quick-look bands. That is not a bug: the DSS bench
+ADC scale is not the flight calibration. detector-smoke always makes a
+fresh flash, so the gates are not affected; a replay started by hand on
+a template or a GS run dir holding one is.
+
 ## Fault injection
 
 Since Phase 4 you can inject faults while the FSW runs and watch its
