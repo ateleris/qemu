@@ -4027,6 +4027,325 @@ static void test_adc_inject(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P4-4: HK hardware protection comparator and IRQ (hk-prot) ---- */
+
+#define CTRL_HKIRQSTA         0x90u
+#define CTRL_HKPROTCONFIG(i)  (0x94u + 4u * (i))
+#define CTRL_UNLOCKINGREG     0xd0u
+#define HK_PROT_LINES         9u
+#define HK_PROT_UNLOCK        0xA5u
+#define HKPROT_EN             (1u << 31)
+#define HKPROT_THR_MASK       0xFFFu
+#define HKIRQSTA_IRQEN_MASK   0x1FFu
+#define HKIRQSTA_PROTSTAT_SH  9u
+#define HKIRQSTA_HOTSAMPLE_SH 20u
+#define HK_IRQ_BIT            (1u << 4) /* IRQ_STIXCTRL_HK = 4 */
+#define HK_PROT_DET           4u        /* line index of DET_C */
+#define HK_PROT_DET_BIT       0x10u     /* its IRQEN/PROTSTAT bit */
+
+/* ICD Table 4-75, line order 1V5 2V5 3V3 SPW DET ATT_C ATT_V HV17 HV01 */
+static const uint32_t hk_prot_reset_thr[HK_PROT_LINES] = {
+    2282, 3416, 3826, 3826, 546, 751, 4095, 2323, 2323,
+};
+/* the HK ADC channel each line watches */
+static const uint32_t hk_prot_ch[HK_PROT_LINES] = {
+    0, 1, 2, 3, 4, 8, 12, 16, 20,
+};
+
+static uint32_t hk_protstat(QTestState *qts)
+{
+    return (ctrl_read(qts, CTRL_HKIRQSTA) >> HKIRQSTA_PROTSTAT_SH) & 0x1FFu;
+}
+
+static uint32_t hk_hotsample(QTestState *qts)
+{
+    return ctrl_read(qts, CTRL_HKIRQSTA) >> HKIRQSTA_HOTSAMPLE_SH;
+}
+
+static bool hk_irq_pending(QTestState *qts)
+{
+    return qtest_readl(qts, IRQMP_PENDING) & HK_IRQ_BIT;
+}
+
+/* the FSW's HK_clearProtectionStatus (HK.c:272-277): tmp | mask, then tmp */
+static void hk_protstat_clear(QTestState *qts, uint32_t mask)
+{
+    uint32_t tmp = ctrl_read(qts, CTRL_HKIRQSTA) &
+                   ~(0x1FFu << HKIRQSTA_PROTSTAT_SH);
+
+    ctrl_write(qts, CTRL_HKIRQSTA, tmp | (mask << HKIRQSTA_PROTSTAT_SH));
+    ctrl_write(qts, CTRL_HKIRQSTA, tmp);
+}
+
+/* an unlocked hkProtConfig write (HK_setProtectionStatusThreshold) */
+static void hk_prot_write_unlocked(QTestState *qts, uint32_t i, uint32_t val)
+{
+    ctrl_write(qts, CTRL_UNLOCKINGREG, HK_PROT_UNLOCK);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(i), val);
+}
+
+/*
+ * P4-4 (D-P4d): the nine HK protection comparators (ICD §4.48-4.52).
+ * Line i (selector i + 1) watches channel hk_prot_ch[i] and owns
+ * IRQEN/PROTSTAT bit 1 << (8 - i). A line samples at each conversion
+ * of its channel and when an adc-inject is set for it; it trips on the
+ * second consecutive sample strictly above its threshold, and PROTSTAT
+ * sets only with ProtEn. HOTSAMPLE is the tripping sample; IRQEN is
+ * R/W, PROTSTAT write-1-to-clear; irq_hk pulses only when a PROTSTAT
+ * bit newly sets with its IRQEN set. hkProtConfig is write-protected
+ * by the 0xA5 token in UnlockingReg (one write cycle), except setting
+ * ProtEn. hk-prot=off keeps the legacy plain storage.
+ * RED on the pre-P4-4 binary: the thresholds reset to 0, nothing
+ * trips, the lock is not enforced and the property is unknown.
+ */
+static void test_hk_prot(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t i, v;
+
+    /* a. reset values */
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, 0);
+    for (i = 0; i < HK_PROT_LINES; i++) {
+        g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(i)), ==,
+                        hk_prot_reset_thr[i]);
+    }
+    g_assert_cmphex(ctrl_read(qts, CTRL_UNLOCKINGREG), ==, 0);
+
+    /* b. hkIrqSta: IRQEN R/W, PROTSTAT W1C, HOTSAMPLE and 19:18 RO */
+    ctrl_write(qts, CTRL_HKIRQSTA, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, HKIRQSTA_IRQEN_MASK);
+    ctrl_write(qts, CTRL_HKIRQSTA, 0x0A5u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, 0x0A5u);
+    ctrl_write(qts, CTRL_HKIRQSTA, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, 0);
+
+    /* c. the unlock rules (DET_C, threshold 546) */
+    /* a locked threshold change is ignored */
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 100);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 546);
+    /* a wrong token does not unlock */
+    ctrl_write(qts, CTRL_UNLOCKINGREG, 0x5A);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 100);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 546);
+    /* an armed token is disarmed by a wrong value */
+    ctrl_write(qts, CTRL_UNLOCKINGREG, HK_PROT_UNLOCK);
+    ctrl_write(qts, CTRL_UNLOCKINGREG, 0x5A);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 100);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 546);
+    /* 0xA5 unlocks one write; the token reads back 0 (write-only) */
+    ctrl_write(qts, CTRL_UNLOCKINGREG, HK_PROT_UNLOCK);
+    g_assert_cmphex(ctrl_read(qts, CTRL_UNLOCKINGREG), ==, 0);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 100);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 100);
+    /* ... and only one */
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 200);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 100);
+    /* the token is spent by any write cycle, not only hkProtConfig's */
+    ctrl_write(qts, CTRL_UNLOCKINGREG, HK_PROT_UNLOCK);
+    ctrl_write(qts, CTRL_MAGICREG, 0);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 200);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 100);
+    /* setting ProtEn needs no token; the locked threshold part is dropped */
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), HKPROT_EN | 300);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==,
+                    HKPROT_EN | 100);
+    /* clearing ProtEn needs it (HK_setProtectionActionEnable) */
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), 100);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==,
+                    HKPROT_EN | 100);
+    hk_prot_write_unlocked(qts, HK_PROT_DET, 100);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 100);
+    /* reserved bits 30:12 read 0 */
+    hk_prot_write_unlocked(qts, HK_PROT_DET, 0x7FFFF000u | 546);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 546);
+
+    /* d. the comparator on DET_C (ch 4, threshold 546) */
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), HKPROT_EN | 546);
+    ctrl_write(qts, CTRL_HKIRQSTA, HK_PROT_DET_BIT);
+    qtest_writel(qts, IRQMP_CLEAR, HK_IRQ_BIT);
+    /* equal is not above */
+    g_assert_true(adc_inject_set(qts, 4, 546));
+    hk_check(qts, 4, 546);
+    hk_check(qts, 4, 546);
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+    g_assert_false(hk_irq_pending(qts));
+    /* one high sample (the injection) is not enough ... */
+    g_assert_true(adc_inject_set(qts, 4, 547));
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+    g_assert_false(hk_irq_pending(qts));
+    /* ... the second consecutive one (the next conversion) trips */
+    hk_check(qts, 4, 547);
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    g_assert_cmpuint(hk_hotsample(qts), ==, 547);
+    g_assert_true(hk_irq_pending(qts));
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA) & HKIRQSTA_IRQEN_MASK, ==,
+                    HK_PROT_DET_BIT);
+    /*
+     * writing 0 to PROTSTAT keeps it: HK_setProtectionStatusIRQMask
+     * (the ISR's mask write) writes PROTSTAT = 0 before the W1C clear
+     */
+    ctrl_write(qts, CTRL_HKIRQSTA, HK_PROT_DET_BIT);
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    ctrl_write(qts, CTRL_HKIRQSTA, 0);
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    g_assert_cmpuint(hk_hotsample(qts), ==, 547);
+    ctrl_write(qts, CTRL_HKIRQSTA, HK_PROT_DET_BIT);
+    /* a further high sample with the bit still set: no new IRQ */
+    qtest_writel(qts, IRQMP_CLEAR, HK_IRQ_BIT);
+    hk_check(qts, 4, 547);
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    g_assert_false(hk_irq_pending(qts));
+    /* the FSW clear: the bit drops, IRQEN and HOTSAMPLE stay */
+    hk_protstat_clear(qts, HK_PROT_DET_BIT);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==,
+                    (547u << HKIRQSTA_HOTSAMPLE_SH) | HK_PROT_DET_BIT);
+    /* still high: the next sample sets it again, a new bit, a new IRQ */
+    g_assert_true(adc_inject_set(qts, 4, 600));
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    g_assert_cmpuint(hk_hotsample(qts), ==, 600);
+    g_assert_true(hk_irq_pending(qts));
+
+    /* a low sample restarts the count */
+    hk_protstat_clear(qts, HK_PROT_DET_BIT);
+    qtest_writel(qts, IRQMP_CLEAR, HK_IRQ_BIT);
+    g_assert_true(adc_inject_set(qts, 4, ADC_INJECT_NONE)); /* 20: low */
+    g_assert_true(adc_inject_set(qts, 4, 700));              /* high 1 */
+    hk_check(qts, 4, 700);                                   /* high 2 */
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    hk_protstat_clear(qts, HK_PROT_DET_BIT);
+    hk_check(qts, 4, 700); /* high 3: re-sets */
+    hk_protstat_clear(qts, HK_PROT_DET_BIT);
+    g_assert_true(adc_inject_set(qts, 4, 546));              /* low */
+    g_assert_true(adc_inject_set(qts, 4, 700));              /* high 1 */
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+    hk_check(qts, 4, 700);                                   /* high 2 */
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+
+    /* IRQEN clear: PROTSTAT and HOTSAMPLE still set, no IRQ */
+    ctrl_write(qts, CTRL_HKIRQSTA, 0);
+    hk_protstat_clear(qts, HK_PROT_DET_BIT);
+    qtest_writel(qts, IRQMP_CLEAR, HK_IRQ_BIT);
+    g_assert_true(adc_inject_set(qts, 4, 650));
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    g_assert_cmpuint(hk_hotsample(qts), ==, 650);
+    g_assert_false(hk_irq_pending(qts));
+    /* enabling IRQEN later does not raise one for the old bit */
+    ctrl_write(qts, CTRL_HKIRQSTA, HK_PROT_DET_BIT);
+    g_assert_false(hk_irq_pending(qts));
+
+    /* ProtEn clear: no PROTSTAT, no IRQ */
+    hk_prot_write_unlocked(qts, HK_PROT_DET, 546);
+    hk_protstat_clear(qts, HK_PROT_DET_BIT);
+    hk_check(qts, 4, 650);
+    hk_check(qts, 4, 650);
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+    g_assert_false(hk_irq_pending(qts));
+    /* the comparator ran meanwhile: re-enabling trips at the next sample */
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), HKPROT_EN | 546);
+    hk_check(qts, 4, 650);
+    g_assert_cmphex(hk_protstat(qts), ==, HK_PROT_DET_BIT);
+    g_assert_true(hk_irq_pending(qts));
+    g_assert_true(adc_inject_set(qts, 4, ADC_INJECT_NONE));
+    hk_protstat_clear(qts, HK_PROT_DET_BIT);
+
+    /* e. every line: its channel, its bit; HOTSAMPLE is shared */
+    ctrl_write(qts, CTRL_HKIRQSTA, HKIRQSTA_IRQEN_MASK);
+    for (i = 0; i < HK_PROT_LINES; i++) {
+        hk_prot_write_unlocked(qts, i, HKPROT_EN | 1500);
+    }
+    for (i = 0; i < HK_PROT_LINES; i++) {
+        uint32_t ch = hk_prot_ch[i];
+
+        qtest_writel(qts, IRQMP_CLEAR, HK_IRQ_BIT);
+        v = 1501 + i;
+        g_assert_true(adc_inject_set(qts, ch, v));
+        hk_check(qts, ch, v);
+        g_test_message("line %u ch %u: PROTSTAT 0x%03x", i, ch,
+                       hk_protstat(qts));
+        g_assert_cmphex(hk_protstat(qts), ==, 1u << (8 - i));
+        g_assert_cmpuint(hk_hotsample(qts), ==, v);
+        g_assert_true(hk_irq_pending(qts));
+        g_assert_true(adc_inject_set(qts, ch, ADC_INJECT_NONE));
+        hk_protstat_clear(qts, 1u << (8 - i));
+    }
+    /* two lines set: both bits, the last sample wins HOTSAMPLE */
+    g_assert_true(adc_inject_set(qts, 0, 3000));
+    hk_check(qts, 0, 3000);
+    g_assert_true(adc_inject_set(qts, 20, 2500));
+    hk_check(qts, 20, 2500);
+    g_assert_cmphex(hk_protstat(qts), ==, 0x101u);
+    g_assert_cmpuint(hk_hotsample(qts), ==, 2500);
+    /* an unprotected channel never trips */
+    hk_protstat_clear(qts, 0x1FFu);
+    g_assert_true(adc_inject_set(qts, 5, 4095));
+    hk_check(qts, 5, 4095);
+    hk_check(qts, 24, 2048);
+    g_assert_true(adc_inject_set(qts, 0, ADC_INJECT_NONE));
+    g_assert_true(adc_inject_set(qts, 20, ADC_INJECT_NONE));
+    hk_check(qts, 0, 700);
+    hk_check(qts, 20, 15);
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+
+    /* f. a reset restores everything; ATT_V's 4095 cannot be exceeded */
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, 0);
+    for (i = 0; i < HK_PROT_LINES; i++) {
+        g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(i)), ==,
+                        hk_prot_reset_thr[i]);
+    }
+    ctrl_write(qts, CTRL_HKPROTCONFIG(6), HKPROT_EN | 4095);
+    g_assert_true(adc_inject_set(qts, 12, 4095));
+    hk_check(qts, 12, 4095);
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+    /* the token does not survive a reset */
+    ctrl_write(qts, CTRL_UNLOCKINGREG, HK_PROT_UNLOCK);
+    qtest_system_reset(qts);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(0), 5);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(0)), ==, 2282);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* g. hk-prot=off: the legacy plain storage, nothing trips */
+    qts = stix_qtest_new_extra("-global grlib-stixctrl.hk-prot=off");
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(4)), ==, 0);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(4), 0x7FFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(4)), ==, 0x7FFFFFFFu);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(4), HKPROT_EN | 1);
+    ctrl_write(qts, CTRL_HKIRQSTA, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, 0xFFFFFFFFu);
+    ctrl_write(qts, CTRL_HKIRQSTA, HK_PROT_DET_BIT);
+    ctrl_write(qts, CTRL_UNLOCKINGREG, HK_PROT_UNLOCK);
+    g_assert_cmphex(ctrl_read(qts, CTRL_UNLOCKINGREG), ==, HK_PROT_UNLOCK);
+    qtest_writel(qts, IRQMP_CLEAR, HK_IRQ_BIT);
+    g_assert_true(adc_inject_set(qts, 4, 600));
+    hk_check(qts, 4, 600);
+    hk_check(qts, 4, 600);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, HK_PROT_DET_BIT);
+    g_assert_false(hk_irq_pending(qts));
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /*
+     * h. hk-adc=off: the registers keep their ICD semantics (reset
+     * values, lock), but with no ADC model nothing is sampled
+     */
+    qts = stix_qtest_new_extra("-global grlib-stixctrl.hk-adc=off");
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==, 546);
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), HKPROT_EN | 100);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKPROTCONFIG(HK_PROT_DET)), ==,
+                    HKPROT_EN | 546);
+    ctrl_write(qts, CTRL_HKIRQSTA, HK_PROT_DET_BIT);
+    qtest_writel(qts, IRQMP_CLEAR, HK_IRQ_BIT);
+    g_assert_true(adc_inject_set(qts, 4, 600));
+    hk_check(qts, 4, 0);
+    hk_check(qts, 4, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKIRQSTA), ==, HK_PROT_DET_BIT);
+    g_assert_false(hk_irq_pending(qts));
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -4080,6 +4399,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/hk-adc", test_hk_adc);
         qtest_add_func("/sparc/stix/powerstat", test_powerstat);
         qtest_add_func("/sparc/stix/adc-inject", test_adc_inject);
+        qtest_add_func("/sparc/stix/hk-prot", test_hk_prot);
     }
 
     return g_test_run();

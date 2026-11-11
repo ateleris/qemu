@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FAULT smoke: the SAFE-mode fault gate (P4-3). Boots the STIX model on
+# FAULT smoke: the SAFE-mode fault gate (P4-3, P4-4). Boots the STIX model on
 # a FRESH flash (an empty run dir: TMBuffer flash backups during a link
 # outage write flash, and the shared flashes must stay untouched), with
 # a QMP socket in the run dir, and proves the FSW's fault detection
@@ -10,7 +10,12 @@
 #            TC before 0x14A3 cancels the automatic enable (0x14A3 then
 #            never comes, so the gate fails loudly, never silently).
 #            The 35 s first send leaves ~20 s for a slow host. Forbids
-#            TM(1,2)/TM(1,8) (a rejected or failed TC) for the run.
+#            TM(1,2)/TM(1,8) (a rejected or failed TC) for the run, and
+#            TM(5,3) 0x9434 (HW protection trip) for every line id but
+#            DET_C's (05) until @95: 0x14A3 arms all nine comparators
+#            (FDIR.c:529-552) and the nominal readings must not trip.
+#            A DET_C trip before @85 would mask DET_C's IRQ (the ISR,
+#            FDIR.c:846-851), so the @85 expectation would then fail.
 #   @35  TC(236,10) 00080000 22 00000003 (1V5_V consecutive count = 3)
 #        and @37 TC(236,10) 00080000 01 0000079F (FDIR_HK_VOLTAGE_LINE_
 #        CHECK, 1V5 low limit = 1951): TM(1,1), TM(1,7) each within 5 s
@@ -24,12 +29,19 @@
 #   @65  adc-inject[40] (PSU_T) = 3900: 9449 17 0F3C 0ED8 and
 #        D420 00100000, 10 s
 #   @80  clear it
-#   @85  stixspw timecodes=false: TM(5,2) 0x542B within 90 s (the FSW
+#   @85  adc-inject[4] (DET_C) = 600, no TC needed (the HW comparator,
+#        reset threshold 546, ICD Table 4-75; armed at 0x14A3): TM(5,3)
+#        9434 05 0258 0222 (id 5 = E_HK_DET_C, HOTSAMPLE, threshold;
+#        FDIR.c:908-915), 10 s. The model trips on the second sample
+#        above 546: the injection, then the FSW's next ch 4 conversion
+#   @95  clear it; from here any TM(5,3) 0x9434 fails the run (the ISR
+#        masked DET_C's IRQEN, so the line stays silent)
+#   @100 stixspw timecodes=false: TM(5,2) 0x542B within 90 s (the FSW
 #        time-code timeout is 60 s, ParamMgmtDef.h:206; seen ~61 s);
 #        from here any TM(5,3) 0x9449 fails the run (the limits stay
 #        tightened, the nominal 2048 / 2300 are inside them)
-#   @180 timecodes=true: TM(5,1) 0x1429 within 10 s
-#   hold to +200 s.
+#   @195 timecodes=true: TM(5,1) 0x1429 within 10 s
+#   hold to +215 s.
 # Why the count TCs: the SW-limit TM goes out when the consecutive
 # out-of-limit count EQUALS hkLineLimits[line].count (HKMonitor.c:467;
 # checks every 1 s). ParamMgmtDef.h gives 3 (value, range 1..255), but
@@ -65,7 +77,7 @@
 #                          (or /) is refused, as in nominal-smoke.sh.
 #                          The QMP socket is <run dir>/qmp.sock and its
 #                          path must stay under 108 bytes.
-#   STIX_FAULT_SECONDS     the probe's --seconds (default 200)
+#   STIX_FAULT_SECONDS     the probe's --seconds (default 215)
 #   --dry-run prints the QEMU and probe command lines, boots nothing.
 #   --check-guard only runs the run-dir guard and exits 0/2.
 #
@@ -98,7 +110,7 @@ done
 ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_FAULT_RUN_DIR:-/tmp/stix-fault-run}"
-DURATION="${STIX_FAULT_SECONDS:-200}"
+DURATION="${STIX_FAULT_SECONDS:-215}"
 PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
 TMTC_PORT=$((20000 + $(id -u)))
 
@@ -151,9 +163,9 @@ case "$DURATION" in
         exit 2
         ;;
 esac
-if [ "$DURATION" -lt 200 ] && [ "$NEGATIVE" -eq 0 ]; then
-    echo "STIX_FAULT_SECONDS must be >= 200 (the 0x1429 window ends" \
-        "at +165 s; got: $DURATION)"
+if [ "$DURATION" -lt 215 ] && [ "$NEGATIVE" -eq 0 ]; then
+    echo "STIX_FAULT_SECONDS must be >= 215 (the 0x1429 window ends" \
+        "at +205 s; got: $DURATION)"
     exit 2
 fi
 
@@ -191,14 +203,24 @@ fi
 
 # TM(5,x) events are on APID 0x5A7; the probe matches the application
 # data (EID first) as a prefix. Payloads: TM_5.c sizes 0x122 for 0x9449
-# (id u8, value u16, limit u16; utils.c:576, high nibble first),
-# 0xD420 one u32 mask (TM_5.c:422), 0x542B / 0x1429 none.
+# (id u8, value u16, limit u16; utils.c:576, high nibble first), the
+# same for 0x9434 (TM_5.c:342-344), 0xD420 one u32 mask (TM_5.c:422),
+# 0x542B / 0x1429 none. The 0x9434 ids (HKData.h:155-170): 01 1V5_C
+# (and 2V5_C, FDIR.c:869), 03 3V3_C, 04 SPW_C, 05 DET_C, 06 ATT_C,
+# 0c ATT_V, 0d HV_01, 0e HV_17.
 PROBE_ARGS=(
     --port "$TMTC_PORT" --seconds "$DURATION" --window 20
     --qmp "$QMP_SOCK"
     --expect "0x5A7:5:1:14a3@30"
     --forbid "0x5A1:1:2"
     --forbid "0x5A1:1:8"
+    --forbid "0x5A7:5:3:943401"
+    --forbid "0x5A7:5:3:943403"
+    --forbid "0x5A7:5:3:943404"
+    --forbid "0x5A7:5:3:943406"
+    --forbid "0x5A7:5:3:94340c"
+    --forbid "0x5A7:5:3:94340d"
+    --forbid "0x5A7:5:3:94340e"
     --send-at 35 --send-hex "$TC_1V5_CNT"
     --expect "0x5A1:1:1:1DACC001@5"
     --expect "0x5A1:1:7:1DACC001@5"
@@ -219,10 +241,14 @@ PROBE_ARGS=(
     --expect "0x5A7:5:3:9449170f3c0ed8@10"
     --expect "0x5A7:5:4:d42000100000@10"
     --send-at 80 --qmp-cmd "$(qom_set /machine/stixctrl 'adc-inject[40]' "$CLEAR")"
-    --send-at 85 --qmp-cmd "$(qom_set /machine/stixspw timecodes false)"
+    --send-at 85 --qmp-cmd "$(qom_set /machine/stixctrl 'adc-inject[4]' 600)"
+    --expect "0x5A7:5:3:94340502580222@10"
+    --send-at 95 --qmp-cmd "$(qom_set /machine/stixctrl 'adc-inject[4]' "$CLEAR")"
+    --forbid "0x5A7:5:3:9434"
+    --send-at 100 --qmp-cmd "$(qom_set /machine/stixspw timecodes false)"
     --expect "0x5A7:5:2:542b@90"
     --forbid "0x5A7:5:3:9449"
-    --send-at 180 --qmp-cmd "$(qom_set /machine/stixspw timecodes true)"
+    --send-at 195 --qmp-cmd "$(qom_set /machine/stixspw timecodes true)"
     --expect "0x5A7:5:1:1429@10"
     --hold
 )

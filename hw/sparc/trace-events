@@ -42,6 +42,9 @@ stixctrl_io_read(uint32_t addr, uint32_t val) "CTRL | Read requested: addr = 0x%
 stixctrl_io_write(uint32_t addr, uint32_t val) "CTRL | Write completed addr = 0x%x, new regval = 0x%x"
 stixctrl_adc_inject_set(uint32_t ch, uint32_t val) "adc-inject[%u] = %u"
 stixctrl_adc_inject_clear(uint32_t ch) "adc-inject[%u] cleared"
+stixctrl_hk_prot_trip(uint32_t sel, uint32_t ch, uint32_t val, uint32_t thr, int irq) "HK protection %u trips: ch %u sample %u > threshold %u, irq=%d"
+stixctrl_hk_prot_unlock(uint32_t value, int unlocked) "unlockingReg write 0x%x: unlocked=%d"
+stixctrl_hk_prot_locked(uint32_t sel, uint32_t value, uint32_t now) "hkProtConfig[%u] locked: write 0x%x applies only a ProtEn set, now 0x%x"
 
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"

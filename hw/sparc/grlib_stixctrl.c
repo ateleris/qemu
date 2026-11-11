@@ -18,6 +18,8 @@
 
 /* HK ADC channels: hkAdc ADDR is 7 bits (STIXCTRL_HKADC_ADDR_MASK) */
 #define STIXCTRL_HK_CHANNELS (STIXCTRL_HKADC_ADDR_MASK + 1)
+/* HK protection lines: hkProtConfig[9], selector = line + 1 */
+#define STIXCTRL_HK_PROT_LINES 9
 
 #define STIXCTRL_REG_SIZE sizeof(stixCtrlRegs_s) /* Size of memory mapped registers */ // TODO: Set to right size
 
@@ -107,6 +109,20 @@ struct STIXCTRL
      * Cleared on device reset.
      */
     uint32_t adc_inject[STIXCTRL_HK_CHANNELS];
+    /*
+     * P4-4 (D-P4d): when true, the nine HK protection comparators run
+     * and hkIrqSta (0x90), hkProtConfig[9] (0x94..0xB4) and
+     * UnlockingReg (0xD0) have their ICD semantics; when false the
+     * three are plain storage (legacy, A/B comparison).
+     */
+    bool hk_prot;
+    /* consecutive samples above threshold per line, saturating at 2 */
+    uint8_t hk_prot_high[STIXCTRL_HK_PROT_LINES];
+    /*
+     * UnlockingReg got 0xA5: the next register write may change a
+     * protected hkProtConfig field
+     */
+    bool hk_prot_unlocked;
 };
 
 #define STIXCTRL_ADC_INJECT_NONE 0xFFFFFFFFu
@@ -495,7 +511,12 @@ static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
 static uint32_t stixctrl_hkcmdsta(STIXCTRL *s)
 {
     uint32_t cmdsta = s->reg.hkCmdSta;
-    uint32_t blockade = 0; /* supplies cut by a protection trip: none */
+    /*
+     * supplies cut by a protection trip: none. A later cut option would
+     * set the line's supply bit here when stixctrl_hk_prot_sample sets
+     * PROTSTAT (latched until the FSW clears the enable, ICD 4.46).
+     */
+    uint32_t blockade = 0;
     uint32_t enables;
 
     if (!s->powerstat) {
@@ -512,6 +533,161 @@ static uint32_t stixctrl_hkcmdsta(STIXCTRL *s)
                 STIXCTRL_HKCMDSTA_SPWEN_MASK) << 3;
 
     return cmdsta | ((enables & ~blockade) << STIXCTRL_HKCMDSTA_POWERSTAT);
+}
+
+/*
+ * P4-4 (D-P4d): HK hardware protection (ICD §4.48-4.52, DD §5.6).
+ * Line i (hkProtConfig[i], selector i + 1) watches one HK ADC channel
+ * and owns IRQEN/PROTSTAT bit 1 << (8 - i): 1V5 = 0x100 ... HV01 =
+ * 0x001. The reset thresholds are ICD Table 4-75; ProtEn resets to 0.
+ */
+static const uint8_t stixctrl_hk_prot_ch[STIXCTRL_HK_PROT_LINES] = {
+    STIXCTRL_HKADC_ADDR_V_HK_DPU_1V5_C,     /* 0 */
+    STIXCTRL_HKADC_ADDR_V_HK_DPU_2V5_C,     /* 1 */
+    STIXCTRL_HKADC_ADDR_V_HK_DPU_3V3_C,     /* 2 */
+    STIXCTRL_HKADC_ADDR_V_HK_DPU_SPW_C,     /* 3 */
+    STIXCTRL_HKADC_ADDR_V_HK_DET_C,         /* 4 */
+    STIXCTRL_HKADC_ADDR_V_HK_ATT_C,         /* 8 */
+    STIXCTRL_HKADC_ADDR_V_HK_ATT_V,         /* 12 */
+    STIXCTRL_HKADC_ADDR_V_HK_HV_17_32_V,    /* 16 */
+    STIXCTRL_HKADC_ADDR_V_HK_HV_01_16_V,    /* 20 */
+};
+
+static const uint16_t stixctrl_hk_prot_reset_thr[STIXCTRL_HK_PROT_LINES] = {
+    2282, 3416, 3826, 3826, 546, 751, 4095, 2323, 2323,
+};
+
+#define STIXCTRL_HK_PROT_EN (1u << STIXCTRL_HKPROTCONFIG_PROTEN)
+#define STIXCTRL_HK_PROT_CFG_MASK \
+    (STIXCTRL_HK_PROT_EN | \
+     (STIXCTRL_HKPROTCONFIG_UPTHRESHOLD_MASK << \
+      STIXCTRL_HKPROTCONFIG_UPTHRESHOLD))
+
+static uint32_t stixctrl_hk_prot_bit(uint32_t line)
+{
+    return 1u << (STIXCTRL_HK_PROT_LINES - 1 - line);
+}
+
+static void stixctrl_hk_prot_reset(STIXCTRL *s)
+{
+    uint32_t i;
+
+    s->reg.hkIrqSta = 0;
+    for (i = 0; i < STIXCTRL_HK_PROT_LINES; i++) {
+        s->reg.hkProtConfig[i] = stixctrl_hk_prot_reset_thr[i];
+        s->hk_prot_high[i] = 0;
+    }
+    s->reg.unlockingReg = 0;
+    s->hk_prot_unlocked = false;
+}
+
+/*
+ * One comparator sample of channel ch. The real loop samples every
+ * line continuously (< 1 ms) and needs two consecutive samples 850 us
+ * apart strictly above the threshold ("exceeded in two consecutive
+ * measurements", ICD 4.48). The model samples a line only at these
+ * events: a guest conversion of its channel (an hkAdc write) and a set
+ * or clear of its adc-inject; "consecutive" means two such events in a
+ * row above threshold, and a sample at or below it restarts the count.
+ * The count runs with ProtEn off too; PROTSTAT sets only with ProtEn
+ * (the turn-off action "is only performed when it is enabled", DD). A
+ * newly set bit latches the sample in HOTSAMPLE (one shared field,
+ * last trip wins) and pulses irq_hk if its IRQEN is set. A bit that is
+ * still set is not re-raised; once cleared, the next high sample sets
+ * it again. There is no supply cut (D-P4d): see stixctrl_hkcmdsta.
+ */
+static void stixctrl_hk_prot_sample(STIXCTRL *s, uint32_t ch, uint32_t val)
+{
+    uint32_t line, cfg, thr, bit, protstat, irqen;
+
+    if (!s->hk_prot || !s->hk_adc) {
+        return;
+    }
+    for (line = 0; line < STIXCTRL_HK_PROT_LINES; line++) {
+        if (stixctrl_hk_prot_ch[line] == ch) {
+            break;
+        }
+    }
+    if (line == STIXCTRL_HK_PROT_LINES) {
+        return;
+    }
+
+    cfg = s->reg.hkProtConfig[line];
+    thr = (cfg >> STIXCTRL_HKPROTCONFIG_UPTHRESHOLD) &
+          STIXCTRL_HKPROTCONFIG_UPTHRESHOLD_MASK;
+    if (val <= thr) {
+        s->hk_prot_high[line] = 0;
+        return;
+    }
+    if (s->hk_prot_high[line] < 2) {
+        s->hk_prot_high[line]++;
+    }
+    if (s->hk_prot_high[line] < 2 || !(cfg & STIXCTRL_HK_PROT_EN)) {
+        return;
+    }
+
+    bit = stixctrl_hk_prot_bit(line);
+    protstat = (s->reg.hkIrqSta >> STIXCTRL_HKIRQSTA_PROTSTAT) &
+               STIXCTRL_HKIRQSTA_PROTSTAT_MASK;
+    if (protstat & bit) {
+        return;
+    }
+    irqen = (s->reg.hkIrqSta >> STIXCTRL_HKIRQSTA_IRQEN) &
+            STIXCTRL_HKIRQSTA_IRQEN_MASK;
+    s->reg.hkIrqSta &= ~(STIXCTRL_HKIRQSTA_HOTSAMPLE_MASK <<
+                         STIXCTRL_HKIRQSTA_HOTSAMPLE);
+    s->reg.hkIrqSta |= (bit << STIXCTRL_HKIRQSTA_PROTSTAT) |
+                       ((val & STIXCTRL_HKIRQSTA_HOTSAMPLE_MASK) <<
+                        STIXCTRL_HKIRQSTA_HOTSAMPLE);
+    trace_stixctrl_hk_prot_trip(line + 1, ch, val, thr, !!(irqen & bit));
+    if (irqen & bit) {
+        qemu_irq_pulse(s->irq_hk);
+    }
+}
+
+/*
+ * hkIrqSta write: IRQEN (8:0) R/W, PROTSTAT (17:9) write-1-to-clear
+ * (HK_clearProtectionStatus writes tmp | mask, then tmp: HK.c:272-277),
+ * HOTSAMPLE (31:20) and 19:18 read-only. Enabling an IRQEN bit whose
+ * PROTSTAT is already set raises nothing (irq_hk only pulses on a new
+ * PROTSTAT bit; the FSW clears PROTSTAT before it arms, FDIR.c:540).
+ */
+static void stixctrl_hk_irqsta_write(STIXCTRL *s, uint32_t value)
+{
+    uint32_t sta = s->reg.hkIrqSta;
+    uint32_t w1c = (value >> STIXCTRL_HKIRQSTA_PROTSTAT) &
+                   STIXCTRL_HKIRQSTA_PROTSTAT_MASK;
+
+    sta &= ~(w1c << STIXCTRL_HKIRQSTA_PROTSTAT);
+    sta &= ~(STIXCTRL_HKIRQSTA_IRQEN_MASK << STIXCTRL_HKIRQSTA_IRQEN);
+    sta |= value & (STIXCTRL_HKIRQSTA_IRQEN_MASK << STIXCTRL_HKIRQSTA_IRQEN);
+    s->reg.hkIrqSta = sta;
+}
+
+/*
+ * hkProtConfig[line] write: ProtEn (31) and the threshold (11:0); 30:12
+ * read 0. "Write protected by UnlockingReg Token (except for protection
+ * enabling)" (ICD 4.49): without the token only a ProtEn 0 -> 1 takes
+ * effect, a threshold change or a ProtEn clear is dropped (traced).
+ * The FSW unlocks right before every threshold write and ProtEn clear,
+ * and sets ProtEn without it (HK.c:205-245). unlocked is the token
+ * state before this write cycle; the caller has already spent it.
+ */
+static void stixctrl_hk_protconfig_write(STIXCTRL *s, uint32_t line,
+                                         uint32_t value, bool unlocked)
+{
+    uint32_t old = s->reg.hkProtConfig[line];
+    uint32_t cfg = value & STIXCTRL_HK_PROT_CFG_MASK;
+
+    if (!unlocked) {
+        uint32_t locked = old | (cfg & STIXCTRL_HK_PROT_EN);
+
+        if (locked != cfg) {
+            trace_stixctrl_hk_prot_locked(line + 1, (uint32_t)value, locked);
+        }
+        cfg = locked;
+    }
+    s->reg.hkProtConfig[line] = cfg;
 }
 
 static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
@@ -558,6 +734,44 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     STIXCTRL *stixctrl = opaque;
+
+    /*
+     * P4-4 (D-P4d): UnlockingReg (0xD0) and the protection registers.
+     * 0xA5 "unlocks protected registers for one write cycle" (ICD 4.52):
+     * the token is spent by the next write to any register of this bank,
+     * whatever it is (the FSW's next write is always the hkProtConfig
+     * write, HK.c:213-214, :240-241). Only bits 7:0 (the Token field)
+     * are compared, so 0xFFFFFFA5 unlocks too; any other value locks.
+     * Writes to the ROTB block window or the AHB data windows are other
+     * MemoryRegions and do not spend it. The token is write-only: 0xD0
+     * reads 0.
+     */
+    if (stixctrl->hk_prot) {
+        bool unlocked = stixctrl->hk_prot_unlocked;
+
+        stixctrl->hk_prot_unlocked = false;
+        if (addr == 0xD0 /* unlockingReg */) {
+            stixctrl->hk_prot_unlocked =
+                ((uint32_t)value & 0xFFu) == STIXCTRL_UNLOCKING_TOKEN;
+            trace_stixctrl_hk_prot_unlock((uint32_t)value,
+                                          stixctrl->hk_prot_unlocked);
+            return;
+        }
+        if (addr == 0x90 /* hkIrqSta */) {
+            stixctrl_hk_irqsta_write(stixctrl, (uint32_t)value);
+            trace_stixctrl_io_write((uint32_t)addr, stixctrl->reg.hkIrqSta);
+            return;
+        }
+        if (addr >= 0x94 && addr < 0x94 + 4 * STIXCTRL_HK_PROT_LINES) {
+            uint32_t line = ((uint32_t)addr - 0x94) / 4;
+
+            stixctrl_hk_protconfig_write(stixctrl, line, (uint32_t)value,
+                                         unlocked);
+            trace_stixctrl_io_write((uint32_t)addr,
+                                    stixctrl->reg.hkProtConfig[line]);
+            return;
+        }
+    }
 
     if (addr == 0xD4 /* watchDog */)
     {
@@ -620,6 +834,8 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
             value = ((val & STIXCTRL_HKADC_VAL_MASK) << STIXCTRL_HKADC_VAL) |
                     (1u << STIXCTRL_HKADC_READY) |
                     ch;
+            /* P4-4: the protection comparator sees this conversion */
+            stixctrl_hk_prot_sample(stixctrl, ch, val);
         } else {
             value |= (1u << STIXCTRL_HKADC_READY);
         }
@@ -771,6 +987,15 @@ static void grlib_stixctrl_reset(DeviceState *d)
      * watchdog reset
      */
     stixctrl_adc_inject_clear(stixctrl);
+
+    /*
+     * P4-4 (D-P4d): the protection registers take their ICD reset
+     * values (reset does not clear reg); hk-prot=off keeps the legacy
+     * plain storage untouched
+     */
+    if (stixctrl->hk_prot) {
+        stixctrl_hk_prot_reset(stixctrl);
+    }
 }
 
 static void grlib_stixctrl_unrealize(DeviceState *dev)
@@ -822,6 +1047,11 @@ static void stixctrl_adc_inject_set(Object *obj, Visitor *v,
     } else {
         trace_stixctrl_adc_inject_set(ch, value);
     }
+    /*
+     * P4-4: the protection loop samples the new reading (a clear
+     * samples the nominal value again, a low sample)
+     */
+    stixctrl_hk_prot_sample(s, ch, stixctrl_hk_value(s, ch));
 }
 
 static const Property grlib_stixctrl_properties[] = {
@@ -829,6 +1059,7 @@ static const Property grlib_stixctrl_properties[] = {
                        STIXCTRL_ROTB_MAX_BLOCKS),
     DEFINE_PROP_BOOL("hk-adc", STIXCTRL, hk_adc, true),
     DEFINE_PROP_BOOL("powerstat", STIXCTRL, powerstat, true),
+    DEFINE_PROP_BOOL("hk-prot", STIXCTRL, hk_prot, true),
 };
 
 /* no injection from the moment the object exists (not only at realize) */

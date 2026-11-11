@@ -1614,9 +1614,18 @@ reply that fails at once).
 | 60 | TC(236,10) `00100000 02 00000ED8` (PSU_T upper = 3800) | TM(1,1), TM(1,7) `1DACC004`, 5 s |
 | 65 | `adc-inject[40]` = 3900 | `9449 17 0F3C 0ED8`, `D420 00100000`, 10 s |
 | 80 | `adc-inject[40]` cleared | — |
-| 85 | stixspw `timecodes` = false | TM(5,2) `542B` within 90 s; TM(5,3) `9449` forbidden from here on |
-| 180 | `timecodes` = true | TM(5,1) `1429` within 10 s |
-| 200 | end (`--hold`) | — |
+| 85 | `adc-inject[4]` (DET_C) = 600 (P4-4, §28) | TM(5,3) `9434 05 0258 0222`, 10 s |
+| 95 | `adc-inject[4]` cleared | TM(5,3) `9434` forbidden from here on |
+| 100 | stixspw `timecodes` = false | TM(5,2) `542B` within 90 s; TM(5,3) `9449` forbidden from here on |
+| 195 | `timecodes` = true | TM(5,1) `1429` within 10 s |
+| 215 | end (`--hold`) | — |
+
+Since P4-4 the connect group also forbids TM(5,3) `9434` for every
+line id except DET_C's (`943401`, `03`, `04`, `06`, `0c`, `0d`, `0e`),
+so a nominal reading that trips at the 0x14A3 arming fails the run.
+The rows from 100 on moved by 15 s, and `STIX_FAULT_SECONDS` (default
+215) must be at least 215. The record below is from the 200 s schedule
+before that change.
 
 The TC(236,10) application data is `fdirMask u32, paramType u8,
 value u32` (TCData.h:151-153). paramType is the FDIR.h enum position:
@@ -1705,11 +1714,143 @@ a failed expectation, a forbidden TM, a QMP error, a closed connection
 or a failed UART check, 2 environment problem). The run-dir guard is
 nominal-smoke's (realpath, refuse the shared run dirs, their parents
 and /). It also refuses a run dir whose `qmp.sock` path would be 108
-bytes or more. `STIX_FAULT_SECONDS` (default 200) must be at least
-200. A failed QMP connect (`QMP ERROR: cannot connect`) is an
+bytes or more. `STIX_FAULT_SECONDS` (default 215 since P4-4) must be at least
+215. A failed QMP connect (`QMP ERROR: cannot connect`) is an
 environment problem, rc 2.
 
 The probe refactor changes one behaviour: a malformed `--expect` or
 `--forbid` is now an argument error (rc 2, "bad arguments"). It used to
 be a traceback with rc 1. tc-smoke and nominal-smoke never pass a
 malformed spec.
+
+## 28. HK hardware protection comparator and IRQ (baseline: plain storage)
+
+**Baseline:** hkIrqSta (0x90), hkProtConfig[9] (0x94..0xB4) and
+UnlockingReg (0xD0) were plain storage. The thresholds read 0, nothing
+ever tripped, `irq_hk` (IRQMP line 4) was never raised, and the unlock
+token was not enforced. The FSW's HW-protection FDIR (`HK_IrqCallback`,
+FDIR.c:829-947) was dead code.
+
+**Model (P4-4, D-P4d):**
+- Nine comparators. Line i (`hkProtConfig[i]`, selector i + 1) watches
+  HK ADC channel 0, 1, 2, 3, 4, 8, 12, 16, 20 (1V5_C, 2V5_C, 3V3_C,
+  SPW_C, DET_C, ATT_C, ATT_V, HV_17_32_V, HV_01_16_V) and owns
+  IRQEN/PROTSTAT bit `1 << (8 - i)` (1V5 = 0x100 ... HV01 = 0x001,
+  ICD Tables 4-72/4-73).
+- Reset (`grlib_stixctrl_reset`, explicit, since reset does not clear
+  `reg`): thresholds from ICD Table 4-75 (2282, 3416, 3826, 3826, 546,
+  751, 4095, 2323, 2323), ProtEn 0, hkIrqSta 0, no token.
+- **Sampling.** The real loop samples every line continuously (< 1 ms)
+  and needs two consecutive samples 850 µs apart strictly above the
+  threshold. The model samples a line only at two events: a guest
+  conversion of its channel (an hkAdc write) and a set or clear of its
+  `adc-inject`. "Consecutive" means two such events in a row with the
+  value `>` the threshold; a sample at or below it restarts the count.
+  An injection is therefore sample 1 and the FSW's next conversion of
+  that channel is sample 2. The count runs with ProtEn 0 too.
+- PROTSTAT sets only with ProtEn = 1. A newly set bit latches the
+  sample in HOTSAMPLE (one shared field, last trip wins) and pulses
+  `irq_hk` (`qemu_irq_pulse`, like ROTB) if its IRQEN bit is set. A bit
+  that is still set is not re-raised; once the FSW clears it, the next
+  high sample sets it again. Setting IRQEN for an already-set PROTSTAT
+  raises nothing.
+- hkIrqSta writes: IRQEN (8:0) R/W, PROTSTAT (17:9) write-1-to-clear
+  (`HK_clearProtectionStatus` writes `tmp | mask`, then `tmp`,
+  HK.c:272-277), HOTSAMPLE (31:20) and 19:18 read-only.
+- hkProtConfig writes keep ProtEn (31) and the threshold (11:0); 30:12
+  read 0. Without the token only a ProtEn 0 → 1 takes effect; a
+  threshold change or a ProtEn clear in the same write is dropped and
+  traced (`stixctrl_hk_prot_locked`). This is "write protected by
+  UnlockingReg Token (except for protection enabling)" (ICD 4.49).
+- UnlockingReg: a write whose bits 7:0 are 0xA5 arms the token; any
+  other value disarms it. The token is spent by the next write to ANY
+  register of the CTRL bank ("unlocks protected registers for one write
+  cycle", ICD 4.52), not only by a hkProtConfig write. 0xD0 reads 0
+  (write-only). The FSW always writes the protected register right
+  after the token (HK.c:213-214, :240-241) and sets ProtEn without it
+  (HK.c:218-222), so every FSW path works. A reset clears the token.
+- Token details:
+  - It is spent by any write to the CTRL register MemoryRegion
+    (0x000-0x0FF). Writes to the ROTB block window (and the AHB data
+    windows) are other regions and do not spend it.
+  - An ISR write to a CTRL register between the token and the
+    protected store (reachable, e.g. with icount) drops the protected
+    write. Accepted as HW-faithful ("one write cycle").
+  - Only bits 7:0 are compared (the Token field), so 0xFFFFFFA5
+    unlocks too.
+- **Shared HOTSAMPLE:** if a second line trips before the ISR reads
+  hkIrqSta, the ISR reports the second line's sample for both bits (as
+  the one-field hardware would).
+- **No vmstate:** the device has none, so the comparator state
+  (counts, token) is not migrated or snapshotted, like the rest of it.
+- Traces: `stixctrl_hk_prot_trip` (selector, channel, sample,
+  threshold, irq), `stixctrl_hk_prot_unlock`, `stixctrl_hk_prot_locked`.
+- **No supply cut** (deviation, D-P4d): the real FPGA latches the
+  non-essential and/or SpW supplies off on a trip (TN REQ-043, DD
+  §5.6). The POWERSTAT `blockade` (`stixctrl_hkcmdsta`, §25) stays 0;
+  the comment there marks where a later cut option would set it.
+- The comparator needs `hk-adc=on` (no ADC model, no samples).
+- `hk-prot=off` (property, default on) keeps the legacy plain storage
+  of 0x90..0xB4 and 0xD0 (reset leaves them alone, nothing trips).
+
+**FSW effect (reviewed against the source):**
+- `FDIR_init` (FDIR.c:308-326) clears ProtEn of the eight non-SPW lines
+  (with the token), writes the SPW_C threshold (3826) and sets its
+  ProtEn per context, IRQEN = SPW_C only.
+- 15 s after the boot report `FDIR_timerEnableFdir` (FDIR.c:529-552)
+  sets ProtEn on all nine lines and all nine IRQEN bits, then 0x14A3.
+  The non-SPW thresholds keep their reset values in SAFE.
+- Every nominal model reading (§22) is below its threshold, so nothing
+  trips on a plain boot (the gate forbids the other line ids). ATT_V's
+  4095 can never be exceeded by a 12-bit sample.
+- On a trip the ISR masks the line's IRQEN, sends TM(5,3) 0x9434
+  `[id u8, HOTSAMPLE u16, threshold u16]`, clears PROTSTAT and signals
+  SAFE (harmless in SAFE).
+- FSW bug (recorded, not modelled around): a 2V5_C trip is reported
+  with id 1, E_HK_DPU_1V5_C (FDIR.c:869).
+
+**Tests:** `/sparc/stix/hk-prot`:
+- the reset values of all nine thresholds, hkIrqSta and 0xD0;
+- hkIrqSta field access (IRQEN R/W, HOTSAMPLE/reserved RO);
+- the unlock rules: locked threshold write ignored, wrong token, one
+  write per token, the token spent by an unrelated CTRL write, ProtEn
+  set without a token (threshold part dropped), ProtEn clear needs it,
+  reserved bits read 0;
+- DET_C: equal is not above; one high sample does not trip, the second
+  does (PROTSTAT, HOTSAMPLE, IRQ); no new IRQ while the bit is set; the
+  FSW clear pattern; re-set after a clear; a low sample restarts the
+  count; IRQEN 0 gives PROTSTAT without IRQ, and a later IRQEN raises
+  nothing; ProtEn 0 gives nothing, re-enabling trips at the next sample;
+- every line's channel and bit; two lines set with the last HOTSAMPLE;
+  an unprotected channel never trips;
+- a reset restores everything (ATT_V 4095 cannot trip), the token does
+  not survive a reset;
+- writing 0 to PROTSTAT (the ISR's IRQ-mask write) keeps the bit;
+- an armed token is disarmed by a wrong value;
+- `hk-prot=off`: plain storage, no trip, no IRQ;
+- `hk-adc=off`: reset values and the lock apply, an injection plus
+  conversions never trips.
+RED on the pre-P4-4 binary (thresholds read 0). The full suite is 37 ok.
+
+**Gate:** fault-smoke (§27) gains the DET_C step: `adc-inject[4]` =
+600 at +85 s, TM(5,3) `9434 05 0258 0222` within 10 s, cleared at
++95 s, after which every 0x9434 is forbidden.
+
+**Gate record** (2026-11-11, worktree at 4700254fe4 plus this change,
+normal ELF, fresh flash per run, under the 21000 flock):
+- **Positive** (`/tmp/stix-p4-hkprot-pos`): PASS, 3 min 27 s. 0x14A3
+  ~14 s after the connect; every §27 expectation as before. DET_C: the
+  injection at +85 s (10:45:27), TM(5,3)
+  `9434 05 0258 0222` (CUC coarse 0x56) at 10:45:28, i.e. within 1 s
+  (the FSW's next ch 4 conversion). The UART shows `HK callback`
+  (FDIR.c:831), `FDIR ID = 5 FDIR ID val = 600, FDIR ID limit = 546`
+  and `Transitioning to safe mode (FDIR.c:941)`. Exactly one 0x9434 in
+  the run. `542B` ~60 s after `timecodes` = false (+100 s), `1429`
+  within 1 s of `timecodes` = true (+195 s).
+- **Negative** (`/tmp/stix-p4-hkprot-neg`): PASS, with exactly
+  `not matched: 0x5A7:5:3:9449070708079f@10 0x5A7:5:4:d42000080000@10`
+  (the probe stops at +50 s, before the DET_C step).
+- boot-smoke PASS (normalized UART matches the golden: no golden
+  change). The shared flash mtimes are unchanged
+  (`/tmp/stix-uprev-run` 2026-11-10 13:05:54, `/tmp/stix-baseline-run`
+  2026-11-09 15:30:10).
