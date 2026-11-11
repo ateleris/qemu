@@ -1106,6 +1106,40 @@ binary at their first new assertion, and green after.
   `det-source=zero` vs `synthetic`. Budget +10 %; recorded.
 - Gates: the full set (nominal-smoke now runs with quiet counts [L]).
 - accepted-diffs §34.
+- **As built (2026-11-11, accepted-diffs §34):**
+  - the scene properties are added by `stix_det_class_init(klass,
+    offsetof(STIXCTRL, det))` and defaulted in `stix_det_instance_init`
+    (so `-global` and a `qom-set` at `-S` work); `det-seed` is qdev;
+    the traces are `stixdet_scene` (with the virtual time) and
+    `stixdet_ql_sky` (events per finished bank);
+  - counting needs the `grp`'s ReadMode bit **1** (readout; the FSW sets
+    0xFFFF at NOMINAL entry, STIX-FSW 600a7a72 `OpModeMgmt.c:513`) besides quarter power,
+    Enable and R3 TH < 63; R3 TH of `asic_ch` c is the 6-bit field c,
+    MSB first, of the raw wire bytes (= the FSW's
+    `utils_getReg3(utils_reorderThreshold3(raw))`);
+  - LTRG = (5 × events + 2) / 4 per `grp` (1.25×, rounded);
+  - **deviation:** the D-3 modes of detector-smoke keep the zero sky
+    (`-global grlib-stixctrl.det-source=zero`) and their checks; the
+    flare step is the new `--flare` mode, and `--flare --negative`
+    (det-flare false @135) must fail exactly `ql-contrast`. The plan's
+    "`--negative` without the QMP flip" is that mode;
+  - `det-seed` is settable only with `-global` (seeded at realize and
+    reset), an explicit exception to D-PLm req. 5. A scene switch
+    mid-period acts from the next tick; exposure already gathered is
+    still drawn at the swap;
+  - **observed levels are 0.475 of the [I] estimates above**, because
+    of an FSW bug (STIX-FSW issue #1069). The NOMINAL-entry R3 (RCR
+    state 0, STIX-FSW 600a7a72 `RateCtrl.c:575, 898-913`) is mirrored
+    twice: the local channel inversion, commit 44e8526b, on top of the
+    global R3 reorder, commit 60e69d75. It enables 4 fixed pixels
+    (`asic_ch` 1, 5, 26, 30 = `pix` 3, 6, 0, 8). `pix` 7 (`asic_ch` 0)
+    depends on an out-of-bounds read of the active-pixel list at index
+    12. Ratio 0.475 with `pix` 7 on (this run), 0.363 with it off.
+    Quiet LC band 0 is about 0x1F (≥ 60), flare about 0x70 (≥ 65536).
+    The `--flare` thresholds hold in either case; a fixed FSW (×2.1 to
+    ×2.8) may raise RCR at 2000 cps, so re-calibrate then
+    (`det-counts-r3-fsw` shows all 12 `pix` count with a correct R3
+    build).
 
 ### D-5: nominal integration and ROTB chunks (tier 3)
 - D-Dg: the swap rule, the EACC/ETRG materialization, the chunk writer,

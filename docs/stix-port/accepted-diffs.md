@@ -2940,3 +2940,291 @@ plus this change, normal ELF, every QEMU run under the 21000 flock):
     FAIL (failed checks: 'uart-idefx trace-not-empty', ...)`, rc 1, as
     required.
   - The shared flash mtimes are unchanged.
+
+## 34. Synthetic sky and the flare switch (baseline: no counts)
+
+**Baseline:** the QL banks were written only with zeros (§31): every
+LACC cell, every LTRG word and every LVAR slot of a finished bank was
+0, SUMCNT (fsmEvents) stayed 0, and the FSW's QL products (SSID 30-34)
+carried only zeros. There was no way to make the detectors see
+anything.
+
+Detector plan D-4 (`docs/stix-port/2026-11-11-detector-plan.md`,
+decisions D-Db, D-Df, D-Dd, D-Dj; "Index spaces").
+
+**FSW tree:** every FSW `file:line` in this section is STIX-FSW
+600a7a72 (`ASW/ASW/src/...`; `Detectors.c` is
+`BSW_ASW/src/BSW/Detectors/Detectors.c`). None is from stix_asw_src.
+
+**The source: accumulators, not events (D-Df).**
+- **Per 100 ms tick** (inside the existing D-1 tick, so only while FSM
+  Enable = 1, i.e. in NOMINAL):
+  - each (`fpga_det`, `pix` 0..11) is gated: its `grp` (= `fpga_det` /
+    2) must read out (its `quarter` powered in idefxConfig, its Enable
+    bit set, its **ReadMode bit 1**; the FSW sets the mode mask to
+    0xFFFF at NOMINAL entry, `OpModeMgmt.c:513`, and clears one `grp`'s
+    bit during each slow-control transaction, `Detectors.c:811`), and
+    the R3 threshold of `asic_ch` = `utils_pixelId2channelId[pix]` must
+    not be 63. The gating is evaluated every tick, so a verification
+    run that clears one `grp`'s ReadMode for part of a tick costs that
+    `grp` at most a tick, not a period;
+  - the threshold is read from the raw (wire-order) R3 store: the FSW's
+    `utils_getReg3(asic_ch, utils_reorderThreshold3(raw))`
+    (`utils.c:538-555, 663-677`) is the 6-bit field number `asic_ch` of
+    the raw bytes counted MSB first (checked exhaustively against a
+    transcription of both FSW functions on random registers);
+  - ALIMON (R12) is not used (its per-`asic_ch` bit order is undefined,
+    plan Doc vs code 12);
+  - every gated pair adds `rate × 0.1 s` to its exposure for the active
+    profile (quiet, or flare while `det-flare` is true);
+  - SUMCNT gets a Poisson draw of the tick's counts in SUMDMASK
+    `fpga_det` × SUMEMASK `ebin` (all `pix`), saturating at 2^32 − 1;
+    fsmEvents reads it live;
+  - the tick's LVAR count is a Poisson draw of the counts in VARDMASK
+    `fpga_det` × VARPMASK `pix` × VAREMASK `ebin`, written to the
+    slot as before (slot rule of §31, clamped at 16 bits).
+  - The FPGA-only masks are read with bit i = index i ([A], plan "Index
+    spaces"; SUMDMASK and VARDMASK are `fpga_det`-indexed, the FSW
+    converts from `subcol` before writing them).
+- **At the QL swap** the finished bank's LACC is drawn cell by cell,
+  `[pix][fpga_det][ebin]` u16 big-endian at byte
+  ((`pix`·32 + `fpga_det`)·32 + `ebin`)·2: Poisson(Σ_profile `pix`
+  share × `ebin` share × exposure), wrapping at 16 bits. LTRG per `grp`
+  (u32 big-endian) = round(1.25 × the drawn events of `fpga_det` 2·`grp`
+  and 2·`grp` + 1), clamped at 24 bits. Then the exposure clears. With
+  `det-source=zero` the exposure is zero and the bank is all zeros, so
+  the §31 lifecycle is unchanged; the D-1 tests still see zeros because
+  their detectors are never powered.
+- The exposure also clears on a fresh enable (with the bank, §31) and on
+  a device reset; a Reset strobe keeps it (it keeps the banks).
+- **Template [I]:** uniform over `fpga_det` (QLDetPerf); `pix` share
+  1.0 for `pix` 0-7 and 0.22 for `pix` 8-11, normalized; quiet: 10 %
+  flat over `ebin` 1-11, 15 % flat over `ebin` 12-30, and 45 / 10 /
+  20 % in `ebin` 18 / 19 / 27 (Ba-133 lines); flare: 70 % thermal over
+  `ebin` 1-10 (×0.7 per bin) and 30 % power law (bin number^−3) over
+  `ebin` 11-25. Nothing in `ebin` 0 or 31. The rate is counts/s per
+  `fpga_det`, so a period holds about rate × 4 s × 32 counts.
+- **PRNG:** xorshift64*, seeded through splitmix64 from `det-seed`
+  (qdev, default 1) at every device reset. Poisson by inversion below a
+  mean of 30, by a rounded normal (Box-Muller) above. On one host the
+  same seed and the same steps give the same banks (`det-counts-seed`);
+  across hosts the libm may differ, and there is no icount, so runs are
+  statistically reproducible only.
+- **No ELUT:** the sky is generated in `ebin` space. With an empty
+  flash the FSW writes 31 into every FPGA ELUT entry (plan Key facts,
+  "The ELUT"), so real hardware would put every count in `ebin` 31.
+  **This is a deliberate deviation** (plan Doc vs code 20): a gate that
+  compares QL against real hardware with an empty flash must not use the
+  synthetic sky.
+
+**The scene properties (D-Db), on `/machine/stixctrl`:**
+- runtime class properties with setters (they also work before realize,
+  so `-global grlib-stixctrl.det-source=zero` and a `qom-set` at `-S`
+  both work):
+  - `det-source` (str): `zero` | `synthetic` (default `synthetic`);
+    anything else is rejected (`replay-dss` arrives with D-7);
+  - `det-flare` (bool, default false): the flare switch;
+  - `det-quiet-cps`, `det-flare-cps` (uint32, counts/s per `fpga_det`,
+    defaults 20 and 2000, 0..1 000 000; above is rejected, not
+    clamped);
+- `det-seed` (qdev uint32, default 1, init-time): **an explicit
+  exception to D-PLm req. 5**. It is settable only with `-global` (or
+  `-device`), not by `qom-set` at `-S`, because the PRNG is seeded at
+  realize and at each device reset;
+- a setter only stores the field and traces `stixdet_scene(source,
+  flare, quiet_cps, flare_cps, vclock_ns)`; the next tick on the
+  virtual clock uses it;
+- the scene survives a device reset (it describes the Sun, not the
+  IDPU); the exposure and the PRNG state do not;
+- **a switch mid-period** acts from the next 100 ms tick and does not
+  rewrite the past. Each tick adds exposure under the source, flare
+  state and rate in force at that tick. Exposure already gathered stays
+  and is drawn at the swap. So `synthetic` → `zero` mid-period still
+  gives a non-zero bank, holding the ticks before the switch, and the
+  next bank is all zeros. `zero` → `synthetic` gives a partial bank.
+  A flare flip mid-period mixes the two profiles in proportion to the
+  ticks spent in each. The swap draws Σ_profile, so the bank is one
+  Poisson draw of the mix;
+- the swap traces `stixdet_ql_sky(done_ql_bank, source, flare,
+  lacc_events)`.
+- The code adds the properties from `stix_det_class_init(klass,
+  offsetof(STIXCTRL, det))` and sets the defaults in
+  `stix_det_instance_init`, so `grlib_stixctrl.c` has one call site each
+  and `struct STIXCTRL` stays private.
+
+**Re-entrancy (D-Dj, the a83fe9a3a5 rule):** the new work runs in the
+tick, under the BQL, and writes the banks only through
+`memory_region_get_ram_ptr` + `memory_region_set_dirty`; its only other
+output is the existing `qemu_irq_pulse`. Nothing dispatches MMIO or DMA
+outside a handler, so `mem_reentrancy_guard` is not engaged. The QMP
+setters store fields only.
+
+**Platform interface (platform plan D-PLm, requirements on the detector
+model):**
+- met by D-4: the flare switch and the sky knobs are QMP `qom-set`
+  properties, readable (req. 4: `det-source`, `det-flare`, the rates),
+  settable while frozen at `-S` (req. 5, `det-props`; `det-seed` is the
+  stated exception above), applied on the
+  virtual clock at the next 100 ms tick (req. 6), no per-event
+  streaming (rule 1), and every name and trace argument carries its
+  index space (req. 7);
+- deferred to D-7 (replay): the STXEVT v1 table and its runtime load by
+  path (req. 1-2), `det-replay-trigger`/`-start`, the single
+  `det-replay-offset-ms` (which replaces D-Db's `det-replay-offset`
+  before D-7 lands), `det-replay-loop` (req. 3), `det-replay-status`
+  (req. 4) and the replay start/stop trace with virtual time (req. 6);
+- deferred to the platform merge (D-PLo): the `det` section of
+  stixctrl's `hw-state` (req. 8); this branch has no `hw-state` yet.
+
+**Gates:**
+- **`detector-smoke.sh`** now runs its D-3 modes (positive and
+  `--negative`) with `-global grlib-stixctrl.det-source=zero`, so the
+  zero-sky checks and their verdicts are unchanged. **Deviation from the
+  plan:** the plan put the flare step into the positive mode; the D-4
+  brief asked to keep the zero-sky check working with the switch off,
+  so the flare is a separate mode:
+  - `--flare`: the default synthetic sky, QMP `det-flare=true` @135 and
+    `false` @195 (seconds from connect; the CONF @215 as before).
+    `ql-check.py --expect-sky-flush (T_exit − T_nom)` checks the flush
+    (the D-3 headers and cadences; SSID 30 band 0, SSID 31 and SSID 33
+    non-zero in every sample but at most one; every SSID 30 RCR byte 0;
+    SSID 32 non-zero for every `subcol`, nothing in `ebin` 0/31, at
+    least half the decoded counts in `ebin` 18/19/27); and
+    `ql-check.py --lc-contrast ON OFF` (a separate check,
+    `ql-contrast`) with the probe's QMP send times minus T_nom: the
+    median SSID 30 band-0 byte of the flare samples (≥ ON + 6 s, ≤ OFF −
+    6 s) at least 8 compressed steps above the quiet median (≤ ON −
+    6 s), ≥ 5 samples each. SSID 34 flags in the window are printed.
+  - `--flare --negative` sends `det-flare=false` @135 (no flip; the QMP
+    path and the timing stay) and passes only when exactly
+    `ql-contrast` fails.
+  - Every mode prints the QEMU process's user+sys CPU (`/proc`), for
+    the cost record below.
+- `ql-check.py` gains `--expect-sky-flush` and `--lc-contrast`, the
+  zero-flush check shares the product/header/cadence part with them,
+  and the self-test adds a synthetic-sky flush (passes both) and seven
+  bad ones (a zero sky, no flip, a too-short window, a risen RCR, a
+  count in `ebin` 31, a spectrum without lines, a dark `subcol`).
+  Mutation checked: with the contrast threshold at 0 the self-test
+  fails.
+- nominal-smoke now runs on the quiet synthetic sky (the default, no
+  `-global`). It has no QL, RCR or QLDetPerf check. Its forbids are
+  unchanged: no NOMINAL → SAFE (TM(5,1) 0021 05 02), no TM(1,8), no
+  TC20 reaction (TM(5,1) 0x142E) and no TM(5,3) 0x9449. It also needs
+  zero IDeF-X write timeouts (`XrayDetFDIR.c:731`) in the UART. A
+  synthetic sky that broke NOMINAL would show there; a risen RCR would
+  not. Only `detector-smoke --flare` asserts that every SSID 30 RCR
+  byte is 0.
+
+**FSW bug: the NOMINAL R3 enables 4 fixed pixels plus pix 7 by
+chance** (confirmed by the coordinator; filed as STIX-FSW issue #1069).
+The first live run gave about 0.47 of the plan's [I] count levels in
+every QL product: quiet LC band 0 about 60 instead of about 130, and
+SSID 32 about 320 instead of 640 per `subcol` in 32 s. The model's own
+`stixdet_ql_sky` trace showed about 1200 events per quiet period
+instead of 2560.
+
+The cause is the R3 the FSW writes at NOMINAL entry, the RCR state-0
+register set (STIX-FSW 600a7a72 `RateCtrl.c:575`). Decoded the FSW's
+own way, `utils_getReg3(utils_reorderThreshold3(wire))`, threshold 62
+sits on:
+- 4 fixed channels: `asic_ch` 1, 5, 26, 30 = `pix` 3, 6, 0, 8;
+- `asic_ch` 0 = `pix` 7, which depends on an out-of-bounds read.
+
+Every other channel is 63.
+
+Root cause (STIX-FSW 600a7a72 `RateCtrl.c:898-913`): the build mirrors
+the channel twice.
+- The local inversion `utils_channelId2pixelId[NUMBER_OF_ASIC_CHANNELS
+  - 1 - iChan]` (commit 44e8526b, 2019-09-06) stacks on the global R3
+  field reorder (`utils_reorderThreshold3`, commit 60e69d75,
+  2019-09-09). Field c therefore takes the active flag of the pixel on
+  `asic_ch` 31 − c.
+- For `iChan` 0 the lookup yields 12 (the guard ring), and
+  `pixels_active_rcr_*[12]` reads one past the 12-entry list. So `pix`
+  7 depends on whatever byte follows the list.
+
+Level ratios against the plan's [I], from the `pix` weights (1.0 large,
+0.22 small, 8.88 in all):
+- `pix` 7 on: 4.22 / 8.88 = **0.475** (this run);
+- `pix` 7 off: 3.22 / 8.88 = **0.363**.
+
+The model follows the registers, so this is what the FPGA would count
+with this FSW. The TM pixel masks still say 0x0FFF. The model is not
+changed. `det-counts-r3-fsw` builds R3 in the FSW's layout,
+independently of the model's decoder, and shows two things:
+- a correct, non-mirrored build of the full mask makes all 12 `pix`
+  count;
+- the mirrored build gives {0, 3, 6, 8} or {0, 3, 6, 7, 8}, depending
+  on the guard slot.
+
+**The --flare gate holds in either case, and is calibrated against this
+bug.**
+- Its thresholds do not scale with the enabled pixel weight:
+  - SSID 30, 31 and 33 non-zero in all samples but one (a quiet
+    period still holds about 900 events at 0.363);
+  - SSID 32 non-zero per `subcol`, nothing in `ebin` 0/31, the lines
+    holding at least half (the `ebin` shares do not depend on `pix`);
+  - the LC contrast of ≥ 8 compressed steps (the flare/quiet rate
+    ratio is 100 in both cases).
+- **A fixed FSW** raises every level by 1/0.475 = 2.1× (or 2.8× from
+  0.363). At the default 2000 cps flare that may push the rate control
+  above state 0. The gate's "every SSID 30 RCR byte 0" would then fail
+  even though the model is right. Re-calibrate `det-flare-cps` (or
+  allow RCR > 0 in the flare window) when #1069 is fixed.
+
+**Gate record (D-4, 2026-11-11).** Each run in a fresh
+`/tmp/stix-d4-*` dir under the 21000 flock, using sparse flash copies.
+Shared flash mtimes unchanged (uprev 2026-11-10 13:05:54, baseline
+2026-11-09 15:30:10). RED on the D-3 binary: all 7 new qtests failed
+(missing props, scene NULL, flare 0 vs λ 2560). GREEN: all 7 ok.
+Final lines:
+- suite (qt.sh all): 61 of 61 ok (54 + 7 new), exit 0
+- probe / ql-check / idefx-trace-check self-tests: `SELF-TEST: PASS`
+- boot-smoke: `BOOT SMOKE: PASS (normalized UART matches golden)`
+- tc-smoke: `TC-SMOKE: PASS`
+- nominal-smoke ±: `NOMINAL-SMOKE: PASS`, `NOMINAL-SMOKE (negative): PASS`
+- fault-smoke ±: `FAULT-SMOKE: PASS`, `FAULT-SMOKE (negative): PASS`
+- detector-smoke ±: `DETECTOR-SMOKE: PASS` (zero flush unchanged), `DETECTOR-SMOKE (negative): PASS`
+- flare ±: `DETECTOR-SMOKE (flare positive): PASS`, `DETECTOR-SMOKE (flare negative): PASS`
+- checkpatch: 0/0 on the diff (only the missing Signed-off-by) and
+  with `-f` on `stix_det.c` and `stix_det.h`
+
+Flare positive TM:
+- switch: on at T_nom+58 s, off at T_nom+115 s
+- SSID 30 band 0: 0x1f quiet (13 samples), 0x70 flare (11 samples);
+  RCR stays 0
+- SSID 34: flagged in 14 of 14 flare periods (status 162, 194); 128
+  when quiet
+- SSID 33 variance: about 25 quiet, about 57 flare
+- SSID 32: mean about 321 per `subcol`; ebin 18, 19 and 27 dominate;
+  ebin 0 and 31 are 0
+
+QEMU CPU, user + sys: zero sky 5.2 + 7.9 s; flare 5.7 + 7.4 s.
+
+The first flare-negative run failed `trace-verif`. The cause was a
+script bug: `--negative` also selected the D-3 det-idefx-off
+`--expect-none` branch. Fixed by adding `IDEFX_NEG`; one re-run then
+passed.
+
+**Review fixes (D-4 review, 2026-11-11).** No blockers. Changes:
+- the R3 finding is now the confirmed FSW bug #1069 (above);
+- the nominal-smoke wording is corrected;
+- the FSW tree is named;
+- the `--flare` calibration note, the `det-seed` exception and the
+  mid-period switch are added;
+- new qtest `det-counts-r3-fsw`. It is a characterization test,
+  mutation-checked: dropping the wire field reversal in its own
+  builder fails it;
+- the cps properties take a per-property opaque (det and field
+  offsets) instead of a `strcmp` on the name.
+
+Re-run, each under the 21000 flock in fresh `/tmp/stix-d4r-*` dirs:
+- self-tests (probe, ql-check, idefx-trace-check): PASS
+- `DETECTOR-SMOKE: PASS`
+- `DETECTOR-SMOKE (negative): PASS`
+- `DETECTOR-SMOKE (flare positive): PASS`
+- `DETECTOR-SMOKE (flare negative): PASS`
+- `NOMINAL-SMOKE: PASS`
+- checkpatch: 0/0 apart from the missing Signed-off-by
+- suite (qt.sh all): 62 of 62 ok, exit 0

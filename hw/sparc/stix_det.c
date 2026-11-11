@@ -6,21 +6,31 @@
  * tick, the QL bank switch with IRQ 3, and the register reset values.
  * Tier 1 (D-2): the IDeF-X serial command interface (ideFxCmdSta,
  * idefxModeData, idefxWriteMask), the 32-ASIC register store behind it,
- * and the index-space conversion tables.
+ * and the index-space conversion tables. Tier 2 (D-4): the synthetic
+ * sky (D-Df): per-tick gating and exposure, live SUMCNT and LVAR, the
+ * LACC/LTRG materialization at the swap, the flare switch and the
+ * scene properties.
  *
- * FSW references are to the ASW tree (BSW = BSW_ASW/src/BSW/...;
- * utils.c, utils.h = ASW/src/utils.*; Detectors.c = BSW Detectors.c).
+ * FSW references are to STIX-FSW 600a7a72, the ASW tree (BSW =
+ * BSW_ASW/src/BSW/...; utils.c, utils.h = ASW/src/utils.*; Detectors.c
+ * = BSW Detectors.c), never to stix_asw_src.
  *
  * Re-entrancy (D-Dj): the tick writes the accumulator banks through
  * memory_region_get_ram_ptr (each write followed by
  * memory_region_set_dirty), never with address_space_*, and its only
  * other output is qemu_irq_pulse. No MMIO dispatch happens from timer
- * context.
+ * context, so the tick needs no mem_reentrancy_guard (the a83fe9a3a5
+ * rule covers paths that dispatch DMA or MMIO outside a handler). The
+ * QMP setters of the scene only store fields; the next tick applies
+ * them.
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/bswap.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
+#include "qapi/visitor.h"
 #include "stix_det.h"
 #include "trace.h"
 
@@ -67,6 +77,11 @@ static const hwaddr stix_det_lvar_off[STIX_DET_QL_BANKS] = {
     STIXCTRL_LVAR2_START - STIXCTRL_LVAR0_START,
     STIXCTRL_LVAR3_START - STIXCTRL_LVAR0_START,
 };
+
+/* D-4 synthetic sky (defined after the index tables it uses) */
+static void stix_det_sky_tick(StixDetState *d);
+static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank);
+static void stix_det_sky_clear_expo(StixDetState *d);
 
 static uint32_t *stix_det_regp(StixDetState *d, hwaddr addr)
 {
@@ -127,8 +142,9 @@ static void stix_det_bank_zero(StixDetState *d, uint32_t ql_bank)
  * 1. while a bank is active, its LVAR slots are written per tick
  *    (stix_det_tick); nothing else writes it;
  * 2. at the swap the finished bank's LACC and LTRG are written in full
- *    from the shadow (tier 0 has no count source: zeros); its LVAR is
- *    not rewritten (it holds the per-tick slots);
+ *    from the period's exposure (stix_det_sky_materialize; zeros with
+ *    det-source=zero); its LVAR is not rewritten (it holds the per-tick
+ *    slots);
  * 3. ActiveQl advances and the newly active bank is zeroed
  *    (stix_det_bank_zero); the active bank is also zeroed on a fresh
  *    enable (SetEnable 0 -> 1 at tick 0, stix_det_fsm_cmd), so no RAM
@@ -145,8 +161,7 @@ static void stix_det_ql_swap(StixDetState *d)
     bool irq = (d->reg->fsmCmd >> STIXCTRL_FSMCMD_QLIRQEN) &
                STIXCTRL_FSMCMD_QLIRQEN_MASK;
 
-    stix_det_ram_zero(d->sram, stix_det_lacc_off[done], STIXCTRL_LACC0_SIZE);
-    stix_det_ram_zero(d->ltrg, stix_det_ltrg_off[done], STIXCTRL_LTRG0_SIZE);
+    stix_det_sky_materialize(d, done);
 
     d->active_ql_bank = next;
     stix_det_bank_zero(d, next);
@@ -161,17 +176,20 @@ static void stix_det_ql_swap(StixDetState *d)
 }
 
 /*
- * One 100 ms tick of the active QL period. Tick k (0-based) writes its
- * LVAR count to slot k of the active bank while k < 40; later ticks of
- * a longer period (QlIntTime is 16 bits) are dropped, so no write ever
- * leaves the bank's 0xA0 bytes (D-Dd, a model choice: the hardware
- * behaviour is undocumented). The period is QlIntTime + 1 ticks.
+ * One 100 ms tick of the active QL period. The sky first adds the
+ * tick's exposure, SUMCNT and LVAR count (stix_det_sky_tick, gated per
+ * tick). Tick k (0-based) writes its LVAR count to slot k of the
+ * active bank while k < 40; later ticks of a longer period (QlIntTime
+ * is 16 bits) are dropped, so no write ever leaves the bank's 0xA0
+ * bytes (D-Dd, a model choice: the hardware behaviour is
+ * undocumented). The period is QlIntTime + 1 ticks.
  */
 static void stix_det_tick(void *opaque)
 {
     StixDetState *d = opaque;
     uint32_t slot = d->ql_tick;
 
+    stix_det_sky_tick(d);
     if (slot < STIX_DET_LVAR_SLOTS) {
         stix_det_ram_stl(d->lvar,
                          stix_det_lvar_off[d->active_ql_bank] +
@@ -220,9 +238,10 @@ static void stix_det_fsm_cmd(StixDetState *d, uint32_t value)
     } else if ((strobes & FSMCMD_BIT(SETENABLE)) && !d->enable) {
         d->enable = true;
         if (d->ql_tick == 0) {
-            /* a fresh period: no stale RAM in the active bank */
+            /* a fresh period: no stale RAM or exposure in the bank */
             stix_det_latch_ql_int_time(d);
             stix_det_bank_zero(d, d->active_ql_bank);
+            stix_det_sky_clear_expo(d);
         }
         stix_det_tick_start(d);
     }
@@ -347,6 +366,12 @@ static inline uint32_t stix_det_quarter_of_grp(uint32_t grp)
     return grp / 4;
 }
 
+/* the inverse of stix_det_fpga_det_of: grp = fpga_det / 2 */
+static inline uint32_t stix_det_grp_of(uint32_t fpga_det)
+{
+    return fpga_det / 2;
+}
+
 /*
  * Range-check one table entry before it is used as an index; false
  * sets errp naming the table, the entry and the bad value
@@ -449,6 +474,7 @@ static bool stix_det_index_selfcheck(Error **errp)
             stix_det_fpga_det_from_subcol[i] ||
             stix_det_fpga_det_of(grp, stix_det_dete_data[i].asic) !=
             stix_det_dete_data[i].fpga_det ||
+            stix_det_grp_of(stix_det_dete_data[i].fpga_det) != grp ||
             stix_det_quarter_of_grp(grp) != stix_det_dete_data[i].quarter) {
             error_setg(errp, "stix_det: dete_data disagrees with the "
                        "index identities at subcol %u", i);
@@ -832,6 +858,491 @@ static void stix_det_idefx_config(StixDetState *d, uint32_t value)
     stix_det_idefx_defaults_mask(d, fpga_det_mask, "quarter power on");
 }
 
+/*
+ * ---- The synthetic sky (D-4, detector plan D-Df) ----
+ *
+ * Accumulators, not events: per 100 ms tick the model gates each
+ * (fpga_det, pix), adds the tick's expected counts to the period's
+ * exposure, and draws the tick's SUMCNT and LVAR counts; at the QL swap
+ * it draws every LACC cell of the finished bank from the exposure and
+ * writes LTRG per grp. The sky is generated in ebin space and never goes
+ * through the FPGA ELUT (a recorded deviation, accepted-diffs §34).
+ */
+
+/* the default scene (D-Db); rates are counts/s per fpga_det */
+#define STIX_DET_QUIET_CPS_DEFAULT 20u
+#define STIX_DET_FLARE_CPS_DEFAULT 2000u
+#define STIX_DET_CPS_MAX 1000000u
+#define STIX_DET_SEED_DEFAULT 1u
+
+/* accumulator widths [D, BRAM widths]: LACC wraps, LTRG and LVAR clamp */
+#define STIX_DET_LTRG_MAX 0xFFFFFFu
+/* Poisson by inversion below this mean, by a rounded normal above */
+#define STIX_DET_POISSON_NORMAL 30.0
+
+static const char *const stix_det_source_name[STIX_DET_SOURCE__MAX] = {
+    [STIX_DET_SOURCE_ZERO] = "zero",
+    [STIX_DET_SOURCE_SYNTHETIC] = "synthetic",
+};
+
+/*
+ * The template (D-Df [I]; the energies are approximate and do not
+ * matter to the gates, since no ELUT is involved). Uniform over
+ * fpga_det (QLDetPerf, QLDetPerf.c:124-143, flags a non-uniform sky).
+ * - pix share: large pix 0-7 weight 1.0, small pix 8-11 0.22 (the area
+ *   ratio, about 4.5 [D]), normalized to 1 over pix 0..11;
+ * - quiet ebin share: 10 % flat over ebin 1-11, 15 % flat over ebin
+ *   12-30, and the Ba-133 lines: 45 % in ebin 18 (31 keV), 10 % in
+ *   ebin 19 (35 keV), 20 % in ebin 27 (81 keV);
+ * - flare ebin share: 70 % thermal over ebin 1-10, falling x0.7 per
+ *   bin, and 30 % power law (bin number ^ -3) over ebin 11-25.
+ * Nothing lands in ebin 0 or 31.
+ */
+static void stix_det_sky_template(StixDetState *d)
+{
+    double *quiet = d->ebin_share[STIX_DET_PROFILE_QUIET];
+    double *flare = d->ebin_share[STIX_DET_PROFILE_FLARE];
+    double w_total = 0, thermal = 0, power = 0;
+    uint32_t pix, ebin;
+
+    for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+        d->pix_share[pix] = pix < 8 ? 1.0 : 0.22;
+        w_total += d->pix_share[pix];
+    }
+    for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+        d->pix_share[pix] /= w_total;
+    }
+
+    memset(d->ebin_share, 0, sizeof(d->ebin_share));
+    for (ebin = 1; ebin <= 11; ebin++) {
+        quiet[ebin] += 0.10 / 11;
+    }
+    for (ebin = 12; ebin <= 30; ebin++) {
+        quiet[ebin] += 0.15 / 19;
+    }
+    quiet[18] += 0.45;
+    quiet[19] += 0.10;
+    quiet[27] += 0.20;
+
+    for (ebin = 1; ebin <= 10; ebin++) {
+        thermal += pow(0.7, ebin - 1);
+    }
+    for (ebin = 11; ebin <= 25; ebin++) {
+        power += pow(ebin, -3.0);
+    }
+    for (ebin = 1; ebin <= 10; ebin++) {
+        flare[ebin] = 0.70 * pow(0.7, ebin - 1) / thermal;
+    }
+    for (ebin = 11; ebin <= 25; ebin++) {
+        flare[ebin] = 0.30 * pow(ebin, -3.0) / power;
+    }
+}
+
+/* xorshift64* (D-Df PRNG), reseeded from det-seed at every reset */
+static uint64_t stix_det_rand64(StixDetState *d)
+{
+    uint64_t x = d->prng;
+
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    d->prng = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+/* uniform in [0, 1) */
+static double stix_det_rand_unit(StixDetState *d)
+{
+    return ldexp((double)(stix_det_rand64(d) >> 11), -53);
+}
+
+/* splitmix64 of the seed, so every seed (0 included) gives a state != 0 */
+static void stix_det_reseed(StixDetState *d)
+{
+    uint64_t z = d->seed + 0x9E3779B97F4A7C15ULL;
+
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z ^= z >> 31;
+    d->prng = z ? z : 1;
+}
+
+/*
+ * A Poisson draw: by inversion for a mean below 30, by a rounded normal
+ * (Box-Muller) above. Runs are statistically, not bit-for-bit,
+ * reproducible across hosts' libm; on one host the same seed and the
+ * same steps give the same counts.
+ */
+static uint64_t stix_det_poisson(StixDetState *d, double lambda)
+{
+    if (lambda <= 0) {
+        return 0;
+    }
+    if (lambda < STIX_DET_POISSON_NORMAL) {
+        double u = stix_det_rand_unit(d);
+        double p = exp(-lambda);
+        double cdf = p;
+        uint64_t k = 0;
+
+        /* the cap only guards a cdf that rounds below u near 1 */
+        while (u > cdf && k < 1000) {
+            k++;
+            p *= lambda / k;
+            cdf += p;
+        }
+        return k;
+    } else {
+        double u1 = 1.0 - stix_det_rand_unit(d);    /* (0, 1] */
+        double u2 = stix_det_rand_unit(d);
+        double z = sqrt(-2.0 * log(u1)) * cos(2.0 * M_PI * u2);
+        double n = floor(lambda + sqrt(lambda) * z + 0.5);
+
+        return n > 0 ? (uint64_t)n : 0;
+    }
+}
+
+static void stix_det_sky_clear_expo(StixDetState *d)
+{
+    memset(d->expo, 0, sizeof(d->expo));
+}
+
+/*
+ * The R3 threshold of one asic_ch of one fpga_det. The store holds R3
+ * raw, in wire order; the FSW reads it back as
+ * utils_getReg3(asic_ch, utils_reorderThreshold3(raw)) (utils.c:538-555,
+ * 663-677), which is the 6-bit field number asic_ch of the raw bytes
+ * counted MSB first (fields 0..31 at bit 6 * asic_ch from the top).
+ */
+static uint32_t stix_det_r3_th(StixDetState *d, uint32_t fpga_det,
+                               uint32_t asic_ch)
+{
+    const uint8_t *r3 = d->idefx_reg[fpga_det][3];
+    uint32_t pos = 6 * asic_ch;
+    uint32_t byte = pos / 8;
+    uint32_t window = (uint32_t)r3[byte] << 8 |
+                      (byte + 1 < STIX_DET_IDEFX_REG_BYTES ? r3[byte + 1] : 0);
+
+    return (window >> (10 - pos % 8)) & 0x3F;
+}
+
+/* a grp reads out: quarter powered, Enable set, ReadMode 1 (not config) */
+static bool stix_det_grp_reads_out(StixDetState *d, uint32_t grp)
+{
+    uint32_t cfg = d->reg->idefxConfig;
+
+    return ((cfg >> stix_det_quarter_of_grp(grp)) & 1) &&
+           ((cfg >> (STIXCTRL_IDEFXCONFIG_ENABLE + grp)) & 1) &&
+           ((d->reg->idefxModeData >> (STIXCTRL_IDEFXMODEDATA_READMODE +
+                                        grp)) & 1);
+}
+
+/*
+ * The pix (bit i = pix i) of one fpga_det that count in this tick
+ * (D-Df, gating per tick): its grp reads out, and the R3 threshold of
+ * asic_ch = utils_pixelId2channelId[pix] is not 63 (63 disables the
+ * channel; XRayADCsCtrl.c:205-209 sets non-pixel channels to it).
+ * ALIMON (R12) is not used: its per-asic_ch bit order is undefined
+ * (plan Doc vs code 12).
+ */
+static uint32_t stix_det_pix_gate(StixDetState *d, uint32_t fpga_det)
+{
+    uint32_t pix, pix_mask = 0;
+
+    if (!stix_det_grp_reads_out(d, stix_det_grp_of(fpga_det))) {
+        return 0;
+    }
+    for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+        if (stix_det_r3_th(d, fpga_det, stix_det_asic_ch_from_pix[pix]) !=
+            0x3F) {
+            pix_mask |= 1u << pix;
+        }
+    }
+    return pix_mask;
+}
+
+/* the share of one profile's counts in the ebin of @ebin_mask (bit i) */
+static double stix_det_ebin_share_masked(StixDetState *d, uint32_t profile,
+                                         uint32_t ebin_mask)
+{
+    double share = 0;
+    uint32_t ebin;
+
+    for (ebin = 0; ebin < STIX_DET_N_EBIN; ebin++) {
+        if ((ebin_mask >> ebin) & 1) {
+            share += d->ebin_share[profile][ebin];
+        }
+    }
+    return share;
+}
+
+/*
+ * One tick of the sky (D-Df): for every gated (fpga_det, pix) add the
+ * tick's expected counts to the exposure of the active profile; draw
+ * the tick's SUMCNT (SUMDMASK fpga_det, SUMEMASK ebin, all pix) and LVAR
+ * count (VARDMASK fpga_det, VARPMASK pix, VAREMASK ebin). The masks are
+ * read live; their bit i is index i ([A] for the FPGA-only pix and ebin
+ * masks, plan "Index spaces"). QLACC is not masked.
+ */
+static void stix_det_sky_tick(StixDetState *d)
+{
+    uint32_t profile = d->flare ? STIX_DET_PROFILE_FLARE :
+                                  STIX_DET_PROFILE_QUIET;
+    uint32_t cps = d->flare ? d->flare_cps : d->quiet_cps;
+    uint32_t sumd_fpga_det = d->reg->fsmSumDmask;
+    uint32_t vard_fpga_det = d->reg->fsmQlVarDMask;
+    uint32_t varp_pix = (d->reg->fsmQlConfig >>
+                         STIXCTRL_FSMQLCONFIG_QLVARPMASK) &
+                        STIXCTRL_FSMQLCONFIG_QLVARPMASK_MASK;
+    double tick_counts, sum_share, var_share, sum_lambda = 0, var_lambda = 0;
+    uint32_t fpga_det, pix;
+    uint64_t n;
+
+    if (d->source != STIX_DET_SOURCE_SYNTHETIC || cps == 0) {
+        return;
+    }
+    tick_counts = cps * (STIX_DET_TICK_NS / 1e9);
+    sum_share = stix_det_ebin_share_masked(d, profile, d->reg->fsmSumEmask);
+    var_share = stix_det_ebin_share_masked(d, profile, d->reg->fsmQlVarEMask);
+
+    for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
+        uint32_t pix_mask = stix_det_pix_gate(d, fpga_det);
+
+        for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+            double c;
+
+            if (!((pix_mask >> pix) & 1)) {
+                continue;
+            }
+            d->expo[fpga_det][pix][profile] += tick_counts;
+            c = tick_counts * d->pix_share[pix];
+            if ((sumd_fpga_det >> fpga_det) & 1) {
+                sum_lambda += c * sum_share;
+            }
+            if (((vard_fpga_det >> fpga_det) & 1) && ((varp_pix >> pix) & 1)) {
+                var_lambda += c * var_share;
+            }
+        }
+    }
+
+    n = stix_det_poisson(d, sum_lambda);
+    d->sumcnt = n > UINT32_MAX - d->sumcnt ? UINT32_MAX : d->sumcnt + n;
+    n = stix_det_poisson(d, var_lambda);
+    d->lvar_tick_count = MIN(d->lvar_tick_count + n, (uint64_t)UINT32_MAX);
+}
+
+/*
+ * The swap (D-Dd step 2, D-Df): write the finished bank's LACC in full,
+ * each cell [pix][fpga_det][ebin] (u16 big-endian at byte
+ * ((pix * 32 + fpga_det) * 32 + ebin) * 2, Detectors.h:68-79) drawn as
+ * Poisson(sum over profiles of ebin share x exposure), wrapping at 16
+ * bits; then LTRG per grp (u32 big-endian) = 1.25 x the events of its
+ * fpga_det 2 * grp and 2 * grp + 1, rounded, clamped at 24 bits; then
+ * clear the exposure for the next period. With det-source=zero the
+ * exposure is zero and so is the bank.
+ */
+static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
+{
+    uint8_t *lacc = (uint8_t *)memory_region_get_ram_ptr(d->sram) +
+                    stix_det_lacc_off[ql_bank];
+    uint64_t grp_events[STIX_DET_N_GRP] = { 0 };
+    uint64_t lacc_events = 0;
+    uint32_t pix, fpga_det, ebin, grp;
+
+    for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+        for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
+            const double *expo = d->expo[fpga_det][pix];
+
+            for (ebin = 0; ebin < STIX_DET_N_EBIN; ebin++) {
+                double lambda = d->pix_share[pix] *
+                    (expo[STIX_DET_PROFILE_QUIET] *
+                     d->ebin_share[STIX_DET_PROFILE_QUIET][ebin] +
+                     expo[STIX_DET_PROFILE_FLARE] *
+                     d->ebin_share[STIX_DET_PROFILE_FLARE][ebin]);
+                uint64_t n = stix_det_poisson(d, lambda);
+
+                stw_be_p(lacc + ((pix * STIX_DET_N_FPGA_DET + fpga_det) *
+                                 STIX_DET_N_EBIN + ebin) * sizeof(uint16_t),
+                         (uint16_t)n);
+                grp_events[stix_det_grp_of(fpga_det)] += n;
+                lacc_events += n;
+            }
+        }
+    }
+    memory_region_set_dirty(d->sram, stix_det_lacc_off[ql_bank],
+                            STIXCTRL_LACC0_SIZE);
+
+    for (grp = 0; grp < STIX_DET_N_GRP; grp++) {
+        uint64_t trig = (5 * grp_events[grp] + 2) / 4;
+
+        stix_det_ram_stl(d->ltrg, stix_det_ltrg_off[ql_bank] +
+                         grp * sizeof(uint32_t),
+                         MIN(trig, (uint64_t)STIX_DET_LTRG_MAX));
+    }
+    trace_stixdet_ql_sky(ql_bank, stix_det_source_name[d->source], d->flare,
+                         lacc_events);
+    stix_det_sky_clear_expo(d);
+}
+
+/* ---- the scene properties (D-Db), on /machine/stixctrl ---- */
+
+static StixDetState *stix_det_of(Object *obj, void *opaque)
+{
+    return (StixDetState *)((uint8_t *)obj + GPOINTER_TO_SIZE(opaque));
+}
+
+static void stix_det_trace_scene(StixDetState *d)
+{
+    trace_stixdet_scene(stix_det_source_name[d->source], d->flare,
+                        d->quiet_cps, d->flare_cps,
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+static void stix_det_source_get(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    char *value = g_strdup(stix_det_source_name[stix_det_of(obj,
+                                                            opaque)->source]);
+
+    visit_type_str(v, name, &value, errp);
+    g_free(value);
+}
+
+static void stix_det_source_set(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    g_autofree char *value = NULL;
+    uint32_t i;
+
+    if (!visit_type_str(v, name, &value, errp)) {
+        return;
+    }
+    for (i = 0; i < STIX_DET_SOURCE__MAX; i++) {
+        if (!strcmp(value, stix_det_source_name[i])) {
+            d->source = i;
+            stix_det_trace_scene(d);
+            return;
+        }
+    }
+    error_setg(errp, "%s: unknown source '%s' (zero or synthetic)", name,
+               value);
+}
+
+static void stix_det_flare_get(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    bool value = stix_det_of(obj, opaque)->flare;
+
+    visit_type_bool(v, name, &value, errp);
+}
+
+static void stix_det_flare_set(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    bool value;
+
+    if (!visit_type_bool(v, name, &value, errp)) {
+        return;
+    }
+    d->flare = value;
+    stix_det_trace_scene(d);
+}
+
+/*
+ * det-quiet-cps and det-flare-cps share the accessors; each property's
+ * opaque says where its StixDetState and its field are (allocated once
+ * per class, which lives as long as QEMU does)
+ */
+typedef struct StixDetCpsProp {
+    size_t det_offset;          /* of the StixDetState in the object */
+    size_t field_offset;        /* of the uint32_t in StixDetState */
+} StixDetCpsProp;
+
+static uint32_t *stix_det_cps_field(StixDetState *d, const StixDetCpsProp *p)
+{
+    return (uint32_t *)((uint8_t *)d + p->field_offset);
+}
+
+static void stix_det_cps_get(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    const StixDetCpsProp *p = opaque;
+    StixDetState *d = stix_det_of(obj, GSIZE_TO_POINTER(p->det_offset));
+    uint32_t value = *stix_det_cps_field(d, p);
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void stix_det_cps_set(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    const StixDetCpsProp *p = opaque;
+    StixDetState *d = stix_det_of(obj, GSIZE_TO_POINTER(p->det_offset));
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    /* reject rather than clamp, so a typo in a script is an error */
+    if (value > STIX_DET_CPS_MAX) {
+        error_setg(errp, "%s: %u counts/s per fpga_det is above %u", name,
+                   value, STIX_DET_CPS_MAX);
+        return;
+    }
+    *stix_det_cps_field(d, p) = value;
+    stix_det_trace_scene(d);
+}
+
+static void *stix_det_cps_prop(size_t det_offset, size_t field_offset)
+{
+    StixDetCpsProp *p = g_new(StixDetCpsProp, 1);
+
+    p->det_offset = det_offset;
+    p->field_offset = field_offset;
+    return p;
+}
+
+void stix_det_instance_init(StixDetState *d)
+{
+    d->source = STIX_DET_SOURCE_SYNTHETIC;
+    d->flare = false;
+    d->quiet_cps = STIX_DET_QUIET_CPS_DEFAULT;
+    d->flare_cps = STIX_DET_FLARE_CPS_DEFAULT;
+}
+
+void stix_det_class_init(ObjectClass *klass, size_t det_offset)
+{
+    void *opaque = GSIZE_TO_POINTER(det_offset);
+
+    object_class_property_add(klass, "det-source", "str", &str_type_info,
+                              stix_det_source_get, stix_det_source_set,
+                              NULL, opaque);
+    object_class_property_set_description(klass, "det-source",
+        "detector count source: zero | synthetic (runtime; survives a "
+        "device reset)");
+    object_class_property_add(klass, "det-flare", "bool", &bool_type_info,
+                              stix_det_flare_get, stix_det_flare_set,
+                              NULL, opaque);
+    object_class_property_set_description(klass, "det-flare",
+        "the flare switch: the synthetic sky uses det-flare-cps and the "
+        "flare spectrum (runtime)");
+    object_class_property_add(klass, "det-quiet-cps", "uint32",
+                              &uint32_type_info, stix_det_cps_get,
+                              stix_det_cps_set, NULL,
+                              stix_det_cps_prop(det_offset,
+                                  offsetof(StixDetState, quiet_cps)));
+    object_class_property_set_description(klass, "det-quiet-cps",
+        "quiet sky, counts/s per fpga_det, 0..1000000 (runtime)");
+    object_class_property_add(klass, "det-flare-cps", "uint32",
+                              &uint32_type_info, stix_det_cps_get,
+                              stix_det_cps_set, NULL,
+                              stix_det_cps_prop(det_offset,
+                                  offsetof(StixDetState, flare_cps)));
+    object_class_property_set_description(klass, "det-flare-cps",
+        "flare sky, counts/s per fpga_det, 0..1000000 (runtime)");
+}
+
 bool stix_det_owns(StixDetState *d, hwaddr addr)
 {
     return d->model && addr <= STIX_DET_REG_LAST;
@@ -910,7 +1421,10 @@ bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value)
  * det-idefx=off), testPulseCmdSta Busy = 1, all others 0. The tick
  * stops, the FSM state clears; the decoders idle and every ASIC takes
  * its register defaults (the IDPU reset cuts the ASIC supply [I]); the
- * RAM banks are kept (they survive a reset, accepted-diffs §13).
+ * RAM banks are kept (they survive a reset, accepted-diffs §13). The
+ * sky (D-4) loses its exposure and reseeds its PRNG from det-seed; the
+ * scene (det-source, det-flare, the rates) is kept: it describes the
+ * Sun, not the IDPU (D-Db).
  */
 void stix_det_reset(StixDetState *d)
 {
@@ -943,6 +1457,8 @@ void stix_det_reset(StixDetState *d)
     d->ql_tick = 0;
     d->ql_int_time = 0;
     d->lvar_tick_count = 0;
+    stix_det_sky_clear_expo(d);
+    stix_det_reseed(d);
 }
 
 bool stix_det_realize(StixDetState *d, stixCtrlRegs_s *reg,
@@ -958,6 +1474,8 @@ bool stix_det_realize(StixDetState *d, stixCtrlRegs_s *reg,
     d->ltrg = ltrg;
     d->irq = irq;
     d->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, stix_det_tick, d);
+    stix_det_sky_template(d);
+    stix_det_reseed(d);
     return true;
 }
 

@@ -53,8 +53,28 @@ sample counts of a NOMINAL window of SECONDS: SSID 30, 33, 34 about
 SECONDS/4, SSID 31 about SECONDS/8 (each +-2), SSID 32 exactly one
 dump of 32 samples whose subcol bytes are 0..31 once each.
 
+--expect-sky-flush SECONDS is the D-4 check of a synthetic sky (plan
+D-4, D-Df): the same products, headers and sample counts as above, but
+non-zero content: SSID 30 band 0 (ebin 1-6) and SSID 31 bands, SSID 33
+values non-zero in every sample but at most one; every SSID 30 RCR byte
+0 (the RCR must not rise, RateCtrl.c:300-360); SSID 32 one dump with
+every subcol 0..31 non-zero, nothing in ebin 0 or 31 (the template has
+none), and at least half of the decoded counts in the Ba-133 line bins
+ebin 18, 19 and 27 (the first 32 s of NOMINAL are quiet). SSID 34
+flags are counted and printed, not asserted.
+
+--lc-contrast ON OFF is the flare-switch check (plan D-4): ON and OFF
+are the flare switch times in seconds after NOMINAL entry; SSID 30
+sample i covers [4 i, 4 i + 4) s of NOMINAL. The median band-0 byte of
+the flare samples (starting at or after ON + 6 s and ending by OFF - 6
+s) must be at least 8 compressed steps above the median of the quiet
+samples (ending by ON - 6 s), with at least 5 samples on each side. The
+6 s margin covers the 1 s resolution of the probe's clock and one QL
+period of phase between NOMINAL entry and the first sample.
+
 Usage:
   ql-check.py DUMP [--samples] [--expect-zero-flush SECONDS]
+              [--expect-sky-flush SECONDS] [--lc-contrast ON OFF]
   ql-check.py --self-test
 Exit codes: 0 decoded (and the check passed), 1 a decode error or a
 failed check, 2 bad usage or an unreadable file. stdlib only.
@@ -402,9 +422,13 @@ CADENCE_S = {30: 4, 31: 8, 33: 4, 34: 4}
 SAMPLE_TOL = 2
 
 
-def check_zero_flush(products, seconds):
-    """The detector-smoke flush check; returns a list of failures."""
-    fails = []
+def check_products(products, seconds, fails):
+    """The shared part of the flush checks: exactly one product per
+    SSID 30-34, the default headers, the SSID 30/31/33/34 sample counts
+    of a NOMINAL window of @seconds and one SSID 32 dump with subcol
+    0..31 once each. Appends to @fails; returns {ssid: samples} of the
+    SSIDs that have exactly one product."""
+    out = {}
     for ssid in range(30, 35):
         prods = products.get(ssid, [])
         if len(prods) != 1:
@@ -418,11 +442,7 @@ def check_zero_flush(products, seconds):
                     fails.append(f"SSID {ssid} {p['where']}: {k} = "
                                  f"0x{got:X}, want 0x{want:X}")
         smp = prod["samples"]
-        nz = [(i, v) for i, s in enumerate(smp)
-              for v in sample_values(ssid, s) if v]
-        if nz:
-            fails.append(f"SSID {ssid}: {len(nz)} nonzero value bytes "
-                         f"(first in sample {nz[0][0]}: 0x{nz[0][1]:02x})")
+        out[ssid] = smp
         if ssid == 32:
             subcols = sorted(s["subcol"] for s in smp)
             if subcols != list(range(NUM_SUBCOL)):
@@ -434,6 +454,116 @@ def check_zero_flush(products, seconds):
             fails.append(f"SSID {ssid}: {len(smp)} samples, want "
                          f"{want:.1f} +-{SAMPLE_TOL} ({seconds} s / "
                          f"{CADENCE_S[ssid]} s)")
+    return out
+
+
+# the Ba-133 line bins of the quiet template (plan D-Df)
+LINE_EBINS = (18, 19, 27)
+SKY_MAX_ZERO_SAMPLES = 1
+
+
+def check_sky_flush(products, seconds):
+    """The D-4 synthetic-sky flush check; returns a list of failures."""
+    fails = []
+    smp = check_products(products, seconds, fails)
+    nonzero = {
+        30: lambda s: s["lc_band"][0],
+        31: lambda s: sum(s["bg_band"]),
+        33: lambda s: s["variance"],
+    }
+    for ssid, value in nonzero.items():
+        if ssid not in smp:
+            continue
+        zeros = [i for i, s in enumerate(smp[ssid]) if not value(s)]
+        if len(zeros) > SKY_MAX_ZERO_SAMPLES:
+            fails.append(f"SSID {ssid}: {len(zeros)} samples with a zero "
+                         f"value (first {zeros[0]}), want at most "
+                         f"{SKY_MAX_ZERO_SAMPLES}")
+    if 30 in smp:
+        rcr = [i for i, s in enumerate(smp[30]) if s["rcr"]]
+        if rcr:
+            fails.append(f"SSID 30: RCR non-zero in {len(rcr)} samples "
+                         f"(first {rcr[0]}: {smp[30][rcr[0]]['rcr']})")
+    if 32 in smp:
+        total = lines = 0
+        for s in smp[32]:
+            if not any(s["ebin"]):
+                fails.append(f"SSID 32: subcol {s['subcol']} has no counts")
+            for ebin in (0, NUM_EBIN - 1):
+                if s["ebin"][ebin]:
+                    fails.append(f"SSID 32: subcol {s['subcol']} ebin "
+                                 f"{ebin} = 0x{s['ebin'][ebin]:02x}, the "
+                                 f"template has nothing there")
+            for ebin, c in enumerate(s["ebin"]):
+                v = s0_decode(c)[0]
+                total += v
+                if ebin in LINE_EBINS:
+                    lines += v
+        if total and lines * 2 < total:
+            fails.append(f"SSID 32: the line bins ebin {LINE_EBINS} hold "
+                         f"{lines} of {total} decoded counts, want at "
+                         f"least half")
+    return fails
+
+
+CONTRAST_MARGIN_S = 6
+CONTRAST_MIN_STEPS = 8
+CONTRAST_MIN_SAMPLES = 5
+
+
+def median(vals):
+    v = sorted(vals)
+    return v[len(v) // 2] if v else None
+
+
+def check_lc_contrast(products, on_s, off_s, out=None):
+    """The D-4 flare-switch check on SSID 30 band 0 (ebin 1-6). Returns
+    a list of failures; prints the medians to @out."""
+    prods = products.get(30, [])
+    if len(prods) != 1:
+        return [f"SSID 30: {len(prods)} products, want 1"]
+    cad = CADENCE_S[30]
+    smp = prods[0]["samples"]
+    quiet = [s["lc_band"][0] for i, s in enumerate(smp)
+             if cad * (i + 1) <= on_s - CONTRAST_MARGIN_S]
+    flare = [s["lc_band"][0] for i, s in enumerate(smp)
+             if cad * i >= on_s + CONTRAST_MARGIN_S and
+             cad * (i + 1) <= off_s - CONTRAST_MARGIN_S]
+    mq, mf = median(quiet), median(flare)
+    if out is not None:
+        fmt = (lambda m: "none" if m is None else f"0x{m:02x} "
+               f"(>= {s0_decode(m)[0]})")
+        print(f"QL-CHECK LC band 0: quiet median {fmt(mq)} over "
+              f"{len(quiet)} samples, flare median {fmt(mf)} over "
+              f"{len(flare)} samples (switch at +{on_s:g} s, off at "
+              f"+{off_s:g} s)", file=out)
+        flags = products.get(34, [])
+        if len(flags) == 1:
+            st = [s["status"] for i, s in enumerate(flags[0]["samples"])
+                  if on_s <= cad * i < off_s]
+            print(f"QL-CHECK SSID 34 in the flare window: "
+                  f"{sum(1 for x in st if x)} of {len(st)} periods "
+                  f"flagged (status bytes {sorted(set(st))})", file=out)
+    if len(quiet) < CONTRAST_MIN_SAMPLES or len(flare) < CONTRAST_MIN_SAMPLES:
+        return [f"SSID 30: {len(quiet)} quiet and {len(flare)} flare "
+                f"samples, want >= {CONTRAST_MIN_SAMPLES} each"]
+    if mf - mq < CONTRAST_MIN_STEPS:
+        return [f"SSID 30 band 0: flare median 0x{mf:02x} is "
+                f"{mf - mq} compressed steps above the quiet median "
+                f"0x{mq:02x}, want >= {CONTRAST_MIN_STEPS}"]
+    return []
+
+
+def check_zero_flush(products, seconds):
+    """The detector-smoke flush check; returns a list of failures."""
+    fails = []
+    smp = check_products(products, seconds, fails)
+    for ssid in sorted(smp):
+        nz = [(i, v) for i, s in enumerate(smp[ssid])
+              for v in sample_values(ssid, s) if v]
+        if nz:
+            fails.append(f"SSID {ssid}: {len(nz)} nonzero value bytes "
+                         f"(first in sample {nz[0][0]}: 0x{nz[0][1]:02x})")
     return fails
 
 
@@ -468,11 +598,11 @@ def ssid30_body(samples, det_mask=0xFFFFFCFF, int_time=39):
     return b
 
 
-def ssid31_body(n):
+def ssid31_body(n, fill=0):
     b = bytes([31]) + be(1, 4) + be(0, 2) + be(79, 2) + bytes([0x2B << 1])
     b += be(0x10821082, 4) + bytes([0x2B, 5])
     for _ in range(5):
-        b += be(n, 2) + bytes(n)
+        b += be(n, 2) + bytes([fill] * n)
     return b + be(n, 2) + bytes(n)
 
 
@@ -485,10 +615,10 @@ def ssid32_body(spectra):
     return b
 
 
-def ssid33_body(n):
+def ssid33_body(n, fill=0):
     b = bytes([33]) + be(1, 4) + be(0, 2) + be(39, 2) + bytes([40])
     b += be(0xFFFFFCFF, 4) + be(0x7FFE0000, 4) + be(0x0FFF, 2)
-    return b + bytes([0x2B]) + be(n, 2) + bytes(n)
+    return b + bytes([0x2B]) + be(n, 2) + bytes([fill] * n)
 
 
 def ssid34_body(n):
@@ -658,8 +788,74 @@ def self_test():
     f = check_zero_flush(decode_lines(off), secs)
     assert len(f) == 1 and "det_mask_subcol" in f[0], f
 
+    self_test_sky(zero_lines, secs, n4, n8)
     print("QL-CHECK SELF-TEST: PASS")
     return 0
+
+
+def self_test_sky(zero_lines, secs, n4, n8):
+    """The D-4 checks: a synthetic-sky flush passes --expect-sky-flush
+    and --lc-contrast; a zero sky, a flush without the flip, a risen
+    RCR, counts in ebin 0/31, a spectrum without lines, a dark subcol
+    and a window too short for the contrast each fail."""
+    on, off = 64, 124
+
+    def lc_samples(flip=True, rcr_at=None):
+        out = []
+        for i in range(n4):
+            hot = flip and 4 * i >= on and 4 * (i + 1) <= off
+            out.append(([0x79 if hot else 0x28, 0x20, 0x10, 0x30, 0x18],
+                        0x40, 1 if i == rcr_at else 0))
+        return out
+
+    def flush(lc, spectra):
+        return [build_packet(ssid30_body(lc)).hex(),
+                build_packet(ssid31_body(n8, 0x22), seq=1).hex(),
+                build_packet(ssid32_body(spectra), seq=2).hex(),
+                build_packet(ssid33_body(n4, 0x30), seq=3).hex(),
+                build_packet(ssid34_body(n4), seq=4).hex()]
+
+    sp = [0] * 32
+    sp[18], sp[19], sp[27], sp[5] = 0x3A, 0x2A, 0x32, 0x10
+    good_sp = [(sc, sp) for sc in range(32)]
+    prods = decode_lines(flush(lc_samples(), good_sp))
+    assert check_sky_flush(prods, secs) == [], check_sky_flush(prods, secs)
+    assert check_lc_contrast(prods, on, off) == []
+    # the band-0 bytes 0x28 (>= 128) and 0x79 (>= 147456): the plan's
+    # expected quiet and flare values
+
+    f = check_sky_flush(decode_lines(zero_lines), secs)
+    assert any("SSID 30: " in x and "zero value" in x for x in f), f
+    assert any("SSID 31: " in x for x in f) and \
+        any("SSID 33: " in x for x in f), f
+    assert sum("has no counts" in x for x in f) == 32, f
+
+    f = check_lc_contrast(decode_lines(flush(lc_samples(False), good_sp)),
+                          on, off)
+    assert len(f) == 1 and "0 compressed steps" in f[0], f
+    f = check_lc_contrast(prods, 4, 12)
+    assert len(f) == 1 and "want >= 5 each" in f[0], f
+
+    f = check_sky_flush(decode_lines(flush(lc_samples(rcr_at=7), good_sp)),
+                        secs)
+    assert len(f) == 1 and "RCR non-zero" in f[0], f
+    edge = list(sp)
+    edge[31] = 1
+    f = check_sky_flush(decode_lines(flush(lc_samples(),
+                                           [(sc, edge if sc == 9 else sp)
+                                            for sc in range(32)])), secs)
+    assert len(f) == 1 and "subcol 9 ebin 31" in f[0], f
+    flat = [0x30] * 32
+    flat[0] = flat[31] = 0
+    f = check_sky_flush(decode_lines(flush(lc_samples(),
+                                           [(sc, flat)
+                                            for sc in range(32)])), secs)
+    assert len(f) == 1 and "line bins" in f[0], f
+    f = check_sky_flush(decode_lines(flush(lc_samples(),
+                                           [(sc, [0] * 32 if sc == 3
+                                             else sp)
+                                            for sc in range(32)])), secs)
+    assert len(f) == 1 and "subcol 3 has no counts" in f[0], f
 
 
 def main():
@@ -672,6 +868,14 @@ def main():
     ap.add_argument("--expect-zero-flush", type=float, metavar="SECONDS",
                     help="check the NOMINAL-exit flush of a zero sky "
                          "after a NOMINAL window of SECONDS")
+    ap.add_argument("--expect-sky-flush", type=float, metavar="SECONDS",
+                    help="check the NOMINAL-exit flush of a synthetic "
+                         "sky after a NOMINAL window of SECONDS (D-4)")
+    ap.add_argument("--lc-contrast", type=float, nargs=2,
+                    metavar=("ON", "OFF"),
+                    help="check the SSID 30 band-0 flare contrast; the "
+                         "flare switch was on from ON to OFF seconds "
+                         "after NOMINAL entry (D-4)")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -690,15 +894,25 @@ def main():
         print(f"QL-CHECK: FAIL (decode: {e})")
         return 1
     report(products, args.samples, sys.stdout)
-    if args.expect_zero_flush is None:
+    fails, passed = [], []
+    if args.expect_zero_flush is not None:
+        fails += check_zero_flush(products, args.expect_zero_flush)
+        passed.append("zero-sky flush, all five SSIDs")
+    if args.expect_sky_flush is not None:
+        fails += check_sky_flush(products, args.expect_sky_flush)
+        passed.append("synthetic-sky flush, all five SSIDs")
+    if args.lc_contrast is not None:
+        fails += check_lc_contrast(products, *args.lc_contrast,
+                                   out=sys.stdout)
+        passed.append("LC band-0 flare contrast")
+    if not passed:
         return 0
-    fails = check_zero_flush(products, args.expect_zero_flush)
     for x in fails:
         print(f"QL-CHECK MISMATCH: {x}")
     if fails:
         print(f"QL-CHECK: FAIL ({len(fails)} mismatches)")
         return 1
-    print("QL-CHECK: PASS (zero-sky flush, all five SSIDs)")
+    print(f"QL-CHECK: PASS ({'; '.join(passed)})")
     return 0
 
 

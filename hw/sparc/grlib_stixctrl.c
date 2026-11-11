@@ -1115,12 +1115,19 @@ static const Property grlib_stixctrl_properties[] = {
      * and idefxConfig plain storage with CmdReady 0 (the 384 timeouts)
      */
     DEFINE_PROP_BOOL("det-idefx", STIXCTRL, det.idefx, true),
+    /* D-4 (D-Db): the synthetic sky's PRNG seed, applied at every reset */
+    DEFINE_PROP_UINT32("det-seed", STIXCTRL, det.seed, 1),
 };
 
-/* no injection from the moment the object exists (not only at realize) */
+/*
+ * no injection from the moment the object exists (not only at realize);
+ * the detector scene defaults likewise (D-4: a -global or a qom-set at
+ * -S before realize must not be overwritten)
+ */
 static void grlib_stixctrl_instance_init(Object *obj)
 {
     stixctrl_adc_inject_clear(GRLIB_STIXCTRL(obj));
+    stix_det_instance_init(&GRLIB_STIXCTRL(obj)->det);
 }
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)
@@ -1143,6 +1150,8 @@ static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)
             "HK ADC override for this channel: raw 0..4095, "
             "4294967295 = none (runtime, needs hk-adc=on)");
     }
+    /* D-4: det-source, det-flare, det-quiet-cps, det-flare-cps */
+    stix_det_class_init(klass, offsetof(STIXCTRL, det));
 }
 
 static const TypeInfo grlib_stixctrl_info = {

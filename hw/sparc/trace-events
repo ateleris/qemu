@@ -54,6 +54,8 @@ stixdet_ro_write_dropped(uint32_t addr, uint32_t value) "CTRL | Write dropped (r
 stixdet_idefx_cmd(uint32_t grp, uint32_t word, uint32_t delivered_grp_mask, uint32_t response) "IDeF-X grp %u word 0x%05x delivered_grp_mask 0x%04x response 0x%04x"
 stixdet_idefx_reg(uint32_t fpga_det, uint32_t reg, int is_read, uint32_t byte_idx, uint32_t byte) "IDeF-X fpga_det %u reg %u read=%d byte[%u] = 0x%02x"
 stixdet_idefx_defaults(uint32_t fpga_det_mask, const char *why) "IDeF-X register defaults fpga_det_mask 0x%08x (%s)"
+stixdet_scene(const char *source, int flare, uint32_t quiet_cps, uint32_t flare_cps, int64_t vclock_ns) "scene source=%s flare=%d quiet_cps=%u flare_cps=%u (per fpga_det) at vclock_ns=%" PRId64
+stixdet_ql_sky(uint32_t done_ql_bank, const char *source, int flare, uint64_t lacc_events) "QL sky: ql_bank %u source=%s flare=%d lacc_events=%" PRIu64
 
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"

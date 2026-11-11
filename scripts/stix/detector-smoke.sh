@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # DETECTOR smoke: the detector-model gate for tiers 0+1 (detector plan
-# D-3, docs/stix-port/2026-11-11-detector-plan.md). Boots the STIX
-# model on a FRESH flash (an empty run dir: a NOMINAL entry writes a
-# flash context, as in nominal-smoke.sh), with a QMP socket in the run
-# dir (unused by this gate; the D-4/D-6 injections will use it), and
-# QEMU traces stixdet_idefx_cmd with wall-clock timestamps into its own
-# trace file. Times are seconds from the TMTC connect:
+# D-3, docs/stix-port/2026-11-11-detector-plan.md) and, with --flare,
+# for the synthetic sky and the flare switch (tier 2, D-4). Boots the
+# STIX model on a FRESH flash (an empty run dir: a NOMINAL entry writes
+# a flash context, as in nominal-smoke.sh), with a QMP socket in the
+# run dir (the --flare mode flips det-flare through it), and QEMU
+# traces stixdet_idefx_cmd with wall-clock timestamps into its own
+# trace file. Without --flare QEMU runs with
+# -global grlib-stixctrl.det-source=zero (the tiers 0+1 zero sky the
+# D-3 checks expect; the model's default is the synthetic sky since
+# D-4). Times are seconds from the TMTC connect:
 #   connect: the nominal-smoke group, TM(5,3) 0x8030 (fresh flash),
 #            TM(5,1) 0x0022, 0x14A3, 0x142E, each within 50 s
 #   @50  TC(236,1) 04 00 (CONF): TM(1,1), TM(5,1) 0021 02 04, TM(1,7);
@@ -47,7 +51,26 @@
 # NOMINAL window [T_nom - 2 s, T_exit + 2 s], at least 3 runs, and no
 # undelivered read address block. The probe's HH:MM:SS times are local
 # and the trace's ISO times are UTC; both become epoch seconds.
-# --negative runs QEMU with -global grlib-stixctrl.det-idefx=off
+# --flare (D-4) keeps the synthetic sky (det-source=synthetic, 20 cps
+# per fpga_det quiet, 2000 flare) and adds two QMP groups:
+#   @135 qom-set /machine/stixctrl det-flare true
+#   @195 qom-set /machine/stixctrl det-flare false
+# (the @215 CONF follows as before). The QL check then becomes
+# ql-check.py --expect-sky-flush (T_exit - T_nom) (the same products,
+# headers and cadences, but non-zero content: SSID 30 band 0, SSID 31,
+# SSID 33 in every sample but one, every SSID 30 RCR byte 0, SSID 32
+# non-zero for every subcol, nothing in ebin 0/31, at least half in
+# the line bins ebin 18/19/27), and a second check, ql-contrast:
+# ql-check.py --lc-contrast ON OFF with the switch times (the probe's
+# QMP send times) minus T_nom: the SSID 30 band-0 median of the flare
+# samples must be >= 8 compressed steps above the quiet median. The
+# SSID 34 flags in the flare window are printed, not asserted. The
+# QEMU process's user+sys CPU seconds are printed in every mode, for
+# the D-4 cost record (det-source=zero vs synthetic).
+# --flare --negative sends det-flare false at @135 (no flip; the QMP
+# path stays exercised) and passes only when exactly ql-contrast
+# fails.
+# --negative alone runs QEMU with -global grlib-stixctrl.det-idefx=off
 # (CmdReady 0, accepted-diffs §32). A read timeout is not a mismatch
 # (XrayDetFDIR.c:611-615), so no TM fault is expected: the probe must
 # still pass (every forbid quiet, the flush seen) and ql-check must
@@ -62,8 +85,8 @@
 # Like tc-smoke.sh this script does NOT take the /tmp/stix-qtest-21000
 # flock itself; the caller must hold it (no script does this for you).
 #
-# Usage: detector-smoke.sh <qemu-binary> [--negative] [--dry-run]
-#                           [--check-guard]
+# Usage: detector-smoke.sh <qemu-binary> [--flare] [--negative]
+#                           [--dry-run] [--check-guard]
 #   STIX_ASW_ELF            as in tc-smoke.sh
 #   STIX_DETECTOR_RUN_DIR   run dir (default /tmp/stix-detector-run).
 #                           Canonicalised, then anything at or above
@@ -86,8 +109,9 @@
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: detector-smoke.sh <qemu-binary> \
-[--negative] [--dry-run] [--check-guard]}"
+[--flare] [--negative] [--dry-run] [--check-guard]}"
 NEGATIVE=0
+FLARE=0
 DRY_RUN=0
 CHECK_GUARD=0
 for a in "${@:2}"; do
@@ -95,6 +119,9 @@ for a in "${@:2}"; do
         --negative)
             [ "$NEGATIVE" -eq 0 ] || { echo "--negative given twice"; exit 2; }
             NEGATIVE=1 ;;
+        --flare)
+            [ "$FLARE" -eq 0 ] || { echo "--flare given twice"; exit 2; }
+            FLARE=1 ;;
         --dry-run)
             [ "$DRY_RUN" -eq 0 ] || { echo "--dry-run given twice"; exit 2; }
             DRY_RUN=1 ;;
@@ -182,6 +209,25 @@ TC_VERIF="40 02 00 00 1D AC C0 03 00 09 19 EC 06 00 02 02 00 1E 8A E9"
 TC_NOM="40 02 00 00 1D AC C0 04 00 07 19 EC 01 00 05 00 0E 3C"
 TC_CONF2="40 02 00 00 1D AC C0 05 00 07 19 EC 01 00 04 00 D6 2E"
 
+# D-4: the flare switch over QMP (--flare). The negative sends false at
+# @135, so nothing flips but the QMP path and the timing stay the same.
+qom_set() {  # path property json-value
+    printf '{"execute": "qom-set", "arguments": %s' \
+        "{\"path\": \"$1\", \"property\": \"$2\", \"value\": $3}}"
+}
+FLARE_ON=true
+[ "$NEGATIVE" -eq 1 ] && FLARE_ON=false
+FLARE_ARGS=()
+if [ "$FLARE" -eq 1 ]; then
+    FLARE_ARGS=(
+        --qmp "$QMP_SOCK"
+        --send-at 135
+        --qmp-cmd "$(qom_set /machine/stixctrl det-flare "$FLARE_ON")"
+        --send-at 195
+        --qmp-cmd "$(qom_set /machine/stixctrl det-flare false)"
+    )
+fi
+
 # TM(5,x) on 0x5A7, the subtype from the EID's severity nibble (1 ->
 # TM(5,1), 5 -> TM(5,2), 9 -> TM(5,3)); TM(21,6) QL on 0x5DC, matched
 # on the SSID (the first application byte).
@@ -217,6 +263,7 @@ PROBE_ARGS=(
     --forbid "0x5A7:5:1:00210502"
     --forbid "0x5A1:1:8"
     --forbid "0x5A7:5:1:142e"
+    ${FLARE_ARGS[@]+"${FLARE_ARGS[@]}"}
     --send-at 215 --send-hex "$TC_CONF2"
     --expect "0x5A1:1:1:1DACC005"
     --expect "0x5A7:5:1:00210504@10"
@@ -238,12 +285,19 @@ QEMU_ARGS=(
     -msg timestamp=on
     -trace "enable=stixdet_idefx_cmd,file=$RUN_DIR/idefx.trace"
 )
-if [ "$NEGATIVE" -eq 1 ]; then
-    QEMU_ARGS+=(-global grlib-stixctrl.det-idefx=off)
+if [ "$FLARE" -eq 0 ]; then
+    # the tiers 0+1 zero sky of the D-3 checks
+    QEMU_ARGS+=(-global grlib-stixctrl.det-source=zero)
+    if [ "$NEGATIVE" -eq 1 ]; then
+        QEMU_ARGS+=(-global grlib-stixctrl.det-idefx=off)
+    fi
 fi
+MODE="positive"
+[ "$NEGATIVE" -eq 1 ] && MODE="negative"
+[ "$FLARE" -eq 1 ] && MODE="flare $MODE"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-    echo "DRY RUN — the commands detector-smoke would run (negative=$NEGATIVE):"
+    echo "DRY RUN — the commands detector-smoke would run ($MODE):"
     printf '(cd %s && timeout %s %s ' "$RUN_DIR" "$((DURATION + 30))" \
         "$QEMU_BIN"
     printf '%q ' "${QEMU_ARGS[@]}"
@@ -271,7 +325,7 @@ cd "$RUN_DIR"
 # appended to, so it must start empty.
 rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
-      qmp.sock
+      ql.contrast.log qmp.sock
 
 PROBE_PID=""
 QEMU_PID=""
@@ -307,6 +361,14 @@ PROBE_RC=$?
 PROBE_PID=""
 kill -0 "$QEMU_PID" 2>/dev/null
 QEMU_ALIVE=$?
+# D-4 cost record: QEMU's own user+sys CPU (the child of timeout)
+QEMU_CPU=""
+QEMU_CHILD="$(pgrep -P "$QEMU_PID" 2>/dev/null | head -1)"
+if [ -n "$QEMU_CHILD" ] && [ -r "/proc/$QEMU_CHILD/stat" ]; then
+    QEMU_CPU="$(awk -v hz="$(getconf CLK_TCK)" \
+        '{ sub(/^.*\) /, ""); printf "user %.1f s, sys %.1f s", \
+           $12 / hz, $13 / hz }' "/proc/$QEMU_CHILD/stat")"
+fi
 kill "$QEMU_PID" 2>/dev/null || true
 wait "$QEMU_PID" 2>/dev/null
 QEMU_RC=$?
@@ -383,7 +445,11 @@ EOF
         "$NOM_SECONDS s"
 fi
 
-# 2. the QL flush content
+[ -n "$QEMU_CPU" ] && echo "QEMU CPU ($MODE): $QEMU_CPU"
+
+# 2. the QL flush content (zero sky, or with --flare the synthetic sky)
+QL_FLUSH_ARG=--expect-zero-flush
+[ "$FLARE" -eq 1 ] && QL_FLUSH_ARG=--expect-sky-flush
 if [ -z "$NOM_SECONDS" ]; then
     echo "CHECK ql: FAIL (no NOMINAL window: 0021 04 05 or 0021 05 04" \
         "not seen)"
@@ -394,7 +460,7 @@ elif [ ! -s ql.dump.hex ]; then
 else
     set +e
     python3 "$QLCHECK" ql.dump.hex --samples \
-        --expect-zero-flush "$NOM_SECONDS" > ql.check.log 2>&1
+        "$QL_FLUSH_ARG" "$NOM_SECONDS" > ql.check.log 2>&1
     QL_RC=$?
     set -e
     grep -E '^(SSID|QL-CHECK)' ql.check.log || true
@@ -403,6 +469,44 @@ else
     else
         echo "CHECK ql: FAIL (ql-check rc=$QL_RC; see ql.check.log)"
         FAILED+=(ql)
+    fi
+fi
+
+# 2b. --flare: the LC band-0 contrast across the flare switch. The
+# switch times are the probe's QMP send times, relative to T_nom.
+if [ "$FLARE" -eq 1 ]; then
+    mapfile -t QMP_HMS < <(grep '>> qmp .*det-flare' detector.probe.log \
+        | cut -d' ' -f1)
+    if [ -z "$NOM_SECONDS" ] || [ "${#QMP_HMS[@]}" -ne 2 ] || \
+        [ ! -s ql.dump.hex ]; then
+        echo "CHECK ql-contrast: FAIL (no NOMINAL window, no dump, or" \
+            "not exactly two det-flare QMP sends: ${#QMP_HMS[@]})"
+        FAILED+=(ql-contrast)
+    else
+        read -r FLARE_ON_S FLARE_OFF_S < <(python3 -c '
+import sys
+def s(hms):
+    h, m, x = (int(v) for v in hms.split(":"))
+    return h * 3600 + m * 60 + x
+t0 = s(sys.argv[1])
+print(*((s(a) - t0) % 86400 for a in sys.argv[2:]))
+' "$T_NOM_HMS" "${QMP_HMS[0]}" "${QMP_HMS[1]}")
+        echo "flare switch: on at T_nom +$FLARE_ON_S s, off at" \
+            "T_nom +$FLARE_OFF_S s"
+        set +e
+        python3 "$QLCHECK" ql.dump.hex \
+            --lc-contrast "$FLARE_ON_S" "$FLARE_OFF_S" \
+            > ql.contrast.log 2>&1
+        QLC_RC=$?
+        set -e
+        grep -E '^QL-CHECK' ql.contrast.log || true
+        if [ "$QLC_RC" -eq 0 ]; then
+            echo "CHECK ql-contrast: ok"
+        else
+            echo "CHECK ql-contrast: FAIL (ql-check rc=$QLC_RC; see" \
+                "ql.contrast.log)"
+            FAILED+=(ql-contrast)
+        fi
     fi
 fi
 
@@ -448,15 +552,19 @@ fi
 # and hold no IDeF-X command word at all (det-idefx=off fires no
 # stixdet_idefx_cmd); only then does trace-verif count as failed as
 # planned. A missing or unreadable trace fails the gate in both modes.
+# The --flare modes keep det-idefx on, so even --flare --negative takes
+# the positive branch here.
+IDEFX_NEG=0
+[ "$NEGATIVE" -eq 1 ] && [ "$FLARE" -eq 0 ] && IDEFX_NEG=1
 TRACE_ARGS=(idefx.trace --run-epoch "$RUN_EPOCH")
 [ -n "${T_NOM_HMS:-}" ] && TRACE_ARGS+=(--t-nom "$T_NOM_HMS")
 [ -n "${T_EXIT_HMS:-}" ] && TRACE_ARGS+=(--t-exit "$T_EXIT_HMS")
-[ "$NEGATIVE" -eq 1 ] && TRACE_ARGS+=(--expect-none)
+[ "$IDEFX_NEG" -eq 1 ] && TRACE_ARGS+=(--expect-none)
 set +e
 python3 "$TRACECHECK" "${TRACE_ARGS[@]}"
 TRACE_RC=$?
 set -e
-if [ "$NEGATIVE" -eq 1 ]; then
+if [ "$IDEFX_NEG" -eq 1 ]; then
     if [ "$TRACE_RC" -eq 0 ]; then
         echo "CHECK trace-verif: FAIL as planned (the trace is empty:" \
             "no IDeF-X command words at all)"
@@ -474,6 +582,19 @@ else
 fi
 
 GOT="${FAILED[*]:-}"
+if [ "$FLARE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
+    # PASS only when the missing flip is all that fails: the LC
+    # contrast check; the sky, probe, UART and trace checks must pass.
+    if [ "$GOT" = "ql-contrast" ]; then
+        echo "DETECTOR-SMOKE (flare negative): PASS (failed exactly as" \
+            "planned: no flare switch, no LC contrast; everything else" \
+            "passed)"
+        exit 0
+    fi
+    echo "DETECTOR-SMOKE (flare negative): FAIL (failed checks:" \
+        "'${GOT}', want 'ql-contrast')"
+    exit 1
+fi
 if [ "$NEGATIVE" -eq 1 ]; then
     # PASS only on the planned failure: exactly the UART IDeF-X check
     # (all 384 NOMINAL-entry writes timed out, and the verification
@@ -494,9 +615,12 @@ if [ "$NEGATIVE" -eq 1 ]; then
         "failures; got $IDEFX_W and $IDEFX_R)"
     exit 1
 fi
+# the D-3 positive keeps its verdict wording; --flare names its mode
+TAG="DETECTOR-SMOKE"
+[ "$FLARE" -eq 1 ] && TAG="DETECTOR-SMOKE ($MODE)"
 if [ -n "$GOT" ]; then
-    echo "DETECTOR-SMOKE: FAIL (failed checks: $GOT)"
+    echo "$TAG: FAIL (failed checks: $GOT)"
     exit 1
 fi
-echo "DETECTOR-SMOKE: PASS"
+echo "$TAG: PASS"
 exit 0

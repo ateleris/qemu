@@ -1,8 +1,11 @@
 /*
  * STIX IDPU detector controller model (detector plan D-Da): the readout
- * FSM, the QL accumulator bank switch and IRQ 3 (D-1), and the IDeF-X
- * serial interface with its ASIC register store (D-2), behind CTRL's
- * APB offsets 0x00-0x4C. Internal to grlib_stixctrl.c; not a QOM device.
+ * FSM, the QL accumulator bank switch and IRQ 3 (D-1), the IDeF-X
+ * serial interface with its ASIC register store (D-2), and the
+ * synthetic sky with the flare switch (D-4), behind CTRL's APB offsets
+ * 0x00-0x4C. Internal to grlib_stixctrl.c; not a QOM device (its
+ * runtime scene properties are added to the controller's class by
+ * stix_det_class_init).
  *
  * Index spaces: every detector-related name carries its space
  * (fpga_det, grp, asic, quarter, asic_ch, pix, subcol, fe_sc, ebin;
@@ -18,6 +21,7 @@
 #include "system/memory.h"
 #include "hw/core/irq.h"
 #include "qemu/timer.h"
+#include "qom/object.h"
 #include "StixIdpu.h"
 
 /* the last detector register: fsmCalRes (StixIdpu.h stixCtrlRegs_s) */
@@ -31,6 +35,22 @@
 #define STIX_DET_N_ASIC_CH 32u      /* asic_ch 0..31 */
 #define STIX_DET_N_PIX 13u          /* pix 0..11, 12 = guard ring */
 #define STIX_DET_N_SUBCOL 32u       /* subcol 0..31 (ICD number - 1) */
+#define STIX_DET_N_EBIN 32u         /* ebin 0..31 (science energy bin) */
+/* pix 0..11 are accumulated; the guard ring (pix 12) never is */
+#define STIX_DET_N_PIX_ACC 12u
+
+/*
+ * D-4 (D-Db det-source): where the counts come from. replay-dss is
+ * added by D-7.
+ */
+typedef enum StixDetSource {
+    STIX_DET_SOURCE_ZERO,
+    STIX_DET_SOURCE_SYNTHETIC,
+    STIX_DET_SOURCE__MAX,
+} StixDetSource;
+
+/* D-4 (D-Df): the synthetic sky's two spectral profiles */
+enum { STIX_DET_PROFILE_QUIET, STIX_DET_PROFILE_FLARE, STIX_DET_N_PROFILE };
 
 /* IDeF-X slow-control register addresses 0..13 (1..12 stored) */
 #define STIX_DET_IDEFX_N_REG 14u
@@ -68,14 +88,14 @@ typedef struct StixDetState {
     bool ql_ready;
     bool cal_enable;
     uint32_t active_ql_bank;    /* fsmSta.ActiveQl, 0..3 */
-    uint32_t sumcnt;            /* fsmEvents; no count source before D-4 */
+    uint32_t sumcnt;            /* fsmEvents: SUMCNT, saturating */
 
     /* the 100 ms tick; runs only while enable */
     QEMUTimer *tick;
     int64_t tick_deadline_ns;   /* absolute, so the tick does not drift */
     uint32_t ql_tick;           /* ticks done in the current QL period */
     uint32_t ql_int_time;       /* QlIntTime latched for this period */
-    uint32_t lvar_tick_count;   /* this tick's LVAR count (D-4 adds) */
+    uint32_t lvar_tick_count;   /* this tick's LVAR count */
 
     /* det-idefx (qdev property): false keeps 0x00-0x0C plain storage */
     bool idefx;
@@ -88,6 +108,29 @@ typedef struct StixDetState {
     uint8_t idefx_reg[STIX_DET_N_FPGA_DET][STIX_DET_IDEFX_N_REG]
                      [STIX_DET_IDEFX_REG_BYTES];
     StixIdefxDecoder idefx_dec[STIX_DET_N_GRP];
+
+    /*
+     * D-4 (D-Db): the scene, set over QMP at run time. It describes the
+     * Sun, not the IDPU, so a device reset keeps it.
+     */
+    uint32_t source;            /* StixDetSource */
+    bool flare;                 /* the flare switch */
+    uint32_t quiet_cps;         /* counts/s per fpga_det, quiet */
+    uint32_t flare_cps;         /* counts/s per fpga_det, flare */
+    /* det-seed (qdev property): the PRNG seed, applied at every reset */
+    uint32_t seed;
+    uint64_t prng;              /* xorshift64* state */
+    /*
+     * D-Df exposure of the active QL period: the expected counts of each
+     * (fpga_det, pix) so far, per profile, summed over the ticks in
+     * which that pair was gated on (rate x 100 ms x the pix share). At
+     * the swap each LACC cell is drawn as Poisson(sum over profiles of
+     * expo x the profile's ebin share).
+     */
+    double expo[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC][STIX_DET_N_PROFILE];
+    /* the template (D-Df), built at realize: pix share and ebin shares */
+    double pix_share[STIX_DET_N_PIX_ACC];
+    double ebin_share[STIX_DET_N_PROFILE][STIX_DET_N_EBIN];
 } StixDetState;
 
 bool stix_det_realize(StixDetState *d, stixCtrlRegs_s *reg,
@@ -95,6 +138,14 @@ bool stix_det_realize(StixDetState *d, stixCtrlRegs_s *reg,
                       MemoryRegion *ltrg, qemu_irq *irq, Error **errp);
 void stix_det_unrealize(StixDetState *d);
 void stix_det_reset(StixDetState *d);
+/* the scene defaults, once per object (instance_init; not on reset) */
+void stix_det_instance_init(StixDetState *d);
+/*
+ * The runtime scene properties (det-source, det-flare, det-quiet-cps,
+ * det-flare-cps) on the owning device class; @det_offset is
+ * offsetof(owner, det), so the owner's struct stays private
+ */
+void stix_det_class_init(ObjectClass *klass, size_t det_offset);
 
 /* true when the model owns the APB offset (det-model on, 0x00-0x4C) */
 bool stix_det_owns(StixDetState *d, hwaddr addr);

@@ -14,10 +14,12 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include "qemu/bswap.h"
 #include "libqtest.h"
 #include "qobject/qbool.h"
 #include "qobject/qnum.h"
+#include "qobject/qstring.h"
 
 #define APB_PNP_BASE 0x800FF000
 #define PNP_ENTRY_COUNT 12   /* words 0x00..0x0b; 0x0c.. must be zero */
@@ -5953,6 +5955,821 @@ static void test_det_idefx_off(void)
     stix_qtest_cleanup();
 }
 
+/* ---- Synthetic sky and the flare switch (detector plan D-4, tier 2) ---- */
+
+#define CTRL_FSMQLVARDMASK   0x24u
+#define CTRL_FSMQLVAREMASK   0x28u
+#define CTRL_FSMSUMDMASK     0x34u
+#define CTRL_FSMSUMEMASK     0x38u
+
+/* LACC [pix][fpga_det][ebin] u16 (Detectors.h:68-79); LTRG per grp u32 */
+/* pix 0..11; pix 12, the guard ring, is never accumulated */
+#define SKY_N_PIX            12u
+#define SKY_N_FPGA_DET       32u    /* fpga_det = 2 * grp + asic */
+#define SKY_N_EBIN           32u
+#define SKY_N_GRP            16u
+#define SKY_N_LVAR_SLOT      40u
+#define SKY_CTRL_PATH        "/machine/stixctrl"
+
+/*
+ * The D-Df template, as the test expects it: per fpga_det the rate is
+ * shared by pix with weight 1.0 (large pix 0-7) and 0.22 (small pix
+ * 8-11), total weight 8.88; the quiet spectrum puts 45 % in ebin 18,
+ * 10 % in ebin 19, 20 % in ebin 27, 10 % flat over ebin 1-11 and 15 %
+ * flat over ebin 12-30; the flare spectrum 70 % in ebin 1-10 (thermal)
+ * and 30 % in ebin 11-25 (power law). Nothing in ebin 0 or 31.
+ */
+#define SKY_PIX_W_TOTAL      8.88
+#define SKY_QUIET_EBIN18     0.45
+
+typedef struct SkyBank {
+    uint16_t lacc[SKY_N_PIX][SKY_N_FPGA_DET][SKY_N_EBIN];
+    uint32_t ltrg_grp[SKY_N_GRP];
+    uint32_t lvar_slot[SKY_N_LVAR_SLOT];
+} SkyBank;
+
+/* one QL bank as the FSW reads it: big-endian (Detectors.h:68-95) */
+static void sky_read_bank(QTestState *qts, uint32_t n, SkyBank *b)
+{
+    g_autofree uint8_t *raw = g_malloc(QL_LACC_SIZE);
+    uint8_t small[QL_LVAR_SIZE];
+    uint32_t pix, fpga_det, ebin, i;
+
+    qtest_memread(qts, QL_LACC(n), raw, QL_LACC_SIZE);
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+                uint32_t off = ((pix * 32 + fpga_det) * 32 + ebin) * 2;
+
+                b->lacc[pix][fpga_det][ebin] = lduw_be_p(raw + off);
+            }
+        }
+    }
+    qtest_memread(qts, QL_LTRG(n), small, QL_LTRG_SIZE);
+    for (i = 0; i < SKY_N_GRP; i++) {
+        b->ltrg_grp[i] = ldl_be_p(small + 4 * i);
+    }
+    qtest_memread(qts, QL_LVAR(n), small, QL_LVAR_SIZE);
+    for (i = 0; i < SKY_N_LVAR_SLOT; i++) {
+        b->lvar_slot[i] = ldl_be_p(small + 4 * i);
+    }
+}
+
+static uint64_t sky_fpga_det_sum(const SkyBank *b, uint32_t fpga_det)
+{
+    uint64_t sum = 0;
+    uint32_t pix, ebin;
+
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+            sum += b->lacc[pix][fpga_det][ebin];
+        }
+    }
+    return sum;
+}
+
+static uint64_t sky_pix_sum(const SkyBank *b, uint32_t fpga_det, uint32_t pix)
+{
+    uint64_t sum = 0;
+    uint32_t ebin;
+
+    for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+        sum += b->lacc[pix][fpga_det][ebin];
+    }
+    return sum;
+}
+
+static uint64_t sky_ebin_sum(const SkyBank *b, uint32_t ebin)
+{
+    uint64_t sum = 0;
+    uint32_t pix, fpga_det;
+
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            sum += b->lacc[pix][fpga_det][ebin];
+        }
+    }
+    return sum;
+}
+
+static uint64_t sky_total(const SkyBank *b)
+{
+    uint64_t sum = 0;
+    uint32_t fpga_det;
+
+    for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+        sum += sky_fpga_det_sum(b, fpga_det);
+    }
+    return sum;
+}
+
+/* |got - lambda| within k Poisson sigmas */
+static void sky_assert_poisson(const char *what, double got, double lambda,
+                               double k)
+{
+    double tol = k * sqrt(lambda > 1 ? lambda : 1);
+
+    g_test_message("%s: %.0f, expected %.1f +- %.1f", what, got, lambda,
+                   tol);
+    g_assert_cmpfloat(fabs(got - lambda), <=, tol);
+}
+
+static bool sky_set_str(QTestState *qts, const char *prop, const char *val)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %s}}", SKY_CTRL_PATH, prop, val);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+static bool sky_set_u32(QTestState *qts, const char *prop, uint32_t val)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %u}}", SKY_CTRL_PATH, prop, val);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+/* a string property, or NULL when it is unknown */
+static char *sky_get_str(QTestState *qts, const char *prop)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s, 'property': %s}}",
+                            SKY_CTRL_PATH, prop);
+    QString *str = qobject_to(QString, qdict_get(resp, "return"));
+    char *val = str ? g_strdup(qstring_get_str(str)) : NULL;
+
+    qobject_unref(resp);
+    return val;
+}
+
+static void sky_expect_scene(QTestState *qts, const char *source, bool flare,
+                             int64_t quiet_cps, int64_t flare_cps)
+{
+    g_autofree char *got = sky_get_str(qts, "det-source");
+    bool ok;
+
+    g_assert_cmpstr(got, ==, source);
+    g_assert_true(stix_qom_get_bool(qts, SKY_CTRL_PATH, "det-flare", &ok) ==
+                  flare);
+    g_assert_true(ok);
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH, "det-quiet-cps"),
+                    ==, quiet_cps);
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH, "det-flare-cps"),
+                    ==, flare_cps);
+}
+
+/*
+ * The NOMINAL-entry detector set-up the sky needs (OpModeMgmt.c:470-513,
+ * 634; QLVariance.c:86): every quarter, grp and ReadMode on is done by
+ * the caller (idefx_power*); here the FPGA masks (all fpga_det in
+ * SUMDMASK and VARDMASK, SUMEMASK 0xFFE = ebin 1-11, VAREMASK
+ * 0x7FFE0000 = ebin 17-30), QlIntTime and VARPMASK (pix bits), then
+ * SetEnable and Reset.
+ */
+static void sky_start(QTestState *qts, uint32_t ql_int_time,
+                      uint32_t varpmask_pix)
+{
+    ctrl_write(qts, CTRL_FSMSUMDMASK, 0xFFFFFFFFu);
+    ctrl_write(qts, CTRL_FSMSUMEMASK, 0xFFEu);
+    ctrl_write(qts, CTRL_FSMQLVARDMASK, 0xFFFFFFFFu);
+    ctrl_write(qts, CTRL_FSMQLVAREMASK, 0x7FFE0000u);
+    ctrl_write(qts, CTRL_FSMQLCONFIG,
+               ql_int_time << 16 | (varpmask_pix & 0xFFFu));
+    det_cmd_or(qts, FSMCMD_SETENABLE);
+    det_cmd_or(qts, FSMCMD_RESET);
+}
+
+/*
+ * det-counts-zero: det-source=zero (here from -global, as the D-3 gate
+ * runs) gives an all-zero finished bank and no SUMCNT, even with every
+ * quarter, grp and ReadMode on; switching to synthetic at run time
+ * fills the next bank (the D-Dd lifecycle is unchanged).
+ */
+static void test_det_counts_zero(void)
+{
+    QTestState *qts =
+        stix_qtest_new_extra("-global grlib-stixctrl.det-source=zero");
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint32_t i;
+
+    sky_expect_scene(qts, "zero", false, 20, 2000);
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+    for (i = 0; i < SKY_N_GRP; i++) {
+        g_assert_cmpuint(b->ltrg_grp[i], ==, 0);
+    }
+    for (i = 0; i < SKY_N_LVAR_SLOT; i++) {
+        g_assert_cmpuint(b->lvar_slot[i], ==, 0);
+    }
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+
+    g_assert_true(sky_set_str(qts, "det-source", "synthetic"));
+    det_step_ticks(qts, 40);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(sky_total(b), >, 0);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), >, 0);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-counts-quiet: the default scene (synthetic, 20 cps per fpga_det)
+ * gives a finished bank of about 32 x 20 x 4 s = 2560 counts (5 sigma),
+ * uniform over fpga_det (the largest below the QLDetPerf limits, 5 x
+ * the median and Cbad 300, QLDetPerf.c:124-143), dominated by the lines
+ * in ebin 18/19/27, the small pix at about 0.22 of a large one, and
+ * SUMCNT (fsmEvents) about the SUMEMASK ebin 1-11 share, 10 %.
+ */
+static void test_det_counts_quiet(void)
+{
+    QTestState *qts = stix_qtest_new();
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint64_t per_fpga_det[SKY_N_FPGA_DET], sorted[SKY_N_FPGA_DET];
+    uint64_t total, lines, large = 0, small = 0, median, max = 0;
+    uint32_t fpga_det, pix, i, j;
+
+    sky_expect_scene(qts, "synthetic", false, 20, 2000);
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    sky_read_bank(qts, 0, b);
+
+    total = sky_total(b);
+    sky_assert_poisson("quiet bank sum", total, 32 * 20 * 4, 5);
+    sky_assert_poisson("SUMCNT (ebin 1-11, 10 %)",
+                       ctrl_read(qts, CTRL_FSMEVENTS), 32 * 20 * 4 * 0.10, 5);
+
+    for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+        per_fpga_det[fpga_det] = sky_fpga_det_sum(b, fpga_det);
+        sorted[fpga_det] = per_fpga_det[fpga_det];
+        max = MAX(max, per_fpga_det[fpga_det]);
+        g_assert_cmpuint(per_fpga_det[fpga_det], >, 0);
+    }
+    for (i = 1; i < SKY_N_FPGA_DET; i++) {      /* insertion sort */
+        uint64_t v = sorted[i];
+
+        for (j = i; j > 0 && sorted[j - 1] > v; j--) {
+            sorted[j] = sorted[j - 1];
+        }
+        sorted[j] = v;
+    }
+    median = sorted[SKY_N_FPGA_DET / 2];
+    g_test_message("per fpga_det: median %" PRIu64 ", max %" PRIu64,
+                   median, max);
+    g_assert_cmpuint(max, <, 5 * MAX(median, 1));
+    g_assert_cmpuint(max, <, 300);
+
+    lines = sky_ebin_sum(b, 18) + sky_ebin_sum(b, 19) + sky_ebin_sum(b, 27);
+    g_assert_cmpfloat((double)lines / total, >, 0.65);
+    g_assert_cmpuint(sky_ebin_sum(b, 18), >, sky_ebin_sum(b, 27));
+    g_assert_cmpuint(sky_ebin_sum(b, 27), >, sky_ebin_sum(b, 19));
+    g_assert_cmpuint(sky_ebin_sum(b, 0), ==, 0);
+    g_assert_cmpuint(sky_ebin_sum(b, 31), ==, 0);
+
+    for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+        for (pix = 0; pix < SKY_N_PIX; pix++) {
+            if (pix < 8) {
+                large += sky_pix_sum(b, fpga_det, pix);
+            } else {
+                small += sky_pix_sum(b, fpga_det, pix);
+            }
+        }
+    }
+    /* per pix: small / large = 0.22 (4 small, 8 large pix) */
+    g_assert_cmpfloat((small / 4.0) / (large / 8.0), >, 0.15);
+    g_assert_cmpfloat((small / 4.0) / (large / 8.0), <, 0.30);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-counts-flare: qom-set det-flare true at run time; the period that
+ * starts after it gives a 100x bank (2000 / 20 cps), thermal in ebin
+ * 1-10; false brings the next bank back to the quiet sum.
+ */
+static void test_det_counts_flare(void)
+{
+    QTestState *qts = stix_qtest_new();
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint64_t total, thermal = 0;
+    uint32_t ebin, pix, fpga_det, max_cell = 0;
+    bool ok;
+
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+    sky_assert_poisson("quiet bank 0", sky_total(b), 2560, 5);
+
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH, "det-flare", true));
+    g_assert_true(stix_qom_get_bool(qts, SKY_CTRL_PATH, "det-flare", &ok));
+    g_assert_true(ok);
+    det_step_ticks(qts, 40);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+    sky_read_bank(qts, 1, b);
+    total = sky_total(b);
+    sky_assert_poisson("flare bank 1", total, 32 * 2000 * 4, 5);
+    for (ebin = 1; ebin <= 10; ebin++) {
+        thermal += sky_ebin_sum(b, ebin);
+    }
+    g_assert_cmpfloat((double)thermal / total, >, 0.6);
+    g_assert_cmpuint(sky_ebin_sum(b, 1), >, sky_ebin_sum(b, 18));
+    /* no LACC cell near the u16 wrap (largest about 200, plan D-4) */
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+                max_cell = MAX(max_cell, b->lacc[pix][fpga_det][ebin]);
+            }
+        }
+    }
+    g_assert_cmpuint(max_cell, <, 1000);
+
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH, "det-flare", false));
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 2, b);
+    sky_assert_poisson("quiet bank 2", sky_total(b), 2560, 5);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * R3 wire bytes with threshold @th_hot on asic_ch @hot_asic_ch and 62 on
+ * every other: the 32 six-bit fields MSB first are asic_ch 0..31 in
+ * wire order (utils_getReg3 after utils_reorderThreshold3, utils.c:
+ * 538-555, 663-677)
+ */
+static void sky_r3_wire(uint8_t r3[24], uint32_t hot_asic_ch, uint32_t th_hot)
+{
+    uint32_t asic_ch, bit;
+
+    memset(r3, 0, 24);
+    for (asic_ch = 0; asic_ch < 32; asic_ch++) {
+        uint32_t th = asic_ch == hot_asic_ch ? th_hot : 62;
+
+        for (bit = 0; bit < 6; bit++) {
+            if ((th >> (5 - bit)) & 1) {
+                uint32_t pos = asic_ch * 6 + bit;
+
+                r3[pos / 8] |= 0x80u >> (pos % 8);
+            }
+        }
+    }
+}
+
+/*
+ * det-counts-gating (per tick, D-Df): a (fpga_det, pix) counts only with
+ * its quarter powered, its grp enabled, its ReadMode bit 1 (readout)
+ * and the R3 threshold of asic_ch = the pix's channel below 63.
+ * - quarter 0 off: fpga_det 0..7 (grp 0..3) and LTRG grp 0..3 are zero;
+ * - grp 5 disabled: fpga_det 10, 11;
+ * - grp 7 in ReadMode 0 (config): fpga_det 14, 15;
+ * - fpga_det 18 (grp 9, asic 0) with TH = 63 on asic_ch 1 = pix 3
+ *   (utils_pixelId2channelId, utils.c:50-53): only that pix is zero.
+ * Then a ReadMode pulse of one tick on grp 12 (fpga_det 24, 25) removes
+ * one tick of 40 from that grp's exposure, not the whole period.
+ */
+static void test_det_counts_gating(void)
+{
+    QTestState *qts = stix_qtest_new();
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint32_t mode = 0xFFFFu & ~(1u << 7);
+    uint32_t fpga_det, pix, grp;
+    double ref = 0, ratio;
+    uint32_t n_ref = 0;
+    uint8_t r3[24];
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 100000));
+    idefx_power(qts, 0xF, 0xFFFF, 0xFFFF);
+    sky_r3_wire(r3, 1, 63);             /* asic_ch 1 = pix 3 */
+    idefx_write_reg(qts, 9, 0, 3, r3, sizeof(r3));
+    idefx_power(qts, 0xE, 0xFFFFu & ~(1u << 5), mode);
+
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+    for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+        uint64_t sum = sky_fpga_det_sum(b, fpga_det);
+        bool off = fpga_det < 8 || fpga_det == 10 || fpga_det == 11 ||
+                   fpga_det == 14 || fpga_det == 15;
+
+        g_test_message("fpga_det %u: %" PRIu64, fpga_det, sum);
+        if (off) {
+            g_assert_cmpuint(sum, ==, 0);
+        } else {
+            g_assert_cmpuint(sum, >, 100000);
+        }
+    }
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        if (pix == 3) {
+            g_assert_cmpuint(sky_pix_sum(b, 18, pix), ==, 0);
+        } else {
+            g_assert_cmpuint(sky_pix_sum(b, 18, pix), >, 1000);
+        }
+    }
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        bool off = grp < 4 || grp == 5 || grp == 7;
+
+        if (off) {
+            g_assert_cmpuint(b->ltrg_grp[grp], ==, 0);
+        } else {
+            g_assert_cmpuint(b->ltrg_grp[grp], >, 0);
+        }
+    }
+
+    /* one tick of 40 with grp 12 in config mode, mid-period */
+    det_step_ticks(qts, 10);
+    qtest_clock_step(qts, DET_TICK_NS / 2);
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, (mode & ~(1u << 12)) << 16);
+    det_step_ticks(qts, 1);
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, mode << 16);
+    qtest_clock_step(qts, DET_TICK_NS / 2);
+    det_step_ticks(qts, 28);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+    sky_read_bank(qts, 1, b);
+    for (fpga_det = 16; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+        if (fpga_det != 18 && fpga_det != 24 && fpga_det != 25) {
+            ref += sky_fpga_det_sum(b, fpga_det);
+            n_ref++;
+        }
+    }
+    ref /= n_ref;
+    ratio = (sky_fpga_det_sum(b, 24) + sky_fpga_det_sum(b, 25)) / (2 * ref);
+    g_test_message("grp 12 after a one-tick ReadMode pulse: %.4f of the "
+                   "others (39/40 = 0.975)", ratio);
+    g_assert_cmpfloat(ratio, >, 0.965);
+    g_assert_cmpfloat(ratio, <, 0.985);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * The FSW's R3 layout, rebuilt here from its description and kept
+ * independent of the model's decoder (STIX-FSW 600a7a72, utils.c:521-555,
+ * 663-677): in software, 6-bit field c (threshold of asic_ch c) sits at
+ * bit 6c counted from the LSB of the 24 bytes read as one big-endian
+ * number; the wire carries the same fields in reversed order (software
+ * field c at LSB field position 31 - c).
+ */
+static void sky_r3_fsw_wire(uint8_t wire[24], const uint8_t th_sw[32])
+{
+    uint8_t sw[24] = { 0 };
+    uint32_t c, bit;
+
+    for (c = 0; c < 32; c++) {
+        for (bit = 0; bit < 6; bit++) {
+            uint32_t b = 6 * c + bit;   /* from the LSB */
+
+            if ((th_sw[c] >> bit) & 1) {
+                sw[23 - b / 8] |= 1u << (b % 8);
+            }
+        }
+    }
+    memset(wire, 0, 24);
+    for (c = 0; c < 32; c++) {
+        for (bit = 0; bit < 6; bit++) {
+            uint32_t from = 6 * c + bit;
+            uint32_t to = 6 * (31 - c) + bit;
+
+            if ((sw[23 - from / 8] >> (from % 8)) & 1) {
+                wire[23 - to / 8] |= 1u << (to % 8);
+            }
+        }
+    }
+}
+
+/*
+ * The test's own oracle for pix -> asic_ch (STIX-FSW 600a7a72,
+ * utils.c:50-53); asic_ch 31 is the guard ring (FSW "pixel" 12).
+ */
+static const uint8_t sky_oracle_pix2asic_ch[12] = {
+    26, 15, 8, 1, 29, 18, 5, 0, 30, 21, 11, 3
+};
+
+/* the pixel on asic_ch @c: 0..11, 12 for the guard ring, -1 for none */
+static int sky_oracle_pix_of(uint32_t c)
+{
+    int pix;
+
+    if (c == 31) {
+        return 12;
+    }
+    for (pix = 0; pix < 12; pix++) {
+        if (sky_oracle_pix2asic_ch[pix] == c) {
+            return pix;
+        }
+    }
+    return -1;
+}
+
+/* software R3 thresholds enabling the pix in @pix_mask, built correctly */
+static void sky_th_correct(uint8_t th_sw[32], uint32_t pix_mask)
+{
+    uint32_t c;
+
+    for (c = 0; c < 32; c++) {
+        int pix = sky_oracle_pix_of(c);
+
+        th_sw[c] = pix >= 0 && pix < 12 && (pix_mask >> pix) & 1 ? 62 : 63;
+    }
+}
+
+/*
+ * software R3 thresholds as the FSW's RCR state build makes them
+ * (STIX-FSW 600a7a72, RateCtrl.c:898-913): field c takes the pixel of
+ * asic_ch 31 - c; the guard-ring slot 12 is read past the end of the
+ * 12-entry active list, so @guard_reads_active picks either outcome
+ */
+static void sky_th_fsw_mirrored(uint8_t th_sw[32], uint32_t pix_mask,
+                                bool guard_reads_active)
+{
+    uint32_t c;
+
+    for (c = 0; c < 32; c++) {
+        int pix = sky_oracle_pix_of(31 - c);
+        bool on = pix == 12 ? guard_reads_active
+                            : pix >= 0 && (pix_mask >> pix) & 1;
+
+        th_sw[c] = on ? 62 : 63;
+    }
+}
+
+/*
+ * det-counts-r3-fsw: R3 written in the FSW's layout gates exactly the
+ * expected pix (fpga_det = 2 * grp + asic, all four in grp 0/1):
+ * - fpga_det 0: a correct build of the full 12-pix mask -> all 12 count
+ *   (what a fixed FSW would give);
+ * - fpga_det 1, 2: the FSW's mirrored build of the full mask, the
+ *   out-of-bounds guard slot read as inactive / active -> pix {0, 3, 6,
+ *   8} / {0, 3, 6, 7, 8} (STIX-FSW issue #1069);
+ * - fpga_det 3: a correct build of pix {4, 11} -> only those two.
+ */
+static void test_det_counts_r3_fsw(void)
+{
+    static const struct {
+        uint32_t fpga_det;
+        uint32_t expect_pix_mask;
+    } want[] = {
+        { 0, 0xFFFu },
+        { 1, 1u << 0 | 1u << 3 | 1u << 6 | 1u << 8 },
+        { 2, 1u << 0 | 1u << 3 | 1u << 6 | 1u << 7 | 1u << 8 },
+        { 3, 1u << 4 | 1u << 11 },
+    };
+    QTestState *qts = stix_qtest_new();
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint8_t th[4][32];
+    uint8_t r3[24];
+    uint32_t i, pix;
+
+    sky_th_correct(th[0], 0xFFFu);
+    sky_th_fsw_mirrored(th[1], 0xFFFu, false);
+    sky_th_fsw_mirrored(th[2], 0xFFFu, true);
+    sky_th_correct(th[3], 1u << 4 | 1u << 11);
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 100000));
+    idefx_power_all(qts);
+    for (i = 0; i < ARRAY_SIZE(want); i++) {
+        sky_r3_fsw_wire(r3, th[i]);
+        idefx_write_reg(qts, want[i].fpga_det / 2, want[i].fpga_det % 2, 3,
+                        r3, sizeof(r3));
+    }
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+    for (i = 0; i < ARRAY_SIZE(want); i++) {
+        for (pix = 0; pix < SKY_N_PIX; pix++) {
+            uint64_t sum = sky_pix_sum(b, want[i].fpga_det, pix);
+
+            g_test_message("fpga_det %u pix %u: %" PRIu64,
+                           want[i].fpga_det, pix, sum);
+            if ((want[i].expect_pix_mask >> pix) & 1) {
+                g_assert_cmpuint(sum, >, 1000);
+            } else {
+                g_assert_cmpuint(sum, ==, 0);
+            }
+        }
+    }
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* one period of the default sky with seed @seed into @b */
+static void sky_seeded_bank(uint32_t seed, SkyBank *b)
+{
+    g_autofree char *arg =
+        g_strdup_printf("-global grlib-stixctrl.det-seed=%u", seed);
+    QTestState *qts = stix_qtest_new_extra(arg);
+
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH, "det-seed"),
+                    ==, seed);
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* det-counts-seed: the same seed and steps give identical banks */
+static void test_det_counts_seed(void)
+{
+    SkyBank *a = g_new0(SkyBank, 1);
+    SkyBank *b = g_new0(SkyBank, 1);
+    SkyBank *c = g_new0(SkyBank, 1);
+
+    sky_seeded_bank(7, a);
+    sky_seeded_bank(7, b);
+    sky_seeded_bank(8, c);
+    g_assert_cmpuint(sky_total(a), >, 0);
+    g_assert_cmpint(memcmp(a, b, sizeof(*a)), ==, 0);
+    g_assert_cmpint(memcmp(a, c, sizeof(*a)), !=, 0);
+    g_free(a);
+    g_free(b);
+    g_free(c);
+}
+
+/*
+ * det-lvar-ltrg: LVAR slots 0..39 each get one tick's count of the
+ * VARPMASK pix, VARDMASK fpga_det and VAREMASK ebin (bit i = index i,
+ * [A]); their sum matches the masked LACC sum of the bank; LTRG per grp
+ * is 1.25 x the events of its fpga_det 2 * grp and 2 * grp + 1; the
+ * layout is big-endian with LACC at ((pix * 32 + fpga_det) * 32 + ebin)
+ * * 2. Then the clamps at 1 M cps and a 10 s period: LVAR 16 bits, LTRG
+ * 24 bits, and LACC wraps at 16 bits (it does not saturate).
+ */
+static void test_det_lvar_ltrg(void)
+{
+    QTestState *qts = stix_qtest_new();
+    SkyBank *b = g_new0(SkyBank, 1);
+    const uint32_t varp_pix = 0x0F0u;           /* pix 4..7 */
+    const uint32_t vard_fpga_det = 0x0000FF00u; /* fpga_det 8..15 */
+    const uint32_t vare_ebin = 0x7FFE0000u;     /* ebin 17..30 */
+    uint64_t masked = 0, slots = 0;
+    uint32_t pix, fpga_det, ebin, grp, i, saturated = 0;
+    double cell;
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 20000));
+    idefx_power_all(qts);
+    sky_start(qts, 39, varp_pix);
+    ctrl_write(qts, CTRL_FSMQLVARDMASK, vard_fpga_det);
+    ctrl_write(qts, CTRL_FSMQLVAREMASK, vare_ebin);
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+                if ((varp_pix >> pix & 1) &&
+                    (vard_fpga_det >> fpga_det & 1) &&
+                    (vare_ebin >> ebin & 1)) {
+                    masked += b->lacc[pix][fpga_det][ebin];
+                }
+            }
+        }
+    }
+    for (i = 0; i < SKY_N_LVAR_SLOT; i++) {
+        g_assert_cmpuint(b->lvar_slot[i], >, 0);
+        g_assert_cmpuint(b->lvar_slot[i], <, 0x10000u);
+        slots += b->lvar_slot[i];
+    }
+    /* two independent draws of the same mean: sigma = sqrt(2 lambda) */
+    g_test_message("LVAR slot sum %" PRIu64 ", masked LACC sum %" PRIu64,
+                   slots, masked);
+    g_assert_cmpfloat(fabs((double)slots - masked), <=,
+                      5 * sqrt(2.0 * masked));
+
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        uint64_t events = sky_fpga_det_sum(b, 2 * grp) +
+                          sky_fpga_det_sum(b, 2 * grp + 1);
+
+        g_assert_cmpuint(b->ltrg_grp[grp], ==, (5 * events + 2) / 4);
+    }
+
+    /* layout: 80000 counts per fpga_det; large pix 1/8.88, ebin 18 45 % */
+    cell = 80000 / SKY_PIX_W_TOTAL * SKY_QUIET_EBIN18;
+    sky_assert_poisson("LACC[pix 0][fpga_det 3][ebin 18]",
+                       b->lacc[0][3][18], cell, 5);
+    sky_assert_poisson("LACC[pix 9][fpga_det 30][ebin 18]",
+                       b->lacc[9][30][18], 0.22 * cell, 5);
+    g_assert_cmpuint(b->lacc[0][3][0], ==, 0);
+    g_assert_cmpuint(b->lacc[0][3][31], ==, 0);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* the clamps: 1 M cps per fpga_det, QlIntTime 99 (10 s) */
+    qts = stix_qtest_new();
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 1000000));
+    idefx_power_all(qts);
+    det_fill_gaps(qts);
+    sky_start(qts, 99, 0xFFF);
+    ctrl_write(qts, CTRL_FSMQLVAREMASK, 0xFFFFFFFFu);
+    det_step_ticks(qts, 100);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    sky_read_bank(qts, 0, b);
+    for (i = 0; i < SKY_N_LVAR_SLOT; i++) {
+        g_assert_cmphex(b->lvar_slot[i], ==, 0xFFFFu);
+    }
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        g_assert_cmphex(b->ltrg_grp[grp], ==, 0xFFFFFFu);
+    }
+    /* about 500 k counts per big cell: wrapped, so not all 0xFFFF */
+    for (pix = 0; pix < 8; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            saturated += b->lacc[pix][fpga_det][18] == 0xFFFFu;
+        }
+    }
+    g_assert_cmpuint(saturated, <, 5);
+    /* the WDT storage and MemBram are untouched (D-Dd slot rule) */
+    det_expect_gaps(qts);
+    g_assert_cmphex(qtest_readl(qts, AHB_UNCHANGED), ==, DET_SENTINEL);
+    g_assert_cmphex(qtest_readl(qts, AHB_MEMBRAM), ==, DET_SENTINEL);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-props: the scene knobs (D-Db) on /machine/stixctrl. Defaults,
+ * read-back, rejection of out-of-range rates and unknown sources (the
+ * old value stays), settable while the VM is stopped (-S, platform
+ * plan D-PLm req. 5); they survive system_reset (they describe the
+ * Sun), and a reset mid-period leaves no tick behind.
+ */
+static void test_det_props(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    sky_expect_scene(qts, "synthetic", false, 20, 2000);
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH, "det-seed"), ==, 1);
+
+    g_assert_false(sky_set_u32(qts, "det-quiet-cps", 1000001));
+    g_assert_false(sky_set_u32(qts, "det-flare-cps", 1000001));
+    g_assert_false(sky_set_str(qts, "det-source", "sky"));
+    g_assert_false(sky_set_str(qts, "det-source", "replay-dss"));
+    g_assert_false(sky_set_str(qts, "det-source", ""));
+    sky_expect_scene(qts, "synthetic", false, 20, 2000);
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 1000000));
+    g_assert_true(sky_set_u32(qts, "det-flare-cps", 0));
+    sky_expect_scene(qts, "synthetic", false, 1000000, 0);
+
+    g_assert_true(sky_set_str(qts, "det-source", "zero"));
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH, "det-flare", true));
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 33));
+    g_assert_true(sky_set_u32(qts, "det-flare-cps", 4444));
+    qtest_system_reset(qts);
+    sky_expect_scene(qts, "zero", true, 33, 4444);
+
+    /* a reset mid-period: no tick, swap or LVAR write afterwards */
+    g_assert_true(sky_set_str(qts, "det-source", "synthetic"));
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 15);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), >, 0);
+    qtest_system_reset(qts);
+    det_fill_bank(qts, 0, 0x5EED0000u);
+    det_step_ticks(qts, 100);
+    det_expect_bank(qts, 0, 0x5EED0000u);
+    g_assert_cmphex(det_sta(qts), ==, 0);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* settable while stopped at -S */
+    qts = stix_qtest_new_extra("-S");
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH, "det-flare", true));
+    g_assert_true(sky_set_u32(qts, "det-flare-cps", 3000));
+    g_assert_true(sky_set_str(qts, "det-source", "zero"));
+    sky_expect_scene(qts, "zero", true, 20, 3000);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -6027,6 +6844,16 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/det-idefx-gating", test_det_idefx_gating);
         qtest_add_func("/sparc/stix/det-idefx-adc", test_det_idefx_adc);
         qtest_add_func("/sparc/stix/det-idefx-off", test_det_idefx_off);
+        qtest_add_func("/sparc/stix/det-counts-zero", test_det_counts_zero);
+        qtest_add_func("/sparc/stix/det-counts-quiet", test_det_counts_quiet);
+        qtest_add_func("/sparc/stix/det-counts-flare", test_det_counts_flare);
+        qtest_add_func("/sparc/stix/det-counts-gating",
+                       test_det_counts_gating);
+        qtest_add_func("/sparc/stix/det-counts-r3-fsw",
+                       test_det_counts_r3_fsw);
+        qtest_add_func("/sparc/stix/det-counts-seed", test_det_counts_seed);
+        qtest_add_func("/sparc/stix/det-lvar-ltrg", test_det_lvar_ltrg);
+        qtest_add_func("/sparc/stix/det-props", test_det_props);
     }
 
     return g_test_run();
