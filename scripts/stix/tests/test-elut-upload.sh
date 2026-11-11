@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Tests for scripts/stix/elut-upload.py (ELUT plan E-1,
 # docs/stix-port/2026-11-11-elut-plan.md). Host only: no QEMU, no flash,
 # and no flight CSV (D-Ed): every CSV here is synthetic, written to a

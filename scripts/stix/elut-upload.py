@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Flight energy LUT (ELUT) upload tool for the STIX model (ELUT plan E-1,
 docs/stix-port/2026-11-11-elut-plan.md). Standard library only.
 
