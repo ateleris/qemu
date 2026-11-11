@@ -107,33 +107,44 @@ class Power:
             gen = self.gen
             self.proc = self.launcher(argv, self.run_dir, self._line)
             self.pid = self.proc.spawn()
-            self.stopping = False
-            self.qmp = QmpConnection(sock, timeout=5.0,
-                                     on_event=lambda m, g=gen:
-                                     self.events.put((g, m)))
             try:
-                self.qmp.connect(retry_s=10.0)
-            except QmpError as e:
-                self._reap("qmp connect failed")
-                raise VerbError(500, "QEMU QMP: %s" % e)
-            try:
-                os.chmod(sock, 0o600)
-            except OSError:
-                pass
-            self.clock.process_started()
-            self._set(FROZEN)
-            self._record("on", pid=self.pid, argv=argv)
-            try:
-                used = rundir.sparse_check(self.run_dir)
-            except rundir.RunDirError as e:
-                self._off_locked("sparse check")
-                raise VerbError(500, str(e))
-            self.log.emit("ctl", "log", "platform.power.sparse",
-                          {"flash_blocks_bytes": used})
-            self._obt_continuity()
-            for h in self.hooks:
-                h("spawned", self)
-            return {"pid": self.pid, "boot_id": self.clock.boot_id}
+                return self._on_spawned(gen, sock, argv)
+            except BaseException:
+                # whatever failed, the child must not outlive the call
+                if self.proc is not None:
+                    self.stopping = True
+                    self._reap("power on failed")
+                raise
+
+    def _on_spawned(self, gen, sock, argv):
+        """The rest of on(); any exception reaps the child."""
+        self.stopping = False
+        self.qmp = QmpConnection(sock, timeout=self.cfg["power"]
+                                 ["qmp_timeout_s"],
+                                 on_event=lambda m, g=gen:
+                                 self.events.put((g, m)))
+        try:
+            self.qmp.connect(retry_s=10.0)
+        except QmpError as e:
+            raise VerbError(500, "QEMU QMP: %s" % e)
+        try:
+            os.chmod(sock, 0o600)
+        except OSError:
+            pass
+        self.clock.process_started()
+        self._set(FROZEN)
+        self._record("on", pid=self.pid, argv=argv)
+        try:
+            used = rundir.sparse_check(self.run_dir)
+        except rundir.RunDirError as e:
+            self._off_locked("sparse check")
+            raise VerbError(500, str(e)) from None
+        self.log.emit("ctl", "log", "platform.power.sparse",
+                      {"flash_blocks_bytes": used})
+        self._obt_continuity()
+        for h in self.hooks:
+            h("spawned", self)
+        return {"pid": self.pid, "boot_id": self.clock.boot_id}
 
     def boot(self):
         with self.lock:
@@ -186,6 +197,15 @@ class Power:
         if self.proc is not None:
             if rc is None:
                 rc = self.proc.wait(0.5)
+            if rc is None:
+                # never return with a live child: terminate, then kill
+                method = (method + "+" if method else "") + "sigterm"
+                self.proc.terminate()
+                rc = self.proc.wait(self.cfg["power"]["kill_grace_s"])
+            if rc is None:
+                method += "+sigkill"
+                self.proc.kill()
+                rc = self.proc.wait(5.0)
             self.proc.finish()
         self.qmp = None
         self.proc = None

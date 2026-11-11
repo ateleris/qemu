@@ -10,7 +10,8 @@ Otherwise it serves QMP on the -qmp unix socket like a frozen (-S)
 leon3: cont/stop/quit, the RESUME/STOP/SHUTDOWN/RESET events, qom-get
 vclock-ns, obt and both hw-state JSONs, qom-set obt, and the test-only
 x-fake-guest-reset, which behaves per -no-reboot / -action like QEMU.
-`noquit` ignores quit (the controller must escalate to SIGTERM).
+`noquit` ignores quit (the controller must escalate to SIGTERM);
+`noqmp` accepts the QMP connection and never answers.
 """
 
 import json
@@ -224,6 +225,8 @@ class Fake:
         srv.listen(1)
         while True:
             conn, _ = srv.accept()
+            if self.variant == "noqmp":
+                time.sleep(3600)     # accepts, never greets, never answers
             self.conn = conn
             self.send(greeting())
             buf = b""

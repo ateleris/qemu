@@ -66,7 +66,7 @@ class Env:
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="stixplat-selftest-")
         self.bins = {}
-        for v in ("new", "old", "noquit"):
+        for v in ("new", "old", "noquit", "noqmp"):
             p = os.path.join(self.tmp, "qemu-%s" % v)
             with open(p, "w") as f:
                 f.write('#!/bin/sh\nexec "%s" "%s" --variant %s "$@"\n'
@@ -531,6 +531,45 @@ def t_uart_cycle(env):
         ctl.shutdown()
 
 
+def _fake_children():
+    """Our live child fake QEMUs (pids)."""
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % d) as f:
+                st = f.read().rsplit(")", 1)[1].split()
+            with open("/proc/%s/cmdline" % d, "rb") as f:
+                cmd = f.read()
+        except OSError:
+            continue
+        if int(st[1]) == os.getpid() and st[0] != "Z" and \
+                b"fake_qemu.py" in cmd:
+            out.append(int(d))
+    return out
+
+
+def t_no_orphan(env):
+    """B2: a QEMU that never answers QMP is killed, never orphaned, and
+    the next power-on spawns exactly one process."""
+    ctl = env.controller(qemu={"binary": env.bins["noqmp"]},
+                         power={"qmp_timeout_s": 0.5})
+    try:
+        e = raises(VerbError, ctl.command, "platform.power.on", {})
+        check(e.status == 500 and ctl.power.state == "off",
+              "a mute QEMU: %s" % e)
+        check(_fake_children() == [], "a live QEMU after the failed on: %r"
+              % _fake_children())
+        ctl.cfg["qemu"]["binary"] = env.bins["new"]
+        ctl.command("platform.power.on", {})
+        kids = _fake_children()
+        check(kids == [ctl.power.pid], "exactly one QEMU: %r" % kids)
+    finally:
+        ctl.shutdown()
+    check(_fake_children() == [], "a live QEMU after shutdown")
+
+
 def _power_recs(ctl, event):
     return [r.obj["data"] for r in ctl.log.since(0)
             if r.kind == "power" and r.obj["data"].get("event") == event]
@@ -723,6 +762,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("record log + rotation", t_log), ("QmpConnection", t_qmp),
          ("SimClock", t_simclock), ("power state machine", t_power),
          ("uart across a power cycle", t_uart_cycle),
+         ("no orphaned QEMU", t_no_orphan),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]
