@@ -1,6 +1,7 @@
 # Phase 4 detailed plan: error injection and POWERSTAT
 
-Status: validated, 2026-11-11. Base: uprev `73558c3571`, track worktree
+Status: done, 2026-11-11 (P4-1..P4-6; see "As built: Phase 4
+acceptance"). Validated before the work started. Base: uprev `73558c3571`, track worktree
 `~/dev/qemu-stix-tc` (branch `stix-uprev-tc`). The user chose "error
 injection" (with POWERSTAT folded in) as the Phase 4 scope.
 
@@ -251,6 +252,62 @@ The Phase 3 set plus fault-smoke from P4-3 on:
 - the probe self-test;
 - nominal-smoke in both modes;
 - fault-smoke.
+
+## As built: Phase 4 acceptance
+
+**Commits** (branch `stix-uprev-tc`):
+- [x] P4-1 POWERSTAT: `1c6b92acd2` (accepted-diffs §25).
+- [x] P4-2 ADC injection and stable QOM paths: `6734968e7b` (§26).
+- [x] P4-3 fault-smoke gate and probe `--qmp`: `4700254fe4` (§27).
+- [x] P4-4 HK HW protection: `27091e745f` (§28).
+- [x] P4-5 SpW link-down: `ca01170003` (§29).
+- [x] P4-6 docs: this commit. ground-station.md "Fault injection",
+  accepted-diffs §30 (known limits after Phase 4), this checklist, the
+  GS-repo line in `docs/stix-qemu.md`, and `STIX_GS_QMP` in
+  `run-qemu-gs.sh`.
+
+**Gates** (the full set on the P4-5 tree, normal ELF, fresh flash per
+gate run, under the 21000 flock). Each passes:
+- [x] suite: 38 ok (35 after P4-1, 36 after P4-2, 37 after P4-4);
+- [x] checkpatch: no style problems;
+- [x] probe self-test;
+- [x] boot-smoke: the normalized UART matches the golden (the golden
+  changed once, at P4-1);
+- [x] soak 300 s;
+- [x] tc-smoke;
+- [x] nominal-smoke, positive and `--negative`;
+- [x] fault-smoke, positive and `--negative` (the negative fails with
+  exactly the two @40 expectations);
+- [x] the shared `/tmp/stix-uprev-run/flash.bin` mtime is unchanged
+  (2026-11-10 13:05:54).
+
+P4-6 changes only docs and `run-qemu-gs.sh`. The script change was
+checked with `sh -n`/`dash -n` and a stub binary, not with QEMU.
+
+**Deviations from the plan, as built:**
+- **The persistence count is 255, not 3** (FSW finding, §27). The gate
+  sends TC(236,10) `<mask> 22 00000003` before each limit TC. The
+  validator's "persistence of 3" was wrong.
+- **The schedule.** The first TC goes at +35 s, not @25/@20: 0x14A3
+  must come within 30 s. The rows moved by 15 s for DET_C at +85 (P4-4)
+  and gained link-down at +210/+230 (P4-5). The run is 250 s, not
+  175 s. 0x9449 is forbidden from +100, not @75.
+- **The second 0x5435 has param 48, not 08** (§29). The ISR's next call
+  sets the external flag again before TMBuffer reports. Both 0x5435s
+  and 0x142D come out in one burst after the clear, so the 0x5435
+  window is 35 s.
+- **More forbids.** The connect group forbids 0x9434 for every line id
+  but DET_C's, and 0x9434 is forbidden from +95.
+- **The optional 2V5_C step is not in the gate.** The id-1 bug is
+  recorded only (§28, §30).
+- **The unlock token** is spent by any write to the CTRL register
+  bank, not only a protected one ("one write cycle", §28).
+- **Added properties:** `hk-prot` (default on; off keeps plain storage,
+  §28). `link-down` is cleared at reset like the injections (§29).
+- **TX during link-down waits** (TE stays set) instead of aborting.
+  dmaControl.LE is ignored (§29).
+- **The GS QMP option** (`STIX_GS_QMP`) was not in the plan. The P4-6
+  docs needed it.
 
 ## Risks and checks
 

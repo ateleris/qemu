@@ -2022,3 +2022,45 @@ normal ELF, fresh flash per run, under the 21000 flock):
   golden is unchanged).
 - The shared flash mtimes are unchanged: `/tmp/stix-uprev-run`
   2026-11-10 13:05:54 and `/tmp/stix-baseline-run` 2026-11-09 15:30:10.
+
+## 30. Known limits after Phase 4
+
+What the Phase 4 fault injection deliberately does **not** do, and the
+FSW behaviour it exposes, so a surprise is not mistaken for a model bug
+(plan P4-6). The GS-side recipe is in `ground-station.md`, "Fault
+injection".
+
+- **No HW power cut** (D-P4d, §28). The real FPGA latches the
+  non-essential and/or SpW supplies off on a protection trip (TN
+  REQ-043, DD §5.6). The model only raises the IRQ, so the event stays
+  observable. The POWERSTAT `blockade` mask (§25) stays 0 as the hook
+  for a later cut option.
+- **The persistence count is 255 after boot** (FSW finding, §27).
+  `ParamMgmt_init` lets the max (255) win over the value 3
+  (ParamMgmt.c:34-36, HKMonitor.c:960-964). A SW limit trip therefore
+  needs TC(236,10) `<mask> 22 00000003` before the limit TC. The model
+  is not involved.
+- **A 2V5_C trip is reported with id 1** (E_HK_DPU_1V5_C, FDIR.c:869;
+  FSW bug, §28). Not modelled around.
+- **Only READY counts as a link error** (FDIR.c:711, §29). The FSW
+  compares an `SPW_linkStatus_e` with an `SPW_result_e` constant whose
+  value equals READY. The FDIR TN (REQ-029/038) means any link error
+  to count. The model follows the code. Bug or late spec change: open.
+- **ATT_V cannot trip.** Its reset threshold is 4095 (ICD Table 4-75),
+  and the comparator is a strict `>` on a 12-bit sample (§28). The FSW
+  writes the non-SPW thresholds only by TC.
+- **The link-down model pins READY, with DE and the error IRQ every
+  1 s** (§29). A real GRSPW cycles through ErrorReset, ErrorWait, Ready,
+  Started and Connecting at link timing. The CE, ER, PE and EE bits are
+  never set. RX units that arrive during the outage are delivered after
+  it.
+- **dmaControl.LE is ignored** (§29). A TX armed during the outage
+  waits for the link instead of aborting. The FSW never sets LE.
+- **No vmstate** (§28). stixctrl and stixspw have none, so the
+  injections, the comparator counts, the unlock token and `link-down`
+  are not migrated or snapshotted.
+- **`timecodes` survives a reset** (§20), unlike `adc-inject[N]` and
+  `link-down`, which a reset clears (§26, §29).
+- **The HW protection thresholds are document values** (D-P4d, §28).
+  The FSW never writes the eight non-SPW thresholds in SAFE, so the code
+  cannot confirm the ICD reset values.

@@ -16,6 +16,9 @@
 #   STIX_GS_TM_PORT  TM TCP port (default 21500)
 #   STIX_GS_UDP_TM_PORT  TM UDP destination (default 21501)
 #   STIX_GS_UDP_TC_PORT  TC UDP bind (default 21502)
+#   STIX_GS_QMP      QMP unix socket path for fault injection (default
+#                    unset: no QMP). Absolute, no comma, under 108 bytes.
+#                    See docs/stix-port/ground-station.md "Fault injection".
 # FSW console: tail -f $STIX_GS_RUN_DIR/uart.raw | tr -d '\000'
 set -eu
 UDP=0
@@ -43,6 +46,17 @@ for p in "$UDP_TM_PORT" "$UDP_TC_PORT"; do
             ;;
     esac
 done
+QMP="${STIX_GS_QMP:-}"
+case "$QMP" in
+    '' | /*) ;;
+    *) echo "run-qemu-gs.sh: STIX_GS_QMP must be an absolute path" >&2; exit 2 ;;
+esac
+case "$QMP" in
+    *,*) echo "run-qemu-gs.sh: STIX_GS_QMP must not contain a comma" >&2; exit 2 ;;
+esac
+# sun_path is 108 bytes including the NUL
+[ "${#QMP}" -lt 108 ] || {
+    echo "run-qemu-gs.sh: STIX_GS_QMP must be under 108 bytes" >&2; exit 2; }
 [ "$RUN" = /tmp/stix-baseline-run ] && { echo "refusing the frozen v11.1 run dir"; exit 2; }
 mkdir -p "$RUN" && cd "$RUN"
 # Since P2-2 the model's device prints are trace events on stderr, not
@@ -58,6 +72,7 @@ UDP_ARGS=""
     -serial file:"$RUN/uart.raw" -kernel "$ELF" \
     -global grlib-stixspw.tmtc-port="$PORT" \
     $UDP_ARGS \
+    ${QMP:+-qmp} ${QMP:+"unix:$QMP,server=on,wait=off"} \
     -trace 'stixtmtc*' -trace stixspw_tx_send \
     -trace stixspw_recv_packet_callback 2>&1 \
   | grep --line-buffered -E "^stix|^qemu-system-sparc:" \

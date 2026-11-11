@@ -1,12 +1,13 @@
 # Attaching the ATS ground station to the STIX emulator
 
-Status 2026-11-10 (after the Phase 2 end-to-end run):
+Status 2026-11-11 (the Phase 2 end-to-end run, plus Phase 4 fault injection):
 
 | Direction | Status |
 |---|---|
 | **TM (emulator → ground station)** | Works end to end. Heartbeats, HK and TC reports are decoded in the ground station's UI and history, over direct UDP (`--udp`) or over TCP with the bridge. |
 | **TC (ground station → FSW)** | Works end to end over direct UDP (`run-qemu-gs.sh --udp`, no bridge), verified 2026-11-10 with QEMU `866ee37709` and ground station `0dcb1af`. TC(17,1) gave TM(1,1), TM(17,2) and TM(1,7). TC(9,129) coarse 0x10000000 gave TM(1,1) and TM(1,7), and the heartbeat CUC then counted from 0x10000000. The transcript is in the Phase 2 acceptance checklist. Over TCP the bridge with `--forward-tc` reaches the same RX path (P2-6; shown in the 2026-11-10 bridge demo). |
 | **Modes (SAFE → CONFIGURATION → NOMINAL)** | Works: the three TCs of the NOMINAL recipe below move the FSW through the modes. The gate `nominal-smoke.sh` passes in both modes (positive and `--negative`; gate record in `accepted-diffs.md` §23), including SID2 with the NOMINAL mode nibble. **A NOMINAL entry writes a flash context — use a scratch run dir** (see the recipe). |
+| **Fault injection** | Works from the outside over QMP (Phase 4): HK ADC values, the HK hardware protection, time-code loss and SpW link-down. The gate `fault-smoke.sh` passes (positive and `--negative`; `accepted-diffs.md` §27-29). See "Fault injection" below. |
 
 The findings, with file:line references on both sides, are in
 `drafts/2026-11-10-gs-attach-report.md`.
@@ -344,9 +345,164 @@ Never use `/tmp/stix-uprev-run` (the golden run dir) or
 - at NOMINAL entry the UART shows 384 `*E writing register … failed`
   lines (`XrayDetFDIR.c:731`): the ASIC register writes time out and
   the NOMINAL path carries on. Expected, not a failure;
-- SID2 shows LV/HV/SpW **off** even in NOMINAL, because the model
-  leaves POWERSTAT (hkCmdSta bits 9:5) at 0 (D-P3a); one TM(5,2)
-  0x542C (no LUTs in flash) is also expected at entry.
+- since P4-1, SID2 shows the commanded supplies as powered: POWERSTAT
+  (hkCmdSta bits 9:5) follows the enables (`accepted-diffs.md` §25).
+  Before P4-1 it read 0, so LV/HV/SpW showed off in every mode;
+- one TM(5,2) 0x542C (no LUTs in flash) is also expected at entry.
+
+## Fault injection
+
+Since Phase 4 you can inject faults while the FSW runs and watch its
+FDIR react in the ground station. The injection goes over QEMU's QMP
+socket, not through the ground station. The model side is in
+`accepted-diffs.md` §26-29. The gate `fault-smoke.sh` runs every case
+below (§27).
+
+### Starting QEMU with a QMP socket
+
+`run-qemu-gs.sh` adds a QMP socket when `STIX_GS_QMP` is set:
+
+```bash
+RUN=/tmp/stix-gs-fault-$(date +%Y%m%d-%H%M%S)
+STIX_GS_RUN_DIR=$RUN STIX_GS_QMP=$RUN/qmp.sock \
+    scripts/stix/gs/run-qemu-gs.sh --udp build/qemu-system-sparc
+```
+
+- The script passes `-qmp unix:PATH,server=on,wait=off`, so QEMU does
+  not wait for a QMP client.
+- PATH must be absolute, contain no comma, and be under 108 bytes (the
+  unix socket path limit). The script refuses anything else.
+- Use a new, empty run dir. A link-down makes TMBuffer write flash
+  backups (§29), and a NOMINAL entry writes a flash context (see
+  "NOMINAL mode").
+
+### Sending qom-set commands
+
+QMP is one JSON object per line. The client reads the greeting and
+sends `qmp_capabilities` before any other command. socat is not
+installed here, so use this shell function (python3 only):
+
+```bash
+qom_set() {  # qom_set <socket> <QOM path> <property> <JSON value>
+    python3 - "$@" <<'EOF'
+import json, socket, sys
+sock, path, prop, value = sys.argv[1:]
+s = socket.socket(socket.AF_UNIX)
+s.connect(sock)
+f = s.makefile("rw")
+f.readline()  # the greeting
+for cmd in ({"execute": "qmp_capabilities"},
+            {"execute": "qom-set", "arguments": {
+                "path": path, "property": prop, "value": json.loads(value)}}):
+    f.write(json.dumps(cmd) + "\n")
+    f.flush()
+    while "event" in (reply := json.loads(f.readline())):
+        pass  # an async event, not the reply
+print(json.dumps(reply))
+EOF
+}
+
+qom_set $RUN/qmp.sock /machine/stixctrl 'adc-inject[24]' 1800
+qom_set $RUN/qmp.sock /machine/stixctrl 'adc-inject[24]' 4294967295
+qom_set $RUN/qmp.sock /machine/stixspw link-down true
+```
+
+It prints `{"return": {}}` on success and `{"error": ...}` otherwise.
+QEMU accepts one QMP client at a time; the function disconnects after
+each command.
+
+For scripted runs, `tmtc-probe.py --qmp PATH` sends the same commands
+on a schedule (`--send-at S --qmp-cmd JSON`) and checks the TM, as
+`fault-smoke.sh` does. The probe is the TCP TM client on 21500, so it
+cannot run next to the bridge (see "Notes and limits").
+
+### The properties
+
+| QOM path | Property | Values | Effect |
+|---|---|---|---|
+| `/machine/stixctrl` | `adc-inject[N]`, N = 0..127 | 0..0xFFF; 4294967295 (0xFFFFFFFF) = no override, the default | Replaces the reading of HK ADC channel N from the next conversion. It also feeds the HW protection comparator. Other values are rejected with a QMP error. Clear with the literal 4294967295: `-1` is rejected. |
+| `/machine/stixspw` | `timecodes` | true (default), false | false stops the SpW time codes. true re-arms them at the next rollover. |
+| `/machine/stixspw` | `link-down` | false (default), true | true: the link status reads READY, DE and the error IRQ come every 1 s, the FSW stops sending TM, time codes stop, and TCs from the ground are held. false: the link reads RUN again, and the held TCs are delivered. |
+
+**Reset:** a device reset (a system reset, including the watchdog's)
+clears every `adc-inject[N]` and `link-down`. `timecodes` is not
+cleared: its timer survives a reset (§20), so set it back to true
+yourself. `run-qemu-gs.sh` passes `-no-reboot`, so a reset there stops
+QEMU anyway.
+
+The channels the recipes use: 24 = DPU_1V5_V, 40 = PSU_T, 4 = DET_C.
+The HW protection watches channels 0, 1, 2, 3, 4, 8, 12, 16 and 20
+(1V5_C, 2V5_C, 3V3_C, SPW_C, DET_C, ATT_C, ATT_V, HV_17_32_V,
+HV_01_16_V), with the reset thresholds 2282, 3416, 3826, 3826, 546,
+751, 4095, 2323 and 2323 (§28).
+
+### The SW limit recipe
+
+**On the gate ELF every HK limit is 0..0xFFF**, so an injected 12-bit
+value alone never trips a SW check. Tighten the limit first, with
+ZIX36010 "STIX Configure FDIR function" (TC(236,10)):
+
+1. **Wait for TM(5,1) EID 0x14A3** (FDIR enabled, about 14 s after
+   QEMU starts). A TC(236,10) sent before it cancels the automatic FDIR enable
+   (FDIR.c:1022): 0x14A3 then never comes, and the HW protections stay
+   off.
+2. **Send ZIX36010 with the persistence count** (paramType
+   `*_CONSECUTIVE_MEASUREMENTS` = 34) set to 3. The FSW boots with the
+   count 255, not 3 (an FSW finding, §27), so without this TC the line
+   must stay out of limits for 255 consecutive 1 s checks.
+3. **Send ZIX36010 with the limit.**
+4. **Inject** the value.
+
+Each TC gives TM(1,1) and TM(1,7) in the same second. The parameters,
+with the names in the ground station's IDB command definitions:
+
+| Step | FDIR mask (PIX00107) | FDIR parameter ID (PIX00289) | Parameter value (236,10) (PIX00290) |
+|---|---|---|---|
+| 1V5 count | 0x00080000 (524288) | 34 (0x22) | 3 |
+| 1V5 low limit | 0x00080000 (524288) | 1 (1V5 low limit) | 1951 (0x79F) |
+| PSU_T count | 0x00100000 (1048576) | 34 (0x22) | 3 |
+| PSU_T upper limit | 0x00100000 (1048576) | 2 (PSU upper limit) | 3800 (0xED8) |
+
+The raw application data is `fdirMask u32, paramType u8, value u32`,
+big-endian (TCData.h:151-153), for example `00080000 22 00000003`. The
+complete TC units are in `scripts/stix/fault-smoke.sh`.
+
+The limits stay tightened after the injection is cleared. The nominal
+readings (2048 on 1V5_V, 2300 on PSU_T) are inside them. A value back
+in limits only resets the counter; there is no recovery event.
+
+### Expected TM
+
+All events are on APID 0x5A7. The data is shown as the gate matches it
+(the EID, then the parameters).
+
+| Case | TC first | Injection | Expected TM |
+|---|---|---|---|
+| 1V5 low | 1V5 count, 1V5 low limit | `adc-inject[24]` = 1800 | TM(5,3) `9449 07 0708 079F` (id 7, value, limit) and TM(5,4) `D420 00080000`, about 3 s later (the third 1 s check) |
+| PSU temp high | PSU_T count, PSU_T upper limit | `adc-inject[40]` = 3900 | TM(5,3) `9449 17 0F3C 0ED8` and TM(5,4) `D420 00100000`, about 3 s later |
+| DET_C HW protection | none (all nine lines are armed at 0x14A3) | `adc-inject[4]` = 600 | TM(5,3) `9434 05 0258 0222` (id 5, sample, threshold 546), within 1 s |
+| Time-code loss | none | `timecodes` = false | TM(5,2) `542B` (no parameters) about 61 s later. From then on the CUC carries bit 31 |
+| | | `timecodes` = true | TM(5,1) `1429` within 1 s |
+| Link-down | none | `link-down` = true, for at least 11 s (the gate holds 20 s) | nothing during the outage, not even heartbeats |
+| | | `link-down` = false | TM(5,2) `5435 48`, once or twice, and TM(5,1) `142D 00`, all within 1 s |
+
+Notes:
+- Clear each `adc-inject[N]` when the case is done (4294967295).
+- After a HW protection trip the FSW masks that line's IRQ. A second
+  injection on the same line in the same boot gives no 0x9434.
+- The FSW reports a 2V5_C trip with id 1, like 1V5_C (FDIR.c:869).
+  ATT_V's threshold 4095 cannot be exceeded by a 12-bit value.
+- During a link-down all TM is queued. The 0x5435 reports come out
+  after the clear. Their parameter 0x48 means external, READY, line 0
+  (§29).
+
+**Every HK trip signals a move to SAFE.** The FSW sends the SAFE
+signal for each 0x9449 and 0x9434 (FDIR.c:629, :941), and the UART
+prints `Transitioning to safe mode`. In SAFE nothing changes. In
+NOMINAL the FSW leaves NOMINAL, so run the fault cases in SAFE, or
+re-enter NOMINAL afterwards with the recipe above. Time-code loss and
+link-down do not change the mode in the source (Timing.c:63-91,
+FDIR.c:768-776).
 
 ## Notes and limits
 
