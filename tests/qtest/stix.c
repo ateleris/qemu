@@ -16,6 +16,7 @@
 #include "qemu/osdep.h"
 #include <math.h>
 #include "qemu/bswap.h"
+#include "qemu/cutils.h"
 #include "libqtest.h"
 #include "qobject/qbool.h"
 #include "qobject/qnum.h"
@@ -169,19 +170,54 @@ static int stix_hold_free_tcp_port(int *port)
 }
 
 /*
+ * Gate-ports plan D-G4: when the suite runs in a slot (STIX_PORT_BASE = the
+ * slot's base port B, exported by scripts/stix/qt.sh), the ports QEMU must
+ * bind itself come from the slot's suite band B+3..B+99. The slot lock
+ * makes the band exclusive, so the release-then-bind window below cannot
+ * race another suite or probe. Returns B, or 0 outside a slot.
+ */
+static int stix_slot_band_base(void)
+{
+    const char *env = getenv("STIX_PORT_BASE");
+    long base;
+
+    if (!env || qemu_strtol(env, NULL, 10, &base) != 0 ||
+        base <= 0 || base > 65535 - 99) {
+        return 0;
+    }
+    return (int)base;
+}
+
+#define STIX_SLOT_BAND_FIRST 3
+#define STIX_SLOT_BAND_PORTS 97 /* B+3 .. B+99 */
+
+/*
  * For tests where QEMU itself must bind the port (tmtc-port=<free>):
- * the release-then-bind window is unavoidable there (P2-1 review).
+ * outside a slot, the release-then-bind window is unavoidable there (P2-1
+ * review); in a slot, the next bindable port of the band, round-robin.
  */
 static int stix_free_tcp_port(void)
 {
+    static unsigned next;
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
     };
     socklen_t addrlen = sizeof(addr);
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    int port;
+    int base = stix_slot_band_base();
+    int fd, port, i;
 
+    for (i = 0; base && i < STIX_SLOT_BAND_PORTS; i++) {
+        port = base + STIX_SLOT_BAND_FIRST + next++ % STIX_SLOT_BAND_PORTS;
+        fd = stix_hold_tcp_port(port);
+        if (fd >= 0) {
+            close(fd);
+            return port;
+        }
+    }
+    g_assert(!base); /* the whole band busy: a stray process in the slot */
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
     g_assert(fd >= 0);
     g_assert(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
     g_assert(getsockname(fd, (struct sockaddr *)&addr, &addrlen) == 0);
@@ -1641,8 +1677,6 @@ static void test_gptimer_prescaler(void)
 
 /* ---- P2-1: hermetic TM server, realize errors instead of exit(1) ---- */
 
-#define TMTC_BASE_PORT 20000 /* IO_TCP_SERVER_BASE_PORT (tmtc_io_server.h) */
-
 /* env keys handing the g_test_trap_subprocess child its parameters; the
  * parent picks the port and the temp flash file */
 #define TMTC_TEST_PORT_ENV  "STIX_TEST_TMTC_PORT"
@@ -1657,48 +1691,68 @@ static gchar *stix_test_path(const char *name)
 }
 
 /* /sparc/stix/tmtc-hermetic: the machine must start under qtest even with
- * the default TM port (20000+uid) held — tmtc-server=auto starts no server
- * under qtest (P2-1). RED on the pre-P2-1 binary: the device still binds
- * the port at realize ("Bind failed"), QEMU exits, qtest_init aborts.
- * The hold is skipped only when the port is genuinely busy (EADDRINUSE —
- * with SO_REUSEADDR that means a real listener, i.e. the condition under
- * test already holds); any other hold failure skips the test instead of
- * passing it vacuously. */
+ * its TM port held — tmtc-server=auto starts no server under qtest (P2-1).
+ * The port is a race-free ephemeral hold passed as tmtc-port=<held>, so
+ * the test never touches the default port 20000+uid that the gate
+ * scripts use (gate-ports plan D-G4; the tmtc-port=0 default path is no
+ * longer exercised here, accepted-diffs §41). RED on the pre-P2-1 11.1
+ * binary: the device still binds the port at realize ("Bind failed"),
+ * QEMU exits, qtest_init aborts. The 5.2 baseline has no tmtc-port
+ * property, so the check does not apply there: it SKIPs explicitly.
+ */
 static void test_tmtc_hermetic(void)
 {
+    g_autofree gchar *extra = NULL;
     int listening = 0;
     socklen_t llen = sizeof(listening);
-    int held = stix_hold_tcp_port(TMTC_BASE_PORT + (int)getuid());
+    bool has_port = false;
     QTestState *qts;
-
-    if (held < 0) {
-        if (errno == EADDRINUSE) {
-            g_test_message("port %d already busy, hold skipped",
-                           TMTC_BASE_PORT + (int)getuid());
-        } else {
-            g_autofree gchar *why = g_strdup_printf(
-                "cannot hold the default TM port %d: %s",
-                TMTC_BASE_PORT + (int)getuid(), g_strerror(errno));
-            g_test_skip(why);
-            return;
-        }
-    } else {
-        /* the hold is really a listener */
-        g_assert(getsockopt(held, SOL_SOCKET, SO_ACCEPTCONN,
-                            &listening, &llen) == 0);
-        g_assert_cmpint(listening, ==, 1);
-    }
+    QDict *resp;
+    QList *props;
+    int port, held;
 
     qts = stix_qtest_new();
+    resp = qtest_qmp(qts,
+                     "{'execute': 'device-list-properties',"
+                     " 'arguments': {'typename': 'grlib-stixspw'}}");
+    props = qobject_to(QList, qdict_get(resp, "return"));
+    if (props) {
+        const QListEntry *entry;
+
+        QLIST_FOREACH_ENTRY(props, entry) {
+            QDict *prop = qobject_to(QDict, qlist_entry_obj(entry));
+
+            if (g_str_equal(qdict_get_str(prop, "name"), "tmtc-port")) {
+                has_port = true;
+                break;
+            }
+        }
+    }
+    qobject_unref(resp);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    if (!has_port) {
+        g_test_skip("5.2 baseline: no tmtc-port property, the hermetic "
+                    "check does not apply");
+        return;
+    }
+
+    held = stix_hold_free_tcp_port(&port);
+    g_assert_cmpint(held, >=, 0);
+    /* the hold is really a listener */
+    g_assert(getsockopt(held, SOL_SOCKET, SO_ACCEPTCONN,
+                        &listening, &llen) == 0);
+    g_assert_cmpint(listening, ==, 1);
+
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-port=%d", port);
+    qts = stix_qtest_new_extra(extra);
 
     /* alive: a PnP readl round-trips, as in test_pnp */
     g_assert_cmphex(stix_pnp_read(qts, 0), ==, pnp_golden[0]);
 
     qtest_quit(qts);
     stix_qtest_cleanup();
-    if (held >= 0) {
-        close(held);
-    }
+    close(held);
 }
 
 /* g_test_trap_subprocess child (precedent:
@@ -3186,13 +3240,34 @@ static int stix_udp_bind_free(int *port)
 
 /*
  * A free UDP port for QEMU's own bind: bind, read, close (the same
- * release-then-bind window stix_free_tcp_port() accepts).
+ * release-then-bind window stix_free_tcp_port() accepts), or in a slot
+ * the next bindable port of the band B+3..B+99, round-robin.
  */
 static int stix_free_udp_port(void)
 {
-    int port;
-    int fd = stix_udp_bind_free(&port);
+    static unsigned next;
+    int base = stix_slot_band_base();
+    int port, fd, i;
 
+    for (i = 0; base && i < STIX_SLOT_BAND_PORTS; i++) {
+        struct sockaddr_in addr = {
+            .sin_family = AF_INET,
+            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        };
+
+        port = base + STIX_SLOT_BAND_FIRST + next++ % STIX_SLOT_BAND_PORTS;
+        addr.sin_port = htons((uint16_t)port);
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        g_assert_cmpint(fd, >=, 0);
+        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            close(fd);
+            return port;
+        }
+        close(fd);
+    }
+    g_assert(!base); /* the whole band busy: a stray process in the slot */
+
+    fd = stix_udp_bind_free(&port);
     close(fd);
     return port;
 }
