@@ -3724,3 +3724,56 @@ unless a test or the platform controller does.
 `spw-timecode-inject`. RED before PL-1: QEMU refuses
 `-global grlib-stixspw.timecode-source=obt` ("Property not found"), and
 `qom-set timecode-once` / `timecode-inject` fail.
+
+**Model (PL-2, read-only state, D-PLo/D-PLr):**
+- **PL-2a, `stixctrl_hk_value` split:** `stixctrl_hk_truth` (the table
+  plus the hkCmdSta/idefxConfig overrides, no injection) and
+  `stixctrl_hk_value` = the injection if set, else the truth. A pure
+  refactor: the hk-adc, powerstat, adc-inject and hk-prot qtests and the
+  boot/nominal/fault gates are unchanged.
+- **`/machine/stixctrl` `hw-state`** (read-only str, JSON via QDict and
+  `qobject_to_json`, `"schema": 1`, `vclock_ns`): `model` (the init-time
+  switches); `supplies` (hkCmdSta enables 4:0 and POWERSTAT 9:5 as
+  `stixctrl_hkcmdsta` composes them, per line `enabled`/`good`);
+  `hk_adc` keyed by `ch` for every channel with a table entry: `truth`,
+  `presented`, `injected` and `last` (the last guest conversion's value
+  and `vclock_ns`, null since reset); `hk_prot` (IRQEN, PROTSTAT,
+  HOTSAMPLE and the 9 lines with `line`, `ch`, `bit`, `threshold`,
+  `prot_en`); `watchdog` (running, count, reload); `scet` (coarse,
+  fine, `unsynced`); `det.quarter_on[quarter]` (idefxConfig 3:0; the
+  FSM, QL bank and replay come later through the detector's accessor).
+  The only new store is the last conversion in the hkAdc write path
+  (cleared at reset), golden-neutral.
+- **`/machine/stixspw` `hw-state`** (same form): `ls`, `link_down`,
+  `status`, `control` (raw, TR/TQ/IE/LI); `timecode` (source, enabled,
+  once_pending, last TIMECNT and its `vclock_ns` from any emitted code,
+  the next due `vclock_ns` from the pending timer, null when none);
+  `obt`; `rx_queued`; `counters` (tm_dropped, rx_dropped, tc_resync,
+  tmtc_connected).
+- **`/machine/stixspw` `vclock-ns`** (read-only uint64):
+  `qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)`, the controller's time master.
+- **The read-only proof:** the getters read the register files and
+  model state directly and never call an MMIO handler (the CTRL read
+  handler stores the SCET and the watchdog into reg on every read); no
+  register, timer, queue or IRQ is touched.
+- **Scripts (PL-2b and PL-2):** the probe's `--qmp` and `QmpClient` take
+  `tcp:HOST:PORT` as well as a unix path (a bad address exits 2);
+  `run-qemu-gs.sh` `STIX_GS_QMP` takes `tcp:127.0.0.1:PORT` or
+  `tcp:localhost:PORT` (numeric port, other hosts refused), and the
+  unix form produces the same `-qmp unix:…,server=on,wait=off` as
+  before.
+
+**Evidence (PL-2):** qtests `/sparc/stix/ctrl-hw-state` (schema, the
+enables and POWERSTAT after hkCmdSta writes, `quarter_on` after
+idefxConfig, truth 2048 vs presented 1800 on an injected ch 24 with the
+last conversion, a DET_C trip in PROTSTAT/HOTSAMPLE, the watchdog, the
+UNSYNCED flag after a 0xC8/0xCC commit with bit 31; two reads equal and
+no `stixctrl_io_read`/`stixspw_io_read` trace line while the getters
+run, with an MMIO read as the positive control), `spw-hw-state` and
+`vclock-ns`. RED before PL-2: `hw-state` and `vclock-ns` are unknown
+properties. The probe self-test gains q8 (a real TCP fake-QMP listener)
+and q9 (the address forms); RED before PL-2b: "cannot connect to
+tcp:127.0.0.1:N: No such file or directory". `scripts/stix/tests/
+test-run-qemu-gs.sh` runs the script against an argv-recording stub
+(no QEMU): 11 cases; RED against the pre-PL-2 script, the two tcp
+accept cases fail with "STIX_GS_QMP must be an absolute path".

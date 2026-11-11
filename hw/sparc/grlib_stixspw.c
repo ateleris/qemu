@@ -10,6 +10,9 @@
 #include "qapi/qapi-types-common.h"
 #include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
+#include "qobject/qnull.h"
 #include "system/physmem.h"
 #include "system/qtest.h"
 #include "StixIdpu.h"
@@ -166,6 +169,12 @@ struct STIXSPW
      * timecodes is false (timecode-once)
      */
     bool once_pending;
+    /*
+     * PL-2 (D-PLo): the last emitted code (timer, once or inject) and
+     * its virtual time, -1 = none; read only by hw-state
+     */
+    uint32_t last_timecnt;
+    int64_t last_emit_ns;
 
     /*
      * D-P4e (P4-5): link-down is runtime-settable (qom-set) and cleared
@@ -535,6 +544,8 @@ static bool stixspw_tc_emit(STIXSPW *s, uint32_t coarse, uint32_t timecnt)
     }
     s->reg.time = timecnt & 63u;
     s->reg.status |= (1u << STIXSPW_STATUS_TO);
+    s->last_timecnt = s->reg.time;
+    s->last_emit_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     trace_stixspw_timecode_emit(coarse, s->reg.time);
     if (s->reg.control & (1u << STIXSPW_CONTROL_TQ)) {
         if (s->reg.control & (1u << STIXSPW_CONTROL_IE)) {
@@ -1271,6 +1282,89 @@ static void grlib_stixspw_set_timecode_inject(Object *obj, Visitor *v,
     trace_stixspw_timecode_manual("inject", value, true);
 }
 
+/* PL-2 (D-PLr): the virtual clock, the controller's time master */
+static void grlib_stixspw_get_vclock_ns(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    uint64_t value = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void stixspw_put_ns_or_null(QDict *d, const char *key, int64_t ns)
+{
+    if (ns >= 0) {
+        qdict_put_int(d, key, ns);
+    } else {
+        qdict_put_null(d, key);
+    }
+}
+
+/*
+ * PL-2 (platform plan D-PLo): the read-only SpW state as one JSON
+ * object, sampled atomically on the main loop. Pure getters only: the
+ * register file is read directly (never through grlib_stixspw_read),
+ * and no register, timer, queue or IRQ is touched.
+ */
+static char *grlib_stixspw_get_hw_state(Object *obj, Error **errp)
+{
+    STIXSPW *s = GRLIB_STIXSPW(obj);
+    g_autoptr(QDict) root = qdict_new();
+    QDict *ctl = qdict_new(), *tc = qdict_new(), *cnt = qdict_new();
+    uint32_t c = s->reg.control;
+    int64_t due = -1;
+    uint32_t coarse;
+    uint16_t fine;
+    GString *json;
+
+    qdict_put_int(root, "schema", 1);
+    qdict_put_int(root, "vclock_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    qdict_put_int(root, "ls", (s->reg.status >> STIXSPW_STATUS_LS) &
+                              STIXSPW_STATUS_LS_MASK);
+    qdict_put_bool(root, "link_down", s->link_down);
+    qdict_put_int(root, "status", s->reg.status);
+
+    qdict_put_int(ctl, "raw", c);
+    qdict_put_bool(ctl, "tr", (c >> STIXSPW_CONTROL_TR) & 1u);
+    qdict_put_bool(ctl, "tq", (c >> STIXSPW_CONTROL_TQ) & 1u);
+    qdict_put_bool(ctl, "ie", (c >> STIXSPW_CONTROL_IE) & 1u);
+    qdict_put_bool(ctl, "li", (c >> STIXSPW_CONTROL_LI) & 1u);
+    qdict_put(root, "control", ctl);
+
+    qdict_put_str(tc, "source", s->obt_mode ? "obt" : "scet");
+    qdict_put_bool(tc, "enabled", s->timecodes);
+    qdict_put_bool(tc, "once_pending", s->once_pending);
+    if (s->last_emit_ns >= 0) {
+        qdict_put_int(tc, "last_timecnt", s->last_timecnt);
+    } else {
+        qdict_put_null(tc, "last_timecnt");
+    }
+    stixspw_put_ns_or_null(tc, "last_vclock_ns", s->last_emit_ns);
+    if (s->tc_timer != NULL && timer_pending(s->tc_timer)) {
+        due = timer_expire_time_ns(s->tc_timer);
+    }
+    stixspw_put_ns_or_null(tc, "next_due_vclock_ns", due);
+    qdict_put(root, "timecode", tc);
+
+    if (DEVICE(obj)->realized && (s->obt_mode || s->scet_ctrl != NULL)) {
+        stixspw_tc_now(s, &coarse, &fine);
+        qdict_put_int(root, "obt", ((uint64_t)coarse << 16) | fine);
+    } else {
+        qdict_put_null(root, "obt");
+    }
+    qdict_put_int(root, "rx_queued", s->rx_count);
+
+    qdict_put_int(cnt, "tm_dropped", s->tmtc.tm_dropped);
+    qdict_put_int(cnt, "rx_dropped", s->rx_dropped);
+    qdict_put_int(cnt, "tc_resync", s->tmtc.tc_resync);
+    qdict_put_bool(cnt, "tmtc_connected", s->tmtc.client_fd >= 0);
+    qdict_put(root, "counters", cnt);
+
+    json = qobject_to_json(QOBJECT(root));
+    return g_string_free(json, false);
+}
+
 static void grlib_stixspw_instance_init(Object *obj)
 {
     STIXSPW *STIXSPW = GRLIB_STIXSPW(obj);
@@ -1281,6 +1375,7 @@ static void grlib_stixspw_instance_init(Object *obj)
     STIXSPW->tmtc.udp_tm_fd = -1;
     STIXSPW->tmtc.udp_tc_fd = -1;
     STIXSPW->timecodes = true;
+    STIXSPW->last_emit_ns = -1;
 
     object_property_add_uint32_ptr(obj, "tm-dropped",
                                    &STIXSPW->tmtc.tm_dropped,
@@ -1315,6 +1410,11 @@ static void grlib_stixspw_instance_init(Object *obj)
                              grlib_stixspw_set_timecode_once);
     object_property_add(obj, "timecode-inject", "uint32", &uint32_type_info,
                         NULL, grlib_stixspw_set_timecode_inject, NULL, NULL);
+    /* PL-2 (D-PLo, D-PLr): read-only state and the virtual clock */
+    object_property_add_str(obj, "hw-state", grlib_stixspw_get_hw_state,
+                            NULL);
+    object_property_add(obj, "vclock-ns", "uint64", &uint64_type_info,
+                        grlib_stixspw_get_vclock_ns, NULL, NULL, NULL);
 }
 
 static void grlib_stixspw_reset(DeviceState *d)

@@ -2,6 +2,11 @@
 #include "qapi/error.h"
 #include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
+#include "qobject/qbool.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
+#include "qobject/qlist.h"
+#include "qobject/qnull.h"
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/sparc/grlib_stix.h"
@@ -111,6 +116,14 @@ struct STIXCTRL
      */
     uint32_t adc_inject[STIXCTRL_HK_CHANNELS];
     /*
+     * PL-2 (D-PLo): the last guest conversion per channel (the value
+     * the hkAdc write returned and its virtual time; -1 = none since
+     * reset), for the hw-state staleness check. Written only in the
+     * hkAdc write path, read only by the hw-state getter.
+     */
+    uint32_t hk_last_val[STIXCTRL_HK_CHANNELS];
+    int64_t hk_last_ns[STIXCTRL_HK_CHANNELS];
+    /*
      * P4-4 (D-P4d): when true, the nine HK protection comparators run
      * and hkIrqSta (0x90), hkProtConfig[9] (0x94..0xB4) and
      * UnlockingReg (0xD0) have their ICD semantics; when false the
@@ -139,6 +152,16 @@ static void stixctrl_adc_inject_clear(STIXCTRL *s)
 
     for (ch = 0; ch < STIXCTRL_HK_CHANNELS; ch++) {
         s->adc_inject[ch] = STIXCTRL_ADC_INJECT_NONE;
+    }
+}
+
+static void stixctrl_hk_last_clear(STIXCTRL *s)
+{
+    uint32_t ch;
+
+    for (ch = 0; ch < STIXCTRL_HK_CHANNELS; ch++) {
+        s->hk_last_val[ch] = 0;
+        s->hk_last_ns[ch] = -1;
     }
 }
 
@@ -933,6 +956,9 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
             uint32_t ch = (uint32_t)value & STIXCTRL_HKADC_ADDR_MASK;
             uint32_t val = stixctrl_hk_value(stixctrl, ch);
 
+            /* PL-2: the last conversion, for hw-state (no side effect) */
+            stixctrl->hk_last_val[ch] = val & STIXCTRL_HKADC_VAL_MASK;
+            stixctrl->hk_last_ns[ch] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             value = ((val & STIXCTRL_HKADC_VAL_MASK) << STIXCTRL_HKADC_VAL) |
                     (1u << STIXCTRL_HKADC_READY) |
                     ch;
@@ -1099,6 +1125,7 @@ static void grlib_stixctrl_reset(DeviceState *d)
      * watchdog reset
      */
     stixctrl_adc_inject_clear(stixctrl);
+    stixctrl_hk_last_clear(stixctrl);
 
     /*
      * P4-4 (D-P4d): the protection registers take their ICD reset
@@ -1173,6 +1200,139 @@ static void stixctrl_adc_inject_set(Object *obj, Visitor *v,
     stixctrl_hk_prot_sample(s, ch, stixctrl_hk_value(s, ch));
 }
 
+/* PL-2: one supply line of hw-state.supplies */
+static void stixctrl_hw_state_line(QDict *lines, const char *name,
+                                   uint32_t enables, uint32_t good,
+                                   uint32_t bit)
+{
+    QDict *l = qdict_new();
+
+    qdict_put_bool(l, "enabled", (enables >> bit) & 1u);
+    qdict_put_bool(l, "good", (good >> bit) & 1u);
+    qdict_put(lines, name, l);
+}
+
+/*
+ * PL-2 (platform plan D-PLo): the read-only hardware state as one JSON
+ * object, sampled atomically on the main loop (the getter runs under
+ * the BQL). Pure getters only: no MMIO handler runs (the CTRL read
+ * handler stores the SCET and the watchdog into reg on every read), no
+ * register, timer or IRQ is touched, so two reads with no virtual time
+ * in between are equal. "schema" versions the layout; every index
+ * names its space (ch = HK ADC channel, line = hkProtConfig selector,
+ * quarter = idefxConfig bit).
+ */
+static char *stixctrl_get_hw_state(Object *obj, Error **errp)
+{
+    STIXCTRL *s = GRLIB_STIXCTRL(obj);
+    g_autoptr(QDict) root = qdict_new();
+    QDict *sup = qdict_new(), *lines = qdict_new();
+    QDict *adc = qdict_new(), *prot = qdict_new(), *wdg = qdict_new();
+    QDict *scet = qdict_new(), *det = qdict_new(), *model = qdict_new();
+    QList *plines = qlist_new(), *qon = qlist_new();
+    uint32_t cmdsta = stixctrl_hkcmdsta(s);
+    uint32_t enables, good, sta, ch, line, q, coarse;
+    uint16_t fine;
+    GString *json;
+
+    qdict_put_int(root, "schema", 1);
+    qdict_put_int(root, "vclock_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+
+    qdict_put_bool(model, "hk_adc", s->hk_adc);
+    qdict_put_bool(model, "powerstat", s->powerstat);
+    qdict_put_bool(model, "hk_prot", s->hk_prot);
+    qdict_put_bool(model, "det_model", s->det.model);
+    qdict_put(root, "model", model);
+
+    /* hkCmdSta bits 4:0 (LV, HV01, HV17, SPW0, SPW1) and POWERSTAT 9:5 */
+    enables = cmdsta & 0x1Fu;
+    good = (cmdsta >> STIXCTRL_HKCMDSTA_POWERSTAT) &
+           STIXCTRL_HKCMDSTA_POWERSTAT_MASK;
+    qdict_put_int(sup, "enables", enables);
+    qdict_put_int(sup, "powerstat", good);
+    stixctrl_hw_state_line(lines, "lv", enables, good, 0);
+    stixctrl_hw_state_line(lines, "hv01", enables, good, 1);
+    stixctrl_hw_state_line(lines, "hv17", enables, good, 2);
+    stixctrl_hw_state_line(lines, "spw0", enables, good, 3);
+    stixctrl_hw_state_line(lines, "spw1", enables, good, 4);
+    qdict_put(sup, "lines", lines);
+    qdict_put(root, "supplies", sup);
+
+    /* every channel with a table entry (the used ones), keyed by ch */
+    for (ch = 0; ch < STIXCTRL_HK_CHANNELS; ch++) {
+        g_autofree char *key = NULL;
+        QDict *c;
+
+        if (stixctrl_hk_adc_table[ch] == 0) {
+            continue;
+        }
+        c = qdict_new();
+        qdict_put_int(c, "truth", stixctrl_hk_truth(s, ch));
+        qdict_put_int(c, "presented", stixctrl_hk_value(s, ch));
+        qdict_put_bool(c, "injected",
+                       s->adc_inject[ch] != STIXCTRL_ADC_INJECT_NONE);
+        if (s->hk_last_ns[ch] >= 0) {
+            QDict *last = qdict_new();
+
+            qdict_put_int(last, "value", s->hk_last_val[ch]);
+            qdict_put_int(last, "vclock_ns", s->hk_last_ns[ch]);
+            qdict_put(c, "last", last);
+        } else {
+            qdict_put_null(c, "last");
+        }
+        key = g_strdup_printf("%u", ch);
+        qdict_put(adc, key, c);
+    }
+    qdict_put(root, "hk_adc", adc);
+
+    sta = s->reg.hkIrqSta;
+    qdict_put_int(prot, "irqen", (sta >> STIXCTRL_HKIRQSTA_IRQEN) &
+                                 STIXCTRL_HKIRQSTA_IRQEN_MASK);
+    qdict_put_int(prot, "protstat", (sta >> STIXCTRL_HKIRQSTA_PROTSTAT) &
+                                    STIXCTRL_HKIRQSTA_PROTSTAT_MASK);
+    qdict_put_int(prot, "hotsample", (sta >> STIXCTRL_HKIRQSTA_HOTSAMPLE) &
+                                     STIXCTRL_HKIRQSTA_HOTSAMPLE_MASK);
+    for (line = 0; line < STIXCTRL_HK_PROT_LINES; line++) {
+        uint32_t cfg = s->reg.hkProtConfig[line];
+        QDict *l = qdict_new();
+
+        qdict_put_int(l, "line", line + 1);
+        qdict_put_int(l, "ch", stixctrl_hk_prot_ch[line]);
+        qdict_put_int(l, "bit", stixctrl_hk_prot_bit(line));
+        qdict_put_int(l, "threshold",
+                      (cfg >> STIXCTRL_HKPROTCONFIG_UPTHRESHOLD) &
+                      STIXCTRL_HKPROTCONFIG_UPTHRESHOLD_MASK);
+        qdict_put_bool(l, "prot_en", !!(cfg & STIXCTRL_HK_PROT_EN));
+        qlist_append(plines, l);
+    }
+    qdict_put(prot, "lines", plines);
+    qdict_put(root, "hk_prot", prot);
+
+    qdict_put_bool(wdg, "running", s->wdg_running);
+    qdict_put_int(wdg, "count", stixctrl_wdg_count(s));
+    qdict_put_int(wdg, "reload", s->wdg_reload);
+    qdict_put(root, "watchdog", wdg);
+
+    stixctrl_scet_now(s, &coarse, &fine);
+    qdict_put_int(scet, "coarse", coarse);
+    qdict_put_int(scet, "fine", fine);
+    qdict_put_bool(scet, "unsynced", s->unsynced_flag);
+    qdict_put(root, "scet", scet);
+
+    /*
+     * idefxConfig 3:0 = quarter power. The FSM, QL bank and replay come
+     * through the detector branch's accessor (D-PLm req. 8)
+     */
+    for (q = 0; q < 4; q++) {
+        qlist_append_bool(qon, (s->reg.idefxConfig >> q) & 1u);
+    }
+    qdict_put(det, "quarter_on", qon);
+    qdict_put(root, "det", det);
+
+    json = qobject_to_json(QOBJECT(root));
+    return g_string_free(json, false);
+}
+
 static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_UINT32("rotb-blocks", STIXCTRL, rotb_blocks,
                        STIXCTRL_ROTB_MAX_BLOCKS),
@@ -1201,6 +1361,9 @@ static void grlib_stixctrl_instance_init(Object *obj)
 {
     stixctrl_adc_inject_clear(GRLIB_STIXCTRL(obj));
     stix_det_instance_init(&GRLIB_STIXCTRL(obj)->det);
+    stixctrl_hk_last_clear(GRLIB_STIXCTRL(obj));
+    /* PL-2 (D-PLo): read-only, no setter */
+    object_property_add_str(obj, "hw-state", stixctrl_get_hw_state, NULL);
 }
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)

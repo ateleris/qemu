@@ -18,7 +18,10 @@
 #include "qemu/bswap.h"
 #include "qemu/cutils.h"
 #include "libqtest.h"
+#include "qapi/error.h"
 #include "qobject/qbool.h"
+#include "qobject/qjson.h"
+#include "qobject/qlist.h"
 #include "qobject/qnum.h"
 #include "qobject/qstring.h"
 
@@ -7719,12 +7722,392 @@ static void test_spw_timecode_inject(void)
     stix_qtest_cleanup();
 }
 
+/* ---- Platform controller (PL-2): read-only state, vclock-ns ---- */
+
+/* the hw-state JSON of a device, parsed; NULL when the property fails */
+static QDict *plat_hw_state(QTestState *qts, const char *path)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'hw-state'}}", path);
+    QString *str = qobject_to(QString, qdict_get(resp, "return"));
+    QDict *st = NULL;
+
+    if (str != NULL) {
+        st = qobject_to(QDict, qobject_from_json(qstring_get_str(str),
+                                                 &error_abort));
+        g_assert(st != NULL);
+    }
+    qobject_unref(resp);
+    return st;
+}
+
+/* the raw hw-state string (for the equality check) */
+static gchar *plat_hw_state_str(QTestState *qts, const char *path)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'hw-state'}}", path);
+    QString *str = qobject_to(QString, qdict_get(resp, "return"));
+    gchar *s;
+
+    g_assert(str != NULL);
+    s = g_strdup(qstring_get_str(str));
+    qobject_unref(resp);
+    return s;
+}
+
+static QDict *plat_dict(QDict *d, const char *key)
+{
+    QDict *v = qdict_get_qdict(d, key);
+
+    g_assert(v != NULL);
+    return v;
+}
+
+static QDict *plat_hk_ch(QDict *st, uint32_t ch)
+{
+    g_autofree gchar *key = g_strdup_printf("%u", ch);
+
+    return plat_dict(plat_dict(st, "hk_adc"), key);
+}
+
+/* the n-th element of a QList (NULL past the end) */
+static QObject *plat_list_nth(QList *l, unsigned n)
+{
+    const QListEntry *e;
+
+    g_assert(l != NULL);
+    for (e = qlist_first(l); e != NULL; e = qlist_next(e)) {
+        if (n-- == 0) {
+            return qlist_entry_obj(e);
+        }
+    }
+    return NULL;
+}
+
+static bool plat_quarter_on(QDict *st, unsigned q)
+{
+    QList *l = qdict_get_qlist(plat_dict(st, "det"), "quarter_on");
+    QBool *b = qobject_to(QBool, plat_list_nth(l, q));
+
+    g_assert(b != NULL);
+    return qbool_get_bool(b);
+}
+
+static QDict *plat_prot_line(QDict *st, unsigned idx)
+{
+    QList *l = qdict_get_qlist(plat_dict(st, "hk_prot"), "lines");
+    QDict *d = qobject_to(QDict, plat_list_nth(l, idx));
+
+    g_assert(d != NULL);
+    return d;
+}
+
+static off_t plat_file_size(const char *path)
+{
+    struct stat st;
+
+    g_assert(stat(path, &st) == 0);
+    return st.st_size;
+}
+
+/*
+ * D-PLo: /machine/stixctrl hw-state is a read-only JSON string (schema
+ * 1) that follows hkCmdSta (enables, POWERSTAT), idefxConfig (quarter
+ * power), an injection (truth = the pre-injection value, presented =
+ * the injected one), the last conversion, a protection trip, the
+ * watchdog and the SCET with its UNSYNCED flag. Reading it is free of
+ * side effects: two reads with no clock_step in between are equal, and
+ * no stixctrl_io_read or stixspw_io_read trace fires while the getters
+ * run (the CTRL read handler stores into reg on every read). RED before
+ * PL-2: hw-state is unknown.
+ */
+static void test_ctrl_hw_state(void)
+{
+    const char *ctrl = "/machine/stixctrl", *spw = "/machine/stixspw";
+    g_autofree gchar *log = NULL;
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *a = NULL, *b = NULL, *c = NULL, *d = NULL;
+    QTestState *qts;
+    QDict *st, *sup, *ch, *last, *prot, *scet, *wdg;
+    off_t sz;
+    int fd;
+
+    fd = g_file_open_tmp("stix-hwstate-trace-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixctrl_io_read -trace stixspw_io_read "
+                            "-D %s", log);
+    qts = stix_qtest_new_extra(extra);
+
+    /* a. JSON, schema 1, with the virtual time */
+    st = plat_hw_state(qts, ctrl);
+    g_assert(st != NULL);
+    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 1);
+    g_assert(qdict_haskey(st, "vclock_ns"));
+    sup = plat_dict(st, "supplies");
+    g_assert_cmpint(qdict_get_int(sup, "enables"), ==, 0);
+    g_assert_cmpint(qdict_get_int(sup, "powerstat"), ==, 0);
+    qobject_unref(st);
+
+    /* b. the enables and POWERSTAT follow hkCmdSta writes */
+    ctrl_write(qts, CTRL_HKCMDSTA, 0x1Fu);
+    st = plat_hw_state(qts, ctrl);
+    sup = plat_dict(st, "supplies");
+    g_assert_cmpint(qdict_get_int(sup, "enables"), ==, 0x1F);
+    g_assert_cmpint(qdict_get_int(sup, "powerstat"), ==, 0x1F);
+    g_assert(qdict_get_bool(plat_dict(plat_dict(sup, "lines"), "spw1"),
+                            "good"));
+    qobject_unref(st);
+    ctrl_write(qts, CTRL_HKCMDSTA, 0x01u); /* LV only */
+    st = plat_hw_state(qts, ctrl);
+    sup = plat_dict(st, "supplies");
+    g_assert_cmpint(qdict_get_int(sup, "enables"), ==, 0x01);
+    g_assert_cmpint(qdict_get_int(sup, "powerstat"), ==, 0x01);
+    g_assert(qdict_get_bool(plat_dict(plat_dict(sup, "lines"), "lv"),
+                            "enabled"));
+    g_assert(!qdict_get_bool(plat_dict(plat_dict(sup, "lines"), "hv01"),
+                             "enabled"));
+    /* the state overrides follow too: ATT_V (ch 12) is 1670 with LV */
+    g_assert_cmpint(qdict_get_int(plat_hk_ch(st, 12), "truth"), ==, 1670);
+    qobject_unref(st);
+
+    /* c. quarter_on follows idefxConfig 3:0 */
+    ctrl_write(qts, CTRL_IDEFXCONFIG, 0x5u);
+    st = plat_hw_state(qts, ctrl);
+    g_assert(plat_quarter_on(st, 0) && !plat_quarter_on(st, 1) &&
+             plat_quarter_on(st, 2) && !plat_quarter_on(st, 3));
+    g_assert_cmpint(qdict_get_int(plat_hk_ch(st, 4), "truth"), ==,
+                    20 + 75 * 2);
+    qobject_unref(st);
+
+    /*
+     * d. an injected channel: truth = the pre-injection value,
+     * presented = the injection; the last conversion is what the guest
+     * read, with its virtual time
+     */
+    st = plat_hw_state(qts, ctrl);
+    ch = plat_hk_ch(st, 24);
+    g_assert_cmpint(qdict_get_int(ch, "truth"), ==, 2048);
+    g_assert_cmpint(qdict_get_int(ch, "presented"), ==, 2048);
+    g_assert(!qdict_get_bool(ch, "injected"));
+    g_assert(qobject_type(qdict_get(ch, "last")) == QTYPE_QNULL);
+    qobject_unref(st);
+    g_assert_true(adc_inject_set(qts, 24, 1800));
+    qtest_clock_step(qts, 5 * MS_NS);
+    hk_check(qts, 24, 1800);
+    st = plat_hw_state(qts, ctrl);
+    ch = plat_hk_ch(st, 24);
+    g_assert_cmpint(qdict_get_int(ch, "truth"), ==, 2048);
+    g_assert_cmpint(qdict_get_int(ch, "presented"), ==, 1800);
+    g_assert(qdict_get_bool(ch, "injected"));
+    last = plat_dict(ch, "last");
+    g_assert_cmpint(qdict_get_int(last, "value"), ==, 1800);
+    g_assert_cmpint(qdict_get_int(last, "vclock_ns"), ==,
+                    qdict_get_int(st, "vclock_ns"));
+    qobject_unref(st);
+
+    /* e. the protection fields follow a trip (DET_C, line 5, ch 4) */
+    ctrl_write(qts, CTRL_HKPROTCONFIG(HK_PROT_DET), HKPROT_EN | 546);
+    ctrl_write(qts, CTRL_HKIRQSTA, HK_PROT_DET_BIT);
+    st = plat_hw_state(qts, ctrl);
+    prot = plat_dict(st, "hk_prot");
+    g_assert_cmpint(qdict_get_int(prot, "irqen"), ==, HK_PROT_DET_BIT);
+    g_assert_cmpint(qdict_get_int(prot, "protstat"), ==, 0);
+    g_assert_cmpint(qdict_get_int(plat_prot_line(st, HK_PROT_DET), "line"),
+                    ==, 5);
+    g_assert_cmpint(qdict_get_int(plat_prot_line(st, HK_PROT_DET), "ch"),
+                    ==, 4);
+    g_assert(qdict_get_bool(plat_prot_line(st, HK_PROT_DET), "prot_en"));
+    g_assert_cmpint(qdict_get_int(plat_prot_line(st, HK_PROT_DET),
+                                  "threshold"), ==, 546);
+    qobject_unref(st);
+    g_assert_true(adc_inject_set(qts, 4, 600));
+    hk_check(qts, 4, 600);
+    st = plat_hw_state(qts, ctrl);
+    prot = plat_dict(st, "hk_prot");
+    g_assert_cmpint(qdict_get_int(prot, "protstat"), ==, HK_PROT_DET_BIT);
+    g_assert_cmpint(qdict_get_int(prot, "hotsample"), ==, 600);
+    qobject_unref(st);
+
+    /* f. the watchdog (RELOAD with 63 cycles) and the SCET */
+    ctrl_write(qts, WDG, WDG_CHANGE(63));
+    ctrl_write(qts, WDG, WDG_RELOAD);
+    qtest_clock_step(qts, 2 * WDG_CYCLE_NS);
+    st = plat_hw_state(qts, ctrl);
+    wdg = plat_dict(st, "watchdog");
+    g_assert(qdict_get_bool(wdg, "running"));
+    g_assert_cmpint(qdict_get_int(wdg, "reload"), ==, 63);
+    g_assert_cmpint(qdict_get_int(wdg, "count"), ==, 61);
+    scet = plat_dict(st, "scet");
+    g_assert(!qdict_get_bool(scet, "unsynced"));
+    qobject_unref(st);
+    /* the UNSYNCED flag follows a guest 0xC8/0xCC commit with bit 31 */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x80000123u);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0x4000u);
+    st = plat_hw_state(qts, ctrl);
+    scet = plat_dict(st, "scet");
+    g_assert(qdict_get_bool(scet, "unsynced"));
+    g_assert_cmpint(qdict_get_int(scet, "coarse"), ==, 0x123);
+    g_assert_cmpint(qdict_get_int(scet, "fine"), ==, 0x4000);
+    qobject_unref(st);
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x00000123u);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0x4000u);
+    st = plat_hw_state(qts, ctrl);
+    g_assert(!qdict_get_bool(plat_dict(st, "scet"), "unsynced"));
+    qobject_unref(st);
+
+    /*
+     * g. reading changes nothing: two reads of each with no clock_step
+     * between are equal, and no *_io_read trace fires during them. The
+     * positive control: one MMIO read does grow the trace log.
+     */
+    qtest_clock_step(qts, 300 * MS_NS); /* mid-second, watchdog running */
+    sz = plat_file_size(log);
+    a = plat_hw_state_str(qts, ctrl);
+    b = plat_hw_state_str(qts, spw);
+    c = plat_hw_state_str(qts, ctrl);
+    d = plat_hw_state_str(qts, spw);
+    g_assert_cmpstr(a, ==, c);
+    g_assert_cmpstr(b, ==, d);
+    g_assert_cmpint(plat_file_size(log), ==, sz);
+    ctrl_read(qts, CTRL_HKCMDSTA);
+    qtest_readl(qts, SPW_STATUS);
+    g_assert_cmpint(plat_file_size(log), >, sz);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    unlink(log);
+}
+
+/*
+ * D-PLo: /machine/stixspw hw-state gives LS and link_down, control
+ * TR/TQ/IE/LI, and the time-code fields (source, enabled, once, the
+ * last TIMECNT and its virtual time, the next due time) after a
+ * rollover. RED before PL-2: hw-state is unknown.
+ */
+static void test_spw_hw_state(void)
+{
+    const char *spw = "/machine/stixspw";
+    QTestState *qts;
+    QDict *st, *ctl, *tc;
+    int64_t t_emit, due;
+    uint32_t coarse;
+
+    qts = stix_qtest_new();
+    st = plat_hw_state(qts, spw);
+    g_assert(st != NULL);
+    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 1);
+    g_assert_cmpint(qdict_get_int(st, "ls"), ==, SPW_LS_RUN);
+    g_assert(!qdict_get_bool(st, "link_down"));
+    tc = plat_dict(st, "timecode");
+    g_assert_cmpstr(qdict_get_str(tc, "source"), ==, "scet");
+    g_assert(qdict_get_bool(tc, "enabled"));
+    g_assert(!qdict_get_bool(tc, "once_pending"));
+    g_assert(qobject_type(qdict_get(tc, "last_timecnt")) == QTYPE_QNULL);
+    /* the timer is armed for the first rollover, 1 s */
+    g_assert_cmpint(qdict_get_int(tc, "next_due_vclock_ns"), ==,
+                    NSEC_PER_SEC);
+    g_assert_cmpint(qdict_get_int(plat_dict(st, "counters"), "rx_dropped"),
+                    ==, 0);
+    g_assert_cmpint(qdict_get_int(st, "rx_queued"), ==, 0);
+    qobject_unref(st);
+
+    /* control bits */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    st = plat_hw_state(qts, spw);
+    ctl = plat_dict(st, "control");
+    g_assert_cmpint(qdict_get_int(ctl, "raw"), ==, SPW_CTRL_FSW);
+    g_assert(qdict_get_bool(ctl, "tr") && qdict_get_bool(ctl, "tq") &&
+             qdict_get_bool(ctl, "ie") && qdict_get_bool(ctl, "li"));
+    qobject_unref(st);
+
+    /* the time-code fields after a rollover */
+    tc_step_rollover(qts);
+    coarse = ctrl_sec(qts);
+    st = plat_hw_state(qts, spw);
+    tc = plat_dict(st, "timecode");
+    g_assert_cmpint(qdict_get_int(tc, "last_timecnt"), ==, coarse & 63u);
+    t_emit = qdict_get_int(tc, "last_vclock_ns");
+    g_assert_cmpint(t_emit, ==, NSEC_PER_SEC);
+    due = qdict_get_int(tc, "next_due_vclock_ns");
+    g_assert_cmpint(due, ==, 2 * NSEC_PER_SEC);
+    g_assert_cmpint(qdict_get_int(st, "obt") >> 16, ==, coarse);
+    qobject_unref(st);
+
+    /* LS and link_down follow link-down */
+    g_assert(stix_qom_set_bool(qts, spw, "link-down", true));
+    st = plat_hw_state(qts, spw);
+    g_assert_cmpint(qdict_get_int(st, "ls"), ==, SPW_LS_READY);
+    g_assert(qdict_get_bool(st, "link_down"));
+    g_assert(qobject_type(qdict_get(plat_dict(st, "timecode"),
+                                    "next_due_vclock_ns")) == QTYPE_QNULL);
+    qobject_unref(st);
+    g_assert(stix_qom_set_bool(qts, spw, "link-down", false));
+    st = plat_hw_state(qts, spw);
+    g_assert_cmpint(qdict_get_int(st, "ls"), ==, SPW_LS_RUN);
+    g_assert(!qdict_get_bool(st, "link_down"));
+    qobject_unref(st);
+
+    /* an injected code is the last one too; obt mode shows its source */
+    g_assert(stix_qom_set_u64(qts, spw, "timecode-inject", 33));
+    st = plat_hw_state(qts, spw);
+    g_assert_cmpint(qdict_get_int(plat_dict(st, "timecode"),
+                                  "last_timecnt"), ==, 33);
+    qobject_unref(st);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    qts = stix_qtest_new_extra("-global grlib-stixspw.timecode-source=obt");
+    st = plat_hw_state(qts, spw);
+    g_assert_cmpstr(qdict_get_str(plat_dict(st, "timecode"), "source"), ==,
+                    "obt");
+    g_assert_cmphex(qdict_get_int(st, "obt"), ==, OBT_DEFAULT_EPOCH);
+    qobject_unref(st);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-PLr: /machine/stixspw vclock-ns is QEMU_CLOCK_VIRTUAL: monotonic,
+ * unchanged without a clock_step (qtest), and it advances exactly with
+ * clock_step. RED before PL-2: vclock-ns is unknown.
+ */
+static void test_vclock_ns(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint64_t t0, t1;
+    bool ok;
+
+    t0 = stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns", &ok);
+    g_assert(ok);
+    t1 = stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns", &ok);
+    g_assert(ok);
+    g_assert_cmpuint(t1, ==, t0);
+    qtest_clock_step(qts, 123456789);
+    t1 = stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns", &ok);
+    g_assert_cmpuint(t1, ==, t0 + 123456789);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns",
+                                      &ok), ==, t1 + 1);
+    /* read-only */
+    g_assert(!stix_qom_set_u64(qts, "/machine/stixspw", "vclock-ns", 0));
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_platform_register(void)
 {
     qtest_add_func("/sparc/stix/spw-obt", test_spw_obt);
     qtest_add_func("/sparc/stix/spw-timecode-once", test_spw_timecode_once);
     qtest_add_func("/sparc/stix/spw-timecode-inject",
                    test_spw_timecode_inject);
+    qtest_add_func("/sparc/stix/ctrl-hw-state", test_ctrl_hw_state);
+    qtest_add_func("/sparc/stix/spw-hw-state", test_spw_hw_state);
+    qtest_add_func("/sparc/stix/vclock-ns", test_vclock_ns);
 }
 
 int main(int argc, char **argv)
