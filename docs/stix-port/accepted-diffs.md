@@ -3306,6 +3306,28 @@ att) can run their gates at the same time without the global 21000 lock.
   `ql` / `ql-contrast` check names its first ql-check mismatch (and how
   many more) in the CHECK line and in the verdict. No ql tolerance
   changed.
+- **Gate timing is monotonic.** The WSL wall clock is stepped back to
+  the Windows time by systemd-timesyncd, mid-run (measured wall /
+  monotonic 0.75-0.88 over 10-20 s, then 1.000 a minute later). On
+  2026-11-11 three parallel detector-smoke runs FAILED `ql` that way:
+  the window from the probe's wall HH:MM:SS read 130 s while the guest
+  ran about 141 s (35 SSID 30 samples, correct for 141 s). Now:
+  - tmtc-probe.py appends `[m=<CLOCK_MONOTONIC s>]` to every event line
+    (chunks, TM, EXPECT OK, sends, QMP); its own `--send-at` / `@N`
+    windows were monotonic already.
+  - detector-smoke takes T_nom, T_exit and the flare switch times from
+    those stamps; ql-check only receives the resulting seconds.
+  - idefx-trace-check (the trace is wall-stamped by QEMU) gets the
+    (realtime, monotonic) pairs the gate sampled before and after the
+    run and places the monotonic window on the wall clock; a pair ratio
+    off by more than 0.5 % is INCONCLUSIVE, exit 3, and so is the gate's
+    verdict. The `--negative` empty-trace check uses no time.
+  - The other gates were checked: nominal-, fault- and tc-smoke time
+    everything inside the probe (monotonic) or with `timeout`/`sleep`;
+    soak slices on `/proc/uptime`; boot-smoke --with-tm only uses
+    `timeout`. None reads a wall-clock time.
+  - Before a gate round, sample the clock ratio (10 s); do not start on
+    a drifting clock.
 - **Fresh-flash gates pre-create flash.bin.** nominal-, fault- and
   detector-smoke delete flash.bin per run and then
   `truncate -s 17716740096 flash.bin`, in legacy and slot mode, so no

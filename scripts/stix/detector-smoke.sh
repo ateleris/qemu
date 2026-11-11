@@ -49,8 +49,15 @@
 # clustered by a > 5 s gap. Each cluster must be one run of exactly 384
 # (every reg 1..12 x every grp 0..15 twice, i.e. 32 ASICs), inside the
 # NOMINAL window [T_nom - 2 s, T_exit + 2 s], at least 3 runs, and no
-# undelivered read address block. The probe's HH:MM:SS times are local
-# and the trace's ISO times are UTC; both become epoch seconds.
+# undelivered read address block.
+# Clocks: all gate timing is CLOCK_MONOTONIC. T_nom, T_exit and the QMP
+# switch times are the probe's [m=...] stamps, so the NOMINAL window the
+# ql checks get cannot shrink when the wall clock is stepped (WSL's
+# timesyncd did, 0.75-0.88 wall/monotonic, and three ql FAILs followed).
+# Only the trace is wall-stamped (QEMU -msg timestamp=on): the gate
+# samples (realtime, monotonic) before and after the run, and when they
+# disagree by more than 0.5 % the trace check, and so the gate, is
+# INCONCLUSIVE (exit 3), never PASS and never a model FAIL.
 # --flare (D-4) keeps the synthetic sky (det-source=synthetic, 20 cps
 # per fpga_det quiet, 2000 flare) and adds two QMP groups:
 #   @135 qom-set /machine/stixctrl det-flare true
@@ -62,7 +69,7 @@
 # non-zero for every subcol, nothing in ebin 0/31, at least half in
 # the line bins ebin 18/19/27), and a second check, ql-contrast:
 # ql-check.py --lc-contrast ON OFF with the switch times (the probe's
-# QMP send times) minus T_nom: the SSID 30 band-0 median of the flare
+# monotonic QMP send stamps) minus T_nom: the SSID 30 band-0 median of the flare
 # samples must be >= 8 compressed steps above the quiet median. The
 # SSID 34 flags in the flare window are printed, not asserted. The
 # QEMU process's user+sys CPU seconds are printed in every mode, for
@@ -114,7 +121,9 @@
 #             the convention for new gates), 1 a failed
 #             expectation, a forbidden TM, a closed connection, a failed
 #             QL, UART or trace check (in --negative: any other set of
-#             failed checks), 2 environment problem.
+#             failed checks), 2 environment problem, 3 INCONCLUSIVE
+#             (the wall clock was stepped during the run; rerun on a
+#             steady clock).
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: detector-smoke.sh <qemu-binary> \
@@ -370,7 +379,7 @@ touch .unfinished
 # appended to, so it must start empty.
 rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
-      ql.contrast.log qmp.sock
+      ql.contrast.log trace.check.log qmp.sock
 truncate -s 17716740096 flash.bin
 
 PROBE_PID=""
@@ -389,8 +398,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The epoch before the start anchors the probe's local HH:MM:SS times.
-RUN_EPOCH="$(date +%s)"
+# Clocks: every window below is timed on CLOCK_MONOTONIC (the probe's
+# [m=...] stamps), never on the wall clock, which WSL's timesyncd can
+# step mid-run. Only the trace check needs the wall clock (QEMU stamps
+# the trace with it); it gets these (realtime, monotonic) pairs from
+# before and after the run and reports INCONCLUSIVE when they disagree.
+# STIX_CLOCK_CMD is a test hook printing "REALTIME MONOTONIC".
+clock_pair() {
+    if [ -n "${STIX_CLOCK_CMD:-}" ]; then
+        "$STIX_CLOCK_CMD"
+    else
+        python3 -c 'import time
+print(f"{time.time():.3f} {time.monotonic():.3f}")'
+    fi
+}
+CLOCK_START="$(clock_pair)"
 # The probe starts first: it retries the TMTC connect until QEMU binds
 # the port, then stays on the connection for the whole run (--hold).
 timeout "$((DURATION + 30))" python3 -u "$PROBE" "${PROBE_ARGS[@]}" \
@@ -405,6 +427,7 @@ set +e
 wait "$PROBE_PID"
 PROBE_RC=$?
 PROBE_PID=""
+CLOCK_END="$(clock_pair)"
 kill -0 "$QEMU_PID" 2>/dev/null
 QEMU_ALIVE=$?
 # D-4 cost record: QEMU's own user+sys CPU (the child of timeout)
@@ -493,23 +516,25 @@ else
     echo "CHECK probe: ok (every TM expectation matched, no forbid fired)"
 fi
 
-# T_nom / T_exit: the probe's arrival times of 0021 04 05 / 0021 05 04
-T_NOM_HMS="$(grep -m1 'EXPECT OK: 0x5A7:5:1:00210405@10' detector.probe.log \
-    | cut -d' ' -f1)" || true
-T_EXIT_HMS="$(grep -m1 'EXPECT OK: 0x5A7:5:1:00210504@10' detector.probe.log \
-    | cut -d' ' -f1)" || true
+# T_nom / T_exit: the probe's monotonic stamps ([m=...]) of the arrivals
+# of 0021 04 05 / 0021 05 04 (the HH:MM:SS are for reading only)
+P_NOM='EXPECT OK: 0x5A7:5:1:00210405@10'
+P_EXIT='EXPECT OK: 0x5A7:5:1:00210504@10'
+mono_of() { # probe-log pattern -> the [m=...] stamp of its first line
+    grep -m1 -- "$1" detector.probe.log |
+        sed -n 's/.*\[m=\([0-9][0-9.]*\)\].*/\1/p'
+}
+hms_of() {
+    grep -m1 -- "$1" detector.probe.log | cut -d' ' -f1
+}
+T_NOM_M="$(mono_of "$P_NOM")" || true
+T_EXIT_M="$(mono_of "$P_EXIT")" || true
 NOM_SECONDS=""
-if [ -n "$T_NOM_HMS" ] && [ -n "$T_EXIT_HMS" ]; then
-    NOM_SECONDS="$(python3 - "$T_NOM_HMS" "$T_EXIT_HMS" <<'EOF'
-import sys
-def s(hms):
-    h, m, x = (int(v) for v in hms.split(":"))
-    return h * 3600 + m * 60 + x
-print((s(sys.argv[2]) - s(sys.argv[1])) % 86400)
-EOF
-)"
-    echo "NOMINAL window: T_nom $T_NOM_HMS, T_exit $T_EXIT_HMS," \
-        "$NOM_SECONDS s"
+if [ -n "$T_NOM_M" ] && [ -n "$T_EXIT_M" ]; then
+    NOM_SECONDS="$(awk -v a="$T_NOM_M" -v b="$T_EXIT_M" \
+        'BEGIN { printf "%.1f", b - a }')"
+    echo "NOMINAL window: T_nom $(hms_of "$P_NOM"), T_exit" \
+        "$(hms_of "$P_EXIT"), $NOM_SECONDS s (monotonic)"
 fi
 
 [ -n "$QEMU_CPU" ] && echo "QEMU CPU ($MODE): $QEMU_CPU"
@@ -546,23 +571,18 @@ fi
 # 2b. --flare: the LC band-0 contrast across the flare switch. The
 # switch times are the probe's QMP send times, relative to T_nom.
 if [ "$FLARE" -eq 1 ]; then
-    mapfile -t QMP_HMS < <(grep '>> qmp .*det-flare' detector.probe.log \
-        | cut -d' ' -f1)
-    if [ -z "$NOM_SECONDS" ] || [ "${#QMP_HMS[@]}" -ne 2 ] || \
+    mapfile -t QMP_M < <(grep '>> qmp .*det-flare' detector.probe.log |
+        sed -n 's/.*\[m=\([0-9][0-9.]*\)\].*/\1/p')
+    if [ -z "$NOM_SECONDS" ] || [ "${#QMP_M[@]}" -ne 2 ] || \
         [ ! -s ql.dump.hex ]; then
         echo "CHECK ql-contrast: FAIL (no NOMINAL window, no dump, or" \
-            "not exactly two det-flare QMP sends: ${#QMP_HMS[@]})"
+            "not exactly two det-flare QMP sends: ${#QMP_M[@]})"
         FAILED+=(ql-contrast)
-        add_why ql-contrast "no window, no dump or ${#QMP_HMS[@]} QMP sends"
+        add_why ql-contrast "no window, no dump or ${#QMP_M[@]} QMP sends"
     else
-        read -r FLARE_ON_S FLARE_OFF_S < <(python3 -c '
-import sys
-def s(hms):
-    h, m, x = (int(v) for v in hms.split(":"))
-    return h * 3600 + m * 60 + x
-t0 = s(sys.argv[1])
-print(*((s(a) - t0) % 86400 for a in sys.argv[2:]))
-' "$T_NOM_HMS" "${QMP_HMS[0]}" "${QMP_HMS[1]}")
+        read -r FLARE_ON_S FLARE_OFF_S < <(awk -v t="$T_NOM_M" \
+            -v a="${QMP_M[0]}" -v b="${QMP_M[1]}" \
+            'BEGIN { printf "%.1f %.1f\n", a - t, b - t }')
         echo "flare switch: on at T_nom +$FLARE_ON_S s, off at" \
             "T_nom +$FLARE_OFF_S s"
         set +e
@@ -629,14 +649,24 @@ fi
 # the positive branch here.
 IDEFX_NEG=0
 [ "$NEGATIVE" -eq 1 ] && [ "$FLARE" -eq 0 ] && IDEFX_NEG=1
-TRACE_ARGS=(idefx.trace --run-epoch "$RUN_EPOCH")
-[ -n "${T_NOM_HMS:-}" ] && TRACE_ARGS+=(--t-nom "$T_NOM_HMS")
-[ -n "${T_EXIT_HMS:-}" ] && TRACE_ARGS+=(--t-exit "$T_EXIT_HMS")
-[ "$IDEFX_NEG" -eq 1 ] && TRACE_ARGS+=(--expect-none)
+# The positive check places the runs in the NOMINAL window on the
+# trace's wall clock, from the monotonic T_nom / T_exit and the clock
+# pairs; a wall-clock step makes it INCONCLUSIVE (rc 3), and then so is
+# the gate. The negative's empty-trace check uses no time at all.
+if [ "$IDEFX_NEG" -eq 1 ]; then
+    TRACE_ARGS=(idefx.trace --expect-none)
+else
+    # shellcheck disable=SC2206 # two "REALTIME MONOTONIC" pairs
+    TRACE_ARGS=(idefx.trace --clock $CLOCK_START $CLOCK_END)
+    [ -n "$T_NOM_M" ] && TRACE_ARGS+=(--t-nom-m "$T_NOM_M")
+    [ -n "$T_EXIT_M" ] && TRACE_ARGS+=(--t-exit-m "$T_EXIT_M")
+fi
 set +e
-python3 "$TRACECHECK" "${TRACE_ARGS[@]}"
+python3 "$TRACECHECK" "${TRACE_ARGS[@]}" > trace.check.log 2>&1
 TRACE_RC=$?
 set -e
+cat trace.check.log
+INCONCLUSIVE=""
 if [ "$IDEFX_NEG" -eq 1 ]; then
     if [ "$TRACE_RC" -eq 0 ]; then
         echo "CHECK trace-verif: FAIL as planned (the trace is empty:" \
@@ -649,12 +679,25 @@ if [ "$IDEFX_NEG" -eq 1 ]; then
     fi
 elif [ "$TRACE_RC" -eq 0 ]; then
     echo "CHECK trace-verif: ok"
+elif [ "$TRACE_RC" -eq 3 ]; then
+    INCONCLUSIVE="$(sed -n 's/^IDEFX-TRACE-CHECK: INCONCLUSIVE (\(.*\))$/\1/p' \
+        trace.check.log)"
+    echo "CHECK trace-verif: INCONCLUSIVE ($INCONCLUSIVE)"
 else
     echo "CHECK trace-verif: FAIL (rc=$TRACE_RC)"
     FAILED+=(trace-verif)
 fi
 
 GOT="${FAILED[*]:-}"
+# A stepped wall clock: no PASS and no model FAIL from this run (exit 3);
+# the other checks' results are listed for the record.
+if [ -n "$INCONCLUSIVE" ]; then
+    VT="DETECTOR-SMOKE"
+    [ "$MODE" = positive ] || VT="DETECTOR-SMOKE ($MODE)"
+    echo "$VT: INCONCLUSIVE ($INCONCLUSIVE; rerun on a steady clock;" \
+        "other failed checks: '${GOT}'$WHY_QL)${STIX_SLOT_TAG}"
+    exit 3
+fi
 # PASS: the run dir may be reused; in slot mode drop the flash copy and
 # the trace (legacy keeps everything)
 pass_cleanup() {

@@ -16,48 +16,67 @@ by a gap > 5 s; each cluster is one verification run
 (XrayDetFDIR.c:140-300, 596-690) and must be exactly 384 = 12 registers
 x 32 ASICs: for every register, every grp 0..15 (grp = fpga_det / 2)
 exactly twice (asic 0 and 1). Every run must lie in the NOMINAL window
-[T_nom - 2 s, T_exit + 2 s]; T_nom / T_exit are the probe's local
-HH:MM:SS arrival times of 0021 04 05 / 0021 05 04, turned into epoch
-seconds at or after --run-epoch. At least --min-runs runs are required,
-and an undelivered read address block is a failure.
+[T_nom - 2 s, T_exit + 2 s]. At least --min-runs runs are required, and
+an undelivered read address block is a failure.
+
+Clocks. T_nom / T_exit are the probe's CLOCK_MONOTONIC stamps ([m=...])
+of 0021 04 05 / 0021 05 04; the trace's stamps are wall-clock (QEMU's
+-msg timestamp=on), and the wall clock can be stepped mid-run (WSL's
+timesyncd). The gate therefore samples (realtime, monotonic) before and
+after the run (--clock R0 M0 R1 M1), and the window is placed on the
+wall clock as R0 + (m - M0). That holds only while the wall clock kept
+pace: when (R1 - R0) / (M1 - M0) differs from 1 by more than 0.5 %, the
+result is INCONCLUSIVE (exit 3) — never a pass, never a model failure.
+Within 0.5 % a 300 s run drifts at most 1.5 s, inside the 2 s slack;
+the 5 s clustering gap is between runs about 30 s apart. A step that is
+undone before the end sample is not seen; the monotonic NOMINAL window
+the ql check uses does not depend on this at all.
 
 --expect-none is the detector-smoke --negative check (det-idefx=off
 keeps the registers as plain storage, so no stixdet_idefx_cmd fires):
 the trace must exist and hold no IDeF-X command word at all, hence 0
-runs and 0 undelivered blocks.
+runs and 0 undelivered blocks. It uses no time, so no clock either.
 
 Usage:
-  idefx-trace-check.py TRACE --run-epoch EPOCH [--t-nom HMS]
-      [--t-exit HMS] [--min-runs N] [--expect-none]
+  idefx-trace-check.py TRACE --clock R0 M0 R1 M1 [--t-nom-m M]
+      [--t-exit-m M] [--min-runs N]
+  idefx-trace-check.py TRACE --expect-none
   idefx-trace-check.py --self-test
 Exit codes: 0 the check passed, 1 it failed, 2 the trace is missing or
-unreadable (or bad usage). stdlib only.
+unreadable (or bad usage), 3 INCONCLUSIVE (the wall clock was stepped).
+stdlib only.
 """
 import argparse
 import datetime
 import re
 import sys
-import time
 
 NUM_GRP = 16
 NUM_REG = 12
 RUN_BLOCKS = NUM_REG * NUM_GRP * 2   # 384
 GAP_S = 5.0
 WINDOW_SLACK_S = 2.0
+CLOCK_TOLERANCE = 0.005   # wall/monotonic rate, 0.5 %
 
 LINE = re.compile(r"^(\S+) stixdet_idefx_cmd IDeF-X grp (\d+) word "
                   r"0x([0-9a-f]+) delivered_grp_mask 0x([0-9a-f]+)")
 
 
-def local_epoch(hms, run_epoch):
-    """A probe HH:MM:SS (local) as epoch seconds, at or after the run
-    start (a run that crosses midnight lands on the next day)."""
-    h, m, s = (int(v) for v in hms.split(":"))
-    day = datetime.datetime.fromtimestamp(run_epoch).replace(
-        hour=0, minute=0, second=0, microsecond=0)
-    t = time.mktime((day + datetime.timedelta(
-        hours=h, minutes=m, seconds=s)).timetuple())
-    return t + 86400 if t < run_epoch - 5 else t
+def clock_step(r0, m0, r1, m1):
+    """None when the wall clock kept pace with the monotonic clock over
+    the run (within CLOCK_TOLERANCE), else the INCONCLUSIVE reason."""
+    if m1 <= m0:
+        return f"monotonic clock did not advance ({m0} -> {m1})"
+    ratio = (r1 - r0) / (m1 - m0)
+    if abs(ratio - 1.0) > CLOCK_TOLERANCE:
+        return (f"clock step: the wall clock advanced {r1 - r0:.1f} s over "
+                f"{m1 - m0:.1f} s monotonic, ratio {ratio:.3f}")
+    return None
+
+
+def to_wall(m, r0, m0):
+    """A monotonic stamp on the wall clock of the run start."""
+    return r0 + (m - m0)
 
 
 def analyse(lines, t_nom=None, t_exit=None, min_runs=3):
@@ -192,42 +211,76 @@ def self_test():
     assert check_none(s) == []
     s, _ = analyse(ok3[:3], t_nom, t_exit)        # one SCINITSEQ word
     assert len(check_none(s)) == 1
-    # midnight: a probe time just after midnight is the next day
-    base = time.mktime(datetime.datetime(2026, 11, 11, 23, 59, 50)
-                       .timetuple())
-    assert local_epoch("00:00:05", base) - base == 15
-    assert local_epoch("23:59:52", base) - base == 2
+    # clocks: monotonic event stamps placed on the wall clock
+    m0, r0 = 5000.0, t_nom - 100.0          # the run started 100 s early
+    assert to_wall(m0 + 100.0, r0, m0) == t_nom
+    assert clock_step(r0, m0, r0 + 300.0, m0 + 300.0) is None
+    assert clock_step(r0, m0, r0 + 298.8, m0 + 300.0) is None   # 0.4 %
+    # a wall clock stepped back: 225 s wall over 300 s monotonic (0.75)
+    why = clock_step(r0, m0, r0 + 225.0, m0 + 300.0)
+    assert why is not None and "ratio 0.750" in why, why
+    assert clock_step(r0, m0, r0 + 301.8, m0 + 300.0) is not None  # 0.6 %
+    # the same trace, the window from monotonic stamps: the verdict does
+    # not change however the probe's wall HH:MM:SS read
+    s, f = analyse(ok3, to_wall(m0 + 100.0, r0, m0),
+                   to_wall(m0 + 240.0, r0, m0))
+    assert f == [] and s["runs"] == 3, f
+    # main(): a step => exit 3 before any verdict; --expect-none is immune
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".trace") as tf:
+        tf.write("\n".join(ok3) + "\n")
+        tf.flush()
+        clk = [str(v) for v in (r0, m0, r0 + 225.0, m0 + 300.0)]
+        assert main([tf.name, "--clock", *clk, "--t-nom-m", str(m0 + 100),
+                     "--t-exit-m", str(m0 + 240)]) == 3
+        clk[2] = str(r0 + 300.0)
+        assert main([tf.name, "--clock", *clk, "--t-nom-m", str(m0 + 100),
+                     "--t-exit-m", str(m0 + 240)]) == 0
+    with tempfile.NamedTemporaryFile("w", suffix=".trace") as tf:
+        assert main([tf.name, "--expect-none"]) == 0
     print("IDEFX-TRACE-CHECK SELF-TEST: PASS")
     return 0
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Count ASIC verification runs in an IDeF-X trace")
     ap.add_argument("trace", nargs="?")
-    ap.add_argument("--run-epoch", type=int,
-                    help="epoch seconds at the run start (anchors the "
-                         "probe's local HH:MM:SS)")
-    ap.add_argument("--t-nom", help="HH:MM:SS of 0021 04 05")
-    ap.add_argument("--t-exit", help="HH:MM:SS of 0021 05 04")
+    ap.add_argument("--clock", nargs=4, type=float,
+                    metavar=("R0", "M0", "R1", "M1"),
+                    help="(realtime, monotonic) before and after the run")
+    ap.add_argument("--t-nom-m", type=float,
+                    help="the probe's monotonic stamp of 0021 04 05")
+    ap.add_argument("--t-exit-m", type=float,
+                    help="the probe's monotonic stamp of 0021 05 04")
     ap.add_argument("--min-runs", type=int, default=3)
     ap.add_argument("--expect-none", action="store_true",
                     help="require an empty trace (det-idefx=off)")
     ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.self_test:
         return self_test()
-    if not args.trace or args.run_epoch is None:
-        ap.error("TRACE and --run-epoch are required")
+    if not args.trace:
+        ap.error("TRACE is required")
+    if not args.expect_none and args.clock is None:
+        ap.error("--clock R0 M0 R1 M1 is required (the window check)")
     try:
         with open(args.trace) as fh:
             lines = fh.readlines()
     except OSError as e:
         print(f"IDEFX-TRACE-CHECK: ERROR (cannot read {args.trace}: {e})")
         return 2
-    t_nom = local_epoch(args.t_nom, args.run_epoch) if args.t_nom else None
-    t_exit = local_epoch(args.t_exit, args.run_epoch) if args.t_exit \
-        else None
+    t_nom = t_exit = None
+    if not args.expect_none:
+        r0, m0, r1, m1 = args.clock
+        why = clock_step(r0, m0, r1, m1)
+        if why is not None:
+            print(f"IDEFX-TRACE-CHECK: INCONCLUSIVE ({why})")
+            return 3
+        if args.t_nom_m is not None:
+            t_nom = to_wall(args.t_nom_m, r0, m0)
+        if args.t_exit_m is not None:
+            t_exit = to_wall(args.t_exit_m, r0, m0)
     summary, fails = analyse(lines, t_nom, t_exit, args.min_runs)
     print(f"ASIC verification runs (delivered read address blocks): "
           f"{summary['runs']}"
@@ -239,7 +292,6 @@ def main():
     for x in fails:
         print(f"  {x}")
     return 1 if fails else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

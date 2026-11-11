@@ -61,6 +61,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -360,7 +361,8 @@ class QmpClient:
         while True:
             msg = self._read_msg(deadline)
             if "event" in msg:
-                print(f"{ts()} QMP event {msg.get('event')} (skipped)",
+                print(f"{ts()} QMP event {msg.get('event')} (skipped) "
+                      f"{mono()}",
                       flush=True)
                 continue
             if "return" in msg:
@@ -480,6 +482,16 @@ def ts():
     return time.strftime("%H:%M:%S")
 
 
+def mono():
+    """The event's CLOCK_MONOTONIC stamp, appended to every event line as
+    [m=SECONDS]. Gates time windows from these, never from the wall-clock
+    HH:MM:SS: the wall clock can be stepped mid-run (WSL's timesyncd
+    pulls it back to the Windows time), the monotonic clock, which QEMU's
+    virtual time follows, cannot. The value is system-wide, so a gate can
+    relate it to its own time.monotonic() samples."""
+    return f"[m={time.monotonic():.3f}]"
+
+
 def verdict(groups, group_window, now, t0):
     """The run_gate verdict computation: (all_matched, failed).
 
@@ -560,7 +572,8 @@ def handle_chunk(chunk, groups, pending, dump=None):
     Factored so the send-side drain (review m1) shares the matcher.
     @dump (a PacketDump) gets every framed unit before it is matched."""
     pending += chunk
-    print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()}", flush=True)
+    print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()} {mono()}",
+          flush=True)
     units, _ = frame_units(pending)
     for unit in units:
         if dump is not None:
@@ -571,11 +584,11 @@ def handle_chunk(chunk, groups, pending, dump=None):
         apid, ptype, subtype, _app = fields
         print(f"{ts()} TM apid=0x{apid:03X} type={ptype} "
               f"subtype={subtype} len={len(unit)} "
-              f"data={unit[:48].hex()}", flush=True)
+              f"data={unit[:48].hex()} {mono()}", flush=True)
         newly_ok, forbidden = match_unit(unit, groups)
         for e in newly_ok:
             print(f"{ts()} EXPECT OK: {e} "
-                  f"(unit len={len(unit)})", flush=True)
+                  f"(unit len={len(unit)}) {mono()}", flush=True)
         if forbidden is not None:
             return forbidden
     return None
@@ -599,7 +612,7 @@ def run_plain(sock, deadline, dump=None):
             break
         saw_any = True
         total += len(chunk)
-        print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()}")
+        print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()} {mono()}")
         if dump is not None and dump.files:
             pending += chunk
             for unit in frame_units(pending)[0]:
@@ -656,15 +669,16 @@ def run_gate(sock, args, groups, qmp=None, dump=None):
                     g["sent"] = True
                     g["t_sent"] = time.monotonic()
                     print(f"{ts()} >> qmp {json.dumps(g['qmp'])} -> "
-                          f"return {json.dumps(ret)} at +{g['at']:.0f}s",
-                          flush=True)
+                          f"return {json.dumps(ret)} at +{g['at']:.0f}s "
+                          f"{mono()}", flush=True)
                     continue
                 payload = bytes.fromhex(g["hex"])
                 sock.sendall(payload)
                 g["sent"] = True
                 g["t_sent"] = time.monotonic()
                 print(f"{ts()} >> sent {len(payload)}B "
-                      f"({g['hex'][:32]}...) at +{g['at']:.0f}s", flush=True)
+                      f"({g['hex'][:32]}...) at +{g['at']:.0f}s {mono()}",
+                      flush=True)
         try:
             chunk = sock.recv(4096)
         except socket.timeout:
@@ -1211,6 +1225,10 @@ def self_test():
     else:
         raise AssertionError("--dump-apid: a duplicate APID accepted")
 
+    # event stamps are CLOCK_MONOTONIC, not the (steppable) wall clock
+    m1 = mono()
+    assert re.fullmatch(r"\[m=\d+\.\d{3}\]", m1), m1
+    assert abs(float(m1[3:-1]) - time.monotonic()) < 1.0, m1
     print("SELF-TEST: PASS")
     return 0
 

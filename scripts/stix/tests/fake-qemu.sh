@@ -8,7 +8,8 @@
 #
 # FAKE_QEMU_ARGV_FILE, when set, gets one record per invocation appended:
 # "argv:" plus the arguments one per line, "cwd: <dir>" and
-# "flash-inode: <inode of ./flash.bin, or none>", then "end".
+# "flash-inode: <inode of ./flash.bin, or none>", then "end". A
+# -trace ...,file=X argument creates X empty.
 set -u
 MODE="${FAKE_QEMU_MODE:-good}"
 SELF="$(readlink -f "$0")"
@@ -26,6 +27,10 @@ prev=""
 for a in "$@"; do
     if [ "$prev" = "-serial" ]; then
         SERIAL_OUT="${a#file:}"
+    fi
+    # -trace ...,file=X: create X empty, like QEMU with no event fired
+    if [ "$prev" = "-trace" ] && [ "${a#*file=}" != "$a" ]; then
+        : > "${a#*file=}"
     fi
     prev="$a"
 done

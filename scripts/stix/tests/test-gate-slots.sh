@@ -445,8 +445,8 @@ check "detector slot --flare: the probe's QMP socket is the slot's" $? "$out"
 # a fake run to the verdict: canned probe lines (T_nom = T_exit, no TM
 # failure) and a one-packet QL dump that the real ql-check rejects
 {
-    echo '%T EXPECT OK: 0x5A7:5:1:00210405@10'
-    echo '%T EXPECT OK: 0x5A7:5:1:00210504@10'
+    echo '%T EXPECT OK: 0x5A7:5:1:00210405@10 [m=1000.000]'
+    echo '%T EXPECT OK: 0x5A7:5:1:00210504@10 [m=1000.000]'
 } > "$W/det.lines"
 echo 0ddcc000001a101506000000000000002200000001000000270002000000000000 \
     > "$W/det.dump"
@@ -487,6 +487,62 @@ echo "$last" |
     grep -q "^DETECTOR-SMOKE: FAIL (failed checks: ql .*; ql: SSID" &&
     ! echo "$last" | grep -q "slot="
 check "detector legacy FAIL: the ql mismatch named, no slot tag" $? "$out"
+
+# --- clock: gate timing is monotonic; a wall-clock step is INCONCLUSIVE ---
+# The probe tags each event with CLOCK_MONOTONIC ([m=...]). Here the wall
+# HH:MM:SS of T_nom and T_exit are equal (a wall clock stepped back by
+# 145 s), the monotonic stamps 145 s apart: the window is 145 s, and the
+# flare switch offsets come from the QMP lines' monotonic stamps.
+{
+    echo '%T EXPECT OK: 0x5A7:5:1:00210405@10 (unit len=25) [m=1000.000]'
+    q='%T >> qmp {"execute": "qom-set"} -> return {}'
+    echo "$q at +135s det-flare [m=1062.000]"
+    echo "$q at +195s det-flare [m=1122.000]"
+    echo '%T EXPECT OK: 0x5A7:5:1:00210504@10 (unit len=25) [m=1145.000]'
+} > "$W/clk.lines"
+clockrun() { # clock-pairs-file args...: a fake slot-1 run, faked clocks
+    local pairs="$1"
+    shift
+    # the fake clock prints line n of the pairs file on its n-th call
+    {
+        echo '#!/bin/sh'
+        echo "n=\$(( \$(cat $pairs.n 2>/dev/null || echo 0) + 1 ))"
+        echo "echo \$n > $pairs.n"
+        echo "sed -n \"\${n}p\" $pairs"
+    } > "$W/clock-cmd"
+    chmod +x "$W/clock-cmd"
+    rm -f "$pairs.n"
+    slotenv STIX_DETECTOR_RUN_DIR="$W/ck" STIX_TMTC_PROBE="$FPROBE" \
+        FAKE_PROBE_LINES="$W/clk.lines" FAKE_PROBE_DUMP="$W/det.dump" \
+        STIX_CLOCK_CMD="$W/clock-cmd" FAKE_QEMU_RUN_SECONDS=10 \
+        bash "$S/detector-smoke.sh" "$FAKE" "$@" 2>&1
+}
+printf '1700000000.000 900.000\n1700000300.000 1200.000\n' > "$W/clk-ok"
+printf '1700000000.000 900.000\n1700000225.000 1200.000\n' > "$W/clk-step"
+out="$(clockrun "$W/clk-ok" --flare)"
+echo "$out" | grep -q "^NOMINAL window: .* 145.0 s (monotonic)" &&
+    echo "$out" |
+        grep -q "^flare switch: on at T_nom +62.0 s, off at T_nom +122.0 s"
+check "clock: the NOMINAL window and flare offsets are monotonic" $? "$out"
+out="$(clockrun "$W/clk-ok")"
+rc=$?
+[ "$rc" -eq 1 ] && ! echo "$out" | grep -q INCONCLUSIVE
+check "clock: ratio 1.000 => a normal verdict (FAIL here), not INCONCLUSIVE" \
+    $? "rc=$rc: $out"
+out="$(clockrun "$W/clk-step")"
+rc=$?
+last="$(echo "$out" | tail -1)"
+[ "$rc" -eq 3 ] &&
+    echo "$last" |
+        grep -q "^DETECTOR-SMOKE: INCONCLUSIVE (clock step: .*0\.750" &&
+    echo "$last" | grep -q "slot=1 busy="
+check "clock: a 0.75 wall/monotonic step => INCONCLUSIVE, exit 3" $? \
+    "rc=$rc: $out"
+out="$(clockrun "$W/clk-step" --negative)"
+rc=$?
+[ "$rc" -eq 1 ] && ! echo "$out" | grep -q INCONCLUSIVE
+check "clock: --negative needs no wall clock (empty trace): not INCONCLUSIVE" \
+    $? "rc=$rc: $out"
 
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"
