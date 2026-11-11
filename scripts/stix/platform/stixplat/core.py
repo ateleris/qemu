@@ -49,6 +49,7 @@ class Controller:
         self.stopping = threading.Event()
         self.poller = None
         self.last_state_poll = 0.0
+        self.last_poll_error = None
         self.last_snapshot = None   # bench time of the last snapshot
         self.server = None
         self._register()
@@ -131,21 +132,43 @@ class Controller:
 
     # -- polling (D-PLr, D-PLo) --
     def poll_state(self):
+        """Sample both hw-states; never raises (S3): a failure is one
+        poller.error record (repeats of the same error are not logged)."""
         q = self.power.qmp
         if q is None or not self.power.qmp_alive():
             return
+        self.last_state_poll = time.monotonic()
         try:
             ctrl = json.loads(q.qom_get(qemu_mod.STIXCTRL, "hw-state"))
             spw = json.loads(q.qom_get(qemu_mod.STIXSPW, "hw-state"))
-        except (QmpError, ValueError, AttributeError, OSError):
-            return
-        self.clock.sample(spw["vclock_ns"])
-        sim = self.clock.exact_sim()
-        if spw.get("obt_kind") == "platform" and spw.get("obt") is not None:
-            self.power.last_obt = (spw["obt"], sim)
-        self._emit_changes(self.state.update_hw(ctrl, spw, sim))
-        self.last_state_poll = time.monotonic()
+        except (QmpError, AttributeError, OSError):
+            return              # QEMU going away: power.watch() reports it
+        except ValueError as e:
+            return self._poll_error("state", e)
+        try:
+            self.clock.sample(spw["vclock_ns"])
+            sim = self.clock.exact_sim()
+            if spw.get("obt_kind") == "platform" and \
+                    spw.get("obt") is not None:
+                self.power.last_obt = (spw["obt"], sim)
+            changes = self.state.update_hw(ctrl, spw, sim)
+        except Exception as e:
+            return self._poll_error("state", e)
+        self._emit_changes(changes)
         self._maybe_snapshot(sim)
+        self._poll_ok()
+
+    def _poll_error(self, where, e):
+        msg = "%s: %s: %s" % (where, type(e).__name__, e)
+        if msg != self.last_poll_error:
+            self.last_poll_error = msg
+            self.log.emit("ctl", "log", "poller.error", {"error": msg})
+
+    def _poll_ok(self):
+        if self.last_poll_error is not None:
+            self.log.emit("ctl", "log", "poller.recovered",
+                          {"after": self.last_poll_error})
+            self.last_poll_error = None
 
     def _maybe_snapshot(self, sim):
         """A full `state` record (path "snapshot") every snapshot_s of
@@ -166,18 +189,25 @@ class Controller:
         state_period = 1.0 / self.cfg["clock"]["state_hz"]
         while not self.stopping.is_set():
             time.sleep(self.clock.wake_in(period))
-            self.power.watch()
-            q = self.power.qmp
-            if q is None or not self.power.qmp_alive():
-                continue
             try:
-                self.clock.sample(q.qom_get(qemu_mod.STIXSPW, "vclock-ns"))
-            except (QmpError, AttributeError, OSError):
-                continue
-            self.clock.run_due()
-            if self.power.state != power_mod.OFF and \
-                    time.monotonic() - self.last_state_poll >= state_period:
-                self.poll_state()
+                self._poll_once(state_period)
+            except Exception as e:      # S3: the poller never dies
+                self._poll_error("loop", e)
+                time.sleep(period)
+
+    def _poll_once(self, state_period):
+        self.power.watch()
+        q = self.power.qmp
+        if q is None or not self.power.qmp_alive():
+            return
+        try:
+            self.clock.sample(q.qom_get(qemu_mod.STIXSPW, "vclock-ns"))
+        except (QmpError, AttributeError, OSError):
+            return
+        self.clock.run_due()
+        if self.power.state != power_mod.OFF and \
+                time.monotonic() - self.last_state_poll >= state_period:
+            self.poll_state()
 
     # -- read endpoints --
     def time_info(self):

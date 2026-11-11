@@ -66,7 +66,7 @@ class Env:
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="stixplat-selftest-")
         self.bins = {}
-        for v in ("new", "old", "noquit", "noqmp"):
+        for v in ("new", "old", "noquit", "noqmp", "badstate"):
             p = os.path.join(self.tmp, "qemu-%s" % v)
             with open(p, "w") as f:
                 f.write('#!/bin/sh\nexec "%s" "%s" --variant %s "$@"\n'
@@ -593,6 +593,61 @@ def t_run_lock(env):
              == "Z", what="QEMU to die with its parent (PDEATHSIG)")
 
 
+def t_poller_robust(env):
+    """S3: a malformed hw-state and a QEMU crash never kill the poller,
+    and a command never ends in a dropped connection."""
+    ctl = env.controller(qemu={"binary": env.bins["badstate"]})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    post = {"Content-Type": "application/json", "X-Stix-Platform": "1"}
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        wait_for(lambda: any(r.obj["path"] == "poller.error"
+                             for r in ctl.log.since(0)), what="poller.error")
+        check(ctl.poller.is_alive(), "the poller died on a bad hw-state")
+        n = sum(r.obj["path"] == "poller.error" for r in ctl.log.since(0))
+        time.sleep(0.5)
+        n2 = sum(r.obj["path"] == "poller.error" for r in ctl.log.since(0))
+        check(n2 == n, "poller.error floods the log (%d -> %d)" % (n, n2))
+        st, _, body = _http(port, "POST", "/api/v1/cmd/log.mark",
+                            body=b'{"text": "x"}', headers=post)
+        check(st == 200, "a command with a bad state poll: %d %r"
+              % (st, body))
+        os.kill(ctl.power.pid, 9)                       # a crash
+        wait_for(lambda: ctl.power.state == "off", what="state off")
+        check(any(r.kind == "power" and "unexpectedly" in
+                  str(r.obj["data"].get("why")) for r in ctl.log.since(0)),
+              "no record of the crash")
+        time.sleep(0.3)
+        check(ctl.poller.is_alive(), "the poller died with QEMU")
+        ctl.cfg["qemu"]["binary"] = env.bins["new"]
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        wait_for(lambda: ctl.state.get("platform.obt") is not None,
+                 what="polling resumes")
+
+        def boom(**kw):
+            raise RuntimeError("internal")
+        ctl.dispatcher.add("x.boom", boom)
+        st, _, body = _http(port, "POST", "/api/v1/cmd/x.boom", body=b"{}",
+                            headers=post)
+        check(st == 500 and json.loads(body)["status"] == 500,
+              "internal error -> 500 JSON")
+        orig = ctl.dispatcher.run
+        ctl.dispatcher.run = lambda *a, **k: 1 / 0
+        st, _, body = _http(port, "POST", "/api/v1/cmd/log.mark",
+                            body=b'{"text": "y"}', headers=post)
+        ctl.dispatcher.run = orig
+        check(st == 500 and any(r.obj["path"] == "api.error"
+                                for r in ctl.log.since(0)),
+              "an error outside the dispatcher -> 500 + record")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
 def _fake_children():
     """Our live child fake QEMUs (pids)."""
     out = []
@@ -826,6 +881,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("uart across a power cycle", t_uart_cycle),
          ("no orphaned QEMU", t_no_orphan),
          ("run-dir lock + PDEATHSIG", t_run_lock),
+         ("poller + command robustness", t_poller_robust),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]

@@ -11,7 +11,8 @@ leon3: cont/stop/quit, the RESUME/STOP/SHUTDOWN/RESET events, qom-get
 vclock-ns, obt and both hw-state JSONs, qom-set obt, and the test-only
 x-fake-guest-reset, which behaves per -no-reboot / -action like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
-`noqmp` accepts the QMP connection and never answers.
+`noqmp` accepts the QMP connection and never answers; `badstate`
+serves a hw-state without its keys.
 """
 
 import json
@@ -194,6 +195,8 @@ class Fake:
                 return self.vclock()
             if prop == "obt":
                 return self.obt()
+            if prop == "hw-state" and self.variant == "badstate":
+                return '{"schema": 1, "vclock_ns": 5}'   # keys missing
             if prop == "hw-state":
                 return json.dumps(self.hw_ctrl() if "ctrl" in a["path"]
                                   else self.hw_spw())

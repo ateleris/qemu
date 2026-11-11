@@ -182,6 +182,11 @@ class Handler(BaseHTTPRequestHandler):
             res = self.ctl.command(verb, args, source="api")
         except VerbError as e:
             return self._err(e.status, str(e))
+        except Exception as e:   # S3: a 500 and a record, never a hang-up
+            err = "%s: %s" % (type(e).__name__, e)
+            self.ctl.log.emit("api", "log", "api.error",
+                              {"verb": verb, "error": err})
+            return self._err(500, err)
         self._send(200, {"ok": True, "verb": verb, "result": res,
                          "seq": self.ctl.log.seq})
 
