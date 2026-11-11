@@ -45,19 +45,20 @@
 # ASIC verification evidence (trace): a successful verification is
 # silent (ENABLE_TRACE_DETFDIR 0, configFSW.h:89), so the evidence is
 # the trace, checked by idefx-trace-check.py: delivered read address
-# blocks (word 0x84000 | reg << 7, reg 1..12, delivered_grp_mask != 0),
-# clustered by a > 5 s gap. Each cluster must be one run of exactly 384
-# (every reg 1..12 x every grp 0..15 twice, i.e. 32 ASICs), inside the
-# NOMINAL window [T_nom - 2 s, T_exit + 2 s], at least 3 runs, and no
-# undelivered read address block.
-# Clocks: all gate timing is CLOCK_MONOTONIC. T_nom, T_exit and the QMP
-# switch times are the probe's [m=...] stamps, so the NOMINAL window the
-# ql checks get cannot shrink when the wall clock is stepped (WSL's
-# timesyncd did, 0.75-0.88 wall/monotonic, and three ql FAILs followed).
-# Only the trace is wall-stamped (QEMU -msg timestamp=on): the gate
-# samples (realtime, monotonic) before and after the run, and when they
-# disagree by more than 0.5 % the trace check, and so the gate, is
-# INCONCLUSIVE (exit 3), never PASS and never a model FAIL.
+# blocks (word 0x84000 | reg << 7, reg 1..12, delivered_grp_mask != 0);
+# a run ends at an FSM strobe or a > 5 s gap. Each run must be exactly
+# 384 (every reg 1..12 x every grp 0..15 twice, i.e. 32 ASICs), inside
+# the NOMINAL window, at least 3 runs, and no undelivered read address
+# block. The window comes from the same trace by ORDER: QEMU also traces
+# stixdet_fsm_strobe, and NOMINAL runs from the strobe that sets the FSM
+# Enable to the one that clears it.
+# Clocks: no gate timing uses the wall clock. T_nom, T_exit and the QMP
+# switch times are the probe's CLOCK_MONOTONIC [m=...] stamps, so the
+# NOMINAL window the ql checks get cannot shrink when the wall clock is
+# stepped (WSL's timesyncd steps it back ~2.5 s every 32 s poll; three ql
+# FAILs came from that), and the trace check compares no times across
+# clocks. The wall/monotonic ratio over the run is printed for the
+# record only.
 # --flare (D-4) keeps the synthetic sky (det-source=synthetic, 20 cps
 # per fpga_det quiet, 2000 flare) and adds two QMP groups:
 #   @135 qom-set /machine/stixctrl det-flare true
@@ -121,9 +122,7 @@
 #             the convention for new gates), 1 a failed
 #             expectation, a forbidden TM, a closed connection, a failed
 #             QL, UART or trace check (in --negative: any other set of
-#             failed checks), 2 environment problem, 3 INCONCLUSIVE
-#             (the wall clock was stepped during the run; rerun on a
-#             steady clock).
+#             failed checks), 2 environment problem.
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: detector-smoke.sh <qemu-binary> \
@@ -326,7 +325,7 @@ QEMU_ARGS=(
     -serial "file:$RUN_DIR/uart.detector.raw"
     -kernel "$ASW_ELF"
     -msg timestamp=on
-    -trace "enable=stixdet_idefx_cmd,file=$RUN_DIR/idefx.trace"
+    -trace "events=$RUN_DIR/idefx.events,file=$RUN_DIR/idefx.trace"
 )
 if [ "$FLARE" -eq 0 ]; then
     # the tiers 0+1 zero sky of the D-3 checks
@@ -381,6 +380,10 @@ rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
       ql.contrast.log trace.check.log qmp.sock
 truncate -s 17716740096 flash.bin
+# the trace events: the IDeF-X words, and the FSM strobes that mark the
+# NOMINAL window in the same file (one -trace option: a second one would
+# reset the trace file)
+printf 'stixdet_idefx_cmd\nstixdet_fsm_strobe\n' > idefx.events
 
 PROBE_PID=""
 QEMU_PID=""
@@ -400,9 +403,8 @@ trap cleanup EXIT
 
 # Clocks: every window below is timed on CLOCK_MONOTONIC (the probe's
 # [m=...] stamps), never on the wall clock, which WSL's timesyncd can
-# step mid-run. Only the trace check needs the wall clock (QEMU stamps
-# the trace with it); it gets these (realtime, monotonic) pairs from
-# before and after the run and reports INCONCLUSIVE when they disagree.
+# step mid-run. These (realtime, monotonic) pairs from before and after
+# the run only report the wall/monotonic ratio, for the record.
 # STIX_CLOCK_CMD is a test hook printing "REALTIME MONOTONIC".
 clock_pair() {
     if [ -n "${STIX_CLOCK_CMD:-}" ]; then
@@ -538,6 +540,10 @@ if [ -n "$T_NOM_M" ] && [ -n "$T_EXIT_M" ]; then
 fi
 
 [ -n "$QEMU_CPU" ] && echo "QEMU CPU ($MODE): $QEMU_CPU"
+# shellcheck disable=SC2086 # two "REALTIME MONOTONIC" pairs
+echo "clock: wall/monotonic over the run $(echo $CLOCK_START $CLOCK_END |
+    awk '{ if ($4 > $2) printf "%.3f", ($3 - $1) / ($4 - $2);
+           else print "?" }') (for the record; no check uses the wall clock)"
 
 # 2. the QL flush content (zero sky, or with --flare the synthetic sky)
 QL_FLUSH_ARG=--expect-zero-flush
@@ -649,24 +655,15 @@ fi
 # the positive branch here.
 IDEFX_NEG=0
 [ "$NEGATIVE" -eq 1 ] && [ "$FLARE" -eq 0 ] && IDEFX_NEG=1
-# The positive check places the runs in the NOMINAL window on the
-# trace's wall clock, from the monotonic T_nom / T_exit and the clock
-# pairs; a wall-clock step makes it INCONCLUSIVE (rc 3), and then so is
-# the gate. The negative's empty-trace check uses no time at all.
-if [ "$IDEFX_NEG" -eq 1 ]; then
-    TRACE_ARGS=(idefx.trace --expect-none)
-else
-    # shellcheck disable=SC2206 # two "REALTIME MONOTONIC" pairs
-    TRACE_ARGS=(idefx.trace --clock $CLOCK_START $CLOCK_END)
-    [ -n "$T_NOM_M" ] && TRACE_ARGS+=(--t-nom-m "$T_NOM_M")
-    [ -n "$T_EXIT_M" ] && TRACE_ARGS+=(--t-exit-m "$T_EXIT_M")
-fi
+# Neither branch compares a time with another clock: the runs are
+# placed in NOMINAL by the FSM strobes' order in the same trace.
+TRACE_ARGS=(idefx.trace)
+[ "$IDEFX_NEG" -eq 1 ] && TRACE_ARGS+=(--expect-none)
 set +e
 python3 "$TRACECHECK" "${TRACE_ARGS[@]}" > trace.check.log 2>&1
 TRACE_RC=$?
 set -e
 cat trace.check.log
-INCONCLUSIVE=""
 if [ "$IDEFX_NEG" -eq 1 ]; then
     if [ "$TRACE_RC" -eq 0 ]; then
         echo "CHECK trace-verif: FAIL as planned (the trace is empty:" \
@@ -679,25 +676,12 @@ if [ "$IDEFX_NEG" -eq 1 ]; then
     fi
 elif [ "$TRACE_RC" -eq 0 ]; then
     echo "CHECK trace-verif: ok"
-elif [ "$TRACE_RC" -eq 3 ]; then
-    INCONCLUSIVE="$(sed -n 's/^IDEFX-TRACE-CHECK: INCONCLUSIVE (\(.*\))$/\1/p' \
-        trace.check.log)"
-    echo "CHECK trace-verif: INCONCLUSIVE ($INCONCLUSIVE)"
 else
     echo "CHECK trace-verif: FAIL (rc=$TRACE_RC)"
     FAILED+=(trace-verif)
 fi
 
 GOT="${FAILED[*]:-}"
-# A stepped wall clock: no PASS and no model FAIL from this run (exit 3);
-# the other checks' results are listed for the record.
-if [ -n "$INCONCLUSIVE" ]; then
-    VT="DETECTOR-SMOKE"
-    [ "$MODE" = positive ] || VT="DETECTOR-SMOKE ($MODE)"
-    echo "$VT: INCONCLUSIVE ($INCONCLUSIVE; rerun on a steady clock;" \
-        "other failed checks: '${GOT}'$WHY_QL)${STIX_SLOT_TAG}"
-    exit 3
-fi
 # PASS: the run dir may be reused; in slot mode drop the flash copy and
 # the trace (legacy keeps everything)
 pass_cleanup() {

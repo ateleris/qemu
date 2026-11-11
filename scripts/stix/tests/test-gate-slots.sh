@@ -90,9 +90,11 @@ legacy_dry() { # script args...: old vs new --dry-run output
     local sc="$1" o n
     shift
     o="$(bash "$OLD/scripts/stix/$sc" "$FAKE" "$@" 2>&1 | sed "s#$OLD#$REPO_ROOT#g")"
-    # detector-smoke's per-mode run dir (-neg) is the one intended change
+    # detector-smoke's intended changes: the per-mode run dir (-neg) and
+    # the trace events file (the FSM strobes mark NOMINAL in the trace)
     n="$(bash "$S/$sc" "$FAKE" "$@" 2>&1 |
-        sed 's#/tmp/stix-detector-run-neg\([/ ]\)#/tmp/stix-detector-run\1#g')"
+        sed -e 's#\(/tmp/stix-detector-run\)-neg\([/ ,]\)#\1\2#g' \
+            -e 's#events=[^ ]*/idefx\.events\\,#enable=stixdet_idefx_cmd\\,#')"
     [ "$o" = "$n" ] && [ -n "$n" ]
     check "legacy: $sc $* identical to $REF" $? \
         "$(diff <(echo "$o") <(echo "$n") | head -5)"
@@ -524,25 +526,24 @@ echo "$out" | grep -q "^NOMINAL window: .* 145.0 s (monotonic)" &&
     echo "$out" |
         grep -q "^flare switch: on at T_nom +62.0 s, off at T_nom +122.0 s"
 check "clock: the NOMINAL window and flare offsets are monotonic" $? "$out"
-out="$(clockrun "$W/clk-ok")"
-rc=$?
-[ "$rc" -eq 1 ] && ! echo "$out" | grep -q INCONCLUSIVE
-check "clock: ratio 1.000 => a normal verdict (FAIL here), not INCONCLUSIVE" \
-    $? "rc=$rc: $out"
-out="$(clockrun "$W/clk-step")"
-rc=$?
-last="$(echo "$out" | tail -1)"
-[ "$rc" -eq 3 ] &&
-    echo "$last" |
-        grep -q "^DETECTOR-SMOKE: INCONCLUSIVE (clock step: .*0\.750" &&
-    echo "$last" | grep -q "slot=1 busy="
-check "clock: a 0.75 wall/monotonic step => INCONCLUSIVE, exit 3" $? \
-    "rc=$rc: $out"
-out="$(clockrun "$W/clk-step" --negative)"
-rc=$?
-[ "$rc" -eq 1 ] && ! echo "$out" | grep -q INCONCLUSIVE
-check "clock: --negative needs no wall clock (empty trace): not INCONCLUSIVE" \
-    $? "rc=$rc: $out"
+# the same fake run with a steady clock and with a 0.75 wall/monotonic
+# step: the same verdict line (the slot tag's load aside), only the
+# reported ratio differs
+for mode in "" --negative --flare; do
+    # shellcheck disable=SC2086 # an optional mode flag
+    o1="$(clockrun "$W/clk-ok" $mode)"
+    r1=$?
+    # shellcheck disable=SC2086
+    o2="$(clockrun "$W/clk-step" $mode)"
+    r2=$?
+    v1="$(echo "$o1" | tail -1 | sed 's/ load=.*//')"
+    v2="$(echo "$o2" | tail -1 | sed 's/ load=.*//')"
+    [ "$r1" -eq "$r2" ] && [ "$v1" = "$v2" ] &&
+        echo "$o1" | grep -q "^clock: wall/monotonic over the run 1.000 " &&
+        echo "$o2" | grep -q "^clock: wall/monotonic over the run 0.750 "
+    check "clock: a 0.75 wall-clock step leaves '${mode:-positive}' unchanged" \
+        $? "rc $r1/$r2: $v1 | $v2"
+done
 
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"

@@ -3317,17 +3317,26 @@ att) can run their gates at the same time without the global 21000 lock.
     windows were monotonic already.
   - detector-smoke takes T_nom, T_exit and the flare switch times from
     those stamps; ql-check only receives the resulting seconds.
-  - idefx-trace-check (the trace is wall-stamped by QEMU) gets the
-    (realtime, monotonic) pairs the gate sampled before and after the
-    run and places the monotonic window on the wall clock; a pair ratio
-    off by more than 0.5 % is INCONCLUSIVE, exit 3, and so is the gate's
-    verdict. The `--negative` empty-trace check uses no time.
+  - idefx-trace-check needs no clock at all. The trace is wall-stamped
+    by QEMU, so a first version placed the monotonic window on the wall
+    clock and reported INCONCLUSIVE (exit 3) beyond 0.5 % drift; on this
+    host every 240 s run spans about seven 2.5 s steps (timesyncd polls
+    every 32 s, offset -1.6 s), so that was INCONCLUSIVE every time. Now
+    QEMU also traces `stixdet_fsm_strobe` into the same file
+    (`-trace events=<run dir>/idefx.events,file=...`), and NOMINAL is the
+    span from the strobe that sets the FSM Enable to the one that clears
+    it, by line order. Measured: SetEnable (0x1) precedes the first
+    verification run, only QlClear strobes (Enable 1) come between runs,
+    ClearEnable (0x2) follows the last. A run ends at a strobe or a > 5 s
+    gap (relative, so a backward step inside a 0.05 s run joins).
+  - detector-smoke prints the run's wall/monotonic ratio for the record;
+    no verdict depends on it.
   - The other gates were checked: nominal-, fault- and tc-smoke time
     everything inside the probe (monotonic) or with `timeout`/`sleep`;
     soak slices on `/proc/uptime`; boot-smoke --with-tm only uses
     `timeout`. None reads a wall-clock time.
-  - Before a gate round, sample the clock ratio (10 s); do not start on
-    a drifting clock.
+  - Wall-clock steps can no longer change a gate verdict, so a drifting
+    clock is no reason to hold a gate round.
 - **Fresh-flash gates pre-create flash.bin.** nominal-, fault- and
   detector-smoke delete flash.bin per run and then
   `truncate -s 17716740096 flash.bin`, in legacy and slot mode, so no
