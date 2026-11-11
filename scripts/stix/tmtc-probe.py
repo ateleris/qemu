@@ -485,9 +485,9 @@ def make_parser():
                          "that group's send; a match before the send is "
                          "ignored. No @window suffix (repeatable)")
     ap.add_argument("--qmp", metavar="PATH",
-                    help="QEMU QMP unix socket, or tcp:HOST:PORT (tcp:[::1]:PORT for IPv6), for the "
-                         "--qmp-cmd groups (connected at the first due "
-                         "--qmp-cmd)")
+                    help="QEMU QMP unix socket, or tcp:HOST:PORT "
+                         "(tcp:[::1]:PORT for IPv6), for the --qmp-cmd "
+                         "groups (connected at the first due --qmp-cmd)")
     ap.add_argument("--qmp-cmd", action=OpAction, metavar="JSON",
                     help="a QMP command object executed at the preceding "
                          "--send-at, e.g. '{\"execute\": \"qom-set\", "
