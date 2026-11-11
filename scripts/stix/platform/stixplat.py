@@ -3,10 +3,14 @@
 """The STIX platform controller: the spacecraft side of the test bench.
 
   stixplat.py --config FILE [--run-dir DIR] [--api-port N]
+  stixplat.py --config FILE --scenario NAME [--scenario ..] [--variant G]
   stixplat.py --self-test [CASE]
 
+mode = "run" (or --scenario, which implies it) runs the scenarios each
+in its own QEMU and exits; --run-dir then sets retention.run_root.
 See docs/stix-port/platform.md. Stdlib only (Python >= 3.11).
-Exit codes: 0 ok, 2 config error, 3 infrastructure failure.
+Exit codes: 0 ok (run mode: all passed), 1 a scenario failed, 2 a
+config or scenario error, 3 an infrastructure failure.
 """
 
 import argparse
@@ -26,6 +30,11 @@ def main():
     ap.add_argument("--config", help="the TOML config")
     ap.add_argument("--run-dir", help="override run_dir.path")
     ap.add_argument("--api-port", type=int, help="override ports.api")
+    ap.add_argument("--scenario", action="append", metavar="NAME",
+                    help="run mode: a scenario file (in run.scenario_dir "
+                    "unless absolute); repeatable")
+    ap.add_argument("--variant", action="append", metavar="GLOB",
+                    help="run mode: only these variants; repeatable")
     ap.add_argument("--self-test", nargs="?", const="", metavar="CASE",
                     help="run the offline self-test (optionally one case)")
     args = ap.parse_args()
@@ -37,9 +46,19 @@ def main():
         over["ports"] = {"api": args.api_port}
     try:
         cfg = config_mod.load(args.config, overrides=over)
+        if args.scenario:
+            cfg = config_mod.merged(cfg, {"mode": "run", "run": {
+                "scenarios": args.scenario,
+                "variants": args.variant or []}})
+        if cfg["mode"] == "run" and args.run_dir:
+            cfg = config_mod.merged(cfg, {"retention": {
+                "run_root": args.run_dir}})
     except (config_mod.ConfigError, OSError) as e:
         print("stixplat: %s" % e, file=sys.stderr)
         return 2
+    if cfg["mode"] == "run":
+        from stixplat import runmode
+        return runmode.run_all(cfg, out=lambda t: print(t, flush=True))
     try:
         ctl = core.Controller(cfg, run_dir=args.run_dir)
     except rundir.RunDirError as e:

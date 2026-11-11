@@ -103,10 +103,18 @@ class Platform:
         return hw["obt"], at
 
     def _platform_state(self):
+        """The controller-owned platform leaves; also refreshed by every
+        state poll, so scenarios can await the counters (PL-5)."""
+        ka = self.keepalive.status()
+        last = self.timesync.status()["last"]
         self.ctl.state_platform({
             "platform.spw.link": "down" if self.link_down else "up",
-            "platform.keepalive.enabled": self.keepalive.enabled,
-            "platform.keepalive.period_s": self.keepalive.period_ns / 1e9})
+            "platform.keepalive.enabled": ka["enabled"],
+            "platform.keepalive.period_s": ka["period_s"],
+            "platform.keepalive.sent": ka["sent"],
+            "platform.keepalive.suppressed": ka["suppressed"],
+            "platform.timesync.verdict": last["verdict"] if last else
+            "none"})
 
     # -- power hooks (D-PLk on_power) -----------------------------------------
     def _on_power(self, event, power):

@@ -47,6 +47,12 @@ DEFAULTS = {
     # "automatic, configurable"); "first_tm" | "boot" | "off"
     "timesync": {"autostart": "first_tm"},
     "faults": {"catalogue": ""},              # "" = the v1 catalogue
+    # PL-5: scenarios (scenario.run reads only from scenario_dir; "" =
+    # scripts/stix/platform/scenarios). mode = "run" runs `scenarios`
+    # (each listed variant, or those matching a `variants` glob) each
+    # in its own controller, QEMU and run dir under retention.run_root
+    "run": {"scenario_dir": "", "scenarios": [], "variants": [],
+            "serve_api": False},
     # bind: loopback only, unless container = true (PL-7: inside a
     # container that is published on 127.0.0.1 only, D-PLj)
     "api": {"bind": "127.0.0.1", "container": False},
@@ -160,6 +166,9 @@ def _check(cfg):
         raise ConfigError("gs.hold_max is 1..64 (the FSW queues 64 TCs)")
     if cfg["keepalive"]["summary_every"] < 1:
         raise ConfigError("keepalive.summary_every must be >= 1")
+    for k in ("scenarios", "variants"):
+        if not all(isinstance(x, str) for x in cfg["run"][k]):
+            raise ConfigError("run.%s is a list of strings" % k)
     if cfg["clock"]["snapshot_s"] < 0:
         raise ConfigError("clock.snapshot_s < 0")
     if cfg["api"]["bind"] not in LOOPBACK and not cfg["api"]["container"]:
@@ -178,6 +187,17 @@ def _check(cfg):
     for k in ("sample_hz", "state_hz"):
         if cfg["clock"][k] <= 0:
             raise ConfigError("clock.%s must be > 0" % k)
+
+
+def merged(cfg, *overs):
+    """@cfg with each override merged in and checked again (a scenario's
+    config for its run)."""
+    out = copy.deepcopy({k: v for k, v in cfg.items() if k != "_path"})
+    for o in overs:
+        if o:
+            _merge(out, o, "")
+    _check(out)
+    return out
 
 
 def load(path=None, text=None, overrides=None):

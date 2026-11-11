@@ -30,6 +30,7 @@ from . import log as log_mod
 from . import probe_lib
 from . import qemu as qemu_mod
 from . import retention
+from . import scenario
 from . import rundir
 from .dispatch import VerbError
 from .qmp import QmpConnection, QmpError, parse_address
@@ -1269,6 +1270,471 @@ def t_timesync_auto(env):
             ctl.shutdown()
 
 
+# -- PL-5: the scenario runner against a scripted world ------------------
+class FakeWorld:
+    """A scripted sim clock and record stream for the Runner (the ctx
+    protocol of scenario.py). @script: [(sim_s, fn(world))]. A pause
+    [(sim_s, ticks)] freezes sim time for that many sleeps."""
+
+    def __init__(self, script=(), pauses=(), on_cmd=None):
+        self.t = 0
+        self.recs = []
+        self.cmds = []
+        self.states = {}
+        self.script = sorted(script, key=lambda x: x[0])
+        self.pauses = dict(pauses)
+        self.paused = 0
+        self.on_cmd = on_cmd or {}
+        self.epoch = 0x10000000 << 16
+        self.obt_skew = 0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        if self.paused:
+            self.paused -= 1
+            return
+        self.t += int(s * NS)
+        while self.script and self.script[0][0] * NS <= self.t:
+            self.script.pop(0)[1](self)
+        for at in list(self.pauses):
+            if at * NS <= self.t:
+                self.paused = self.pauses.pop(at)
+
+    def rec(self, kind, path, data):
+        r = {"seq": len(self.recs) + 1, "sim_time": self.t, "kind": kind,
+             "path": path, "source": "tm", "data": data}
+        self.recs.append(r)
+        return r
+
+    def tm(self, apid, ptype, sub, app, cuc=None):
+        u = _tm_unit(apid, ptype, sub, app,
+                     cuc=self.obt() if cuc is None else cuc)
+        return self.rec("tm", "tm.0x%03x" % apid,
+                        {"hex": u[4:].hex(), "decoded": decode.decode(u)})
+
+    def event(self, eid, params=b""):
+        return self.tm(0x5A7, 5, 1, eid.to_bytes(2, "big") + params)
+
+    def obt(self):
+        return self.epoch + self.t * 65536 // NS + self.obt_skew
+
+    # the ctx protocol
+    def last_seq(self):
+        return len(self.recs)
+
+    def records(self, since):
+        return [r for r in self.recs if r["seq"] > since]
+
+    def command(self, verb, args):
+        self.cmds.append((self.t / NS, verb, args))
+        fn = self.on_cmd.get(verb)
+        return fn(self, args) if fn else {}
+
+    def state(self, path):
+        if path not in self.states:
+            return None
+        return {"truth": self.states[path], "presented": self.states[path]}
+
+    def read_obt(self):
+        return self.obt(), self.t
+
+    def emit(self, kind, path, data):
+        return self.rec(kind, path, data)
+
+
+def _sc(steps, variants=None, duration_s=30, **top):
+    d = {"api": 1, "name": "t", "duration_s": duration_s,
+         "setup": [], "steps": steps, "teardown": []}
+    if variants:
+        d["variants"] = variants
+    d.update(top)
+    return scenario.validate(d)
+
+
+def _run(sc, world, variant=None):
+    r = scenario.Runner(sc, variant, world, tick_s=0.1)
+    return r, r.run()
+
+
+def _verdicts(res):
+    return [st["verdict"] for st in res["steps"]]
+
+
+def t_scn_validate(env):
+    """PL-5: scenario errors are ScenarioError (exit 2), never a pass."""
+    good = {"api": 1, "name": "ok", "duration_s": 10,
+            "steps": [{"at": 0, "await_tm": ["0x5E5:3:25@5"]}]}
+    scenario.validate(good)
+    for bad in ({}, dict(good, api=2), dict(good, name="a b"),
+                dict(good, duration_s=0), dict(good, nosuch=1),
+                dict(good, steps=[{"at": 0, "nosuch": 1}]),
+                dict(good, steps=[{"await_tm": ["0x5E5:3:25@5"]}]),
+                dict(good, steps=[{"at": 0, "after": 1}]),
+                dict(good, steps=[{"at": 0, "await_tm": ["0x5E5:3:25"]}]),
+                dict(good, steps=[{"at": 0, "await_tm": ["junk@5"]}]),
+                dict(good, steps=[{"at": 0, "assert_no_tm": ["0x5A1:1:8@3"]}]),
+                dict(good, steps=[{"at": 0, "await_event": [{"eid": "14a"}]}]),
+                dict(good, steps=[{"at": 0, "await_uart": [
+                    {"re": "(", "timeout_s": 1}]}]),
+                dict(good, steps=[{"at": 0, "await_state": [
+                    {"path": "x", "timeout_s": 1}]}]),
+                dict(good, steps=[{"at": 0, "await_state": [
+                    {"path": "x", "eq": 1, "gt": 0, "timeout_s": 1}]}]),
+                dict(good, steps=[{"at": 0, "assert_consistent": ["idpu.*"]}]),
+                dict(good, steps=[{"at": 0, "variants": ["x"]}]),
+                dict(good, variants=["a", "a"]),
+                dict(good, config={"qemu": {"binary": "/bin/sh"}}),
+                dict(good, variant_config={"nope": {}}),
+                dict(good, steps=[{"at": 0, "do": "x", "args": []}])):
+        e = raises(scenario.ScenarioError, scenario.validate, bad)
+        check(scenario.EXIT["error"] == 2, "exit 2")
+    e = raises(scenario.ScenarioError, scenario.validate,
+               dict(good, steps=[{"at": 0, "assert_consistent": ["a"]}]))
+    check("PL-8" in str(e), "assert_consistent names PL-8: %s" % e)
+
+
+def t_scn_runner(env):
+    """PL-5: awaits are unordered within their window and armed at their
+    step; a late match is a timeout; forbids arm at their step; silence
+    windows; the verdict and the evidence."""
+    w = FakeWorld(script=[
+        (1, lambda w: w.event(0x1429)),         # before step 2 arms
+        (3, lambda w: w.event(0x142D, b"\x00")),
+        (4, lambda w: w.event(0x14A3)),
+        (12, lambda w: w.event(0x5435, b"\x48")),
+        (16, lambda w: w.tm(0x5E5, 3, 25, b"\x04"))])
+    sc = _sc([
+        {"at": 0, "do": "platform.power.boot",
+         "await_event": [{"eid": "14a3", "timeout_s": 6},
+                         {"eid": "142d", "data": "00", "timeout_s": 6}]},
+        {"at": 2, "assert_no_event": [{"eid": "1429"}],
+         "await_event": [{"eid": "5435", "data": "48", "timeout_s": 5}]},
+        {"at": 4, "assert_silence": {"after_s": 1, "for_s": 6}},
+        {"at": 13, "assert_no_tm": ["0x5E5:3:25"]},
+        {"at": 13, "assert_no_tm": [{"tm": "0x5E5:3:25", "for_s": 2}]}],
+        duration_s=20)
+    r, res = _run(sc, w)
+    check(_verdicts(res) == ["pass", "timeout", "pass", "fail", "pass"],
+          "verdicts %r" % _verdicts(res))
+    check(res["verdict"] == "fail" and scenario.exit_code(res) == 1,
+          "overall %r" % res["verdict"])
+    st = res["steps"][0]["checks"][0]
+    check(st["evidence"]["matched_seq"] is not None and
+          st["evidence"]["seq_from"] <= st["evidence"]["matched_seq"],
+          "evidence %r" % st)
+    check(w.cmds[0][1] == "platform.power.boot", "do ran")
+    exp = [x for x in w.recs if x["kind"] == "expect"]
+    check(len(exp) >= 5 and all(x["path"].startswith("scenario.t")
+                                for x in exp), "expect records")
+    # a record fetched in the same tick as the deadline, but stamped
+    # after it: too late for an await, outside a forbid's for_s
+    w = FakeWorld(script=[(5.05, lambda w: w.event(0x14A3)),
+                          (6.05, lambda w: w.event(0x1429))])
+    r, res = _run(_sc([{"at": 0, "await_event": [{"eid": "14a3",
+                                                  "timeout_s": 5}]},
+                       {"at": 4, "assert_no_event": [{"eid": "1429",
+                                                      "for_s": 2}]}],
+                      duration_s=8), w)
+    check(_verdicts(res) == ["timeout", "pass"],
+          "stamped past the deadline %r" % _verdicts(res))
+    # a silence broken
+    w = FakeWorld(script=[(5, lambda w: w.tm(0x5E5, 3, 25, b"\x04"))])
+    r, res = _run(_sc([{"at": 0, "assert_silence": {"after_s": 2,
+                                                    "for_s": 5}}]), w)
+    check(_verdicts(res) == ["fail"], "silence broken %r" % _verdicts(res))
+    # an await still open at the end is a timeout, never a pass
+    w = FakeWorld()
+    r, res = _run(_sc([{"at": 0, "await_tm": ["0x5E5:3:25@50"]}],
+                      duration_s=5), w)
+    check(_verdicts(res) == ["timeout"], "open at the end %r" % res)
+
+
+def t_scn_variants(env):
+    """PL-5: steps filtered by variant globs; T0 is the boot; `after`."""
+    sc = _sc([{"at": 0, "do": "platform.power.boot"},
+              {"at": 5, "do": "fault.inject", "variants": ["fault_*"],
+               "args": {"id": "x"}},
+              {"after": 2, "do": "fault.clear",
+               "variants": ["fault_with_recovery"], "args": {"id": "x"}}],
+             variants=["nominal", "fault_no_recovery",
+                       "fault_with_recovery"], duration_s=10)
+    runs = {}
+    for v in sc["variants"]:
+        w = FakeWorld(on_cmd={"platform.power.boot":
+                              lambda w, a: w.sleep(1.5)})
+        _run(sc, w, v)
+        runs[v] = [(round(t, 1), verb) for t, verb, _ in w.cmds]
+    check(runs["nominal"] == [(0.0, "platform.power.boot")], "%r" % runs)
+    check([v for _, v in runs["fault_no_recovery"]] ==
+          ["platform.power.boot", "fault.inject"] and
+          runs["fault_no_recovery"][1][0] == 6.5,
+          "at is from T0, the boot (1.5 s): %r" % runs)
+    check(runs["fault_with_recovery"][2] == (8.5, "fault.clear"),
+          "after: 2 s after the previous step %r" % runs)
+    raises(scenario.ScenarioError, scenario.Runner, sc, "other",
+           FakeWorld())
+
+
+def t_scn_pause_abort(env):
+    """PL-5: timeouts are sim time (a pause inside one does not expire
+    it); abort ends the run with errors; a failing do is an error."""
+    w = FakeWorld(script=[(6, lambda w: w.event(0x14A3))],
+                  pauses=[(3, 200)])        # 200 ticks = 20 s of wall
+    r, res = _run(_sc([{"at": 0, "await_event": [{"eid": "14a3",
+                                                  "timeout_s": 4}]}],
+                      duration_s=8), w)
+    check(_verdicts(res) == ["timeout"], "6 s sim > 4 s: %r" % res)
+    w = FakeWorld(script=[(3.5, lambda w: w.event(0x14A3))],
+                  pauses=[(3, 200)])
+    r, res = _run(_sc([{"at": 0, "await_event": [{"eid": "14a3",
+                                                  "timeout_s": 4}]}],
+                      duration_s=8), w)
+    check(_verdicts(res) == ["pass"], "the pause is not sim time %r" % res)
+    holder = {}
+    w = FakeWorld(script=[(2, lambda w: holder["r"].abort("test"))])
+    sc = _sc([{"at": 0, "await_tm": ["0x5E5:3:25@9"]},
+              {"at": 5, "do": "fault.inject", "args": {"id": "x"}}],
+             teardown=[{"do": "platform.power.off"}], duration_s=10)
+    r = scenario.Runner(sc, None, w, tick_s=0.1)
+    holder["r"] = r
+    res = r.run()
+    check(res["verdict"] == "error" and _verdicts(res) == ["error",
+                                                           "error"] and
+          res["aborted"] == "test", "abort %r" % res)
+    check([v for _, v, _ in w.cmds] == ["platform.power.off"],
+          "teardown after abort, no fault.inject %r" % w.cmds)
+
+    def boom(w, a):
+        raise VerbError(409, "STIX is off")
+    w = FakeWorld(on_cmd={"fault.inject": boom})
+    r, res = _run(_sc([{"at": 1, "do": "fault.inject",
+                        "args": {"id": "x"}}], duration_s=3), w)
+    check(_verdicts(res) == ["error"] and "STIX is off" in
+          res["steps"][0]["why"] and scenario.exit_code(res) == 2,
+          "a failed do %r" % res)
+
+    def infra(w, a):
+        raise VerbError(500, "QMP gone")
+    w = FakeWorld(on_cmd={"fault.inject": infra})
+    r, res = _run(_sc([{"at": 1, "do": "fault.inject",
+                        "args": {"id": "x"}}], duration_s=3), w)
+    check(scenario.exit_code(res) == 3, "a 5xx is infra %r" % res)
+    for status, code in ((409, 3), (400, 2)):
+        def refuse(w, a, status=status):
+            raise VerbError(status, "refused")
+        w = FakeWorld(on_cmd={"platform.power.on": refuse})
+        r, res = _run(_sc([{"at": 0, "await_tm": ["0x5E5:3:25@1"]}],
+                          setup=[{"do": "platform.power.on"}],
+                          duration_s=2), w)
+        check(scenario.exit_code(res) == code and
+              _verdicts(res) == ["error"],
+              "a %d in the setup exits %d: %r" % (status, code, res))
+
+
+def t_scn_state_cuc(env):
+    """PL-5: await_state predicates and expect_cuc."""
+    def setter(path, v):
+        return lambda w: w.states.__setitem__(path, v)
+    w = FakeWorld(script=[(1, setter("a", "down")), (1, setter("n", 3)),
+                          (2, setter("n", 7)), (3, setter("n", 7.05)),
+                          (4, setter("s", 1)), (4.5, setter("s", 2))])
+    w.states.update({"s": 0, "c": 5})
+    sc = _sc([{"at": 0, "await_state": [
+        {"path": "a", "eq": "down", "timeout_s": 3},
+        {"path": "a", "ne": "up", "timeout_s": 3},
+        {"path": "n", "gt": 5, "timeout_s": 3},
+        {"path": "n", "lt": 4, "timeout_s": 3},
+        {"path": "n", "within": [7, 0.1], "timeout_s": 4},
+        {"path": "a", "in_set": ["down", "x"], "timeout_s": 3},
+        {"path": "s", "changed": True, "timeout_s": 6},
+        {"path": "s", "stable_for": 2, "timeout_s": 8}]},
+        {"at": 0, "await_state": [{"path": "c", "changed": True,
+                                   "timeout_s": 2}]},
+        {"at": 3.5, "await_state": [{"path": "s", "stable_for": 3,
+                                     "timeout_s": 3}]}], duration_s=9)
+    r, res = _run(sc, w)
+    check(_verdicts(res) == ["pass", "timeout", "timeout"],
+          "state %r" % [[c["verdict"] for c in st["checks"]]
+                        for st in res["steps"]])
+    w = FakeWorld(script=[(1, lambda w: w.tm(0x5E5, 3, 25, b"\x04")),
+                          (3, lambda w: setattr(w, "obt_skew", 40 << 16)),
+                          (4, lambda w: w.tm(0x5E5, 3, 25, b"\x04",
+                                             cuc=w.obt() - (40 << 16)))])
+    sc = _sc([{"at": 0, "expect_cuc": [{"apid": "0x5E5", "within_s": 0.3,
+                                        "timeout_s": 2}]},
+              {"at": 2, "expect_cuc": [{"apid": "0x5E5", "outside_s": 10,
+                                        "timeout_s": 3}]},
+              {"at": 2, "expect_cuc": [{"apid": "0x5E5", "within_s": 0.3,
+                                        "timeout_s": 3}]}], duration_s=6)
+    r, res = _run(sc, w)
+    check(_verdicts(res) == ["pass", "pass", "fail"], "cuc %r" % res)
+
+
+SCN_PASS = {"api": 1, "name": "fake-pass", "duration_s": 3,
+            "setup": [{"do": "platform.power.on"}],
+            "steps": [{"at": 0, "do": "platform.power.boot",
+                       "await_uart": [{"re": "STIX ASW", "timeout_s": 2}],
+                       "await_state": [{"path": "platform.power",
+                                        "eq": "running", "timeout_s": 2}]}],
+            "teardown": [{"do": "platform.power.off"}]}
+SCN_FAIL = {"api": 1, "name": "fake-fail", "duration_s": 2,
+            "variants": ["nominal", "fault_x"],
+            "setup": [{"do": "platform.power.on"}],
+            "steps": [{"at": 0, "do": "platform.power.boot"},
+                      {"at": 0.2, "variants": ["fault_*"],
+                       "await_tm": ["0x5A7:5:1:142d@1"]}],
+            "teardown": [{"do": "platform.power.off"}]}
+SCN_LONG = {"api": 1, "name": "fake-long", "duration_s": 60,
+            "setup": [{"do": "platform.power.on"}],
+            "steps": [{"at": 0, "do": "platform.power.boot",
+                       "await_tm": ["0x5A7:5:1:142d@50"]}],
+            "teardown": [{"do": "platform.power.off"}]}
+
+
+def _scn_dir(env):
+    d = os.path.join(env.tmp, "scn-%d" % env.n)
+    os.makedirs(d, exist_ok=True)
+    for sc in (SCN_PASS, SCN_FAIL, SCN_LONG):
+        with open(os.path.join(d, sc["name"] + ".json"), "w") as f:
+            json.dump(sc, f)
+    with open(os.path.join(d, "broken.json"), "w") as f:
+        json.dump(dict(SCN_PASS, name="broken", steps=[
+            {"at": 0, "assert_consistent": ["idpu.*"]}]), f)
+    with open(os.path.join(d, "nested.json"), "w") as f:
+        json.dump(dict(SCN_PASS, name="nested", steps=[
+            {"at": 0, "do": "scenario.run", "args": {"file": "x"}}]), f)
+    return d
+
+
+def t_scn_verbs(env):
+    """PL-5: scenario.run / scenario.abort on a live controller (the
+    fake QEMU): one at a time, files from the scenario dir only."""
+    d = _scn_dir(env)
+    ctl = env.controller(run={"scenario_dir": d})
+    try:
+        cmd = ctl.command
+        r = cmd("scenario.run", {"file": "fake-pass.json"})
+        check(r["started"] and r["scenario"] == "fake-pass", "%r" % r)
+        e = raises(VerbError, cmd, "scenario.run", {"file": "fake-pass.json"})
+        check(e.status == 409, "a second scenario: %s" % e)
+        wait_for(lambda: (ctl.status()["scenario"] or {}).get("phase") ==
+                 "done", timeout=15, what="the scenario")
+        st = ctl.status()["scenario"]
+        check(st["verdict"] == "pass", "verdict %r" % st)
+        check(ctl.power.state == "off", "teardown powered off")
+        ends = [x.obj["data"] for x in ctl.log.since(0)
+                if x.kind == "expect" and
+                x.obj["path"] == "scenario.fake-pass" and
+                x.obj["data"].get("phase") == "end"]
+        check(ends and ends[0]["verdict"] == "pass", "end record %r" % ends)
+        for f, status in (("../x.json", 403), ("/etc/passwd", 403),
+                          ("nosuch.json", 404), ("broken.json", 400),
+                          ("nested.json", 400)):
+            e = raises(VerbError, cmd, "scenario.run", {"file": f})
+            check(e.status == status, "%s: %s" % (f, e))
+        e = raises(VerbError, cmd, "scenario.run",
+                   {"file": "fake-fail.json"})
+        check(e.status == 400 and "variant" in str(e), "variant needed")
+        e = raises(VerbError, cmd, "scenario.abort", {})
+        check(e.status == 409, "nothing to abort")
+        cmd("scenario.run", {"file": "fake-long.json"})
+        wait_for(lambda: ctl.power.state == "running", timeout=10,
+                 what="the long scenario's boot")
+        cmd("scenario.abort", {})
+        wait_for(lambda: ctl.status()["scenario"]["phase"] == "done",
+                 timeout=15, what="the abort")
+        check(ctl.status()["scenario"]["verdict"] == "error" and
+              ctl.power.state == "off", "abort: %r"
+              % ctl.status()["scenario"])
+    finally:
+        ctl.shutdown()
+
+
+def t_platform_leaves(env):
+    """PL-5: the platform counters scenarios await on are state leaves,
+    refreshed by the poller (volatile: no change record per TC20)."""
+    ctl = env.controller(keepalive={"autostart": "boot"},
+                         timesync={"autostart": "off"})
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        wait_for(lambda: (ctl.state.get("platform.keepalive.sent") or
+                          {}).get("truth", 0) > 2, what="sent leaf")
+        ctl.command("platform.spw.link", {"state": "down"})
+        wait_for(lambda: (ctl.state.get("platform.keepalive.suppressed") or
+                          {}).get("truth", 0) > 2, what="suppressed leaf")
+        ch = [r for r in ctl.log.since(0) if r.kind == "state" and
+              "platform.keepalive.sent" in json.dumps(r.obj["data"]) and
+              not r.obj["data"].get("snapshot")]
+        check(not ch, "change records for a volatile counter: %d" % len(ch))
+        check(ctl.state.get("platform.timesync.verdict") is not None,
+              "the verdict leaf exists")
+    finally:
+        ctl.shutdown()
+
+
+def t_runmode(env):
+    """PL-5: mode = "run": each scenario variant in its own controller,
+    QEMU and run dir; reports, summary.json, the log slice; exit 0/1/2."""
+    from . import runmode
+    d = _scn_dir(env)
+    root = os.path.join(env.tmp, "runs-root-%d" % env.n)
+
+    def cfg(scns, **over):
+        o = env.overrides(**over)
+        o["mode"] = "run"
+        o.setdefault("run", {}).update(scenario_dir=d, scenarios=scns)
+        o["retention"] = {"run_root": root, "min_free_mb": 1}
+        return config_mod.load(overrides=o)
+    out = []
+    rc = runmode.run_all(cfg(["fake-pass.json", "fake-fail.json"]),
+                         out=out.append)
+    check(rc == 1, "a failing variant: exit %d (%r)" % (rc, out))
+    reps = sorted(os.listdir(os.path.join(root, "reports")))
+    check(len(reps) == 1, "one report dir %r" % reps)
+    rdir = os.path.join(root, "reports", reps[0])
+    with open(os.path.join(rdir, "summary.json")) as f:
+        summ = json.load(f)
+    got = [(x["scenario"], x["variant"], x["verdict"]) for x in summ["runs"]]
+    check(got == [("fake-pass", "default", "pass"),
+                  ("fake-fail", "nominal", "pass"),
+                  ("fake-fail", "fault_x", "fail")] and summ["exit"] == 1,
+          "summary %r" % got)
+    for x in summ["runs"]:
+        check(os.path.exists(os.path.join(rdir, x["report"])), "report")
+        with open(os.path.join(rdir, x["slice"])) as f:
+            sl = [json.loads(ln) for ln in f]
+        check(sl and sl[0]["seq"] > x["seq_from"] and
+              sl[-1]["seq"] <= x["seq_to"], "the slice %r" % x)
+        check(retention.read_marker(x["run_dir"])["status"] ==
+              ("passed" if x["verdict"] == "pass" else "failed"),
+              "marker %s" % x["run_dir"])
+    with open(os.path.join(rdir, "summary.txt")) as f:
+        txt = f.read()
+    check("FAIL" in txt and "fake-fail.fault_x" in txt, "text %r" % txt)
+    check(runmode.run_all(cfg(["fake-pass.json"]), out=out.append) == 0,
+          "all passed: 0")
+    n = len(os.listdir(os.path.join(root, "runs")))
+    check(runmode.run_all(cfg(["fake-pass.json", "broken.json"]),
+                          out=out.append) == 2 and
+          len(os.listdir(os.path.join(root, "runs"))) == n,
+          "a scenario error: 2, before anything runs")
+    check(runmode.run_all(cfg(["fake-pass.json"],
+                              qemu={"binary": env.bins["old"]}),
+                          out=out.append) == 3, "a binary refused: 3")
+    o = env.overrides()
+    o["mode"] = "run"
+    o["run"] = {"scenario_dir": d, "scenarios": ["fake-fail.json"],
+                "variants": ["fault_*"]}
+    o["retention"] = {"run_root": root, "min_free_mb": 1}
+    out2 = []
+    check(runmode.run_all(config_mod.load(overrides=o), out=out2.append)
+          == 1 and sum("fake-fail" in x for x in out2) == 1,
+          "the variant filter: %r" % out2)
+
+
 def t_relay(env):
     """D-PLg: the relay is byte-identical, one tm.jsonl line per TM; the
     proxy adds the SpW header; a GS TC while the link is down is dropped
@@ -2017,6 +2483,14 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("keep-alive: no drift", t_keepalive_drift),
          ("keep-alive: aggregate log", t_keepalive_log),
          ("keep-alive: rx trace filter", t_keepalive_trace),
+         ("scenario: validation", t_scn_validate),
+         ("scenario: runner", t_scn_runner),
+         ("scenario: variants, T0, after", t_scn_variants),
+         ("scenario: pause, abort, errors", t_scn_pause_abort),
+         ("scenario: state and CUC", t_scn_state_cuc),
+         ("scenario verbs", t_scn_verbs),
+         ("platform state leaves", t_platform_leaves),
+         ("run mode", t_runmode),
          ("TM relay + TC proxy", t_relay),
          ("hold queue (SF5)", t_hold_queue),
          ("GS side security (SF6)", t_gs_security),

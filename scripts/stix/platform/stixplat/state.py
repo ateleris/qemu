@@ -16,7 +16,8 @@ import threading
 VOLATILE = ("idpu.scet.coarse", "idpu.scet.fine", "idpu.watchdog.count",
             "platform.obt", "platform.timecode.last_timecnt",
             "platform.timecode.last_vclock_ns",
-            "platform.timecode.next_due_vclock_ns")
+            "platform.timecode.next_due_vclock_ns",
+            "platform.keepalive.sent", "platform.keepalive.suppressed")
 
 
 def leaf(truth, presented=None, unit=None, index_space=None, t_sim=0,

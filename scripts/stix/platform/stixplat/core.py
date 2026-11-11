@@ -14,6 +14,7 @@ from . import log as log_mod
 from . import power as power_mod
 from . import qemu as qemu_mod
 from . import rundir
+from . import scenario as scenario_mod
 from .dispatch import Dispatcher, VerbError
 from .qmp import QmpError
 from .simclock import SimClock
@@ -57,6 +58,8 @@ class Controller:
         self.last_sparse = time.monotonic()
         self.last_snapshot = None   # bench time of the last snapshot
         self.server = None
+        self.runner = None
+        self.scn_lock = threading.Lock()
         self._register()
         from .plat import Platform
         self.trace_filters = []     # fn(name, line) -> True drops it
@@ -88,12 +91,65 @@ class Controller:
               args={"text": {"type": "string", "required": True},
                     "data": {"type": "object"}},
               doc="a marker record in the log")
+        d.add("scenario.run", self._scenario_run,
+              args={"file": {"type": "string", "required": True},
+                    "variant": {"type": "string"}},
+              doc="run a scenario from the scenario dir (one at a time)")
+        d.add("scenario.abort", self._scenario_abort,
+              doc="abort the running scenario (its teardown still runs)")
         d.add("debug.qmp", self._debug_qmp,
               args={"command": {"type": "string", "required": True,
                                 "enum": list(DEBUG_QMP)},
                     "arguments": {"type": "object"}},
               doc="a raw QMP command (dev and gates only)",
               enabled=self._debug_enabled)
+
+    # -- scenarios (PL-5) --
+    def scenario_dir(self):
+        return os.path.realpath(self.cfg["run"]["scenario_dir"] or
+                                scenario_mod.DEFAULT_DIR)
+
+    def _scenario_run(self, file, variant=None):
+        base = self.scenario_dir()
+        path = os.path.realpath(os.path.join(base, file))
+        if os.path.commonpath([base, path]) != base:
+            raise VerbError(403, "scenarios are read from %s only" % base)
+        if not os.path.isfile(path):
+            raise VerbError(404, "no scenario %s" % file)
+        try:
+            sc = scenario_mod.load(path)
+            runner = scenario_mod.Runner(sc, variant,
+                                         scenario_mod.CtlCtx(self))
+        except scenario_mod.ScenarioError as e:
+            raise VerbError(400, str(e))
+        with self.scn_lock:
+            if self.runner is not None and \
+                    self.runner.state["phase"] != "done":
+                raise VerbError(409, "scenario %s is running"
+                                % self.runner.state["name"])
+            self.runner = runner
+        self.scn_thread = threading.Thread(
+            target=self._scenario_thread, args=(runner,), name="scenario",
+            daemon=True)
+        self.scn_thread.start()
+        return {"started": True, "scenario": sc["name"],
+                "variant": runner.variant}
+
+    def _scenario_thread(self, runner):
+        try:
+            runner.result = runner.run()
+        except Exception as e:      # never a silent pass
+            runner.state.update(phase="done", verdict="error")
+            self.log.emit("scn", "log", "scenario.error",
+                          {"error": "%s: %s" % (type(e).__name__, e)})
+
+    def _scenario_abort(self):
+        with self.scn_lock:
+            r = self.runner
+        if r is None or r.state["phase"] == "done":
+            raise VerbError(409, "no scenario is running")
+        r.abort("scenario.abort")
+        return {"aborting": r.state["name"]}
 
     def command(self, verb, args, source="api"):
         res = self.dispatcher.run(verb, args, source=source)
@@ -193,6 +249,7 @@ class Controller:
         except Exception as e:
             return self._poll_error("state", e)
         self._emit_changes(changes)
+        self.plat._platform_state()
         if snapshot:
             self._maybe_snapshot(sim)
         self._poll_ok()
@@ -297,7 +354,9 @@ class Controller:
                 "debug_used": self.debug_used,
                 "platform": self.plat.status(),
                 "faults": self.plat.faults.status(),
-                "forcings": self.plat.forcing.status(), "scenario": None}
+                "forcings": self.plat.forcing.status(),
+                "scenario": None if self.runner is None else
+                dict(self.runner.state)}
 
     # -- lifecycle --
     def start(self, serve=True):
@@ -315,6 +374,10 @@ class Controller:
     def shutdown(self, why="shutdown"):
         """Power off QEMU cleanly (if on) and close the log."""
         self.log.emit("ctl", "log", "controller.stop", {"why": why})
+        r = self.runner
+        if r is not None and r.state["phase"] != "done":
+            r.abort("controller shutdown")
+            self.scn_thread.join(timeout=30)
         if self.power.state != power_mod.OFF:
             try:
                 self.power.off()
