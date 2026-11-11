@@ -140,7 +140,11 @@ DURATION="${STIX_DETECTOR_SECONDS:-240}"
 PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
 QLCHECK="$REPO_ROOT/scripts/stix/ql-check.py"
 TRACECHECK="$REPO_ROOT/scripts/stix/idefx-trace-check.py"
-TMTC_PORT=$((20000 + $(id -u)))
+# Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
+# and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
+. "$REPO_ROOT/scripts/stix/lib/slot.sh"
+stix_slot_setup
+RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 
 # The run-dir guard of nominal-smoke.sh (review M1 there): canonical
 # first (realpath -m resolves a trailing slash, //, /., a symlink or a
@@ -279,6 +283,7 @@ PROBE_ARGS=(
 QEMU_ARGS=(
     -M leon3_generic -m 64M -no-reboot
     -display none -monitor none
+    "${STIX_SLOT_QEMU_ARGS[@]}"
     -qmp "unix:$QMP_SOCK,server=on,wait=off"
     -serial "file:$RUN_DIR/uart.detector.raw"
     -kernel "$ASW_ELF"

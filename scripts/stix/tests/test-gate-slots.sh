@@ -8,7 +8,7 @@
 #
 # Legacy mode (STIX_PORT_BASE unset) must stay byte-identical: each gate
 # is also run from the pre-change scripts at STIX_LEGACY_REF (default
-# 93438dfa3b, the gate-ports base), extracted with git archive, and the
+# 2721343939, the gate-ports base after D-3), extracted with git archive, and the
 # QEMU argv, probe argv and output are compared. Without that commit the
 # identity cases are skipped (reported, not failed). Bump the ref when a
 # later commit changes a gate's legacy command line on purpose.
@@ -23,7 +23,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 S="$REPO_ROOT/scripts/stix"
 FAKE="$S/tests/fake-qemu.sh"
 FPROBE="$S/tests/fake-probe.py"
-REF="${STIX_LEGACY_REF:-93438dfa3b}"
+REF="${STIX_LEGACY_REF:-2721343939}"
 UIDB=$((20000 + $(id -u)))
 B1=$((UIDB + 100))
 PASS=0
@@ -98,6 +98,9 @@ if [ -n "$OLD" ]; then
     legacy_dry fault-smoke.sh --dry-run
     legacy_dry fault-smoke.sh --negative --dry-run
     legacy_dry fault-smoke.sh --check-guard
+    legacy_dry detector-smoke.sh --dry-run
+    legacy_dry detector-smoke.sh --negative --dry-run
+    legacy_dry detector-smoke.sh --check-guard
 
     # boot-smoke: the same fake QEMU argv and the same output
     for v in old new; do
@@ -287,6 +290,13 @@ dry_ok() { # script dir args...
 }
 dry_ok nominal-smoke.sh "$W/nom" STIX_NOMINAL_RUN_DIR="$W/nom"
 dry_ok fault-smoke.sh "$W/flt" STIX_FAULT_RUN_DIR="$W/flt"
+out="$(slotenv STIX_DETECTOR_RUN_DIR="$W/det" bash "$S/detector-smoke.sh" \
+    "$FAKE" --dry-run 2>&1)"
+echo "$out" | grep -q "^(cd $W/det-s1 && timeout " &&
+    echo "$out" | grep -q -- "-monitor none -global grlib-stixspw.tmtc-port=$B1 " &&
+    echo "$out" | grep -q -- "unix:$W/det-s1/qmp.sock" &&
+    echo "$out" | grep -q "^python3 -u .* --port $B1 "
+check "slot: detector-smoke.sh --dry-run (-s1 dir, -global, --port)" $? "$out"
 out="$(slotenv STIX_FAULT_RUN_DIR="$W/flt" bash "$S/fault-smoke.sh" \
     "$FAKE" --dry-run 2>&1)"
 echo "$out" | grep -q -- "-qmp unix:$W/flt-s1/qmp.sock" &&
