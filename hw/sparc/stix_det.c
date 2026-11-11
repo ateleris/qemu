@@ -9,7 +9,9 @@
  * and the index-space conversion tables. Tier 2 (D-4): the synthetic
  * sky (D-Df): per-tick gating and exposure, live SUMCNT and LVAR, the
  * LACC/LTRG materialization at the swap, the flare switch and the
- * scene properties.
+ * scene properties. Tier 3 (D-5, D-Dg): the nominal integration (the
+ * swap rule over fsmIntTime/fsmIntEvents, ActiveNominal, EACC/ETRG) and
+ * the 49-block science chunk it appends to the ROTB ring.
  *
  * FSW references are to STIX-FSW 600a7a72, the ASW tree (BSW =
  * BSW_ASW/src/BSW/...; utils.c, utils.h = ASW/src/utils.*; Detectors.c
@@ -17,12 +19,16 @@
  *
  * Re-entrancy (D-Dj): the tick writes the accumulator banks through
  * memory_region_get_ram_ptr (each write followed by
- * memory_region_set_dirty), never with address_space_*, and its only
- * other output is qemu_irq_pulse. No MMIO dispatch happens from timer
- * context, so the tick needs no mem_reentrancy_guard (the a83fe9a3a5
- * rule covers paths that dispatch DMA or MMIO outside a handler). The
- * QMP setters of the scene only store fields; the next tick applies
- * them.
+ * memory_region_set_dirty) and the ROTB ring through its host buffer
+ * (stixctrl_rotb_append), never with address_space_*; its only other
+ * outputs are qemu_irq_pulse (IRQ 3, and IRQ 7 for a dropped chunk).
+ * These are writes into guest-visible memory from timer context, outside
+ * any MMIO dispatch, so the tick engages the controller's
+ * mem_reentrancy_guard for its whole run (the a83fe9a3a5 rule, as
+ * stixspw_guard_enter/exit): should a future change let it reach the
+ * controller's own MMIO, that access is refused ("Blocked re-entrant
+ * IO") as on the in-MMIO paths. The QMP setters of the scene only store
+ * fields; the next tick applies them.
  */
 
 #include "qemu/osdep.h"
@@ -31,6 +37,7 @@
 #include "qapi/error.h"
 #include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
+#include "hw/core/qdev.h"
 #include "stix_det.h"
 #include "trace.h"
 
@@ -78,10 +85,24 @@ static const hwaddr stix_det_lvar_off[STIX_DET_QL_BANKS] = {
     STIXCTRL_LVAR3_START - STIXCTRL_LVAR0_START,
 };
 
+/* the nominal banks: EACC n in the SRAM region, ETRG n in its own */
+static const hwaddr stix_det_eacc_off[STIX_DET_NOM_BANKS] = {
+    STIXCTRL_EACC0_START - STIXCTRL_SRAM_START,
+    STIXCTRL_EACC1_START - STIXCTRL_SRAM_START,
+};
+static const hwaddr stix_det_etrg_off[STIX_DET_NOM_BANKS] = {
+    0,
+    STIXCTRL_ETRG1_START - STIXCTRL_ETRG0_START,
+};
+
 /* D-4 synthetic sky (defined after the index tables it uses) */
 static void stix_det_sky_tick(StixDetState *d);
 static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank);
 static void stix_det_sky_clear_expo(StixDetState *d);
+/* D-5 nominal integration (defined after the sky it draws from) */
+static void stix_det_nominal_tick(StixDetState *d);
+static void stix_det_nom_fresh(StixDetState *d);
+static void stix_det_nom_latch(StixDetState *d);
 
 static uint32_t *stix_det_regp(StixDetState *d, hwaddr addr)
 {
@@ -187,8 +208,12 @@ static void stix_det_ql_swap(StixDetState *d)
 static void stix_det_tick(void *opaque)
 {
     StixDetState *d = opaque;
+    MemReentrancyGuard *guard = &DEVICE(d->owner)->mem_reentrancy_guard;
+    bool guard_was = guard->engaged_in_io;
     uint32_t slot = d->ql_tick;
 
+    /* D-Dj: out-of-MMIO writes into guest-visible memory, see the top */
+    guard->engaged_in_io = true;
     stix_det_sky_tick(d);
     if (slot < STIX_DET_LVAR_SLOTS) {
         stix_det_ram_stl(d->lvar,
@@ -202,9 +227,11 @@ static void stix_det_tick(void *opaque)
     if (d->ql_tick > d->ql_int_time) {
         stix_det_ql_swap(d);
     }
+    stix_det_nominal_tick(d);
 
     d->tick_deadline_ns += STIX_DET_TICK_NS;
     timer_mod_ns(d->tick, d->tick_deadline_ns);
+    guard->engaged_in_io = guard_was;
 }
 
 /*
@@ -216,10 +243,13 @@ static void stix_det_tick(void *opaque)
  *   SetEnable and freezes everything else [I].
  * - SetEnable (0 -> 1) starts the tick; at a period start (tick 0,
  *   e.g. after a device reset) it latches QlIntTime and zeroes the
- *   active bank (a fresh enable).
- * - Reset clears QlReady and SUMCNT, restarts the QL period and
- *   re-latches QlIntTime; ActiveQl and the banks stay [I]. It re-phases
- *   the tick only while enabled.
+ *   active bank (a fresh enable); likewise at the start of a nominal
+ *   integration it latches the nominal parameters and zeroes the active
+ *   EACC/ETRG bank (D-5).
+ * - Reset clears QlReady and SUMCNT, restarts the QL period and the
+ *   nominal integration and re-latches their parameters; ActiveQl,
+ *   ActiveNominal and the banks stay [I]. It re-phases the tick only
+ *   while enabled.
  * - QlClear clears QlReady; SetCalEnable sets CalEnable. CalClear and
  *   OverflowClear clear status that never sets (no calibration and no
  *   FIFO model: CalReady and QueueOverflow read 0).
@@ -243,6 +273,9 @@ static void stix_det_fsm_cmd(StixDetState *d, uint32_t value)
             stix_det_bank_zero(d, d->active_ql_bank);
             stix_det_sky_clear_expo(d);
         }
+        if (d->nom_tick == 0) {
+            stix_det_nom_fresh(d);
+        }
         stix_det_tick_start(d);
     }
     if (strobes & FSMCMD_BIT(RESET)) {
@@ -251,6 +284,8 @@ static void stix_det_fsm_cmd(StixDetState *d, uint32_t value)
         d->ql_tick = 0;
         d->lvar_tick_count = 0;
         stix_det_latch_ql_int_time(d);
+        d->nom_tick = 0;
+        stix_det_nom_latch(d);
         if (d->enable) {
             stix_det_tick_start(d);
         }
@@ -272,9 +307,10 @@ static uint32_t stix_det_fsm_sta(StixDetState *d)
 {
     return ((uint32_t)d->enable << STIXCTRL_FSMSTA_ENABLE) |
            (d->active_ql_bank << STIXCTRL_FSMSTA_ACTIVEQL) |
+           (d->active_nom_bank << STIXCTRL_FSMSTA_ACTIVENOMINAL) |
            ((uint32_t)d->ql_ready << STIXCTRL_FSMSTA_QLREADY) |
            ((uint32_t)d->cal_enable << STIXCTRL_FSMSTA_CALENABLE);
-    /* QueueOverflow, ActiveNominal (D-5) and CalReady read 0 */
+    /* QueueOverflow and CalReady read 0 */
 }
 
 /*
@@ -1081,7 +1117,9 @@ static double stix_det_ebin_share_masked(StixDetState *d, uint32_t profile,
  * the tick's SUMCNT (SUMDMASK fpga_det, SUMEMASK ebin, all pix) and LVAR
  * count (VARDMASK fpga_det, VARPMASK pix, VAREMASK ebin). The masks are
  * read live; their bit i is index i ([A] for the FPGA-only pix and ebin
- * masks, plan "Index spaces"). QLACC is not masked.
+ * masks, plan "Index spaces"). QLACC is not masked. The nominal
+ * integration (D-5) gets the same exposure for the fpga_det in SUMDMASK
+ * (EACC is gated by it [D, RP-0067]); the others count in ETRG only.
  */
 static void stix_det_sky_tick(StixDetState *d)
 {
@@ -1116,7 +1154,10 @@ static void stix_det_sky_tick(StixDetState *d)
             d->expo[fpga_det][pix][profile] += tick_counts;
             c = tick_counts * d->pix_share[pix];
             if ((sumd_fpga_det >> fpga_det) & 1) {
+                d->nom_expo[fpga_det][pix][profile] += tick_counts;
                 sum_lambda += c * sum_share;
+            } else {
+                d->nom_trg_extra_grp[stix_det_grp_of(fpga_det)] += c;
             }
             if (((vard_fpga_det >> fpga_det) & 1) && ((varp_pix >> pix) & 1)) {
                 var_lambda += c * var_share;
@@ -1131,26 +1172,25 @@ static void stix_det_sky_tick(StixDetState *d)
 }
 
 /*
- * The swap (D-Dd step 2, D-Df): write the finished bank's LACC in full,
- * each cell [pix][fpga_det][ebin] (u16 big-endian at byte
- * ((pix * 32 + fpga_det) * 32 + ebin) * 2, Detectors.h:68-79) drawn as
- * Poisson(sum over profiles of ebin share x exposure), wrapping at 16
- * bits; then LTRG per grp (u32 big-endian) = 1.25 x the events of its
- * fpga_det 2 * grp and 2 * grp + 1, rounded, clamped at 24 bits; then
- * clear the exposure for the next period. With det-source=zero the
- * exposure is zero and so is the bank.
+ * Draw one accumulator bank from an exposure set (D-Df): each cell
+ * [pix][fpga_det][ebin] (u16 big-endian at byte ((pix * 32 + fpga_det)
+ * * 32 + ebin) * 2, Detectors.h:68-79, the same layout for LACC and
+ * EACC) is Poisson(sum over profiles of ebin share x exposure), wrapping
+ * at 16 bits. Adds the drawn events per grp to @grp_events; returns the
+ * total.
  */
-static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
+static uint64_t stix_det_draw_acc(StixDetState *d,
+                                  double (*expo_set)[STIX_DET_N_PIX_ACC]
+                                                    [STIX_DET_N_PROFILE],
+                                  uint8_t *acc,
+                                  uint64_t grp_events[STIX_DET_N_GRP])
 {
-    uint8_t *lacc = (uint8_t *)memory_region_get_ram_ptr(d->sram) +
-                    stix_det_lacc_off[ql_bank];
-    uint64_t grp_events[STIX_DET_N_GRP] = { 0 };
-    uint64_t lacc_events = 0;
-    uint32_t pix, fpga_det, ebin, grp;
+    uint64_t acc_events = 0;
+    uint32_t pix, fpga_det, ebin;
 
     for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
         for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
-            const double *expo = d->expo[fpga_det][pix];
+            const double *expo = expo_set[fpga_det][pix];
 
             for (ebin = 0; ebin < STIX_DET_N_EBIN; ebin++) {
                 double lambda = d->pix_share[pix] *
@@ -1160,27 +1200,245 @@ static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
                      d->ebin_share[STIX_DET_PROFILE_FLARE][ebin]);
                 uint64_t n = stix_det_poisson(d, lambda);
 
-                stw_be_p(lacc + ((pix * STIX_DET_N_FPGA_DET + fpga_det) *
-                                 STIX_DET_N_EBIN + ebin) * sizeof(uint16_t),
+                stw_be_p(acc + ((pix * STIX_DET_N_FPGA_DET + fpga_det) *
+                                STIX_DET_N_EBIN + ebin) * sizeof(uint16_t),
                          (uint16_t)n);
                 grp_events[stix_det_grp_of(fpga_det)] += n;
-                lacc_events += n;
+                acc_events += n;
             }
         }
     }
+    return acc_events;
+}
+
+/* triggers per grp: 1.25 x the events, rounded, clamped at 24 bits */
+static uint32_t stix_det_trg_of(uint64_t grp_events)
+{
+    return MIN((5 * grp_events + 2) / 4, (uint64_t)STIX_DET_LTRG_MAX);
+}
+
+/*
+ * The QL swap (D-Dd step 2, D-Df): write the finished bank's LACC in
+ * full (stix_det_draw_acc), then LTRG per grp (u32 big-endian) = 1.25 x
+ * the events of its fpga_det 2 * grp and 2 * grp + 1, then clear the
+ * exposure for the next period. With det-source=zero the exposure is
+ * zero and so is the bank.
+ */
+static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
+{
+    uint8_t *lacc = (uint8_t *)memory_region_get_ram_ptr(d->sram) +
+                    stix_det_lacc_off[ql_bank];
+    uint64_t grp_events[STIX_DET_N_GRP] = { 0 };
+    uint64_t lacc_events;
+    uint32_t grp;
+
+    lacc_events = stix_det_draw_acc(d, d->expo, lacc, grp_events);
     memory_region_set_dirty(d->sram, stix_det_lacc_off[ql_bank],
                             STIXCTRL_LACC0_SIZE);
 
     for (grp = 0; grp < STIX_DET_N_GRP; grp++) {
-        uint64_t trig = (5 * grp_events[grp] + 2) / 4;
-
         stix_det_ram_stl(d->ltrg, stix_det_ltrg_off[ql_bank] +
                          grp * sizeof(uint32_t),
-                         MIN(trig, (uint64_t)STIX_DET_LTRG_MAX));
+                         stix_det_trg_of(grp_events[grp]));
     }
     trace_stixdet_ql_sky(ql_bank, stix_det_source_name[d->source], d->flare,
                          lacc_events);
     stix_det_sky_clear_expo(d);
+}
+
+/*
+ * ---- The nominal integration and the ROTB chunks (D-5, plan D-Dg) ----
+ *
+ * The integration runs on the same 100 ms tick. It ends at the first
+ * tick t (ticks since its start) with
+ *   ((t >= IntTimeMax + 1) || (SUMCNT >= IntEventsMax)) &&
+ *   t >= IntTimeMin + 1
+ * [D, TN Table 5-8; RP-0067], the parameters latched at its start
+ * (fsmIntTime min 15:0 / max 31:16, fsmIntEvents; Detectors.c:1140-1149).
+ * At the swap:
+ * 1. the finished bank's EACC/ETRG are materialized from the
+ *    integration's exposure (stix_det_draw_acc; EACC gated by SUMDMASK,
+ *    the ETRG triggers not);
+ * 2. ActiveNominal toggles; 3. SUMCNT restarts at 0;
+ * 4. with det-rotb on, the bank goes into the ROTB ring as one 49-block
+ *    chunk (stixctrl_rotb_append: rotbConfig ENABLE = 1 and TESTMODE =
+ *    0, all or nothing). The FSM is enabled here by construction: the
+ *    tick only runs while it is;
+ * 5. the finished bank is zeroed (RotbCtrl's read and clear [D]), also
+ *    when no chunk was taken, so every integration starts from zero.
+ * The FSW never reads EACC/ETRG in NOMINAL; it reads the chunk
+ * (RotAccumulator_doTask, RotAccuCompactor_processDetectorBlock).
+ */
+
+/* RotAccumulator.h: descriptor type 0x8000 = detector data */
+#define STIX_DET_CHUNK_DESC_DETECTOR 0x8000u
+/* data at +8 in every block: u16 descriptor, u32 coarse, u16 fine */
+#define STIX_DET_CHUNK_DATA_OFF 8u
+#define STIX_DET_CHUNK_DATA_BYTES \
+    (STIXCTRL_BLOCK_SIZE - STIX_DET_CHUNK_DATA_OFF)
+
+static const char *const stix_det_rotb_result_name[] = {
+    [STIX_DET_ROTB_APPENDED] = "appended",
+    [STIX_DET_ROTB_DISABLED] = "rotb-disabled",
+    [STIX_DET_ROTB_TESTMODE] = "rotb-testmode",
+    [STIX_DET_ROTB_FULL] = "ring-full",
+};
+
+static void stix_det_nom_bank_zero(StixDetState *d, uint32_t nom_bank)
+{
+    stix_det_ram_zero(d->sram, stix_det_eacc_off[nom_bank],
+                      STIXCTRL_EACC0_SIZE);
+    stix_det_ram_zero(d->etrg, stix_det_etrg_off[nom_bank],
+                      STIXCTRL_ETRG0_SIZE);
+}
+
+static void stix_det_nom_clear_expo(StixDetState *d)
+{
+    memset(d->nom_expo, 0, sizeof(d->nom_expo));
+    memset(d->nom_trg_extra_grp, 0, sizeof(d->nom_trg_extra_grp));
+}
+
+/* the parameters are latched at the start of each integration */
+static void stix_det_nom_latch(StixDetState *d)
+{
+    d->nom_int_time_min = (d->reg->fsmIntTime >>
+                           STIXCTRL_FSMINTTIME_INTTIMEMIN) &
+                          STIXCTRL_FSMINTTIME_INTTIMEMIN_MASK;
+    d->nom_int_time_max = (d->reg->fsmIntTime >>
+                           STIXCTRL_FSMINTTIME_INTTIMEMAX) &
+                          STIXCTRL_FSMINTTIME_INTTIMEMAX_MASK;
+    d->nom_int_events_max = d->reg->fsmIntEvents;
+}
+
+/*
+ * a fresh enable at the start of an integration: latch, and no stale
+ * RAM (EACC/ETRG survive a reset, §13) or exposure in the active bank
+ */
+static void stix_det_nom_fresh(StixDetState *d)
+{
+    stix_det_nom_latch(d);
+    stix_det_nom_bank_zero(d, d->active_nom_bank);
+    stix_det_nom_clear_expo(d);
+}
+
+/*
+ * EACC/ETRG of the finished integration (step 1). ETRG per grp counts
+ * the triggers of both its fpga_det: the drawn EACC events plus a draw
+ * of the events of fpga_det outside SUMDMASK. Returns the EACC events.
+ */
+static uint64_t stix_det_nom_materialize(StixDetState *d, uint32_t nom_bank)
+{
+    uint8_t *eacc = (uint8_t *)memory_region_get_ram_ptr(d->sram) +
+                    stix_det_eacc_off[nom_bank];
+    uint64_t grp_events[STIX_DET_N_GRP] = { 0 };
+    uint64_t eacc_events;
+    uint32_t grp;
+
+    eacc_events = stix_det_draw_acc(d, d->nom_expo, eacc, grp_events);
+    memory_region_set_dirty(d->sram, stix_det_eacc_off[nom_bank],
+                            STIXCTRL_EACC0_SIZE);
+    for (grp = 0; grp < STIX_DET_N_GRP; grp++) {
+        uint64_t ev = grp_events[grp] +
+                      stix_det_poisson(d, d->nom_trg_extra_grp[grp]);
+
+        stix_det_ram_stl(d->etrg, stix_det_etrg_off[nom_bank] +
+                         grp * sizeof(uint32_t), stix_det_trg_of(ev));
+    }
+    stix_det_nom_clear_expo(d);
+    return eacc_events;
+}
+
+/*
+ * Build the chunk of one finished bank (RotAccuCompactor.c:76-270):
+ * block n (0..48) = u16 descriptor 0x8000 | n, the SCET as 0xC8/0xCC
+ * read at the integration end (coarse u32 with UNSYNCED in bit 31, fine
+ * u16; ArchiveManager.c:131 masks the flag), then the next 504 bytes of
+ * the stream EACC (0x6000, [pix][fpga_det][ebin] u16) + ETRG (0x40, u32
+ * per grp, read as hw/lw u16 pairs), zero-padded (56 B in block 48).
+ * Everything is big-endian, as the banks are.
+ */
+static void stix_det_chunk_build(StixDetState *d, uint32_t nom_bank,
+                                 uint32_t coarse_reg, uint16_t fine)
+{
+    const uint8_t *part[2] = {
+        (uint8_t *)memory_region_get_ram_ptr(d->sram) +
+            stix_det_eacc_off[nom_bank],
+        (uint8_t *)memory_region_get_ram_ptr(d->etrg) +
+            stix_det_etrg_off[nom_bank],
+    };
+    const uint32_t part_len[2] = { STIXCTRL_EACC0_SIZE, STIXCTRL_ETRG0_SIZE };
+    uint32_t n, i = 0, part_off = 0;
+
+    memset(d->chunk, 0, sizeof(d->chunk));
+    for (n = 0; n < STIX_DET_CHUNK_BLOCKS; n++) {
+        uint8_t *blk = d->chunk + n * STIXCTRL_BLOCK_SIZE;
+        uint32_t done = 0;
+
+        stw_be_p(blk, STIX_DET_CHUNK_DESC_DETECTOR | n);
+        stl_be_p(blk + 2, coarse_reg);
+        stw_be_p(blk + 6, fine);
+        while (done < STIX_DET_CHUNK_DATA_BYTES && i < 2) {
+            uint32_t len = MIN(STIX_DET_CHUNK_DATA_BYTES - done,
+                               part_len[i] - part_off);
+
+            memcpy(blk + STIX_DET_CHUNK_DATA_OFF + done,
+                   part[i] + part_off, len);
+            done += len;
+            part_off += len;
+            if (part_off == part_len[i]) {
+                i++;
+                part_off = 0;
+            }
+        }
+    }
+}
+
+/* the nominal swap (steps 1-5 above) */
+static void stix_det_nominal_swap(StixDetState *d)
+{
+    uint32_t done = d->active_nom_bank;
+    uint32_t int_ticks = d->nom_tick;
+    uint32_t sumcnt = d->sumcnt;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t eacc_events = stix_det_nom_materialize(d, done);
+    StixDetRotbResult r;
+    uint32_t coarse_reg, rotb_count = 0;
+    uint16_t fine;
+
+    d->active_nom_bank = done ^ 1;
+    d->sumcnt = 0;
+    d->nom_tick = 0;
+    stix_det_nom_latch(d);
+    trace_stixdet_nominal_swap(done, d->active_nom_bank, int_ticks, sumcnt,
+                               eacc_events, now);
+
+    if (d->rotb) {
+        stixctrl_scet_reg(d->owner, &coarse_reg, &fine);
+        stix_det_chunk_build(d, done, coarse_reg, fine);
+        r = stixctrl_rotb_append(d->owner, d->chunk, STIX_DET_CHUNK_BLOCKS,
+                                 &rotb_count);
+        if (r == STIX_DET_ROTB_APPENDED) {
+            trace_stixdet_chunk(done, STIX_DET_CHUNK_BLOCKS, coarse_reg, fine,
+                                int_ticks, eacc_events, rotb_count, now);
+        } else {
+            trace_stixdet_chunk_drop(stix_det_rotb_result_name[r], done,
+                                     int_ticks, rotb_count, now);
+        }
+    } else {
+        trace_stixdet_chunk_drop("det-rotb-off", done, int_ticks, 0, now);
+    }
+    stix_det_nom_bank_zero(d, done);
+}
+
+/* one tick of the running integration: count it, swap when it ends */
+static void stix_det_nominal_tick(StixDetState *d)
+{
+    d->nom_tick++;
+    if ((d->nom_tick >= d->nom_int_time_max + 1 ||
+         d->sumcnt >= d->nom_int_events_max) &&
+        d->nom_tick >= d->nom_int_time_min + 1) {
+        stix_det_nominal_swap(d);
+    }
 }
 
 /* ---- the scene properties (D-Db), on /machine/stixctrl ---- */
@@ -1423,8 +1681,9 @@ bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value)
  * its register defaults (the IDPU reset cuts the ASIC supply [I]); the
  * RAM banks are kept (they survive a reset, accepted-diffs §13). The
  * sky (D-4) loses its exposure and reseeds its PRNG from det-seed; the
- * scene (det-source, det-flare, the rates) is kept: it describes the
- * Sun, not the IDPU (D-Db).
+ * nominal integration (D-5) restarts in bank 0; the scene (det-source,
+ * det-flare, the rates) is kept: it describes the Sun, not the IDPU
+ * (D-Db).
  */
 void stix_det_reset(StixDetState *d)
 {
@@ -1458,17 +1717,26 @@ void stix_det_reset(StixDetState *d)
     d->ql_int_time = 0;
     d->lvar_tick_count = 0;
     stix_det_sky_clear_expo(d);
+    d->active_nom_bank = 0;
+    d->nom_tick = 0;
+    d->nom_int_time_min = 0;
+    d->nom_int_time_max = 0;
+    d->nom_int_events_max = 0;
+    stix_det_nom_clear_expo(d);
     stix_det_reseed(d);
 }
 
-bool stix_det_realize(StixDetState *d, stixCtrlRegs_s *reg,
+bool stix_det_realize(StixDetState *d, STIXCTRL *owner, stixCtrlRegs_s *reg,
                       MemoryRegion *sram, MemoryRegion *lvar,
-                      MemoryRegion *ltrg, qemu_irq *irq, Error **errp)
+                      MemoryRegion *ltrg, MemoryRegion *etrg, qemu_irq *irq,
+                      Error **errp)
 {
     if (!stix_det_index_selfcheck(errp)) {
         return false;
     }
+    d->owner = owner;
     d->reg = reg;
+    d->etrg = etrg;
     d->sram = sram;
     d->lvar = lvar;
     d->ltrg = ltrg;

@@ -178,6 +178,19 @@ void stixctrl_scet_now(STIXCTRL *s, uint32_t *coarse, uint16_t *fine)
     *fine = scet.fine;
 }
 
+/*
+ * D-5: the SCET exactly as the 0xC8/0xCC read composes it (bit 31 of
+ * the seconds is the UNSYNCED status flag), for the detector chunks
+ */
+void stixctrl_scet_reg(STIXCTRL *s, uint32_t *coarse_reg, uint16_t *fine)
+{
+    stixCtrl_scet_s scet = nsToSCET(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                                    s->time_correction_ns);
+
+    *coarse_reg = scet.coarse | (s->unsynced_flag << 31);
+    *fine = scet.fine;
+}
+
 void stixctrl_set_scet_commit_hook(STIXCTRL *s,
                                    StixCtrlScetCommitFn fn, void *opaque)
 {
@@ -286,6 +299,56 @@ static uint32_t stixctrl_rotb_cmdsta(STIXCTRL *s)
             << STIXCTRL_ROTBCMDSTA_BLOCKCOUNT);
 }
 
+/*
+ * the block at the write pointer becomes the newest one in the ring
+ * (PUTBLOCK in TESTMODE, and the detector chunks, D-5); the caller
+ * checks that it is not full
+ */
+static void stixctrl_rotb_push(STIXCTRL *s)
+{
+    s->rotb_wr = (s->rotb_wr + 1) % s->rotb_blocks;
+    s->rotb_count++;
+    s->rotb_full = s->rotb_count == s->rotb_blocks;
+}
+
+/*
+ * D-5 (detector plan D-Dg): the hardware fill path. The detector model
+ * hands over one chunk at a nominal swap (timer context, BQL held, the
+ * device's re-entrancy guard engaged by the caller). It is appended only
+ * with rotbConfig ENABLE = 1 and TESTMODE = 0 (in TESTMODE the window and
+ * PUTBLOCK own the ring, §12). It goes in whole or not at all: with fewer
+ * free blocks than the chunk it is dropped and IRQ 7 pulses once (the
+ * docs say the hardware overwrites the oldest block; dropping keeps the
+ * §12 drop-new rule and never leaves a partial chunk, plan Doc vs code
+ * 7). Reaching capacity only sets FULL, as for PUTBLOCK.
+ */
+StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
+                                       uint32_t n_blocks,
+                                       uint32_t *rotb_count)
+{
+    uint32_t cfg = s->reg.rotbConfig;
+    uint32_t i;
+
+    *rotb_count = s->rotb_count;
+    if (!((cfg >> STIXCTRL_ROTBCONFIG_ENABLE) & 1u)) {
+        return STIX_DET_ROTB_DISABLED;
+    }
+    if ((cfg >> STIXCTRL_ROTBCONFIG_TESTMODE) & 1u) {
+        return STIX_DET_ROTB_TESTMODE;
+    }
+    if (s->rotb_blocks - s->rotb_count < n_blocks) {
+        qemu_irq_pulse(s->irq_rotb);
+        return STIX_DET_ROTB_FULL;
+    }
+    for (i = 0; i < n_blocks; i++) {
+        memcpy(&s->rotb_ring[s->rotb_wr * STIXCTRL_BLOCK_SIZE],
+               blocks + i * STIXCTRL_BLOCK_SIZE, STIXCTRL_BLOCK_SIZE);
+        stixctrl_rotb_push(s);
+    }
+    *rotb_count = s->rotb_count;
+    return STIX_DET_ROTB_APPENDED;
+}
+
 /* ROTB FIFO commands, from the FSW driver (RotBuf.c
  * RotBuf_advancePointer/RotBuf_clear, OpModeMgmt.c mode switches):
  * GETBLOCK advances the read pointer, PUTBLOCK the write pointer
@@ -325,9 +388,7 @@ static void stixctrl_rotb_command(STIXCTRL *s, uint32_t cmd)
             qemu_irq_pulse(s->irq_rotb);
             break;
         }
-        s->rotb_wr = (s->rotb_wr + 1) % s->rotb_blocks;
-        s->rotb_count++;
-        s->rotb_full = s->rotb_count == s->rotb_blocks;
+        stixctrl_rotb_push(s);
         break;
     case STIXCTRL_ROTBCMDSTA_COMMAND_V_RESETFIFO:
         s->rotb_rd = s->rotb_wr = s->rotb_count = 0;
@@ -977,9 +1038,9 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
 
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 
-    if (!stix_det_realize(&STIXCTRL->det, &STIXCTRL->reg, &STIXCTRL->sram,
-                          &STIXCTRL->lvar, &STIXCTRL->ltrg,
-                          &STIXCTRL->irq_detectors, errp)) {
+    if (!stix_det_realize(&STIXCTRL->det, STIXCTRL, &STIXCTRL->reg,
+                          &STIXCTRL->sram, &STIXCTRL->lvar, &STIXCTRL->ltrg,
+                          &STIXCTRL->etrg, &STIXCTRL->irq_detectors, errp)) {
         timer_free(STIXCTRL->wdg_timer);
         STIXCTRL->wdg_timer = NULL;
         g_free(STIXCTRL->rotb_ring);
@@ -1117,6 +1178,8 @@ static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_BOOL("det-idefx", STIXCTRL, det.idefx, true),
     /* D-4 (D-Db): the synthetic sky's PRNG seed, applied at every reset */
     DEFINE_PROP_UINT32("det-seed", STIXCTRL, det.seed, 1),
+    /* D-5 (D-Db): off makes no ROTB chunks; the nominal swap stays */
+    DEFINE_PROP_BOOL("det-rotb", STIXCTRL, det.rotb, true),
 };
 
 /*

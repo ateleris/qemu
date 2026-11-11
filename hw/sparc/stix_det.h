@@ -2,7 +2,8 @@
  * STIX IDPU detector controller model (detector plan D-Da): the readout
  * FSM, the QL accumulator bank switch and IRQ 3 (D-1), the IDeF-X
  * serial interface with its ASIC register store (D-2), and the
- * synthetic sky with the flare switch (D-4), behind CTRL's APB offsets
+ * synthetic sky with the flare switch (D-4), and the nominal integration
+ * with its ROTB science chunks (D-5), behind CTRL's APB offsets
  * 0x00-0x4C. Internal to grlib_stixctrl.c; not a QOM device (its
  * runtime scene properties are added to the controller's class by
  * stix_det_class_init).
@@ -22,6 +23,7 @@
 #include "hw/core/irq.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "hw/sparc/grlib_stix.h"
 #include "StixIdpu.h"
 
 /* the last detector register: fsmCalRes (StixIdpu.h stixCtrlRegs_s) */
@@ -52,6 +54,21 @@ typedef enum StixDetSource {
 /* D-4 (D-Df): the synthetic sky's two spectral profiles */
 enum { STIX_DET_PROFILE_QUIET, STIX_DET_PROFILE_FLARE, STIX_DET_N_PROFILE };
 
+/*
+ * D-5 (D-Dg): one detector chunk in the ROTB, 49 blocks of
+ * STIXCTRL_BLOCK_SIZE (RotAccumulator.h LAST_DETECTOR_BLOCK_NUMBER 48)
+ */
+#define STIX_DET_CHUNK_BLOCKS 49u
+#define STIX_DET_NOM_BANKS 2u       /* EACC0/1, ETRG0/1 */
+
+/* what the ROTB did with a chunk (stixctrl_rotb_append) */
+typedef enum StixDetRotbResult {
+    STIX_DET_ROTB_APPENDED,
+    STIX_DET_ROTB_DISABLED,     /* rotbConfig ENABLE = 0 */
+    STIX_DET_ROTB_TESTMODE,     /* rotbConfig TESTMODE = 1 */
+    STIX_DET_ROTB_FULL,         /* fewer free blocks than the chunk */
+} StixDetRotbResult;
+
 /* IDeF-X slow-control register addresses 0..13 (1..12 stored) */
 #define STIX_DET_IDEFX_N_REG 14u
 #define STIX_DET_IDEFX_REG_BYTES 24u    /* R3: 192 bits */
@@ -78,7 +95,13 @@ typedef struct StixDetState {
     MemoryRegion *sram;         /* ELUT, LACC0-3 (and TLUT, EACC) */
     MemoryRegion *lvar;         /* LVAR0-3, shared with WDT/MemBram BRAM */
     MemoryRegion *ltrg;         /* LTRG0-3 */
+    MemoryRegion *etrg;         /* ETRG0-1 (D-5) */
     qemu_irq *irq;              /* IRQMP line 3 (IRQ_STIXCTRL_DETCTRL) */
+    /*
+     * the owning controller: its ROTB ring takes the chunks, its SCET
+     * stamps them, and its mem_reentrancy_guard covers the tick (D-Dj)
+     */
+    STIXCTRL *owner;
 
     /* det-model (qdev property): false keeps the legacy plain storage */
     bool model;
@@ -96,6 +119,20 @@ typedef struct StixDetState {
     uint32_t ql_tick;           /* ticks done in the current QL period */
     uint32_t ql_int_time;       /* QlIntTime latched for this period */
     uint32_t lvar_tick_count;   /* this tick's LVAR count */
+
+    /*
+     * D-5 (D-Dg): the nominal integration. ActiveNominal toggles at each
+     * nominal swap; nom_tick counts the ticks of the running
+     * integration; its parameters (fsmIntTime min/max, fsmIntEvents) are
+     * latched at its start.
+     */
+    uint32_t active_nom_bank;   /* fsmSta.ActiveNominal, 0..1 */
+    uint32_t nom_tick;
+    uint32_t nom_int_time_min;
+    uint32_t nom_int_time_max;
+    uint32_t nom_int_events_max;
+    /* det-rotb (qdev property): false makes no chunks (the swap stays) */
+    bool rotb;
 
     /* det-idefx (qdev property): false keeps 0x00-0x0C plain storage */
     bool idefx;
@@ -128,14 +165,27 @@ typedef struct StixDetState {
      * expo x the profile's ebin share).
      */
     double expo[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC][STIX_DET_N_PROFILE];
+    /*
+     * D-5: the exposure of the running nominal integration, as expo but
+     * only for the ticks in which the fpga_det was in SUMDMASK (EACC is
+     * gated by it); nom_trg_extra_grp holds, per grp, the expected
+     * events of read-out fpga_det outside SUMDMASK, which count in ETRG
+     * only (the triggers are not masked [I]).
+     */
+    double nom_expo[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
+                   [STIX_DET_N_PROFILE];
+    double nom_trg_extra_grp[STIX_DET_N_GRP];
+    /* the chunk being built at a nominal swap */
+    uint8_t chunk[STIX_DET_CHUNK_BLOCKS * STIXCTRL_BLOCK_SIZE];
     /* the template (D-Df), built at realize: pix share and ebin shares */
     double pix_share[STIX_DET_N_PIX_ACC];
     double ebin_share[STIX_DET_N_PROFILE][STIX_DET_N_EBIN];
 } StixDetState;
 
-bool stix_det_realize(StixDetState *d, stixCtrlRegs_s *reg,
+bool stix_det_realize(StixDetState *d, STIXCTRL *owner, stixCtrlRegs_s *reg,
                       MemoryRegion *sram, MemoryRegion *lvar,
-                      MemoryRegion *ltrg, qemu_irq *irq, Error **errp);
+                      MemoryRegion *ltrg, MemoryRegion *etrg, qemu_irq *irq,
+                      Error **errp);
 void stix_det_unrealize(StixDetState *d);
 void stix_det_reset(StixDetState *d);
 /* the scene defaults, once per object (instance_init; not on reset) */
@@ -152,5 +202,19 @@ bool stix_det_owns(StixDetState *d, hwaddr addr);
 uint32_t stix_det_read(StixDetState *d, hwaddr addr);
 /* false when the write was dropped (a read-only register) */
 bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value);
+
+/*
+ * Provided by grlib_stixctrl.c for the detector model (D-5):
+ * - stixctrl_scet_reg: the SCET as 0xC8 (UNSYNCED in bit 31) and 0xCC
+ *   read right now;
+ * - stixctrl_rotb_append: append @n_blocks blocks of STIXCTRL_BLOCK_SIZE
+ *   to the ROTB ring if rotbConfig has ENABLE = 1 and TESTMODE = 0 and
+ *   all of them fit; a chunk that does not fit is dropped whole and
+ *   pulses IRQ 7 once. *rotb_count is the block count afterwards.
+ */
+void stixctrl_scet_reg(STIXCTRL *s, uint32_t *coarse_reg, uint16_t *fine);
+StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
+                                       uint32_t n_blocks,
+                                       uint32_t *rotb_count);
 
 #endif

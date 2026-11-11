@@ -56,6 +56,9 @@ stixdet_idefx_reg(uint32_t fpga_det, uint32_t reg, int is_read, uint32_t byte_id
 stixdet_idefx_defaults(uint32_t fpga_det_mask, const char *why) "IDeF-X register defaults fpga_det_mask 0x%08x (%s)"
 stixdet_scene(const char *source, int flare, uint32_t quiet_cps, uint32_t flare_cps, int64_t vclock_ns) "scene source=%s flare=%d quiet_cps=%u flare_cps=%u (per fpga_det) at vclock_ns=%" PRId64
 stixdet_ql_sky(uint32_t done_ql_bank, const char *source, int flare, uint64_t lacc_events) "QL sky: ql_bank %u source=%s flare=%d lacc_events=%" PRIu64
+stixdet_nominal_swap(uint32_t done_nom_bank, uint32_t active_nom_bank, uint32_t int_ticks, uint32_t sumcnt, uint64_t eacc_events, int64_t vclock_ns) "nominal swap: nom_bank %u finished, nom_bank %u active, int_ticks=%u sumcnt=%u eacc_events=%" PRIu64 " at vclock_ns=%" PRId64
+stixdet_chunk(uint32_t done_nom_bank, uint32_t n_blocks, uint32_t scet_coarse_reg, uint32_t scet_fine, uint32_t int_ticks, uint64_t eacc_events, uint32_t rotb_count, int64_t vclock_ns) "chunk: nom_bank %u, %u blocks, scet 0x%08x:0x%04x, int_ticks=%u eacc_events=%" PRIu64 " rotb_count=%u at vclock_ns=%" PRId64
+stixdet_chunk_drop(const char *why, uint32_t done_nom_bank, uint32_t int_ticks, uint32_t rotb_count, int64_t vclock_ns) "chunk dropped (%s): nom_bank %u, int_ticks=%u rotb_count=%u at vclock_ns=%" PRId64
 
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"

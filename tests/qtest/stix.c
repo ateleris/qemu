@@ -4813,12 +4813,44 @@ static void det_cmd_or(QTestState *qts, uint32_t bits)
     ctrl_write(qts, CTRL_FSMCMD, ctrl_read(qts, CTRL_FSMCMD) | bits);
 }
 
-/* NOMINAL entry order (OpModeMgmt.c:669-672): SetEnable, then Reset */
-static void det_start(QTestState *qts, uint32_t ql_int_time)
+#define CTRL_FSMINTTIME      0x1cu
+#define CTRL_FSMINTEVENTS    0x2cu
+
+/*
+ * Detectors_setNominalIntParams (Detectors.c:1140-1149): fsmIntTime =
+ * min 15:0 | max 31:16 (ticks - 1), fsmIntEvents = the event limit
+ */
+static void nom_set_params(QTestState *qts, uint32_t time_min,
+                           uint32_t time_max, uint32_t events_max)
 {
+    ctrl_write(qts, CTRL_FSMINTTIME,
+               (time_min & 0xFFFFu) | (time_max & 0xFFFFu) << 16);
+    ctrl_write(qts, CTRL_FSMINTEVENTS, events_max);
+}
+
+/*
+ * NOMINAL entry order: the nominal integration parameters
+ * (OpModeMgmt.c:625), then SetEnable and Reset (OpModeMgmt.c:669-672)
+ */
+static void det_start_nom(QTestState *qts, uint32_t ql_int_time,
+                          uint32_t time_min, uint32_t time_max,
+                          uint32_t events_max)
+{
+    nom_set_params(qts, time_min, time_max, events_max);
     ctrl_write(qts, CTRL_FSMQLCONFIG, ql_int_time << 16);
     det_cmd_or(qts, FSMCMD_SETENABLE);
     det_cmd_or(qts, FSMCMD_RESET);
+}
+
+/*
+ * ... with the FSW's NOMINAL-entry parameters 9 / 199 / 1800 (1 s min,
+ * 20 s max, 1800 events; ParamMgmtDef.h:382-384), so the D-5 nominal
+ * swap rule does not swap (and reset SUMCNT) every tick, as it would
+ * with the reset values 0 / 0 / 0
+ */
+static void det_start(QTestState *qts, uint32_t ql_int_time)
+{
+    det_start_nom(qts, ql_int_time, 9, 199, 1800);
 }
 
 static void det_step_ticks(QTestState *qts, int64_t ticks)
@@ -5054,9 +5086,14 @@ static void det_expect(QTestState *qts, uint32_t addr, uint32_t len,
 
 /* every byte outside the four banks' used parts keeps its sentinel */
 #define DET_SENTINEL 0xA5A55A5Au
-/* just below LACC0 (the ELUT's last words) and past the LACC3 stride */
+/*
+ * just below LACC0 (the ELUT's last words), and the unused 0x2000 of
+ * each EACC stride. (Up to D-4 the words at QL_LACC(4) were guarded too;
+ * that is EACC0, 0xE01A0000, which the D-5 nominal integration writes.)
+ */
 #define DET_BELOW_LACC0 (QL_LACC(0) - 0x10u)
-#define DET_PAST_LACC3  QL_LACC(4)
+#define DET_EACC(n)     (0xE01A0000u + (n) * 0x8000u)
+#define DET_EACC_SIZE   0x6000u
 
 static void det_fill_gaps(QTestState *qts)
 {
@@ -5067,7 +5104,10 @@ static void det_fill_gaps(QTestState *qts)
      * LTRG word past it to guard
      */
     det_fill(qts, DET_BELOW_LACC0, 0x10u, DET_SENTINEL);
-    det_fill(qts, DET_PAST_LACC3, 0x10u, DET_SENTINEL);
+    for (n = 0; n < 2; n++) {
+        det_fill(qts, DET_EACC(n) + DET_EACC_SIZE, 0x8000u - DET_EACC_SIZE,
+                 DET_SENTINEL);
+    }
 
     for (n = 0; n < 4; n++) {
         det_fill(qts, QL_LVAR(n) + QL_LVAR_SIZE, 0x100u - QL_LVAR_SIZE,
@@ -5082,7 +5122,10 @@ static void det_expect_gaps(QTestState *qts)
     uint32_t n;
 
     det_expect(qts, DET_BELOW_LACC0, 0x10u, DET_SENTINEL);
-    det_expect(qts, DET_PAST_LACC3, 0x10u, DET_SENTINEL);
+    for (n = 0; n < 2; n++) {
+        det_expect(qts, DET_EACC(n) + DET_EACC_SIZE, 0x8000u - DET_EACC_SIZE,
+                   DET_SENTINEL);
+    }
 
     for (n = 0; n < 4; n++) {
         det_expect(qts, QL_LVAR(n) + QL_LVAR_SIZE, 0x100u - QL_LVAR_SIZE,
@@ -6218,20 +6261,30 @@ static void sky_expect_scene(QTestState *qts, const char *source, bool flare,
  * 634; QLVariance.c:86): every quarter, grp and ReadMode on is done by
  * the caller (idefx_power*); here the FPGA masks (all fpga_det in
  * SUMDMASK and VARDMASK, SUMEMASK 0xFFE = ebin 1-11, VAREMASK
- * 0x7FFE0000 = ebin 17-30), QlIntTime and VARPMASK (pix bits), then
- * SetEnable and Reset.
+ * 0x7FFE0000 = ebin 17-30), the nominal integration parameters
+ * (OpModeMgmt.c:625), QlIntTime and VARPMASK (pix bits), then SetEnable
+ * and Reset.
  */
-static void sky_start(QTestState *qts, uint32_t ql_int_time,
-                      uint32_t varpmask_pix)
+static void sky_start_nom(QTestState *qts, uint32_t ql_int_time,
+                          uint32_t varpmask_pix, uint32_t time_min,
+                          uint32_t time_max, uint32_t events_max)
 {
     ctrl_write(qts, CTRL_FSMSUMDMASK, 0xFFFFFFFFu);
     ctrl_write(qts, CTRL_FSMSUMEMASK, 0xFFEu);
     ctrl_write(qts, CTRL_FSMQLVARDMASK, 0xFFFFFFFFu);
     ctrl_write(qts, CTRL_FSMQLVAREMASK, 0x7FFE0000u);
+    nom_set_params(qts, time_min, time_max, events_max);
     ctrl_write(qts, CTRL_FSMQLCONFIG,
                ql_int_time << 16 | (varpmask_pix & 0xFFFu));
     det_cmd_or(qts, FSMCMD_SETENABLE);
     det_cmd_or(qts, FSMCMD_RESET);
+}
+
+/* ... with the FSW's nominal integration parameters 9 / 199 / 1800 */
+static void sky_start(QTestState *qts, uint32_t ql_int_time,
+                      uint32_t varpmask_pix)
+{
+    sky_start_nom(qts, ql_int_time, varpmask_pix, 9, 199, 1800);
 }
 
 /*
@@ -6855,6 +6908,478 @@ static void test_det_props(void)
     stix_qtest_cleanup();
 }
 
+/* ---- Nominal integration and ROTB chunks (detector plan D-5, tier 3) ---- */
+
+#define FSMSTA_ACTIVENOMINAL (1u << 4)
+
+/* ETRG n at 0xE0600000 + n * 0x40 (StixIdpu.h:342-350): u32 per grp */
+#define DET_ETRG(n)          (0xE0600000u + (n) * 0x40u)
+#define DET_ETRG_SIZE        0x40u
+
+/*
+ * The chunk (RotAccumulator.c:150-220, RotAccuCompactor.c:76-270): 49
+ * blocks of 512 B; block n starts with the u16 descriptor 0x8000 | n
+ * (ROTBUF_DESCRIPTOR_DETECTORS_DATA, block number 5:0), then the SCET
+ * (coarse u32 at +2, fine u16 at +6), then 504 data bytes. The data
+ * stream is the EACC bank, 12 x 32 x 32 u16 [pix][fpga_det][ebin], the
+ * ETRG bank, 16 x (u16 hw, u16 lw) per grp, and a 56 B pad.
+ */
+#define CHUNK_BLOCKS         49u
+#define CHUNK_DESC_DETECTOR  0x8000u
+#define CHUNK_DATA_OFF       8u
+#define CHUNK_PAD            56u
+
+typedef struct NomChunk {
+    uint16_t desc[CHUNK_BLOCKS];
+    uint32_t scet_coarse_reg[CHUNK_BLOCKS];     /* as 0xC8 reads */
+    uint16_t scet_fine[CHUNK_BLOCKS];
+    uint16_t eacc[SKY_N_PIX][SKY_N_FPGA_DET][SKY_N_EBIN];
+    uint32_t etrg_grp[SKY_N_GRP];
+    uint8_t pad[CHUNK_PAD];
+} NomChunk;
+
+/*
+ * Read one chunk from the ring as the FSW does: the block at the read
+ * pointer through the 0xE0800000 window, then GETBLOCK, 49 times. The
+ * decode is the FSW's: type (w0 >> 16) & 0xC000 must be detector data,
+ * the block number (w0 >> 16) & 0x3F must run 0..48 (the compactor
+ * compares the whole byte, RotAccuCompactor.c:88-96), the counts are
+ * read as u16 from +8 of every block, 12288 of them in rot-counter
+ * order (pix << 10 | fpga_det << 5 | ebin), then the 16 trigger pairs,
+ * then the pad. Asserts the framing; returns the decoded chunk.
+ */
+static void nom_read_chunk(QTestState *qts, NomChunk *c)
+{
+    g_autofree uint8_t *stream = g_malloc0(CHUNK_BLOCKS * 504u);
+    uint32_t n, i, k = 0, grp;
+
+    for (n = 0; n < CHUNK_BLOCKS; n++) {
+        uint8_t blk[512];
+        uint32_t w0;
+
+        for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+            stl_be_p(blk + 4 * i, qtest_readl(qts, ROTB_WINDOW + 4u * i));
+        }
+        rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+        w0 = ldl_be_p(blk);
+        c->desc[n] = w0 >> 16;
+        g_assert_cmphex((w0 >> 16) & 0xC000u, ==, CHUNK_DESC_DETECTOR);
+        g_assert_cmpuint((w0 >> 16) & 0x3Fu, ==, n);
+        g_assert_cmpuint((uint8_t)(w0 >> 16), ==, n);
+        c->scet_coarse_reg[n] = ldl_be_p(blk + 2);
+        c->scet_fine[n] = lduw_be_p(blk + 6);
+        memcpy(stream + n * 504u, blk + CHUNK_DATA_OFF, 504u);
+    }
+    for (k = 0; k < SKY_N_PIX * SKY_N_FPGA_DET * SKY_N_EBIN; k++) {
+        c->eacc[k >> 10][(k >> 5) & 0x1F][k & 0x1F] =
+            lduw_be_p(stream + 2 * k);
+    }
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        uint16_t hw = lduw_be_p(stream + 2 * k + 4 * grp);
+        uint16_t lw = lduw_be_p(stream + 2 * k + 4 * grp + 2);
+
+        c->etrg_grp[grp] = (uint32_t)hw << 16 | lw;
+    }
+    memcpy(c->pad, stream + 2 * k + 4 * SKY_N_GRP, CHUNK_PAD);
+    g_assert_cmpuint(2 * k + 4 * SKY_N_GRP + CHUNK_PAD, ==,
+                     CHUNK_BLOCKS * 504u);
+}
+
+static uint64_t nom_fpga_det_sum(const NomChunk *c, uint32_t fpga_det)
+{
+    uint64_t sum = 0;
+    uint32_t pix, ebin;
+
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+            sum += c->eacc[pix][fpga_det][ebin];
+        }
+    }
+    return sum;
+}
+
+static bool nom_active(QTestState *qts)
+{
+    return det_sta(qts) & FSMSTA_ACTIVENOMINAL;
+}
+
+/* every block's SCET is what 0xC8/0xCC read at the swap */
+static void nom_expect_scet_now(QTestState *qts, const NomChunk *c)
+{
+    uint32_t coarse_reg = ctrl_read(qts, CTRL_LONGTIMERSEC);
+    uint32_t fine = ctrl_read(qts, CTRL_LONGTIMERSUBSEC);
+    uint32_t n;
+
+    for (n = 0; n < CHUNK_BLOCKS; n++) {
+        g_assert_cmphex(c->scet_coarse_reg[n], ==, coarse_reg);
+        g_assert_cmphex(c->scet_fine[n], ==, fine & 0xFFFFu);
+    }
+}
+
+/*
+ * det-chunk-format: a nominal integration of 5 s (time rule, no event
+ * limit) ends with one 49-block chunk in the ring, decoded the way
+ * RotAccumulator / RotAccuCompactor decode it: descriptors 0x8000 | n,
+ * n = 0..48; every block carries the SCET 0xC8/0xCC read at the swap
+ * (the integration end, ArchiveManager.c:131); the payload is the EACC
+ * bank [pix][fpga_det][ebin] and the ETRG bank by grp, then a zero pad.
+ * The decode equals what was materialized: every ETRG word is exactly
+ * 1.25 x (rounded) the decoded EACC events of its grp's two fpga_det
+ * (no SUMDMASK bit is clear), the pix the R3 switched off (fpga_det
+ * 18, asic_ch 1 = pix 3) is zero at its own offsets only, nothing lands
+ * in ebin 0 or 31, and the total matches the rate. The EACC and ETRG
+ * banks read zero afterwards (read and clear). The next integration
+ * uses bank 1 and makes the next chunk, 5 s later.
+ * RED on the D-4 binary: the ring stays empty.
+ */
+static void test_det_chunk_format(void)
+{
+    QTestState *qts = rotb_qtest_new(128);
+    NomChunk *c = g_new0(NomChunk, 1);
+    uint32_t pix, fpga_det, ebin, grp, coarse_1, fine_1;
+    uint64_t total = 0;
+    uint8_t r3[24];
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 1000));
+    idefx_power_all(qts);
+    sky_r3_wire(r3, 1, 63);             /* asic_ch 1 = pix 3 */
+    idefx_write_reg(qts, 9, 0, 3, r3, sizeof(r3));
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+
+    sky_start_nom(qts, 39, 0xFFF, 9, 49, 0xFFFFFFFFu);
+    det_step_ticks(qts, 49);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    g_assert_false(nom_active(qts));
+    det_step_ticks(qts, 1);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    g_assert_true(nom_active(qts));
+
+    nom_read_chunk(qts, c);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    nom_expect_scet_now(qts, c);
+    coarse_1 = c->scet_coarse_reg[0];
+    fine_1 = c->scet_fine[0];
+
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            uint64_t sum = 0;
+
+            g_assert_cmpuint(c->eacc[pix][fpga_det][0], ==, 0);
+            g_assert_cmpuint(c->eacc[pix][fpga_det][31], ==, 0);
+            for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+                sum += c->eacc[pix][fpga_det][ebin];
+            }
+            if (fpga_det == 18 && pix == 3) {
+                g_assert_cmpuint(sum, ==, 0);
+            } else {
+                g_assert_cmpuint(sum, >, 0);
+            }
+            total += sum;
+        }
+    }
+    sky_assert_poisson("chunk EACC total", total,
+                       1000.0 * 5 * (32 - 1.0 / SKY_PIX_W_TOTAL), 5);
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        uint64_t ev = nom_fpga_det_sum(c, 2 * grp) +
+                      nom_fpga_det_sum(c, 2 * grp + 1);
+
+        g_assert_cmpuint(c->etrg_grp[grp], ==, (5 * ev + 2) / 4);
+    }
+    for (pix = 0; pix < CHUNK_PAD; pix++) {
+        g_assert_cmpuint(c->pad[pix], ==, 0);
+    }
+    det_expect(qts, DET_EACC(0), DET_EACC_SIZE, 0);
+    det_expect(qts, DET_ETRG(0), DET_ETRG_SIZE, 0);
+
+    /* the next integration, in bank 1, gives the next chunk 5 s later */
+    det_step_ticks(qts, 49);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    det_step_ticks(qts, 1);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    g_assert_false(nom_active(qts));
+    nom_read_chunk(qts, c);
+    nom_expect_scet_now(qts, c);
+    g_assert_true(c->scet_coarse_reg[0] > coarse_1 ||
+                  (c->scet_coarse_reg[0] == coarse_1 &&
+                   c->scet_fine[0] > fine_1));
+    g_assert_cmpuint(nom_fpga_det_sum(c, 0), >, 0);
+    det_expect(qts, DET_EACC(1), DET_EACC_SIZE, 0);
+    det_expect(qts, DET_ETRG(1), DET_ETRG_SIZE, 0);
+
+    g_free(c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-nominal-rule (D-Dg): the integration ends at the first tick t
+ * (ticks since its start) with ((t >= IntTimeMax + 1) || (SUMCNT >=
+ * IntEventsMax)) && t >= IntTimeMin + 1; then ActiveNominal toggles and
+ * SUMCNT restarts at 0. With the FSW's 9 / 199 / 1800 the quiet sky (64
+ * SUMEMASK events/s) ends on the max time, 20 s; the flare (~4600
+ * events per tick) on the min time, 1 s. The parameters are latched at
+ * the start of each integration, so a write takes effect at the next
+ * one; a Reset strobe restarts the count and re-latches. With an event
+ * limit of 100 and no min time the quiet sky ends on the events.
+ * RED on the D-4 binary: ActiveNominal never moves.
+ */
+static void test_det_nominal_rule(void)
+{
+    QTestState *qts = stix_qtest_new();
+    int k;
+
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+
+    /* quiet: the max time, 200 ticks */
+    det_step_ticks(qts, 199);
+    g_assert_false(nom_active(qts));
+    sky_assert_poisson("SUMCNT after 199 quiet ticks",
+                       ctrl_read(qts, CTRL_FSMEVENTS),
+                       32 * 20 * 19.9 * 0.10, 5);
+    det_step_ticks(qts, 1);
+    g_assert_true(nom_active(qts));
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+
+    /* flare: 1800 events within a tick, so the min time, 10 ticks */
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH, "det-flare", true));
+    det_step_ticks(qts, 9);
+    g_assert_true(nom_active(qts));
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), >=, 1800);
+    det_step_ticks(qts, 1);
+    g_assert_false(nom_active(qts));
+
+    /* a new min time applies from the next integration on */
+    nom_set_params(qts, 29, 199, 1800);
+    det_step_ticks(qts, 9);
+    g_assert_false(nom_active(qts));
+    det_step_ticks(qts, 1);
+    g_assert_true(nom_active(qts));
+    det_step_ticks(qts, 29);
+    g_assert_true(nom_active(qts));
+    det_step_ticks(qts, 1);
+    g_assert_false(nom_active(qts));
+
+    /* quiet again; a new max time applies from the next integration on */
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH, "det-flare", false));
+    nom_set_params(qts, 9, 49, 1800);
+    det_step_ticks(qts, 199);
+    g_assert_false(nom_active(qts));
+    det_step_ticks(qts, 1);
+    g_assert_true(nom_active(qts));
+    det_step_ticks(qts, 49);
+    g_assert_true(nom_active(qts));
+    det_step_ticks(qts, 1);
+    g_assert_false(nom_active(qts));
+
+    /* Reset restarts the integration count */
+    det_step_ticks(qts, 20);
+    det_cmd_or(qts, FSMCMD_RESET);
+    det_step_ticks(qts, 49);
+    g_assert_false(nom_active(qts));
+    det_step_ticks(qts, 1);
+    g_assert_true(nom_active(qts));
+
+    /* the event limit: 100 events at ~6.4 per tick, no min time */
+    nom_set_params(qts, 0, 199, 100);
+    det_cmd_or(qts, FSMCMD_RESET);
+    for (k = 1; k <= 40 && nom_active(qts); k++) {
+        det_step_ticks(qts, 1);
+    }
+    g_test_message("event limit 100 reached after %d ticks", k - 1);
+    g_assert_false(nom_active(qts));
+    g_assert_cmpint(k - 1, >=, 8);
+    g_assert_cmpint(k - 1, <=, 30);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-chunk-gating (D-Dg): a chunk is appended only with rotbConfig
+ * ENABLE = 1, TESTMODE = 0 and the FSM enabled; in TESTMODE or with
+ * ENABLE = 0 the swap still happens (ActiveNominal toggles) but the
+ * ring stays as it is; with the FSM disabled nothing swaps.
+ * det-rotb=off swaps without chunks.
+ * RED on the D-4 binary: no swap.
+ */
+static void test_det_chunk_gating(void)
+{
+    QTestState *qts = rotb_qtest_new(256);
+
+    det_start_nom(qts, 39, 0, 9, 0xFFFFFFFFu);  /* 10-tick integrations */
+
+    rotb_cfg(qts, true, true);
+    det_step_ticks(qts, 10);
+    g_assert_true(nom_active(qts));
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    rotb_cfg(qts, false, false);
+    det_step_ticks(qts, 10);
+    g_assert_false(nom_active(qts));
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    rotb_cfg(qts, true, false);
+    det_step_ticks(qts, 10);
+    g_assert_true(nom_active(qts));
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+
+    det_cmd_or(qts, FSMCMD_CLEARENABLE);
+    det_step_ticks(qts, 100);
+    g_assert_true(nom_active(qts));
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+
+    det_cmd_or(qts, FSMCMD_SETENABLE);
+    det_step_ticks(qts, 10);
+    g_assert_false(nom_active(qts));
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    qts = stix_qtest_new_extra("-global grlib-stixctrl.rotb-blocks=256 "
+                               "-global grlib-stixctrl.det-rotb=off");
+    rotb_cfg(qts, true, false);
+    det_start_nom(qts, 39, 0, 9, 0xFFFFFFFFu);
+    det_step_ticks(qts, 10);
+    g_assert_true(nom_active(qts));
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-chunk-full (D-Dg "Ring full"): with rotb-blocks=60 the first chunk
+ * fits (49 blocks); the second finds 11 free and is dropped whole, with
+ * one IRQ 7 pulse; BLOCKCOUNT stays 49 and FULL stays 0. Each further
+ * dropped chunk pulses again. Draining the ring returns the first chunk
+ * intact, and the next chunk fits again.
+ * RED on the D-4 binary: no chunk.
+ */
+static void test_det_chunk_full(void)
+{
+    QTestState *qts = rotb_qtest_new(60);
+    NomChunk *c = g_new0(NomChunk, 1);
+
+    rotb_cfg(qts, true, false);
+    qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
+    det_start_nom(qts, 39, 0, 9, 0xFFFFFFFFu);
+
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    g_assert_cmpuint(rotb_full(qts), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT,
+                     ==, ROTB_IRQ_BIT);
+    qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
+
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT,
+                     ==, ROTB_IRQ_BIT);
+    qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
+
+    nom_read_chunk(qts, c);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    g_free(c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-chunk-sumdmask: SUMDMASK (fpga_det bits) gates EACC [D, RP-0067]:
+ * with fpga_det 5 masked its chunk counts are 0 while its QL LACC counts
+ * are not (QLACC is not masked). The triggers are not masked [I]: ETRG
+ * grp 2 (fpga_det 4, 5) holds 1.25 x the events of both, so it exceeds
+ * 1.25 x fpga_det 4's EACC by about 1.25 x 5000; every other grp is
+ * exactly 1.25 x its EACC events.
+ * RED on the D-4 binary: no chunk.
+ */
+static void test_det_chunk_sumdmask(void)
+{
+    QTestState *qts = rotb_qtest_new(128);
+    NomChunk *c = g_new0(NomChunk, 1);
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint64_t extra;
+    uint32_t grp;
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 1000));
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+    sky_start_nom(qts, 39, 0xFFF, 9, 49, 0xFFFFFFFFu);
+    ctrl_write(qts, CTRL_FSMSUMDMASK, ~(1u << 5));
+    det_step_ticks(qts, 50);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(sky_fpga_det_sum(b, 5), >, 1000);
+    nom_read_chunk(qts, c);
+    g_assert_cmpuint(nom_fpga_det_sum(c, 5), ==, 0);
+    g_assert_cmpuint(nom_fpga_det_sum(c, 4), >, 3000);
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        uint64_t ev = nom_fpga_det_sum(c, 2 * grp) +
+                      nom_fpga_det_sum(c, 2 * grp + 1);
+
+        if (grp != 2) {
+            g_assert_cmpuint(c->etrg_grp[grp], ==, (5 * ev + 2) / 4);
+        }
+    }
+    extra = c->etrg_grp[2] - (5 * nom_fpga_det_sum(c, 4) + 2) / 4;
+    g_test_message("ETRG grp 2 beyond fpga_det 4: %" PRIu64, extra);
+    g_assert_cmpuint(extra, >, 5000);
+    g_assert_cmpuint(extra, <, 7500);
+
+    g_free(b);
+    g_free(c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-chunk-guard (D-Dj; the a83fe9a3a5 rule for out-of-MMIO writes):
+ * the tick writes the QL and EACC banks and the ROTB ring from timer
+ * context, outside any MMIO dispatch, with the device's
+ * mem_reentrancy_guard engaged, as the SpW out-of-MMIO paths do; it must
+ * release the guard. After timer-driven swaps and chunks every CTRL MMIO
+ * path still answers: the detector registers, the composed rotbCmdSta,
+ * GETBLOCK and the block window, and IRQ 3 still pulses. A guard left
+ * engaged would refuse all of them ("Blocked re-entrant IO").
+ * RED on the D-4 binary: no chunk.
+ */
+static void test_det_chunk_guard(void)
+{
+    QTestState *qts = rotb_qtest_new(128);
+
+    rotb_cfg(qts, true, false);
+    ctrl_write(qts, CTRL_FSMCMD, FSMCMD_QLIRQEN);
+    det_start_nom(qts, 9, 0, 9, 0xFFFFFFFFu);
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+    det_step_ticks(qts, 20);
+
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, FSMCMD_QLIRQEN);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMINTTIME), ==, 9u << 16);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+    g_assert_true(det_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR);
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS - 1);
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR | 1u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -6939,6 +7464,13 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/det-counts-seed", test_det_counts_seed);
         qtest_add_func("/sparc/stix/det-lvar-ltrg", test_det_lvar_ltrg);
         qtest_add_func("/sparc/stix/det-props", test_det_props);
+        qtest_add_func("/sparc/stix/det-chunk-format", test_det_chunk_format);
+        qtest_add_func("/sparc/stix/det-nominal-rule", test_det_nominal_rule);
+        qtest_add_func("/sparc/stix/det-chunk-gating", test_det_chunk_gating);
+        qtest_add_func("/sparc/stix/det-chunk-full", test_det_chunk_full);
+        qtest_add_func("/sparc/stix/det-chunk-sumdmask",
+                       test_det_chunk_sumdmask);
+        qtest_add_func("/sparc/stix/det-chunk-guard", test_det_chunk_guard);
     }
 
     return g_test_run();
