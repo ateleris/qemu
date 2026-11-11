@@ -1291,6 +1291,60 @@ def t_relay(env):
         ctl.shutdown()
 
 
+def t_gs_security(env):
+    """SF6: the GS side is loopback-only unless in a container; the GS
+    emulation never poses as the platform (source 14); a GS TC claiming
+    source 14 is refused and logged; [::1] works for TM and TC."""
+    bad = ['[gs]\nbind = "0.0.0.0"\n',
+           '[gs]\ntm_dests = ["10.0.0.5:21501"]\n',
+           '[gs]\ntm_dests = ["127.0.0.1:21501", "gs.example:21501"]\n',
+           '[gs]\nemulation_source = 14\n',
+           '[gs]\nemulation_source = 256\n',
+           '[gs]\ntm_dests = ["::1:21501"]\n',
+           '[gs]\ntm_dests = ["[::1:21501"]\n']
+    for text in bad:
+        raises(config_mod.ConfigError, config_mod.load, text=text)
+    for text in ('[gs]\nbind = "0.0.0.0"\ntm_dests = ["10.0.0.5:21501"]\n'
+                 '[api]\ncontainer = true\n',
+                 '[gs]\nbind = "::1"\ntm_dests = ["[::1]:21501", '
+                 '"localhost:21501"]\n'):
+        config_mod.load(text=text)
+    gs6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    gs6.bind(("::1", 0))
+    gs6.settimeout(2)
+    ctl = env.controller(gs={"tm_dests": ["[::1]:%d"
+                                          % gs6.getsockname()[1]],
+                             "bind": "::1"},
+                         timesync={"autostart": "off"})
+    qemu_tc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    qemu_tc.bind(("127.0.0.1", ctl.cfg["ports"]["qemu_tc"]))
+    qemu_tc.settimeout(2)
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        u = _tm_unit(0x5E5, 3, 25, b"\x04")
+        snd.sendto(u, ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"]))
+        check(gs6.recvfrom(4096)[0] == u[4:], "TM to [::1]")
+        tc14 = tcbuild.tc_packet(0x5AC, 5, 9, 129, bytes(6), source=14)
+        gs6.sendto(tc14, ("::1", ctl.cfg["ports"]["gs_tc"]))
+        wait_for(lambda: [r for r in ctl.log.since(0)
+                          if r.obj["path"] == "tc.refused"],
+                 what="the tc.refused record")
+        ok_tc = tcbuild.tc_packet(0x5AC, 6, 17, 1, source=0)
+        gs6.sendto(ok_tc, ("::1", ctl.cfg["ports"]["gs_tc"]))
+        check(qemu_tc.recvfrom(4096)[0] == tcbuild.unit(ok_tc),
+              "a GS TC over [::1] (and not the source-14 one first)")
+        rec = [r.obj["data"] for r in ctl.log.since(0)
+               if r.obj["path"] == "tc.refused"][0]
+        check(rec["source"] == 14 and not rec["delivered"], "refused %r"
+              % rec)
+    finally:
+        for sk in (gs6, qemu_tc, snd):
+            sk.close()
+        ctl.shutdown()
+
+
 def t_hold_queue(env):
     """SF5: the hold queue is capped (below the FSW's 64-unit queue),
     with every drop logged, and is dropped (logged) at power off and at
@@ -1870,6 +1924,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("keep-alive: rx trace filter", t_keepalive_trace),
          ("TM relay + TC proxy", t_relay),
          ("hold queue (SF5)", t_hold_queue),
+         ("GS side security (SF6)", t_gs_security),
          ("platform TCs (9/20, R2)", t_platform_tcs),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),

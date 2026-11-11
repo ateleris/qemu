@@ -82,6 +82,23 @@ CHOICES = {
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 
 
+def parse_dest(d):
+    """"host:port" or "[v6]:port" -> (host, port); ConfigError else."""
+    d = str(d)
+    if d.startswith("["):
+        host, sep, port = d[1:].partition("]:")
+        if not sep or not host:
+            raise ConfigError("%r is not [ipv6]:port" % d)
+    else:
+        host, _, port = d.rpartition(":")
+        if ":" in host:
+            raise ConfigError("%r: an IPv6 host needs brackets, "
+                              "[::1]:port" % d)
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ConfigError("%r is not host:port" % d)
+    return host, int(port)
+
+
 class ConfigError(Exception):
     pass
 
@@ -118,10 +135,22 @@ def _check(cfg):
             raise ConfigError("ports.%s = %r is out of range" % (k, p))
     if not 0 <= cfg["qemu"]["obt_epoch"] < (1 << 48):
         raise ConfigError("qemu.obt_epoch is wider than the 48-bit CUC")
+    # SF6: the GS side has no authentication either (D-PLj)
+    open_ok = cfg["api"]["container"]
     for d in cfg["gs"]["tm_dests"]:
-        host, _, port = str(d).rpartition(":")
-        if not host or not port.isdigit() or not 0 < int(port) < 65536:
-            raise ConfigError("gs.tm_dests entry %r is not host:port" % d)
+        host, _ = parse_dest(d)
+        if host not in LOOPBACK and not open_ok:
+            raise ConfigError("gs.tm_dests %r is not loopback; only a "
+                              "container ([api] container = true) may "
+                              "send TM off the host" % d)
+    if cfg["gs"]["bind"] not in LOOPBACK and not open_ok:
+        raise ConfigError("gs.bind = %r is not loopback; only a container "
+                          "([api] container = true) may take GS TCs off "
+                          "the host" % cfg["gs"]["bind"])
+    src = cfg["gs"]["emulation_source"]
+    if not 0 <= src <= 255 or src == 14:
+        raise ConfigError("gs.emulation_source = %r: 0..255 and not 14, "
+                          "which is the platform's own source" % src)
     if not 0.125 <= cfg["keepalive"]["period_s"] <= 3600:
         raise ConfigError("keepalive.period_s is 0.125..3600")
     if not 1 <= cfg["gs"]["hold_max"] <= 64:

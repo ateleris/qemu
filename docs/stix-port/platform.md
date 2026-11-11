@@ -112,6 +112,13 @@ There is no authentication, so the controller is localhost-only:
   a malformed or negative `Content-Length` gives 400;
 - a comma in the run dir, the ELF or the binary path is refused, because
   it would split QEMU's option strings.
+- the GS side has no authentication either: `[gs] bind` and every
+  `[gs] tm_dests` host must be loopback, under the same
+  `[api] container` exception. An IPv6 destination is written
+  `[::1]:port`;
+- only the controller speaks as the platform: a GS TC claiming source
+  14 is refused and logged as `tc.refused`, and `[gs] emulation_source`
+  may not be 14.
 
 ## The run dir
 

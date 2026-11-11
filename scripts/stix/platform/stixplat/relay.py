@@ -18,6 +18,7 @@ import os
 import socket
 import threading
 
+from . import config as config_mod
 from . import decode as decode_mod
 from . import tcbuild
 
@@ -33,16 +34,18 @@ class Relay:
         self.link_ok = link_ok
         p = cfg["ports"]
         self.qemu_tc = ("127.0.0.1", p["qemu_tc"])
-        self.dests = [(h, int(port)) for h, port in
-                      (d.rsplit(":", 1) for d in cfg["gs"]["tm_dests"])]
+        self.dests = [config_mod.parse_dest(d)
+                      for d in cfg["gs"]["tm_dests"]]
         self.policy = cfg["gs"]["tc_during_link_down"]
         self.hold_max = cfg["gs"]["hold_max"]
         self.held = []
         self.tm_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.tm_sock.bind(("127.0.0.1", p["qemu_tm"]))
-        self.gs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.gs_sock = socket.socket(_family(cfg["gs"]["bind"]),
+                                     socket.SOCK_DGRAM)
         self.gs_sock.bind((cfg["gs"]["bind"], p["gs_tc"]))
         self.out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.out6 = None            # made for the first [v6] destination
         # a receiver blocked in recvfrom keeps a closed socket's port
         # bound, so the loops wake up to see `stopping`
         for sk in (self.tm_sock, self.gs_sock):
@@ -77,7 +80,7 @@ class Relay:
         sp = unit[4:]
         for d in self.dests:
             try:
-                self.out.sendto(sp, d)
+                self._out(d).sendto(sp, d)
             except OSError:
                 pass            # a GS that is not listening is fine
         dec = decode_mod.decode(unit)
@@ -109,7 +112,21 @@ class Relay:
                 continue
             except OSError:
                 break
+            p = tcbuild.parse_tc(data)
+            if p is not None and p[4] == tcbuild.SOURCE_PLATFORM:
+                # SF6: only the controller speaks as the platform
+                self.log.emit("tc", "tc", "tc.refused", dict(
+                    _tc_info(data), delivered=False, why="a GS TC "
+                    "claiming source 14, the platform's own"))
+                continue
             self.gs_tc(data, src)
+
+    def _out(self, dest):
+        if _family(dest[0]) == socket.AF_INET:
+            return self.out
+        if self.out6 is None:
+            self.out6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        return self.out6
 
     def gs_tc(self, sp, src=None, source="tc", path="tc.gs"):
         """A TC from the GS (bare SP): add the SpW header and forward,
@@ -160,12 +177,18 @@ class Relay:
         self.stopping = True
         for t in self.threads:
             t.join(timeout=2)
-        for s in (self.tm_sock, self.gs_sock, self.out):
+        for s in (self.tm_sock, self.gs_sock, self.out, self.out6):
+            if s is None:
+                continue
             try:
                 s.close()
             except OSError:
                 pass
         self.tm_file.close()
+
+
+def _family(host):
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
 
 
 def _tc_info(sp):
