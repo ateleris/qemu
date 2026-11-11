@@ -29,7 +29,8 @@ the run with "FORBIDDEN TM: ...". It arms at its group's send (the
 connect group arms at connect) and stays armed; a match before its
 group's send is ignored. Forbids take no @window suffix.
 
-QMP groups (--qmp PATH, --qmp-cmd JSON; P4-3): a send group can be a
+QMP groups (--qmp PATH, --qmp-cmd JSON; P4-3): PATH is a unix socket or,
+since PL-2b, tcp:HOST:PORT. A send group can be a
 QMP command instead of a TC unit, e.g. a qom-set that injects a fault.
 It takes the preceding --send-at, collects the expectations and
 forbids that follow, and drains the TM already buffered before it
@@ -279,6 +280,19 @@ class QmpError(Exception):
     """A QMP failure: an error reply, a closed socket or a timeout."""
 
 
+def qmp_address(path):
+    """The socket family and address of a --qmp value (PL-2b): a unix
+    socket path, or tcp:HOST:PORT (platform plan D-PLj; HOST is used
+    as given, the callers keep it to 127.0.0.1/localhost)."""
+    if not path.startswith("tcp:"):
+        return socket.AF_UNIX, path
+    host, sep, port = path[4:].rpartition(":")
+    if not sep or not host or not port.isdigit() or \
+            not 0 < int(port) < 65536:
+        raise QmpError("bad QMP address %r: want tcp:HOST:PORT" % path)
+    return socket.AF_INET, (host, int(port))
+
+
 class QmpClient:
     """A minimal synchronous QMP client (P4-3).
 
@@ -303,10 +317,11 @@ class QmpClient:
     def _connect(self):
         deadline = time.monotonic() + self.timeout
         if self.sock is None:
+            family, addr = qmp_address(self.path)
             while True:
-                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s = socket.socket(family, socket.SOCK_STREAM)
                 try:
-                    s.connect(self.path)
+                    s.connect(addr)
                     self.sock = s
                     break
                 except OSError as e:
@@ -450,8 +465,9 @@ def make_parser():
                          "that group's send; a match before the send is "
                          "ignored. No @window suffix (repeatable)")
     ap.add_argument("--qmp", metavar="PATH",
-                    help="QEMU QMP unix socket for the --qmp-cmd groups "
-                         "(connected at the first due --qmp-cmd)")
+                    help="QEMU QMP unix socket, or tcp:HOST:PORT, for the "
+                         "--qmp-cmd groups (connected at the first due "
+                         "--qmp-cmd)")
     ap.add_argument("--qmp-cmd", action=OpAction, metavar="JSON",
                     help="a QMP command object executed at the preceding "
                          "--send-at, e.g. '{\"execute\": \"qom-set\", "
@@ -1229,6 +1245,47 @@ def self_test():
     m1 = mono()
     assert re.fullmatch(r"\[m=\d+\.\d{3}\]", m1), m1
     assert abs(float(m1[3:-1]) - time.monotonic()) < 1.0, m1
+
+    # q8. PL-2b: QMP over TCP. --qmp tcp:HOST:PORT connects with
+    #     AF_INET (a real listener on an ephemeral 127.0.0.1 port); the
+    #     same greeting/capabilities/command exchange as the unix form
+    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lst.bind(("127.0.0.1", 0))
+    lst.listen(1)
+    tport = lst.getsockname()[1]
+    tbox = {}
+
+    def tcp_accept():
+        peer, _ = lst.accept()
+        th_, b_ = fake_qmp(peer, [ok_ret, b'{"return": {"tcp": 1}}\r\n'])
+        th_.join(timeout=3)
+        tbox.update(b_)
+        peer.close()
+    tth = threading.Thread(target=tcp_accept)
+    tth.start()
+    c = QmpClient("tcp:127.0.0.1:%d" % tport, timeout=1.0)
+    ret = c.execute(json.loads(qset))
+    c.close()
+    tth.join(timeout=3)
+    lst.close()
+    assert not tth.is_alive() and ret == {"tcp": 1}, ret
+    assert [m["execute"] for m in tbox["cmds"]] == \
+        ["qmp_capabilities", "qom-set"]
+    # q9. the address forms: a unix path stays a path; tcp needs a
+    #     host and a numeric port
+    assert qmp_address("/x/qmp.sock") == (socket.AF_UNIX, "/x/qmp.sock")
+    assert qmp_address("tcp:127.0.0.1:4444") == \
+        (socket.AF_INET, ("127.0.0.1", 4444))
+    assert qmp_address("tcp:localhost:4444") == \
+        (socket.AF_INET, ("localhost", 4444))
+    for bad in ("tcp:127.0.0.1", "tcp::4444", "tcp:127.0.0.1:x",
+                "tcp:127.0.0.1:70000"):
+        try:
+            qmp_address(bad)
+            raise AssertionError("bad QMP address accepted: %s" % bad)
+        except QmpError:
+            pass
+
     print("SELF-TEST: PASS")
     return 0
 
@@ -1252,6 +1309,11 @@ def main():
     if any(g.get("qmp") is not None for g in groups):
         if not args.qmp:
             print("bad arguments: --qmp-cmd needs --qmp PATH")
+            return 2
+        try:
+            qmp_address(args.qmp)
+        except QmpError as e:
+            print("bad arguments: --qmp: %s" % e)
             return 2
         qmp = QmpClient(args.qmp)
 
