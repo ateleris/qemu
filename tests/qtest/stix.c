@@ -8822,6 +8822,25 @@ static void test_flash_latency_system_reset(void)
     stix_qtest_cleanup();
 }
 
+/*
+ * /sparc/stix/flash-savevm (review SHOULD-1): the flash has no vmstate
+ * yet (platform roadmap R-r3), so it is unmigratable: a savevm must be
+ * refused naming the device, instead of a snapshot that silently drops
+ * a pending op and the sequence state.
+ */
+static void test_flash_savevm(void)
+{
+    QTestState *qts = stix_qtest_new();
+    g_autofree char *out = qtest_hmp(qts, "savevm flash-test");
+
+    g_test_message("savevm: %s", out);
+    g_assert_nonnull(strstr(out, "non-migratable device"));
+    g_assert_nonnull(strstr(out, "grlib-stixflash"));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -8852,6 +8871,7 @@ int main(int argc, char **argv)
                        test_flash_latency_props);
         qtest_add_func("/sparc/stix/flash-latency-system-reset",
                        test_flash_latency_system_reset);
+        qtest_add_func("/sparc/stix/flash-savevm", test_flash_savevm);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);

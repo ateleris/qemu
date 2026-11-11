@@ -11,6 +11,7 @@
 #include "system/physmem.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "migration/vmstate.h"
 #include "StixIdpu.h"
 
 #if defined(CONFIG_FALLOCATE_PUNCH_HOLE)
@@ -939,6 +940,20 @@ static const Property grlib_stixflash_properties[] = {
     DEFINE_PROP_UINT32("tbers-us", STIXFLASH, tbers_us, 1500),
 };
 
+/*
+ * Review SHOULD-1: no vmstate yet, so the device blocks migration and
+ * savevm instead of silently dropping a pending op. A real vmsd belongs
+ * to platform roadmap item R-r3 (savevm/loadvm) and needs: cmd_sta,
+ * write_counter, ram_address, page_address, chip, page, command, mcm,
+ * memory_bit_type, the StixFlashOp record (pending, cmd, mcm, chip,
+ * page, page_address, ram_address, sample_failed), page_data (a
+ * program's issue-time sample) and the timer (VMSTATE_TIMER_PTR).
+ */
+static const VMStateDescription vmstate_grlib_stixflash = {
+    .name = "grlib-stixflash",
+    .unmigratable = 1,
+};
+
 /* D-F9: read-only op counters */
 static void grlib_stixflash_instance_init(Object *obj)
 {
@@ -960,6 +975,7 @@ static void grlib_stixflash_class_init(ObjectClass *klass, const void *data)
 
     dc->realize = grlib_stixflash_realize;
     dc->unrealize = grlib_stixflash_unrealize;
+    dc->vmsd = &vmstate_grlib_stixflash;
     device_class_set_legacy_reset(dc, grlib_stixflash_reset);
     device_class_set_props(dc, grlib_stixflash_properties);
 }
