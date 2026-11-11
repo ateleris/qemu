@@ -1,7 +1,7 @@
 # Gate ports plan: parallel-safe QEMU test runs
 
-Status: plan only, 2026-11-11. Validated and revised: the review findings
-are folded in (see "Review resolutions"). Nothing is implemented.
+Status: implemented 2026-11-11 (G-0..G-4 and G-2b, see "As built"). The
+review findings are folded in (see "Review resolutions").
 - Track worktree: `~/dev/qemu-stix-gateports`, branch
   `stix-uprev-gateports`, from `d2c6cae28a`.
 - The integration branch `stix-uprev-tc` is already at `93438dfa3b`
@@ -553,3 +553,63 @@ together with the slot-band recommendation.
 | Rec. | Suite QEMU ports come from the slot band B+3..B+99 instead of a retry (D-G4, G-3) |
 | Rec. | qt.sh is committed as `scripts/stix/qt.sh` under a slot lock; `--baseline` uses slot 0 (D-G5, G-4) |
 | Rec. | Facts corrected: ephemeral range 43255-47350, Windows port facts, VHDX reuse, 27 leaked files at 0 KB; `busy=` is read without taking locks; the master-missing guard; the lock fd is inherited by children |
+
+## As built (2026-11-11)
+
+Branch `stix-uprev-gateports`, rebased onto D-3 (`2721343939`) on the
+coordinator's request after D-3 committed, so G-2b is part of the series.
+
+Deviations from the plan:
+- **No strace on the host.** The G-3 RED/checks use an LD_PRELOAD bind(2)
+  logger (`scripts/stix/tests/bind-log.c`, driven by
+  `test-qtest-ports.sh`) instead of `strace -f -e trace=bind`. It also
+  logs the result, so (c) counts the two refused binds of the suite's
+  own "port busy" tests separately from real binds.
+- **The fake-QEMU harness did not capture argv.** `fake-qemu.sh` now
+  records argv, CWD and the flash inode (`FAKE_QEMU_ARGV_FILE`), a new
+  `fake-probe.py` records the probe argv, and boot-smoke and tc-smoke
+  honour `STIX_TMTC_PROBE` like soak.sh already did.
+- **tc-smoke already had `--dry-run`** (the inventory said only nominal
+  and fault had it); the README note was correct and is unchanged. The
+  legacy identity test compares all dry runs with the pre-change scripts
+  (`STIX_LEGACY_REF`, now `2721343939`).
+- **An explicit run dir also gets `-s<k>`** in slot mode (the plan said
+  "the default run dir"), so two auto runs with the same `STIX_*RUN_DIR`
+  cannot share a dir; the nominal/fault/detector guard runs on the
+  suffixed path.
+- **`qt.sh --baseline` runs in `/tmp/stix-qt-baseline` with a sparse copy
+  of the master**: the wrapper strips `flash-file`, and the 5.2 model
+  writes a full 16.5 GB `flash.bin` into a CWD without one. The single-test
+  path follows the arch libqtest parses from the binary name
+  (`sparc-52-wrapper.sh`). `lib/slot.sh` gained `stix_flash_copy`.
+- `stix.c` gained one small helper (`stix_slot_band_base`, using
+  `qemu_strtol`) next to the two `stix_free_*` bodies, and the now unused
+  `TMTC_BASE_PORT` define was removed.
+- **G-2b is minimal** (the D-4 implementer is extending detector-smoke):
+  port, run dir and the `-global` line only. TODO after D-4: the
+  `${STIX_SLOT_TAG}` verdict tags and `stix_slot_cleanup` (flash.bin,
+  idefx.trace) on PASS.
+
+Gate results on the tip:
+- G-a: test-slot 42/42, test-gate-slots 26/26, test-boot-smoke 5/5,
+  test-soak 10/10, probe self-test PASS.
+- G-3: (a) RED on the old binary (`tcp 21000`), GREEN after; (b) the
+  suite with 21000 held: 54 ok; (c) the suite in slot 1: 54 ok, 15 binds
+  in 21103..21199, 7 ephemeral, 2 refused; (d) `qt.sh --baseline
+  tmtc-hermetic`: SKIP with the reason.
+- G-b (legacy, each gate under the 21000 flock, beside G-d): suite 54
+  ok; boot-smoke, tc-smoke, nominal, nominal --negative, fault, fault
+  --negative, soak 300 s: all PASS.
+- G-c: 14 samples of `/proc/<qemu>/fd` in slot dirs s1..s3, every open
+  flash.bin is the slot copy's inode, never the master's.
+- G-d (1)-(7): all ok/PASS, (3) three rounds; (4) the fourth run waited
+  and then passed; (5) a legacy boot-smoke plus three auto tc-smokes;
+  (7) with a clean `make -j8` rebuild (98 s). Every verdict showed
+  `busy=1` at start and load <= 0.93; per-expectation latencies were not
+  compared in detail (no failure, no flake).
+- G-f: `df /mnt/c` free space went up by 442 MiB over G-d (other
+  tracks' cleanup); slot dirs are 48-92 KiB each, and no slot dir kept a
+  flash.bin after its PASS.
+- The shared flash stats are unchanged (uprev 2026-11-10 13:05:54, 32
+  blocks; baseline 2026-11-09 15:30:10).
+- G-e (two full tracks in parallel against the serial time) was not run.
