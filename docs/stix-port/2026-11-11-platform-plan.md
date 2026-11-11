@@ -1961,3 +1961,14 @@ defaults that the user can override.
 - the record schema, SSE with stdlib, and `tomllib` on 3.12;
 - detector consistency on `dss_det` = `fpga_det`, the guard ring, the
   ELUT path and the scene knobs at `-S`.
+
+## As built
+
+- **PL-1..PL-3** are on `stix-uprev-platform`. accepted-diffs P-1 holds
+  the C-side record.
+- **TODO (on the rebase onto gate-ports):** move
+  `scripts/stix/platform/tests/core-smoke.sh` to the gate slot scheme
+  (`scripts/stix/lib/slot.sh`: a slot run dir, slot ports, the shared
+  slot lock) instead of its fixed 2152x ports and
+  `/tmp/stix-plat/core-smoke`. gate-ports is not merged yet (PL-3 review
+  S7).

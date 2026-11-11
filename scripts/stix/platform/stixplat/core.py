@@ -50,6 +50,7 @@ class Controller:
         self.poller = None
         self.last_state_poll = 0.0
         self.last_poll_error = None
+        self.last_sparse = time.monotonic()
         self.last_snapshot = None   # bench time of the last snapshot
         self.server = None
         self._register()
@@ -197,6 +198,10 @@ class Controller:
 
     def _poll_once(self, state_period):
         self.power.watch()
+        every = self.cfg["power"]["sparse_check_s"]
+        if every > 0 and time.monotonic() - self.last_sparse >= every:
+            self.last_sparse = time.monotonic()
+            self.power.sparse_poll()
         q = self.power.qmp
         if q is None or not self.power.qmp_alive():
             return

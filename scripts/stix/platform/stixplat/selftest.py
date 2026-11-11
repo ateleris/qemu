@@ -662,6 +662,29 @@ def t_poller_robust(env):
         ctl.shutdown()
 
 
+def t_sparse_poll(env):
+    """S7: the poller re-checks the flash; above the limit it powers off
+    and logs why."""
+    ctl = env.controller(power={"sparse_check_s": 0.2,
+                                "sparse_limit_mb": 1})
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        time.sleep(0.5)
+        check(ctl.power.state == "running", "a sparse flash powered off")
+        with open(os.path.join(ctl.run_dir, "flash.bin"), "r+b") as f:
+            f.write(os.urandom(2 << 20))       # 2 MB of real blocks
+            f.flush()
+            os.fsync(f.fileno())
+        wait_for(lambda: ctl.power.state == "off", what="sparse power-off")
+        why = [r.obj["data"] for r in ctl.log.since(0)
+               if r.obj["path"] == "platform.power.sparse" and
+               not r.obj["data"].get("ok", True)]
+        check(why and "not sparse" in why[-1]["error"], "sparse record")
+    finally:
+        ctl.shutdown()
+
+
 def _fake_children():
     """Our live child fake QEMUs (pids)."""
     out = []
@@ -945,6 +968,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("no orphaned QEMU", t_no_orphan),
          ("run-dir lock + PDEATHSIG", t_run_lock),
          ("poller + command robustness", t_poller_robust),
+         ("periodic sparse check", t_sparse_poll),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]

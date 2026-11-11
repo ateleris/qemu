@@ -7397,6 +7397,19 @@ static void test_det_chunk_guard(void)
 #define OBT_MASK              0xFFFFFFFFFFFFull
 #define MS_NS                 (1000 * 1000LL)
 
+/*
+ * Every platform qtest says tmtc-server=off explicitly: under qtest the
+ * auto default binds nothing already, but no test here may ever take
+ * the gates' TMTC port 20000 + uid (PL-3 review S7).
+ */
+static QTestState *plat_qtest_new(const char *extra)
+{
+    g_autofree gchar *all = g_strdup_printf(
+        "-global grlib-stixspw.tmtc-server=off %s", extra);
+
+    return stix_qtest_new_extra(all);
+}
+
 /* A uint64 property, or *ok = false when qom-get fails. */
 static uint64_t stix_qom_get_u64(QTestState *qts, const char *path,
                                  const char *prop, bool *ok)
@@ -7478,7 +7491,7 @@ static void test_spw_obt(void)
     extra = g_strdup_printf("-global grlib-stixspw.timecode-source=obt "
                             "-global grlib-stixspw.obt-epoch=%" PRIu64,
                             epoch);
-    qts = stix_qtest_new_extra(extra);
+    qts = plat_qtest_new(extra);
     qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
     spw_to_clear(qts);
 
@@ -7555,7 +7568,7 @@ static void test_spw_obt(void)
     stix_qtest_cleanup();
 
     /* e. scet mode (the default): obt reads the SCET; a set is refused */
-    qts = stix_qtest_new();
+    qts = plat_qtest_new("");
     qtest_clock_step(qts, 300 * MS_NS);
     obt = plat_obt(qts);
     g_assert_cmphex(obt >> 16, ==, ctrl_sec(qts));
@@ -7569,7 +7582,7 @@ static void test_spw_obt(void)
     stix_qtest_cleanup();
 
     /* f. the default epoch is 0x10000000 (coarse & 63 = 0, D-PLb) */
-    qts = stix_qtest_new_extra("-global grlib-stixspw.timecode-source=obt");
+    qts = plat_qtest_new("-global grlib-stixspw.timecode-source=obt");
     g_assert_cmphex(plat_obt(qts), ==, OBT_DEFAULT_EPOCH);
     qtest_quit(qts);
     stix_qtest_cleanup();
@@ -7589,7 +7602,7 @@ static void test_spw_timecode_once(void)
     uint32_t coarse;
     bool ok, v;
 
-    qts = stix_qtest_new();
+    qts = plat_qtest_new("");
     qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
     g_assert(stix_qom_set_bool(qts, path, "timecodes", false));
     spw_to_clear(qts);
@@ -7667,7 +7680,7 @@ static void test_spw_timecode_inject(void)
     const char *path = "/machine/stixspw";
     QTestState *qts;
 
-    qts = stix_qtest_new();
+    qts = plat_qtest_new("");
     qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
     g_assert(stix_qom_set_bool(qts, path, "timecodes", false));
     qtest_clock_step(qts, 300 * MS_NS); /* mid-second: a wrong-time code */
@@ -7841,7 +7854,7 @@ static void test_ctrl_hw_state(void)
     close(fd);
     extra = g_strdup_printf("-trace stixctrl_io_read -trace stixspw_io_read "
                             "-D %s", log);
-    qts = stix_qtest_new_extra(extra);
+    qts = plat_qtest_new(extra);
 
     /* a. JSON, schema 1, with the virtual time */
     st = plat_hw_state(qts, ctrl);
@@ -7997,7 +8010,7 @@ static void test_spw_hw_state(void)
     int64_t t_emit, due;
     uint32_t coarse;
 
-    qts = stix_qtest_new();
+    qts = plat_qtest_new("");
     st = plat_hw_state(qts, spw);
     g_assert(st != NULL);
     g_assert_cmpint(qdict_get_int(st, "schema"), ==, 1);
@@ -8061,7 +8074,7 @@ static void test_spw_hw_state(void)
     qtest_quit(qts);
     stix_qtest_cleanup();
 
-    qts = stix_qtest_new_extra("-global grlib-stixspw.timecode-source=obt");
+    qts = plat_qtest_new("-global grlib-stixspw.timecode-source=obt");
     st = plat_hw_state(qts, spw);
     g_assert_cmpstr(qdict_get_str(plat_dict(st, "timecode"), "source"), ==,
                     "obt");
@@ -8078,7 +8091,7 @@ static void test_spw_hw_state(void)
  */
 static void test_vclock_ns(void)
 {
-    QTestState *qts = stix_qtest_new();
+    QTestState *qts = plat_qtest_new("");
     uint64_t t0, t1;
     bool ok;
 
@@ -8095,6 +8108,15 @@ static void test_vclock_ns(void)
                                       &ok), ==, t1 + 1);
     /* read-only */
     g_assert(!stix_qom_set_u64(qts, "/machine/stixspw", "vclock-ns", 0));
+    /* S7: plat_qtest_new() never lets a TMTC server bind */
+    {
+        QDict *resp = qtest_qmp(qts, "{'execute': 'qom-get', 'arguments': "
+                                "{'path': '/machine/stixspw', "
+                                "'property': 'tmtc-server'}}");
+
+        g_assert_cmpstr(qdict_get_try_str(resp, "return"), ==, "off");
+        qobject_unref(resp);
+    }
     qtest_quit(qts);
     stix_qtest_cleanup();
 }
@@ -8113,6 +8135,7 @@ static void test_plat_realize_error_subprocess(void)
     g_assert_nonnull(flash);
     /* qtest_init aborts: QEMU realize fails and exits */
     qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixspw.tmtc-server=off "
                       "-global grlib-stixflash.flash-file=%s -global %s",
                       flash, global);
     qtest_quit(qts);
@@ -8184,7 +8207,7 @@ static void test_plat_review_extras(void)
     close(fd);
     extra = g_strdup_printf("-trace stixspw_timecode_manual "
                             "-trace stixspw_timecode_once_drop -D %s", log);
-    qts = stix_qtest_new_extra(extra);
+    qts = plat_qtest_new(extra);
     qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
     g_assert(stix_qom_set_bool(qts, spw, "timecodes", false));
     spw_to_clear(qts);
@@ -8227,7 +8250,7 @@ static void test_plat_review_extras(void)
     extra = g_strdup_printf("-global grlib-stixspw.timecode-source=obt "
                             "-global grlib-stixspw.obt-epoch=%" PRIu64,
                             OBT_CUC(0x10000005u, 0));
-    qts = stix_qtest_new_extra(extra);
+    qts = plat_qtest_new(extra);
     qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
     g_assert(stix_qom_set_bool(qts, spw, "timecodes", false));
     spw_to_clear(qts);

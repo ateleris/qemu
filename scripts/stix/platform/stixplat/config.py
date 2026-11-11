@@ -35,7 +35,9 @@ DEFAULTS = {
     "api": {"bind": "127.0.0.1", "container": False},
     "power": {"off_time_s": 2.0, "cycle_boots": True,
               "quit_timeout_s": 5.0, "qmp_timeout_s": 5.0,
-              "kill_grace_s": 2.0},
+              "kill_grace_s": 2.0,
+              # D-PLl second line, repeated while on (PL-3 review S7)
+              "sparse_check_s": 30.0, "sparse_limit_mb": 1024},
     "clock": {"sample_hz": 20.0, "state_hz": 2.0,
               "snapshot_s": 10.0},  # a full state record (0 = off)
     "log": {"max_log_mb": 50, "max_log_files": 5, "ring": 20000},

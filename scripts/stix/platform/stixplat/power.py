@@ -138,7 +138,8 @@ class Power:
         self._set(FROZEN)
         self._record("on", pid=self.pid, argv=argv)
         try:
-            used = rundir.sparse_check(self.run_dir)
+            used = rundir.sparse_check(self.run_dir,
+                                       limit=self.sparse_limit())
         except rundir.RunDirError as e:
             self._off_locked("sparse check")
             raise VerbError(500, str(e)) from None
@@ -148,6 +149,23 @@ class Power:
         for h in self.hooks:
             h("spawned", self)
         return {"pid": self.pid, "boot_id": self.clock.boot_id}
+
+    def sparse_limit(self):
+        return self.cfg["power"]["sparse_limit_mb"] << 20
+
+    def sparse_poll(self):
+        """The periodic sparse check (poller): over the limit, power off
+        and say why."""
+        with self.lock:
+            if self.state == OFF:
+                return
+            try:
+                rundir.sparse_check(self.run_dir, when="while on",
+                                    limit=self.sparse_limit())
+            except rundir.RunDirError as e:
+                self.log.emit("ctl", "log", "platform.power.sparse",
+                              {"ok": False, "error": str(e)})
+                self._off_locked("sparse check")
 
     def boot(self):
         with self.lock:

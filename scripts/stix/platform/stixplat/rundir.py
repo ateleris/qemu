@@ -132,15 +132,15 @@ def preflight(run_dir, fs=None):
     sparse_check(run_dir, fs, when="existing")
 
 
-def sparse_check(run_dir, fs=None, when="after power-on"):
-    """flash.bin must stay under 1 GiB of real blocks."""
+def sparse_check(run_dir, fs=None, when="after power-on", limit=GIB):
+    """flash.bin must stay under @limit (1 GiB) of real blocks."""
     fs = fs or RealFs()
     flash = os.path.join(run_dir, "flash.bin")
     if fs.exists(flash):
         used = fs.blocks_bytes(flash)
-        if used >= GIB:
+        if used >= limit:
             raise RunDirError("%s flash.bin is not sparse: %d bytes of "
-                              "blocks (limit 1 GiB)" % (when, used))
+                              "blocks (limit %d)" % (when, used, limit))
         return used
     return None
 
