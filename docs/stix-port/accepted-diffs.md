@@ -3777,6 +3777,22 @@ unless a test or the platform controller does.
   unix form produces the same `-qmp unix:…,server=on,wait=off` as
   before.
 
+- **The warm-reset window (PL-4 review NIT):** the device reset of a
+  warm guest reset (`-action reboot=reset`) clears `link-down` and every
+  `adc-inject[N]`, and the controller re-applies them when the QMP
+  `RESET` event reaches it, while the guest already runs. For that
+  window the FSW sees the link up and the true ADC values: a QMP event
+  read plus one `qom-set` round trip per switch, of the order of 1 ms
+  of wall time each [I, not measured], so a few ms for a handful of
+  forcings. No FSW-visible effect is expected [I]: after a reset the
+  boot software runs from PROM and loads the ASW from flash for well
+  over a second before the ASW starts the SpW link and the HK ADC
+  sequence. A synchronous re-apply is possible without a C change
+  (`reboot=shutdown,shutdown=pause`, then `system_reset`, re-apply
+  while frozen, `cont`), but it changes the warm policy's argv, the
+  power state machine and the bench-clock pause accounting, so it is
+  left as a follow-up; the cold policy re-applies before `cont` already.
+
 **Evidence (PL-2):** qtests `/sparc/stix/ctrl-hw-state` (schema, the
 enables and POWERSTAT after hkCmdSta writes, `quarter_on` after
 idefxConfig, truth 2048 vs presented 1800 on an injected ch 24 with the

@@ -135,6 +135,9 @@ def _check(cfg):
             raise ConfigError("ports.%s = %r is out of range" % (k, p))
     if not 0 <= cfg["qemu"]["obt_epoch"] < (1 << 48):
         raise ConfigError("qemu.obt_epoch is wider than the 48-bit CUC")
+    if cfg["qemu"]["obt_epoch"] >> 47:
+        raise ConfigError("qemu.obt_epoch sets coarse bit 31, the CUC's "
+                          "\"unsynchronised\" flag")
     # SF6: the GS side has no authentication either (D-PLj)
     open_ok = cfg["api"]["container"]
     for d in cfg["gs"]["tm_dests"]:

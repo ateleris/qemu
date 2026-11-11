@@ -136,7 +136,9 @@ def t_config(env):
     for bad in ('nosuch = 1\n', '[ports]\napi = "x"\n',
                 '[qemu]\non_guest_reset = "never"\n', '[ports]\napi = 0\n',
                 '[power]\ncycle_boots = 1\n', 'mode = \n',
-                '[qemu]\nobt_epoch = 281474976710656\n'):
+                '[qemu]\nobt_epoch = 281474976710656\n',
+                # coarse bit 31 is the CUC "unsynchronised" flag
+                '[qemu]\nobt_epoch = %d\n' % (0x80000000 << 16)):
         raises(config_mod.ConfigError, config_mod.load, text=bad)
     # S6: a non-loopback bind needs [api] container = true (PL-7)
     raises(config_mod.ConfigError, config_mod.load,
@@ -855,6 +857,38 @@ def t_decode(env):
     check(d["sid"] == 2 and d["mode"] == 5, "SID 2 mode %r" % d)
     check(decode.decode(bytes.fromhex("40020000" + "1dacc000000519110100"
                                       "d77e")) is None, "a TC is no TM")
+
+
+def t_truncated(env):
+    """NIT: truncated units never raise in the parser or the decoder:
+    they decode as far as they go (None when there is no header)."""
+    tc = tcbuild.tc9_129(3, 0x10000000)
+    for n in range(len(tc)):
+        p = tcbuild.parse_tc(tc[:n])
+        check(p is None or not p[6], "a %d-byte TC parsed with a good CRC"
+              % n)
+    units = [bytes.fromhex(h) for h in (
+        "490200000da1c00200151001020000000014832a1dacc0010002110112346f1f",
+        "490200000de5c000001a1003190e000000013d1204000000010000000000000000"
+        "00000000",
+        "490200000da7c005000910110200000000148220")]
+    units.append(_tm_unit(0x5A1, 1, 8, bytes.fromhex("1dacc0010002")))
+    units.append(_tm_unit(0x5A7, 5, 1, bytes.fromhex("142e")))
+    units.append(_tm_unit(0x5A4, 3, 25, bytes.fromhex("0215")))
+    for u in units:
+        for n in range(len(u)):
+            d = decode.decode(u[:n])
+            check(d is None if n < 20 else isinstance(d, dict),
+                  "%d of %d bytes: %r" % (n, len(u), d))
+            if d is not None:
+                decode.describe(d)
+    d = decode.decode(units[3][:-1])
+    check("fid" not in d and d["tc"]["seq"] == 1, "TM(1,8) cut in the FID "
+          "%r" % d)
+    d = decode.decode(units[4][:-1])
+    check("eid" not in d, "TM(5,1) cut in the EID %r" % d)
+    d = decode.decode(units[5][:-1])
+    check(d["sid"] == 2 and "mode" not in d, "SID 2 cut before the mode")
 
 
 def t_timesync_window(env):
@@ -1974,6 +2008,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("snapshot race", t_snapshot_race),
          ("tcbuild: CRC + smoke TCs", t_tcbuild),
          ("decoder on real units", t_decode),
+         ("truncated TC/TM input", t_truncated),
          ("time sync window (D-PLd)", t_timesync_window),
          ("time sync verdicts", t_timesync_verdicts),
          ("time sync reserve + re-check", t_timesync_reserve),
