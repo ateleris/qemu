@@ -80,9 +80,13 @@ def _num(v):
 
 
 def load(path):
+    """A scenario file; whole-line "#" comments (the SPDX tag) are
+    dropped, as in the fault catalogue and QEMU's QAPI files."""
     try:
         with open(path) as f:
-            obj = json.load(f, parse_constant=_no_constant)
+            text = "".join(ln if not ln.lstrip().startswith("#") else "\n"
+                           for ln in f)
+        obj = json.loads(text, parse_constant=_no_constant)
     except (OSError, ValueError) as e:
         raise ScenarioError("scenario %s: %s" % (path, e))
     return validate(obj)

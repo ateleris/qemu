@@ -2042,10 +2042,32 @@ defaults that the user can override.
   125 ms), B2 (automatic time sync), SF1-SF9 and the NITs; see D-PLd,
   D-PLe, D-PLo, D-PLq and P-1 for the as-built text. Left as a
   follow-up: the synchronous warm-reset re-apply (P-1).
+- **PL-5** is on `stix-uprev-platform` (no C change). As built:
+  - the gate scenarios live in `scripts/stix/platform/scenarios/`; like
+    the fault catalogue they take whole-line `#` comments (the SPDX tag);
+  - `gate-keepalive` (R1) stops the keep-alive at +65 and enters NOMINAL
+    at +75; 0x142E is forbidden until +102 and awaited by +115. First
+    live run: NOMINAL entered at +78.4, 0x142E at +109.1 (30.7 s after
+    the entry, 44 s after the last TC(20,128)), then 0021 05 02;
+  - `gate-timesync`: **the two variants are not told apart yet.** In
+    the first live run both had the same pre-sync heartbeat (CUC coarse
+    0x28 at +40.6 s, the FSW counting from 0, not synced bit clear), no
+    0x1429 in either before the TC(9,129), and an exact CUC after it
+    (-1 ms in both). The FSW does not take the time from the codes
+    before a TC(9,129), so "no 0x1429" and "far before" hold in both
+    variants; the scenario passes as the plan asks but only shows that
+    a mismatched epoch does not break the D-PLd sync. Open question
+    for the review: what `mismatch` should observe;
+  - `gate-timecode-loss` is in run-smoke only with
+    `STIX_RUN_SMOKE_LONG=1`;
+  - a self-test filter that matches no case now FAILs (it passed with
+    nothing run).
 - **TODO (on the rebase onto gate-ports):** move
-  `scripts/stix/platform/tests/core-smoke.sh` and `link-smoke.sh` to the
-  gate slot scheme (`scripts/stix/lib/slot.sh`: a slot run dir, slot
-  ports, the shared slot lock) instead of their fixed ports (core-smoke
-  21520-21522; link-smoke 21525-21528 and the fake GS on 21531) and
-  `/tmp/stix-plat/core-smoke`, `/tmp/stix-plat/link-smoke`. gate-ports is not merged yet (PL-3 review
+  `scripts/stix/platform/tests/core-smoke.sh`, `link-smoke.sh` and
+  `run-smoke.sh` to the gate slot scheme (`scripts/stix/lib/slot.sh`: a
+  slot run dir, slot ports, the shared slot lock) instead of their fixed
+  ports (core-smoke 21520-21522; link-smoke 21525-21528 and the fake GS
+  on 21531; run-smoke 21535-21538 and the TM sink 21541) and
+  `/tmp/stix-plat/core-smoke`, `/tmp/stix-plat/link-smoke`,
+  `/tmp/stix-plat/run-smoke`. gate-ports is not merged yet (PL-3 review
   S7).

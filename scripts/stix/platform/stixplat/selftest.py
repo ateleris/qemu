@@ -1362,6 +1362,10 @@ def _verdicts(res):
     return [st["verdict"] for st in res["steps"]]
 
 
+# split so checkpatch does not take it for this file's tag
+SPDX = "SPDX-License-" "Identifier:"
+
+
 def t_scn_validate(env):
     """PL-5: scenario errors are ScenarioError (exit 2), never a pass."""
     good = {"api": 1, "name": "ok", "duration_s": 10,
@@ -1393,6 +1397,31 @@ def t_scn_validate(env):
     e = raises(scenario.ScenarioError, scenario.validate,
                dict(good, steps=[{"at": 0, "assert_consistent": ["a"]}]))
     check("PL-8" in str(e), "assert_consistent names PL-8: %s" % e)
+    # whole-line "#" comments (the SPDX tag) as in the fault catalogue
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "c.json")
+        with open(p, "w") as f:
+            f.write("# " + SPDX + " GPL-2.0-or-later\n" +
+                    json.dumps(good) + "\n  # trailing\n")
+        check(scenario.load(p)["name"] == "ok", "commented scenario loads")
+        with open(p, "w") as f:
+            f.write(json.dumps(good)[:-1] + ', "x": "a # b"}\n')
+        raises(scenario.ScenarioError, scenario.load, p)
+    # the shipped scenarios: all valid, each with its SPDX line, and
+    # their config overrides merge
+    shipped = sorted(f for f in os.listdir(scenario.DEFAULT_DIR)
+                     if f.endswith(".json"))
+    check({"gate-spw-link.json", "gate-keepalive.json", "gate-timesync.json",
+           "gate-negative.json"} <= set(shipped), "gates: %r" % shipped)
+    for f in shipped:
+        p = os.path.join(scenario.DEFAULT_DIR, f)
+        with open(p) as fh:
+            check(fh.readline().startswith("# " + SPDX),
+                  "%s: SPDX first" % f)
+        sc = scenario.load(p)
+        for v in sc["variants"]:
+            config_mod.merged(config_mod.load(), sc["config"],
+                              sc["variant_config"].get(v, {}))
 
 
 def t_scn_runner(env):
@@ -2505,11 +2534,12 @@ CASES = [("config", t_config), ("argv golden", t_argv),
 
 def main(only=None):
     env = Env()
-    failed = 0
+    failed = ran = 0
     try:
         for name, fn in CASES:
             if only and only not in name:
                 continue
+            ran += 1
             t0 = time.monotonic()
             try:
                 fn(env)
@@ -2520,5 +2550,8 @@ def main(only=None):
             sys.stdout.flush()
     finally:
         env.close()
+    if not ran:
+        failed = 1
+        print("FAIL no case matches %r" % only)
     print("SELF-TEST: %s" % ("PASS" if not failed else "FAIL"))
     return 1 if failed else 0

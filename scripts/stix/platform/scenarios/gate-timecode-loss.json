@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+{"api": 1, "name": "gate-timecode-loss",
+ "description": "Optional (about 160 s): the time codes stop at +60; the FSW reports 0x542B (no code for 60 s, ParamMgmtDef.h:206) within 75 s, and 0x1429 (resynchronised) within 10 s of their return at +140.",
+ "duration_s": 160,
+ "setup": [{"do": "platform.power.on"}],
+ "steps": [
+  {"at": 0, "name": "boot", "do": "platform.power.boot",
+   "await_event": [{"eid": "14a3", "timeout_s": 50}]},
+  {"at": 60, "name": "codes off", "do": "platform.timecode.enable",
+   "args": {"enabled": false},
+   "await_event": [{"eid": "542b", "timeout_s": 75}]},
+  {"at": 140, "name": "codes on", "do": "platform.timecode.enable",
+   "args": {"enabled": true},
+   "await_event": [{"eid": "1429", "timeout_s": 10}]}],
+ "teardown": [{"do": "platform.power.off"}]}

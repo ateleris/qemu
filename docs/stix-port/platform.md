@@ -135,3 +135,50 @@ binary older than 21f898484f: that binary would write a plain 16.5 GB
 flash.
 
 Copy a flash only with `cp --sparse=always`.
+
+## Scenarios and `mode = "run"` (PL-5)
+
+A scenario is a JSON file (`api: 1`) in `scripts/stix/platform/scenarios/`
+(or `[run] scenario_dir`): JSON plus whole-line `#` comments (the SPDX
+tag), as in the fault catalogue. The runner is `stixplat/scenario.py`.
+
+- **Timing**: `at` counts from T0, the sim time after the step that runs
+  `platform.power.boot` (else the end of setup); `after` counts from the
+  previous step that runs in this variant. All timeouts and windows are
+  sim (bench) time, so a frozen bench does not time out.
+- **Checks** arm before the step's verb runs, so a reaction that comes
+  back during the verb is not lost: `await_tm` (a probe spec with
+  `@timeout` or `{tm, timeout_s}`), `await_event` (`{eid, data,
+  timeout_s}`, `data` a hex prefix of the parameters), `await_uart`,
+  `await_state` (`{path, eq|ne|lt|gt|within|in_set|changed|stable_for,
+  timeout_s}`), `assert_no_tm`, `assert_no_event` (armed to the end or
+  for `for_s`), `assert_silence` (`{after_s, for_s}`: no TM unit),
+  `expect_cuc` (`{apid, within_s|outside_s, timeout_s}`: the APID's next
+  CUC against the platform OBT). `assert_consistent` is an error until
+  PL-8.
+- **Variants**: `variants` names them; a step with `variants` (globs)
+  runs only in those. `config` and `variant_config` may set a small
+  whitelist (`scenario.CONFIG_ALLOWED`); anything else is a scenario
+  error.
+- **Verdicts**: pass, fail, timeout (a check), error. Each check and
+  step is logged as an `expect` record on `scenario.<name>.s<i>`, the
+  end on `scenario.<name>`, with the seq range as evidence.
+
+Interactive: `scenario.run {file, variant}` (the file must lie in the
+scenario dir; 409 while one runs) and `scenario.abort`; `/status` shows
+`scenario`.
+
+`mode = "run"` (`stixplat.py --config c.toml --scenario f.json
+[--variant glob]`): every scenario is validated first, then each variant
+runs in its own controller, QEMU and fresh run dir
+`<run_root>/runs/<stamp>-<name>[.<variant>]/`. Reports:
+`<run_root>/reports/<stamp>/` with `<name>.json` (the result), the log
+slice `<name>.jsonl`, `summary.json` and `summary.txt`. Exit 0 all
+pass, 1 a fail, 2 a scenario/config error, 3 infrastructure (the worst
+wins). Retention runs at the end.
+
+The gate scenarios: `gate-spw-link` (nominal, fault_no_recovery,
+fault_with_recovery), `gate-keepalive` (the NOMINAL-entry re-arm, R1),
+`gate-timesync` (aligned, mismatch), the optional `gate-timecode-loss`,
+and `gate-negative`, which must fail with exactly one unmatched await
+(`tests/run-smoke.sh` checks both).
