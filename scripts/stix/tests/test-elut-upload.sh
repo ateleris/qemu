@@ -57,7 +57,8 @@ for subcol in range(32):
             e[0] = 0
         if variant == "edge4096" and (subcol, pix) == (31, 11):
             e[30] = 4096
-        row = ["900.5", "0.11", str(pix_cell), str(subcol)] + [str(x) for x in e]
+        row = ["900.5", "0.11", str(pix_cell), str(subcol)]
+        row += [str(x) for x in e]
         if variant == "cols34":
             row = row[:34]
         lines.append(",".join(row))
@@ -89,14 +90,18 @@ for v in lf crlf; do
     fi
 done
 # the crlf variant has the leading-space preamble line, like the flight file
-grep -q '^ Channel' "$T/crlf.csv" && report "leading-space preamble present" ok ||
+if grep -q '^ Channel' "$T/crlf.csv"; then
+    report "leading-space preamble present" ok
+else
     report "leading-space preamble present" "synth lost it"
+fi
 
 # 3. bad CSVs: rc 2 and the error names the line and index space
 bad() { # variant expected-text
     synth "$1"
     local err rc
-    err="$(python3 "$TOOL" encode --csv "$T/$1.csv" --emit hex 2>&1 > /dev/null)"
+    err="$(python3 "$TOOL" encode --csv "$T/$1.csv" --emit hex \
+        2>&1 > /dev/null)"
     rc=$?
     if [ "$rc" -eq 2 ] && grep -qF -- "$2" <<< "$err"; then
         report "reject $1" ok
@@ -138,7 +143,8 @@ for pix in range(4):
 print(app.hex())
 EOF
 )"
-first="$(python3 "$TOOL" encode --csv "$T/lf.csv" --emit hex 2> /dev/null | head -1)"
+first="$(python3 "$TOOL" encode --csv "$T/lf.csv" --emit hex 2> /dev/null |
+    head -1)"
 first="${first// /}"
 first="${first,,}"
 # 40020000 1DAC C010 00D7 19 ED 07 00 | app | CRC
@@ -162,11 +168,24 @@ if [ "${#A[@]}" -eq $((97 * 8)) ] &&
         [ "${A[$((95 * 8 + 1))]}" = "121.25" ] &&
         [ "${A[$((96 * 8 + 1))]}" = "127" ] &&
         [ "${A[$((96 * 8 + 3))]}" = "$APPLY_HEX" ] &&
-        [ "${APPLY_HEX:0:50}" = "40 02 00 00 1D AC C0 70 00 08 19 ED 08 00 03 00 01" ] &&
+        [ "${APPLY_HEX:0:50}" = \
+            "40 02 00 00 1D AC C0 70 00 08 19 ED 08 00 03 00 01" ] &&
         [ "${A[$((96 * 8 + 7))]}" = "0x5A1:1:7:1DACC070@38" ]; then
     report "probe-args layout" ok
 else
     report "probe-args layout" "n=${#A[@]} [0..7]=${A[*]:0:8} last=${A[*]: -8}"
+fi
+
+# --no-apply (elut-smoke --negative): the 96 TC(237,7) groups only
+mapfile -t A < <(python3 "$TOOL" encode --csv "$T/lf.csv" --no-apply \
+    --emit probe-args 2> /dev/null)
+nh="$(python3 "$TOOL" encode --csv "$T/lf.csv" --no-apply --emit hex \
+    2> /dev/null | wc -l)"
+if [ "${#A[@]}" -eq $((96 * 8)) ] && [ "$nh" -eq 96 ] &&
+        ! printf '%s\n' "${A[@]}" | grep -q 'ED 08'; then
+    report "--no-apply leaves out TC(237,8)" ok
+else
+    report "--no-apply leaves out TC(237,8)" "args=${#A[@]} hex=$nh"
 fi
 
 # 6. check-dump exit codes

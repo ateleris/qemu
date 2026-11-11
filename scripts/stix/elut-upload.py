@@ -490,10 +490,14 @@ def self_test():
     # 1. CRC: the four nominal-smoke units rebuild byte for byte
     def t1():
         want = {
-            (1, 236, 1, "0400"): "40 02 00 00 1D AC C0 01 00 07 19 EC 01 00 04 00 4A C1",
-            (2, 236, 6, "07040000"): "40 02 00 00 1D AC C0 02 00 09 19 EC 06 00 07 04 00 00 AF BA",
-            (3, 236, 1, "0500"): "40 02 00 00 1D AC C0 03 00 07 19 EC 01 00 05 00 BF 97",
-            (4, 17, 1, ""): "40 02 00 00 1D AC C0 04 00 05 19 11 01 00 16 B8",
+            (1, 236, 1, "0400"):
+                "40 02 00 00 1D AC C0 01 00 07 19 EC 01 00 04 00 4A C1",
+            (2, 236, 6, "07040000"):
+                "40 02 00 00 1D AC C0 02 00 09 19 EC 06 00 07 04 00 00 AF BA",
+            (3, 236, 1, "0500"):
+                "40 02 00 00 1D AC C0 03 00 07 19 EC 01 00 05 00 BF 97",
+            (4, 17, 1, ""):
+                "40 02 00 00 1D AC C0 04 00 05 19 11 01 00 16 B8",
         }
         for (seq, svc, sub, app), hexs in want.items():
             got = unit_hex(tc_unit(seq, svc, sub, bytes.fromhex(app)))
@@ -697,6 +701,8 @@ def main(argv=None):
     enc.add_argument("--apply-window", type=float, default=38.0)
     enc.add_argument("--emit", choices=("probe-args", "hex"),
                      default="probe-args")
+    enc.add_argument("--no-apply", action="store_true",
+                     help="leave out TC(237,8) (elut-smoke --negative)")
     chk = sub.add_parser("check-dump")
     chk.add_argument("--csv")
     chk.add_argument("--dump", required=True)
@@ -737,8 +743,11 @@ def main(argv=None):
     units = elut_units(rows, args.first_seq)
     seq_apply = args.first_seq + N_ELUT_TCS
     apply = apply_unit(args.lut_id, seq_apply)
+    if args.no_apply:
+        print("no TC(237,8): the upload is not applied or stored",
+              file=sys.stderr)
     if args.emit == "hex":
-        for u in units + [apply]:
+        for u in units + ([] if args.no_apply else [apply]):
             print(unit_hex(u))
         return 0
     out = []
@@ -749,10 +758,12 @@ def main(argv=None):
                 "--expect", "0x5A1:1:1:%s@%s" % (a, fmt_t(args.ack_window)),
                 "--expect", "0x5A1:1:7:%s@%s" % (a, fmt_t(args.ack_window))]
     a = ack_data(seq_apply)
-    out += ["--send-at", fmt_t(args.t0 + args.pace * N_ELUT_TCS + 5),
-            "--send-hex", unit_hex(apply),
-            "--expect", "0x5A1:1:1:%s@%s" % (a, fmt_t(args.ack_window)),
-            "--expect", "0x5A1:1:7:%s@%s" % (a, fmt_t(args.apply_window))]
+    if not args.no_apply:
+        out += ["--send-at", fmt_t(args.t0 + args.pace * N_ELUT_TCS + 5),
+                "--send-hex", unit_hex(apply),
+                "--expect", "0x5A1:1:1:%s@%s" % (a, fmt_t(args.ack_window)),
+                "--expect",
+                "0x5A1:1:7:%s@%s" % (a, fmt_t(args.apply_window))]
     print("\n".join(out))
     return 0
 
