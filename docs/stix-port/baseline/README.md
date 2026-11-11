@@ -107,7 +107,9 @@ REPAIRED old model.
     its trace log); a FAIL or ERROR keeps everything.
   - **Disk guard, every mode:** a gate exits 2 before starting QEMU when
     `df /mnt/c` (the Windows disk behind the WSL VHDX, which never
-    shrinks) shows less than `STIX_DISK_MIN_GB` (3) GB free.
+    shrinks) shows less than `STIX_DISK_MIN_GB` (3) GB free, or when
+    `/mnt/c` is not mounted. `--dry-run`, `--check-guard` and the
+    ELF-absent SKIP skip it and take no slot lock.
   - The qtest suite: `scripts/stix/qt.sh [test-name]` builds, takes a
     slot and runs the suite or one test; `scripts/stix/qt.sh --baseline`
     runs the 5.2 wrapper in slot 0 (see step 3), for non-flash tests

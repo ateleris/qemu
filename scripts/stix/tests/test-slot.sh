@@ -430,6 +430,55 @@ check "cleanup: FAIL keeps everything" $? "$(ls "$WORK/run")"
 [ -e "$WORK/run/flash.bin" ]
 check "cleanup: a legacy PASS keeps everything" $? "$(ls "$WORK/run")"
 
+# --- review NITs: peek mode, the /mnt/c mountpoint, stix_slot_dir / ---
+# peek (dry-run / check-guard / SKIP paths): no lock, no wait, no guard
+hold 1
+out="$(helper 'stix_slot_setup peek; echo "$STIX_SLOT $TMTC_PORT"' \
+    STIX_PORT_BASE=auto STIX_DF_CMD="$WORK/df-low")"
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(echo "$out" | tail -1)" = "2 $((UIDB + 200))" ] &&
+    ! is_held 2
+check "peek: auto skips a held slot, takes no lock, no disk guard" $? \
+    "rc=$rc: $out"
+hold 2
+hold 3
+t0=$SECONDS
+out="$(helper 'stix_slot_setup peek; echo "$STIX_SLOT"' \
+    STIX_PORT_BASE=auto STIX_SLOT_WAIT=30)"
+rc=$?
+[ "$rc" -eq 0 ] && [ $((SECONDS - t0)) -lt 5 ] &&
+    [ "$(echo "$out" | tail -1)" = 1 ]
+check "peek: all slots held => no wait (slot 1 shown)" $? "rc=$rc: $out"
+out="$(helper 'stix_slot_setup peek; echo "$STIX_SLOT"' STIX_PORT_BASE=3)"
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(echo "$out" | tail -1)" = 3 ]
+check "peek: a held slot number is not refused" $? "rc=$rc: $out"
+release_all
+out="$(helper 'stix_slot_setup peek; echo REACHED' STIX_DF_CMD="$WORK/df-low")"
+[ "$(echo "$out" | tail -1)" = REACHED ]
+check "peek: legacy, no disk guard" $? "$out"
+out="$(helper 'stix_slot_setup peek' STIX_PORT_BASE=auto STIX_SLOTS=9)"
+rc=$?
+[ "$rc" -eq 2 ]
+check "peek: still refuses a bad STIX_SLOTS" $? "rc=$rc: $out"
+# the disk guard refuses an unmounted /mnt/c instead of measuring /
+mkdir -p "$WORK/not-a-mount"
+out="$(helper 'stix_disk_guard; echo REACHED' STIX_MNT_C="$WORK/not-a-mount")"
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "not a mountpoint"
+check "disk guard: /mnt/c present but not mounted => exit 2" $? \
+    "rc=$rc: $out"
+out="$(helper 'stix_disk_guard; echo REACHED' STIX_MNT_C="$WORK/no-such")"
+[ "$out" = REACHED ]
+check "disk guard: no /mnt/c at all (not WSL) => measures /tmp" $? "$out"
+for d in / //; do
+    out="$(helper "stix_slot_setup > /dev/null; stix_slot_dir '$d'
+        echo REACHED" STIX_PORT_BASE=1)"
+    rc=$?
+    [ "$rc" -eq 2 ] && ! echo "$out" | grep -q REACHED
+    check "stix_slot_dir '$d' is refused" $? "rc=$rc: $out"
+done
+
 # --- scripts/stix/qt.sh with a fake build and a fake suite ---
 QT="$REPO_ROOT/scripts/stix/qt.sh"
 # the fake suite reports what it sees: its slot base, whether that slot's

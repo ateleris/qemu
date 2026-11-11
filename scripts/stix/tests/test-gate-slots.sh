@@ -361,6 +361,58 @@ for sc in nominal-smoke.sh fault-smoke.sh detector-smoke.sh; do
         "$(grep -n -A3 '^rm -f flash.bin' "$S/$sc")"
 done
 
+# NIT: dry-run / check-guard / ELF-absent SKIP boot nothing, so they take
+# no slot lock, never wait for one and skip the disk guard
+GS="${STIX_GATES_DIR:-$S}"
+printf '#!/bin/sh\necho Avail\necho 1024\n' > "$W/df-low"
+chmod +x "$W/df-low"
+mkdir -p "$W/locks"
+PEEKH=()
+for k in 1 2 3; do
+    flock -o "$W/locks/stix-qtest-$((UIDB + 100 * k)).lock" sleep 300 \
+        > /dev/null 2>&1 < /dev/null &
+    PEEKH+=($!)
+done
+sleep 0.3
+for sc in nominal-smoke.sh fault-smoke.sh detector-smoke.sh; do
+    for a in --dry-run --check-guard; do
+        t0=$SECONDS
+        out="$(env STIX_PORT_BASE=auto STIX_SLOT_LOCK_DIR="$W/locks" \
+            STIX_SLOT_WAIT=20 STIX_DF_CMD="$W/df-low" \
+            STIX_NOMINAL_RUN_DIR="$W/pk" STIX_FAULT_RUN_DIR="$W/pk" \
+            STIX_DETECTOR_RUN_DIR="$W/pk" \
+            timeout 60 bash "$GS/$sc" "$FAKE" "$a" 2>&1)"
+        rc=$?
+        [ "$rc" -eq 0 ] && [ $((SECONDS - t0)) -lt 10 ]
+        check "peek: $sc $a, all slots held, low disk: no wait, exit 0" $? \
+            "rc=$rc t=$((SECONDS - t0)): $out"
+    done
+done
+t0=$SECONDS
+out="$(env STIX_PORT_BASE=auto STIX_SLOT_LOCK_DIR="$W/locks" \
+    STIX_SLOT_WAIT=20 STIX_DF_CMD="$W/df-low" STIX_RUN_DIR="$W/pk" \
+    timeout 60 bash "$GS/tc-smoke.sh" "$FAKE" --dry-run 2>&1)"
+rc=$?
+[ "$rc" -eq 0 ] && [ $((SECONDS - t0)) -lt 10 ]
+check "peek: tc-smoke.sh --dry-run, all slots held, low disk: no wait" $? \
+    "rc=$rc t=$((SECONDS - t0)): $out"
+t0=$SECONDS
+out="$(env STIX_PORT_BASE=auto STIX_SLOT_LOCK_DIR="$W/locks" \
+    STIX_SLOT_WAIT=20 STIX_DF_CMD="$W/df-low" \
+    STIX_NOMINAL_RUN_DIR="$W/pk" STIX_ASW_ELF="$W/no-such.elf" \
+    timeout 60 bash "$GS/nominal-smoke.sh" "$FAKE" 2>&1)"
+rc=$?
+[ "$rc" -eq 0 ] && [ $((SECONDS - t0)) -lt 10 ] && echo "$out" | grep -q SKIP
+check "peek: nominal-smoke ELF-absent SKIP: no wait, no disk guard" $? \
+    "rc=$rc t=$((SECONDS - t0)): $out"
+out="$(env STIX_PORT_BASE=auto STIX_SLOT_LOCK_DIR="$W/locks" \
+    STIX_SLOT_WAIT=1 STIX_DF_CMD="$W/df-low" STIX_NOMINAL_RUN_DIR="$W/pk" \
+    timeout 60 bash "$GS/nominal-smoke.sh" "$FAKE" 2>&1)"
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "disk guard"
+check "peek: a real nominal run still runs the disk guard" $? "rc=$rc: $out"
+for p in "${PEEKH[@]}"; do kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
+
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

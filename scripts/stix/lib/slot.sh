@@ -69,23 +69,31 @@ stix_slot_check_gs() { # highest slot index in use
     done
 }
 
-# The number of held slot locks in 0..STIX_SLOTS other than our own, read
-# from /proc/locks without taking (or probing) any lock.
-stix_slot_busy() {
-    local n=0 k f id t
-    local held
+# 0 if slot k's lock is held by anyone, read from /proc/locks without
+# taking (or probing) the lock.
+stix_slot_held() { # k
+    local f id t held
+    f="$(stix_slot_lock "$1")"
+    [ -e "$f" ] || return 1
     held=" $(awk '$2 == "FLOCK" { printf "%s ", $6 }' /proc/locks 2>/dev/null)"
+    # /proc/locks names a file as MAJOR:MINOR:INODE, the device numbers in
+    # %02x (fs/locks.c); stat %d is the encoded st_dev
+    read -r -a t <<< "$(stat -L -c '%d %i' "$f" 2>/dev/null)" || return 1
+    [ "${#t[@]}" -eq 2 ] || return 1
+    id="$(printf '%02x:%02x:%s' $(((t[0] >> 8) & 0xfff)) \
+        $(((t[0] & 0xff) | ((t[0] >> 12) & 0xfff00))) "${t[1]}")"
+    case "$held" in *" $id "*) return 0 ;; esac
+    return 1
+}
+
+# The number of held slot locks in 0..STIX_SLOTS other than our own.
+stix_slot_busy() {
+    local n=0 k
     for ((k = 0; k <= ${STIX_SLOTS:-3}; k++)); do
         [ "$k" -ne "$STIX_SLOT" ] || [ "$STIX_SLOT_MODE" -eq 0 ] || continue
-        f="$(stix_slot_lock "$k")"
-        [ -e "$f" ] || continue
-        # /proc/locks names a file as MAJOR:MINOR:INODE, the device
-        # numbers in %02x (fs/locks.c); stat %d is the encoded st_dev
-        read -r -a t <<< "$(stat -L -c '%d %i' "$f" 2>/dev/null)" || continue
-        [ "${#t[@]}" -eq 2 ] || continue
-        id="$(printf '%02x:%02x:%s' $(((t[0] >> 8) & 0xfff)) \
-            $(((t[0] & 0xff) | ((t[0] >> 12) & 0xfff00))) "${t[1]}")"
-        case "$held" in *" $id "*) n=$((n + 1)) ;; esac
+        if stix_slot_held "$k"; then
+            n=$((n + 1))
+        fi
     done
     echo "$n"
 }
@@ -105,10 +113,17 @@ stix_slot_try() { # k -> 0 if its lock is now held on STIX_SLOT_FD
 # The free space guard (D-G7): the real limit is the Windows host C:.
 stix_disk_guard() {
     local min_gb="${STIX_DISK_MIN_GB:-3}" df_cmd avail
+    local mnt="${STIX_MNT_C:-/mnt/c}"
     if [ -n "${STIX_DF_CMD:-}" ]; then
         df_cmd="$STIX_DF_CMD"
-    elif [ -d /mnt/c ]; then
-        df_cmd="df --output=avail /mnt/c"
+    elif [ -e "$mnt" ]; then
+        # an unmounted /mnt/c would measure / (the VHDX), not C:
+        if ! mountpoint -q "$mnt"; then
+            echo "disk guard: $mnt is not a mountpoint; cannot see the" \
+                "Windows disk's free space"
+            exit 2
+        fi
+        df_cmd="df --output=avail $mnt"
     else
         df_cmd="df --output=avail /tmp"
     fi
@@ -127,9 +142,16 @@ stix_disk_guard() {
 
 # Parse STIX_PORT_BASE, take the slot and set TMTC_PORT. Runs the disk
 # guard in every mode. Exits 2 on any refusal.
-stix_slot_setup() {
+#
+# "peek" is for paths that boot nothing (--dry-run, --check-guard, the
+# ELF-absent SKIP): it sets the same variables but takes no lock, never
+# waits and skips the disk guard. auto shows the first slot not held
+# right now (slot 1 when all are), a number is shown even when held.
+stix_slot_setup() { # [peek]
     local req="${STIX_PORT_BASE:-}" n="${STIX_SLOTS:-3}" k waited
-    stix_disk_guard
+    local peek=0
+    [ "${1:-}" != peek ] || peek=1
+    [ "$peek" -eq 1 ] || stix_disk_guard
     if [ -z "$req" ]; then
         TMTC_PORT=$((20000 + $(id -u)))
         return 0
@@ -139,7 +161,13 @@ stix_slot_setup() {
             echo "slot: STIX_SLOTS must be a positive integer (got: $n)"
             exit 2 ;;
     esac
-    if [ "$req" = auto ]; then
+    if [ "$req" = auto ] && [ "$peek" -eq 1 ]; then
+        stix_slot_check_gs "$n" || exit 2
+        for ((k = 1; k <= n; k++)); do
+            stix_slot_held "$k" || break
+        done
+        [ "$k" -le "$n" ] || k=1
+    elif [ "$req" = auto ]; then
         stix_slot_check_gs "$n" || exit 2
         waited=0
         while :; do
@@ -165,7 +193,7 @@ stix_slot_setup() {
         esac
         k="$req"
         stix_slot_check_gs "$k" || exit 2
-        if ! stix_slot_try "$k"; then
+        if [ "$peek" -eq 0 ] && ! stix_slot_try "$k"; then
             echo "slot: slot $k is held ($(stix_slot_lock "$k"))"
             exit 2
         fi
@@ -184,6 +212,10 @@ stix_slot_setup() {
 
 # The run dir for this mode: unchanged in legacy, <dir>-s<k> in slot mode.
 stix_slot_dir() { # dir
+    if [ "$(realpath -m -- "$1")" = / ]; then
+        echo "slot: refusing run dir / ($1)" >&2
+        exit 2
+    fi
     if [ "$STIX_SLOT_MODE" -eq 1 ]; then
         echo "${1%/}-s$STIX_SLOT"
     else

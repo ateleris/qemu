@@ -3262,7 +3262,10 @@ att) can run their gates at the same time without the global 21000 lock.
   pre-change scripts). The one addition is the disk guard: every gate,
   legacy included, exits 2 before QEMU when `df /mnt/c` shows less than
   `STIX_DISK_MIN_GB` (3) GB free (the WSL VHDX lives on C: and never
-  shrinks).
+  shrinks). A `/mnt/c` that exists but is not a mountpoint is an error,
+  not a reason to measure `/`. Paths that boot nothing (`--dry-run`,
+  `--check-guard`, the ELF-absent SKIP) only peek at the slot: no lock,
+  no wait, no disk guard.
 - **The master flash is not copied in legacy mode.** Measured: SAFE boots
   on the already-booted master issue no page write or erase (mtime fixed
   since 2026-11-10 13:05:54, 32 blocks). Slot mode boots private sparse

@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
 # ss stand-in for the fake-QEMU tests (review S5): an empty listening
 # table, so the gates' "TMTC port busy" check passes even while another
 # track's real QEMU holds 20000+uid. Nothing in these tests binds a port.

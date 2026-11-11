@@ -94,7 +94,14 @@ PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
 # Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
 # and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
 . "$REPO_ROOT/scripts/stix/lib/slot.sh"
-stix_slot_setup
+# dry-run, check-guard and the ELF-absent SKIP boot nothing: they peek at
+# the slot (no lock, no wait, no disk guard)
+if [ "$DRY_RUN" -eq 1 ] || [ "$CHECK_GUARD" -eq 1 ] ||
+        [ ! -f "$ASW_ELF" ]; then
+    stix_slot_setup peek
+else
+    stix_slot_setup
+fi
 RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 
 # The shared flashes must never be touched (review M1): a NOMINAL entry
