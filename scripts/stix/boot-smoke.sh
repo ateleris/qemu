@@ -4,7 +4,9 @@
 #
 # Usage: boot-smoke.sh <qemu-binary> [--with-tm]
 #   (STIX_ASW_ELF overrides the default ELF path; unset + absent => SKIP)
-#   (STIX_RUN_DIR overrides the run directory; STIX_SMOKE_SECONDS the window)
+#   (STIX_RUN_DIR overrides the run directory; STIX_SMOKE_SECONDS the window;
+#   STIX_TMTC_PROBE the TM probe script; STIX_PORT_BASE the slot, see
+#   scripts/stix/lib/slot.sh: slot mode boots a private copy of the flash)
 #
 # Exit codes: 0 pass (or SKIP), 1 diff, 2 environment problem.
 set -euo pipefail
@@ -36,14 +38,19 @@ grep -q "icount: none" "$GOLDEN_DIR/run-flags.txt" || {
     echo "run-flags.txt drifted from the pinned no-icount golden"; exit 2; }
 
 # The TMTC server binds 20000+getuid() (e.g. 21000 for uid 1000).
-TMTC_PORT=$((20000 + $(id -u)))
+# Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
+# and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
+. "$REPO_ROOT/scripts/stix/lib/slot.sh"
+stix_slot_setup
+RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
-    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?"
+    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?${STIX_SLOT_TAG}"
     exit 2
 fi
 
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
+stix_flash_private
 [ -f flash.bin ] || { echo "flash.bin missing — run capture-golden.sh first"; exit 2; }
 
 # Stale outputs from a previous run must never satisfy this smoke.
@@ -53,6 +60,7 @@ rc=0
 timeout "$DURATION" "$QEMU_BIN" \
     -M leon3_generic -m 64M -no-reboot \
     -display none -monitor none \
+    "${STIX_SLOT_QEMU_ARGS[@]}" \
     -serial file:"$RUN_DIR/uart.smoke.raw" \
     -kernel "$ASW_ELF" > qemu-stdout.smoke.log 2>&1 || rc=$?
 # rc 124 = the run simply reached the time limit: the normal end of a
@@ -83,9 +91,9 @@ cut_boot uart.golden.norm > uart.golden.boot
 cut_boot uart.smoke.norm > uart.smoke.boot
 
 if diff -u uart.golden.boot uart.smoke.boot; then
-    echo "BOOT SMOKE: PASS (normalized UART matches golden)"
+    echo "BOOT SMOKE: PASS (normalized UART matches golden)${STIX_SLOT_TAG}"
 else
-    echo "BOOT SMOKE: FAIL (diff above)"
+    echo "BOOT SMOKE: FAIL (diff above)${STIX_SLOT_TAG}"
     exit 1
 fi
 
@@ -94,21 +102,24 @@ fi
 # asserts non-empty telemetry with the CCSDS-looking header byte 0x49.
 if [ "${2:-}" = "--with-tm" ] || [ "${STIX_WITH_TM:-}" = "1" ]; then
     rm -f tm.smoke.log
-    ( timeout 60 python3 "$REPO_ROOT/scripts/stix/tmtc-probe.py" \
+    ( timeout 60 python3 "${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}" \
         --port "$TMTC_PORT" --seconds 40 > tm.smoke.log 2>&1 ) &
     PROBE_PID=$!
     sleep 1
     tmrc=0
     timeout 45 "$QEMU_BIN" -M leon3_generic -m 64M -no-reboot \
         -display none -monitor none -serial file:/dev/null \
+        "${STIX_SLOT_QEMU_ARGS[@]}" \
         -kernel "$ASW_ELF" > /dev/null 2>&1 || tmrc=$?
     if [ "$tmrc" -ne 0 ] && [ "$tmrc" -ne 124 ]; then
-        echo "TM CHECK: QEMU exited with rc=$tmrc"; exit 2
+        echo "TM CHECK: QEMU exited with rc=$tmrc${STIX_SLOT_TAG}"; exit 2
     fi
     wait $PROBE_PID || true
     if grep -Eq '\+ *[0-9]+B 49' tm.smoke.log; then
-        echo "TM CHECK: PASS (telemetry observed on port $TMTC_PORT)"
+        echo "TM CHECK: PASS (telemetry observed on port $TMTC_PORT)${STIX_SLOT_TAG}"
     else
-        echo "TM CHECK: FAIL"; cat tm.smoke.log; exit 1
+        echo "TM CHECK: FAIL${STIX_SLOT_TAG}"; cat tm.smoke.log; exit 1
     fi
 fi
+# every failure exited above: slot mode drops the private flash
+stix_slot_cleanup 0 flash.bin

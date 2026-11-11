@@ -29,8 +29,19 @@ ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
 DURATION=90
 
+# The one intended writer of the master flash: slot mode (STIX_PORT_BASE,
+# scripts/stix/lib/slot.sh) never opens the shared flash, so it is
+# refused here, and the flags recorded below never change.
+if [ -n "${STIX_PORT_BASE:-}" ]; then
+    echo "capture-golden.sh refuses slot mode (STIX_PORT_BASE=$STIX_PORT_BASE):" \
+        "it writes the master flash; unset STIX_PORT_BASE"
+    exit 2
+fi
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/slot.sh"
+
 [ -x "$QEMU_BIN" ] || { echo "not executable: $QEMU_BIN"; exit 2; }
 [ -f "$ASW_ELF" ] || { echo "ASW ELF missing: $ASW_ELF"; exit 2; }
+stix_disk_guard
 
 # The TMTC server binds 20000+getuid(); refuse to run if it is taken.
 TMTC_PORT=$((20000 + $(id -u)))
@@ -46,6 +57,11 @@ cd "$RUN_DIR"
 if [ "$RUN_DIR" = /tmp/stix-baseline-run ]; then
     echo "refusing to run in the frozen v11.1 reference dir $RUN_DIR"; exit 2
 fi
+# Exclusive against the slot-mode copies (stix_flash_private takes it
+# shared): no copy is taken while this run writes the master.
+exec {FLASH_LOCK_FD}>> .flash.lock
+flock -x -w 60 "$FLASH_LOCK_FD" || {
+    echo "the flash lock $RUN_DIR/.flash.lock is busy (a slot-mode copy?)"; exit 2; }
 [ -f flash.bin ] || echo "flash.bin absent: the model creates it (sparse, inverted; D-I)"
 
 echo "Capturing golden artifacts (${DURATION}s)..."

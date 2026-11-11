@@ -5,9 +5,22 @@
 # 0.5 s until killed or FAKE_QEMU_RUN_SECONDS elapse (heartbeat), or
 # appends for FAKE_QEMU_FREEZE_AFTER seconds and then stays alive but
 # silent — a hung guest (freeze).
+#
+# FAKE_QEMU_ARGV_FILE, when set, gets one record per invocation appended:
+# "argv:" plus the arguments one per line, "cwd: <dir>" and
+# "flash-inode: <inode of ./flash.bin, or none>", then "end".
 set -u
 MODE="${FAKE_QEMU_MODE:-good}"
 SELF="$(readlink -f "$0")"
+if [ -n "${FAKE_QEMU_ARGV_FILE:-}" ]; then
+    {
+        echo "argv:"
+        printf '%s\n' "$@"
+        echo "cwd: $(pwd)"
+        echo "flash-inode: $(stat -c %i flash.bin 2>/dev/null || echo none)"
+        echo "end"
+    } >> "$FAKE_QEMU_ARGV_FILE"
+fi
 SERIAL_OUT=""
 prev=""
 for a in "$@"; do

@@ -31,6 +31,8 @@
 #                                multiple of SLICE
 #   STIX_TMTC_PROBE              TM probe script (tests substitute a fake)
 #   STIX_SOAK_MARGIN (30)        gap between window end and the end of the run
+#   STIX_PORT_BASE               the slot (scripts/stix/lib/slot.sh); slot
+#                                mode boots a private copy of the flash
 #
 # Exit codes: 0 pass, 1 TM heartbeat stopped (no TM chunk in some slice),
 #             2 environment problem, QEMU crash, or QEMU exited early.
@@ -60,14 +62,19 @@ QEMU_BIN="$(realpath -e "$QEMU_BIN_ARG")" || {
 [ -x "$QEMU_BIN" ] || { echo "not executable: $QEMU_BIN"; exit 2; }
 [ -f "$ASW_ELF" ] || { echo "ASW ELF missing: $ASW_ELF"; exit 2; }
 
-TMTC_PORT=$((20000 + $(id -u)))
+# Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
+# and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
+. "$REPO_ROOT/scripts/stix/lib/slot.sh"
+stix_slot_setup
+RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
-    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?"
+    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?${STIX_SLOT_TAG}"
     exit 2
 fi
 
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
+stix_flash_private
 [ -f flash.bin ] || { echo "flash.bin missing — run capture-golden.sh first"; exit 2; }
 rm -f uart.soak.raw tm.soak-probe.log qemu-stdout.soak.log
 : > uart.soak.raw
@@ -99,6 +106,7 @@ PROBE_PID=$!
 timeout "$((SECONDS_TOTAL + 60))" "$QEMU_BIN" \
     -M leon3_generic -m 64M -no-reboot \
     -display none -monitor none \
+    "${STIX_SLOT_QEMU_ARGS[@]}" \
     -serial file:"$RUN_DIR/uart.soak.raw" \
     -kernel "$ASW_ELF" > qemu-stdout.soak.log 2>&1 &
 QEMU_PID=$!
@@ -123,7 +131,8 @@ qemu_ended_early() {
     local rc=0
     wait "$QEMU_PID" || rc=$?
     QEMU_PID=""
-    echo "SOAK: FAIL — QEMU exited rc=$rc before the ${SECONDS_TOTAL}s limit. Tail:"
+    echo "SOAK: FAIL — QEMU exited rc=$rc before the ${SECONDS_TOTAL}s" \
+        "limit.${STIX_SLOT_TAG} Tail:"
     tail -5 qemu-stdout.soak.log
     echo "UART tail:"
     tail -3 uart.soak.raw | tr -d '\000'
@@ -156,7 +165,8 @@ for ((i = 1; i <= N_SLICES; i++)); do
     TM_PREV="$TM_NOW"
     SLICE_COUNTS="$SLICE_COUNTS $NEW_CHUNKS"
     if [ "$NEW_CHUNKS" -eq 0 ]; then
-        echo "SOAK: FAIL — TM heartbeat stopped: no TM in slice ${i}/${N_SLICES} (${SLICE_START}s..${SLICE_END}s after start)"
+        echo "SOAK: FAIL — TM heartbeat stopped: no TM in slice ${i}/${N_SLICES}" \
+            "(${SLICE_START}s..${SLICE_END}s after start)${STIX_SLOT_TAG}"
         echo "TM probe log tail:"
         tail -5 tm.soak-probe.log
         exit 1
@@ -182,4 +192,8 @@ done
 # healthy guest can have a silent UART (the once-per-second watchdog error
 # print is gone). The TM gate above is the liveness verdict.
 TM_TOTAL=$(grep '^# total' tm.soak-probe.log 2>/dev/null | awk '{print $3}' || true)
-echo "SOAK: PASS (${SECONDS_TOTAL}s; TM chunks/slice:${SLICE_COUNTS}  — ${N_SLICES} slices of ${SLICE}s; UART grew $SIZE_START -> $SIZE_END bytes in the ${WINDOW}s window; probe TM total ${TM_TOTAL:-none} bytes)"
+echo "SOAK: PASS (${SECONDS_TOTAL}s; TM chunks/slice:${SLICE_COUNTS}  —" \
+    "${N_SLICES} slices of ${SLICE}s; UART grew $SIZE_START -> $SIZE_END" \
+    "bytes in the ${WINDOW}s window; probe TM total ${TM_TOTAL:-none}" \
+    "bytes)${STIX_SLOT_TAG}"
+stix_slot_cleanup 0 flash.bin

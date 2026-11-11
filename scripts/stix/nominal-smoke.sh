@@ -53,6 +53,8 @@
 #                            /tmp/stix-baseline-run is refused: those
 #                            flashes must never see a NOMINAL entry.
 #   STIX_NOMINAL_SECONDS     the probe's --seconds (default 190)
+#   STIX_PORT_BASE           the slot (scripts/stix/lib/slot.sh): its port
+#                            and the run dir <dir>-s<k>
 #   --dry-run prints the QEMU and probe command lines, boots nothing.
 #   --check-guard only runs the run-dir guard and exits 0/2.
 #
@@ -87,7 +89,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_NOMINAL_RUN_DIR:-/tmp/stix-nominal-run}"
 DURATION="${STIX_NOMINAL_SECONDS:-190}"
 PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
-TMTC_PORT=$((20000 + $(id -u)))
+# Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
+# and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
+. "$REPO_ROOT/scripts/stix/lib/slot.sh"
+stix_slot_setup
+RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 
 # The shared flashes must never be touched (review M1): a NOMINAL entry
 # writes a flash context, and the old plain string compare was bypassed
@@ -206,7 +212,8 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY RUN — the commands nominal-smoke would run (negative=$NEGATIVE):"
     echo "(cd $RUN_DIR && timeout $((DURATION + 30)) $QEMU_BIN \
--M leon3_generic -m 64M -no-reboot -display none -monitor none \
+-M leon3_generic -m 64M -no-reboot -display none -monitor none\
+${STIX_SLOT_QEMU_ARGS[*]:+ ${STIX_SLOT_QEMU_ARGS[*]}} \
 -serial file:$RUN_DIR/uart.nominal.raw -kernel $ASW_ELF \
 -trace stixdet_idefx_cmd > qemu-stdout.nominal.log 2>&1)"
     printf 'python3 -u %s ' "$PROBE"
@@ -223,7 +230,7 @@ fi
 command -v gawk > /dev/null || { echo "gawk is required"; exit 2; }
 
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
-    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?"
+    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?${STIX_SLOT_TAG}"
     exit 2
 fi
 
@@ -260,6 +267,7 @@ PROBE_PID=$!
 timeout "$((DURATION + 30))" "$QEMU_BIN" \
     -M leon3_generic -m 64M -no-reboot \
     -display none -monitor none \
+    "${STIX_SLOT_QEMU_ARGS[@]}" \
     -serial file:"$RUN_DIR/uart.nominal.raw" \
     -kernel "$ASW_ELF" -trace stixdet_idefx_cmd \
     > qemu-stdout.nominal.log 2>&1 &
@@ -283,17 +291,19 @@ set -e
 # the verdict line is always the last thing the gate prints.
 if [ "$QEMU_ALIVE" -ne 0 ]; then
     tail -5 qemu-stdout.nominal.log
-    echo "NOMINAL-SMOKE: ERROR (QEMU died or never started; qemu rc=$QEMU_RC)"
+    echo "NOMINAL-SMOKE: ERROR (QEMU died or never started;" \
+        "qemu rc=$QEMU_RC)${STIX_SLOT_TAG}"
     exit 2
 fi
 if [ "$PROBE_RC" -eq 124 ]; then
     tail -5 nominal.probe.log
-    echo "NOMINAL-SMOKE: ERROR (the probe hit its own timeout)"
+    echo "NOMINAL-SMOKE: ERROR (the probe hit its own timeout)${STIX_SLOT_TAG}"
     exit 2
 fi
 if grep -q "could not connect" nominal.probe.log 2>/dev/null; then
     tail -5 nominal.probe.log
-    echo "NOMINAL-SMOKE: ERROR (the probe never connected; QEMU rc=$QEMU_RC)"
+    echo "NOMINAL-SMOKE: ERROR (the probe never connected;" \
+        "QEMU rc=$QEMU_RC)${STIX_SLOT_TAG}"
     exit 2
 fi
 if [ "$PROBE_RC" -ne 0 ]; then
@@ -314,7 +324,7 @@ if [ "$PROBE_RC" -ne 0 ]; then
         fi
     fi
     tail -5 nominal.probe.log
-    echo "NOMINAL-SMOKE: FAIL ($WHY)"
+    echo "NOMINAL-SMOKE: FAIL ($WHY)${STIX_SLOT_TAG}"
     exit 1
 fi
 
@@ -323,12 +333,12 @@ fi
 # UART checks, NULs stripped.
 tr -d '\000' < uart.nominal.raw > uart.nominal.txt
 if ! grep -q "init: SAFE mode" uart.nominal.txt; then
-    echo "NOMINAL-SMOKE: FAIL (the UART has no 'init: SAFE mode' banner)"
+    echo "NOMINAL-SMOKE: FAIL (the UART has no 'init: SAFE mode' banner)${STIX_SLOT_TAG}"
     exit 1
 fi
 if grep -Eq 'storing new context[01] failed' uart.nominal.txt; then
     grep -Em1 'storing new context[01] failed' uart.nominal.txt
-    echo "NOMINAL-SMOKE: FAIL (a flash context write failed)"
+    echo "NOMINAL-SMOKE: FAIL (a flash context write failed)${STIX_SLOT_TAG}"
     exit 1
 fi
 # D-2: the IDeF-X interface is modelled, so the NOMINAL-entry register
@@ -337,7 +347,7 @@ IDEFX_N="$(grep -c 'XrayDetFDIR.c:731' uart.nominal.txt || true)"
 if [ "$IDEFX_N" -ne 0 ]; then
     grep -m1 'XrayDetFDIR.c:731' uart.nominal.txt
     echo "NOMINAL-SMOKE: FAIL ($IDEFX_N IDeF-X write timeouts," \
-        "XrayDetFDIR.c:731; expected 0)"
+        "XrayDetFDIR.c:731; expected 0)${STIX_SLOT_TAG}"
     exit 1
 fi
 echo "IDeF-X write timeouts (XrayDetFDIR.c:731): 0 (expected)"
@@ -368,12 +378,13 @@ case "$IDEFX_W" in
         echo "IDeF-X delivered write address blocks:${IDEFX_W#OK}" ;;
     *)
         echo "NOMINAL-SMOKE: FAIL (IDeF-X register writes not seen at" \
-            "NOMINAL entry, want >= 32 per register:${IDEFX_W#LOW})"
+            "NOMINAL entry, want >= 32 per register:${IDEFX_W#LOW})${STIX_SLOT_TAG}"
         exit 1 ;;
 esac
+stix_slot_cleanup 0 flash.bin qemu-stdout.nominal.log
 if [ "$NEGATIVE" -eq 1 ]; then
-    echo "NOMINAL-SMOKE (negative): PASS"
+    echo "NOMINAL-SMOKE (negative): PASS${STIX_SLOT_TAG}"
 else
-    echo "NOMINAL-SMOKE: PASS"
+    echo "NOMINAL-SMOKE: PASS${STIX_SLOT_TAG}"
 fi
 exit 0

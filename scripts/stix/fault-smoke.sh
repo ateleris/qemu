@@ -92,6 +92,8 @@
 #                          The QMP socket is <run dir>/qmp.sock and its
 #                          path must stay under 108 bytes.
 #   STIX_FAULT_SECONDS     the probe's --seconds (default 250)
+#   STIX_PORT_BASE         the slot (scripts/stix/lib/slot.sh): its port
+#                          and the run dir <dir>-s<k>
 #   --dry-run prints the QEMU and probe command lines, boots nothing.
 #   --check-guard only runs the run-dir guard and exits 0/2.
 #
@@ -126,7 +128,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_FAULT_RUN_DIR:-/tmp/stix-fault-run}"
 DURATION="${STIX_FAULT_SECONDS:-250}"
 PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
-TMTC_PORT=$((20000 + $(id -u)))
+# Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
+# and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
+. "$REPO_ROOT/scripts/stix/lib/slot.sh"
+stix_slot_setup
+RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 
 # The run-dir guard of nominal-smoke.sh (review M1 there): canonical
 # first (realpath -m resolves a trailing slash, //, /., a symlink or a
@@ -275,7 +281,8 @@ PROBE_ARGS=(
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY RUN — the commands fault-smoke would run (negative=$NEGATIVE):"
     echo "(cd $RUN_DIR && timeout $((DURATION + 30)) $QEMU_BIN \
--M leon3_generic -m 64M -no-reboot -display none -monitor none \
+-M leon3_generic -m 64M -no-reboot -display none -monitor none\
+${STIX_SLOT_QEMU_ARGS[*]:+ ${STIX_SLOT_QEMU_ARGS[*]}} \
 -qmp unix:$QMP_SOCK,server=on,wait=off \
 -serial file:$RUN_DIR/uart.fault.raw -kernel $ASW_ELF \
 > qemu-stdout.fault.log 2>&1)"
@@ -291,7 +298,7 @@ fi
 }
 
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
-    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?"
+    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?${STIX_SLOT_TAG}"
     exit 2
 fi
 
@@ -327,6 +334,7 @@ PROBE_PID=$!
 timeout "$((DURATION + 30))" "$QEMU_BIN" \
     -M leon3_generic -m 64M -no-reboot \
     -display none -monitor none \
+    "${STIX_SLOT_QEMU_ARGS[@]}" \
     -qmp "unix:$QMP_SOCK,server=on,wait=off" \
     -serial file:"$RUN_DIR/uart.fault.raw" \
     -kernel "$ASW_ELF" > qemu-stdout.fault.log 2>&1 &
@@ -348,27 +356,29 @@ set -e
 # line is always the last thing the gate prints.
 if [ "$QEMU_ALIVE" -ne 0 ]; then
     tail -5 qemu-stdout.fault.log
-    echo "FAULT-SMOKE: ERROR (QEMU died or never started; qemu rc=$QEMU_RC)"
+    echo "FAULT-SMOKE: ERROR (QEMU died or never started;" \
+        "qemu rc=$QEMU_RC)${STIX_SLOT_TAG}"
     exit 2
 fi
 if [ "$PROBE_RC" -eq 124 ]; then
     tail -5 fault.probe.log
-    echo "FAULT-SMOKE: ERROR (the probe hit its own timeout)"
+    echo "FAULT-SMOKE: ERROR (the probe hit its own timeout)${STIX_SLOT_TAG}"
     exit 2
 fi
 if [ "$PROBE_RC" -eq 2 ]; then
     tail -5 fault.probe.log
-    echo "FAULT-SMOKE: ERROR (the probe rejected its arguments)"
+    echo "FAULT-SMOKE: ERROR (the probe rejected its arguments)${STIX_SLOT_TAG}"
     exit 2
 fi
 if grep -q "QMP ERROR: cannot connect" fault.probe.log 2>/dev/null; then
     tail -5 fault.probe.log
-    echo "FAULT-SMOKE: ERROR (no QMP connection; QEMU rc=$QEMU_RC)"
+    echo "FAULT-SMOKE: ERROR (no QMP connection; QEMU rc=$QEMU_RC)${STIX_SLOT_TAG}"
     exit 2
 fi
 if grep -q "could not connect" fault.probe.log 2>/dev/null; then
     tail -5 fault.probe.log
-    echo "FAULT-SMOKE: ERROR (the probe never connected; QEMU rc=$QEMU_RC)"
+    echo "FAULT-SMOKE: ERROR (the probe never connected;" \
+        "QEMU rc=$QEMU_RC)${STIX_SLOT_TAG}"
     exit 2
 fi
 
@@ -400,30 +410,32 @@ if [ "$NEGATIVE" -eq 1 ]; then
         ! grep -q 'FORBIDDEN TM: \|QMP ERROR: ' fault.probe.log; then
         tail -5 fault.probe.log
         echo "expected failure seen: not matched: $MISSED"
-        echo "FAULT-SMOKE (negative): PASS"
+        stix_slot_cleanup 0 flash.bin
+        echo "FAULT-SMOKE (negative): PASS${STIX_SLOT_TAG}"
         exit 0
     fi
     tail -5 fault.probe.log
     if [ "$PROBE_RC" -eq 0 ]; then
         echo "FAULT-SMOKE (negative): FAIL (the probe passed: the gate" \
-            "did not detect the missing reaction)"
+            "did not detect the missing reaction)${STIX_SLOT_TAG}"
     else
-        echo "FAULT-SMOKE (negative): FAIL (wrong failure: $(why_failed))"
+        echo "FAULT-SMOKE (negative): FAIL (wrong failure: $(why_failed))${STIX_SLOT_TAG}"
     fi
     exit 1
 fi
 
 if [ "$PROBE_RC" -ne 0 ]; then
     tail -5 fault.probe.log
-    echo "FAULT-SMOKE: FAIL ($(why_failed))"
+    echo "FAULT-SMOKE: FAIL ($(why_failed))${STIX_SLOT_TAG}"
     exit 1
 fi
 
 # The probe passed. The UART check, NULs stripped.
 tr -d '\000' < uart.fault.raw > uart.fault.txt
 if ! grep -q "init: SAFE mode" uart.fault.txt; then
-    echo "FAULT-SMOKE: FAIL (the UART has no 'init: SAFE mode' banner)"
+    echo "FAULT-SMOKE: FAIL (the UART has no 'init: SAFE mode' banner)${STIX_SLOT_TAG}"
     exit 1
 fi
-echo "FAULT-SMOKE: PASS"
+stix_slot_cleanup 0 flash.bin
+echo "FAULT-SMOKE: PASS${STIX_SLOT_TAG}"
 exit 0

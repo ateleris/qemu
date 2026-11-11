@@ -18,6 +18,9 @@
 # Usage: tc-smoke.sh <qemu-binary> [--dry-run]
 #   STIX_ASW_ELF, STIX_RUN_DIR            as in boot-smoke.sh
 #   STIX_TC_SEND_AT (20), STIX_TC_WINDOW (10), STIX_TC_SECONDS (60)
+#   STIX_TMTC_PROBE                       the TM probe script (tests)
+#   STIX_PORT_BASE                        the slot (scripts/stix/lib/slot.sh);
+#                                         slot mode boots a private flash copy
 #   --dry-run prints the commands without booting anything.
 #
 # Exit codes: 0 pass (or SKIP / dry-run), 1 a TM expectation failed,
@@ -35,8 +38,12 @@ RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
 SEND_AT="${STIX_TC_SEND_AT:-20}"
 WINDOW="${STIX_TC_WINDOW:-10}"
 DURATION="${STIX_TC_SECONDS:-60}"
-PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
-TMTC_PORT=$((20000 + $(id -u)))
+PROBE="${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}"
+# Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
+# and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
+. "$REPO_ROOT/scripts/stix/lib/slot.sh"
+stix_slot_setup
+RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 
 QEMU_BIN="$(realpath -e "$QEMU_BIN_ARG")" || {
     echo "qemu binary not found: $QEMU_BIN_ARG"; exit 2; }
@@ -95,7 +102,8 @@ PROBE_ARGS=(
 if [ "$DRY_RUN" = "--dry-run" ]; then
     echo "DRY RUN — the commands tc-smoke would run:"
     echo "(cd $RUN_DIR && timeout $((DURATION + 20)) $QEMU_BIN \
--M leon3_generic -m 64M -no-reboot -display none -monitor none \
+-M leon3_generic -m 64M -no-reboot -display none -monitor none\
+${STIX_SLOT_QEMU_ARGS[*]:+ ${STIX_SLOT_QEMU_ARGS[*]}} \
 -serial file:$RUN_DIR/uart.tc.raw -kernel $ASW_ELF \
 > qemu-stdout.tc.log 2>&1)"
     printf 'python3 -u %s ' "$PROBE"
@@ -107,12 +115,13 @@ fi
 [ -f "$ASW_ELF" ] || { echo "SKIP: ASW ELF absent ($ASW_ELF); set STIX_ASW_ELF to enable"; exit 0; }
 
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
-    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?"
+    echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?${STIX_SLOT_TAG}"
     exit 2
 fi
 
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
+stix_flash_private
 [ -f flash.bin ] || { echo "flash.bin missing — run capture-golden.sh first"; exit 2; }
 rm -f uart.tc.raw tc.smoke.probe.log qemu-stdout.tc.log
 
@@ -135,6 +144,7 @@ PROBE_PID=$!
 timeout "$((DURATION + 20))" "$QEMU_BIN" \
     -M leon3_generic -m 64M -no-reboot \
     -display none -monitor none \
+    "${STIX_SLOT_QEMU_ARGS[@]}" \
     -serial file:"$RUN_DIR/uart.tc.raw" \
     -kernel "$ASW_ELF" > qemu-stdout.tc.log 2>&1 &
 QEMU_PID=$!
@@ -157,26 +167,27 @@ set -e
 # FAIL (<which expectation>, exit 1), ERROR (environment problem,
 # QEMU dying or never starting, exit 2).
 if [ "$QEMU_ALIVE" -ne 0 ]; then
-    echo "TC-SMOKE: ERROR (QEMU died or never started; qemu rc=$QEMU_RC)"
+    echo "TC-SMOKE: ERROR (QEMU died or never started; qemu rc=$QEMU_RC)${STIX_SLOT_TAG}"
     tail -5 qemu-stdout.tc.log
     exit 2
 fi
 if [ "$PROBE_RC" -eq 124 ]; then
-    echo "TC-SMOKE: ERROR (the probe hit its own timeout)"
+    echo "TC-SMOKE: ERROR (the probe hit its own timeout)${STIX_SLOT_TAG}"
     tail -5 tc.smoke.probe.log
     exit 2
 fi
 if grep -q "could not connect" tc.smoke.probe.log 2>/dev/null; then
-    echo "TC-SMOKE: ERROR (the probe never connected; QEMU rc=$QEMU_RC)"
+    echo "TC-SMOKE: ERROR (the probe never connected; QEMU rc=$QEMU_RC)${STIX_SLOT_TAG}"
     tail -5 tc.smoke.probe.log
     exit 2
 fi
 if [ "$PROBE_RC" -eq 0 ]; then
-    echo "TC-SMOKE: PASS"
+    stix_slot_cleanup 0 flash.bin
+    echo "TC-SMOKE: PASS${STIX_SLOT_TAG}"
     exit 0
 fi
 WHY="$(grep -m1 -o 'EXPECTATION NOT MATCHED: .*' tc.smoke.probe.log \
     | cut -d' ' -f4-)" || true
-echo "TC-SMOKE: FAIL (${WHY:-probe rc=$PROBE_RC; see tc.smoke.probe.log})"
+echo "TC-SMOKE: FAIL (${WHY:-probe rc=$PROBE_RC; see tc.smoke.probe.log})${STIX_SLOT_TAG}"
 tail -5 tc.smoke.probe.log
 exit 1
