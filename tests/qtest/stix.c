@@ -382,6 +382,47 @@ static void test_flash_error_paths(void)
     stix_qtest_cleanup();
 }
 
+/*
+ * F-1 (flash latency plan D-F4): the device reset handler drops any
+ * pending op and returns the sequence state to its power-on value. A
+ * system reset after RAMAD and PAGEAD (write_counter 2) must leave
+ * write_counter 0 and cmdSta 0, so a fresh three-write sequence runs
+ * instead of failing as a "sequence" violation. RED before F-1: the
+ * reset handler was empty, cmdSta kept the last op's status and the
+ * RAMAD write after the reset failed the sequence.
+ */
+static void test_flash_reset_state(void)
+{
+    QTestState *qts;
+    uint32_t sta;
+
+    qts = stix_qtest_new();
+
+    /* a completed read leaves a non-zero cmdSta (READY | WRPROT | ...) */
+    flash_issue(qts, 0x40000000u, 0, CMD_PAGE_READ);
+    g_assert_cmphex(qtest_readl(qts, FLASH_CMDSTA), !=, 0);
+
+    /* mid-sequence: RAMAD, PAGEAD (write_counter 2), then reset */
+    qtest_writel(qts, FLASH_RAMAD, 0x40000000u);
+    qtest_writel(qts, FLASH_PAGEAD, 0);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, FLASH_CMDSTA), ==, 0);
+
+    /* a fresh three-write sequence succeeds: FAILED clear, IRQ 1 */
+    qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
+    qtest_writel(qts, 0x40000000u, 0);
+    flash_issue(qts, 0x40000000u, 0, CMD_PAGE_READ);
+    sta = qtest_readl(qts, FLASH_CMDSTA);
+    g_assert_cmpuint(sta & FTNAND_FAILED, ==, 0);
+    g_assert_cmpuint(sta & FTNAND_READY, ==, FTNAND_READY);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & FLASH_IRQ_BIT, ==,
+                     FLASH_IRQ_BIT);
+    g_assert_cmphex(qtest_readl(qts, 0x40000000u), ==, 0xffffffffu);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 /* ---- B2: flash addressing helpers ---- */
 
 /* Full backing-file size: 2 MCMs x 8 chips x 4096 blocks x 64 pages x
@@ -8317,6 +8358,8 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/flash-error-paths", test_flash_error_paths);
         qtest_add_func("/sparc/stix/flash-addressing", test_flash_addressing);
         qtest_add_func("/sparc/stix/flash-storage", test_flash_storage);
+        qtest_add_func("/sparc/stix/flash-reset-state",
+                       test_flash_reset_state);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);
