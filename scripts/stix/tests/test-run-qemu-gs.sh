@@ -64,16 +64,29 @@ want="unix:$TMP/qmp.sock,server=on,wait=off"
 [ "$RC" = 0 ] && [ "$got" = "$want" ] && report "unix form unchanged" ok \
     || report "unix form unchanged" "rc=$RC got '$got'"
 
-for addr in tcp:127.0.0.1:21519 tcp:localhost:21519; do
+# accepted: value -> the -qmp argument (an IPv6 host gets brackets)
+for case in "tcp:127.0.0.1:21519=tcp:127.0.0.1:21519" \
+            "tcp:localhost:21519=tcp:localhost:21519" \
+            "tcp:[::1]:21519=tcp:[::1]:21519" \
+            "tcp:::1:21519=tcp:[::1]:21519" \
+            "tcp:127.0.0.1:1=tcp:127.0.0.1:1" \
+            "tcp:127.0.0.1:65535=tcp:127.0.0.1:65535"; do
+    addr="${case%%=*}"
+    want="${case#*=},server=on,wait=off"
     run_gs "$addr"
     got="$(qmp_arg)"
-    [ "$RC" = 0 ] && [ "$got" = "$addr,server=on,wait=off" ] \
+    [ "$RC" = 0 ] && [ "$got" = "$want" ] \
         && report "accept $addr" ok \
         || report "accept $addr" "rc=$RC got '$got' $(cat "$TMP/err")"
 done
 
+# refused (D-PLj: loopback only, port 1..65535, no comma anywhere)
 for addr in tcp:0.0.0.0:21519 tcp:192.168.1.2:21519 tcp:127.0.0.1: \
-            tcp:127.0.0.1:x tcp:127.0.0.1:1,y relative.sock /a,b; do
+            tcp:127.0.0.1:x tcp:127.0.0.1:1,y relative.sock /a,b \
+            tcp:127.0.0.1:0 tcp:127.0.0.1:99999 tcp:127.0.0.1:065536 \
+            tcp:x,opt:5 tcp:127.0.0.1,opt:5 tcp:localhost,x=y:5 \
+            tcp:localhost.evil:5 tcp:10.0.0.1:5 tcp:[::2]:5 tcp::5 \
+            tcp:127.0.0.1; do
     run_gs "$addr"
     [ "$RC" = 2 ] && [ ! -e "$TMP/argv" ] && report "refuse $addr" ok \
         || report "refuse $addr" "rc=$RC"

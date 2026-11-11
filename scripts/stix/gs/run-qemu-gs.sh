@@ -18,8 +18,9 @@
 #   STIX_GS_UDP_TC_PORT  TC UDP bind (default 21502)
 #   STIX_GS_QMP      QMP for fault injection (default unset: no QMP):
 #                    a unix socket path (absolute, no comma, under 108
-#                    bytes), or tcp:127.0.0.1:PORT / tcp:localhost:PORT
-#                    (PL-2; loopback only, no other host).
+#                    bytes), or tcp:HOST:PORT with HOST 127.0.0.1,
+#                    localhost or [::1] and PORT 1..65535 (PL-2;
+#                    loopback only, no other host, no comma).
 #                    See docs/stix-port/ground-station.md "Fault injection".
 # FSW console: tail -f $STIX_GS_RUN_DIR/uart.raw | tr -d '\000'
 set -eu
@@ -55,20 +56,32 @@ bad_qmp() {
     echo "run-qemu-gs.sh: STIX_GS_QMP $1" >&2
     exit 2
 }
+# no comma anywhere: QEMU would read it as a chardev option
 case "$QMP" in
-    tcp:127.0.0.1:* | tcp:localhost:*)
-        # PL-2 (D-PLj): loopback TCP only; the port is numeric
-        QMP_PORT="${QMP##*:}"
+    *,*) bad_qmp "must not contain a comma" ;;
+esac
+case "$QMP" in
+    tcp:*)
+        # PL-2 (D-PLj): loopback TCP only, port 1..65535
+        QMP_REST="${QMP#tcp:}"
+        QMP_PORT="${QMP_REST##*:}"
+        QMP_HOST="${QMP_REST%:*}"
+        [ "$QMP_REST" != "$QMP_PORT" ] || bad_qmp "tcp needs HOST:PORT"
+        case "$QMP_HOST" in
+            127.0.0.1 | localhost | '[::1]') ;;
+            ::1) QMP_HOST='[::1]' ;;
+            *) bad_qmp "tcp host must be 127.0.0.1, localhost or [::1]" ;;
+        esac
         case "$QMP_PORT" in
             '' | *[!0-9]*) bad_qmp "tcp port must be numeric" ;;
         esac
-        QMP_ARG="$QMP,server=on,wait=off"
+        # at most 5 digits before the numeric test (no overflow)
+        { [ "${#QMP_PORT}" -le 5 ] && [ "$QMP_PORT" -ge 1 ] &&
+          [ "$QMP_PORT" -le 65535 ]; } ||
+            bad_qmp "tcp port must be 1..65535"
+        QMP_ARG="tcp:$QMP_HOST:$QMP_PORT,server=on,wait=off"
         ;;
-    tcp:*) bad_qmp "tcp must be 127.0.0.1 or localhost" ;;
     '' | /*)
-        case "$QMP" in
-            *,*) bad_qmp "must not contain a comma" ;;
-        esac
         # sun_path is 108 bytes including the NUL
         [ "${#QMP}" -lt 108 ] || bad_qmp "must be under 108 bytes"
         [ -z "$QMP" ] || QMP_ARG="unix:$QMP,server=on,wait=off"
