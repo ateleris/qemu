@@ -1287,11 +1287,20 @@ class FakeWorld:
         self.on_cmd = on_cmd or {}
         self.epoch = 0x10000000 << 16
         self.obt_skew = 0
+        self.power = "running"
+        self.wall = 0.0
 
     def now(self):
         return self.t
 
+    def mono(self):
+        return self.wall
+
+    def power_state(self):
+        return self.power
+
     def sleep(self, s):
+        self.wall += s
         if self.paused:
             self.paused -= 1
             return
@@ -1405,8 +1414,11 @@ def t_scn_validate(env):
                     json.dumps(good) + "\n  # trailing\n")
         check(scenario.load(p)["name"] == "ok", "commented scenario loads")
         with open(p, "w") as f:
-            f.write(json.dumps(good)[:-1] + ', "x": "a # b"}\n')
-        raises(scenario.ScenarioError, scenario.load, p)
+            f.write(json.dumps(dict(good, description="a # b"), indent=1)
+                    .replace('"description"', '\n  # c\n  "description"')
+                    + "\n")
+        check(scenario.load(p)["description"] == "a # b",
+              "a '#' inside a value round-trips")
     # the shipped scenarios: all valid, each with its SPDX line, and
     # their config overrides merge
     shipped = sorted(f for f in os.listdir(scenario.DEFAULT_DIR)
@@ -1482,7 +1494,8 @@ def t_scn_runner(env):
 
 def t_scn_variants(env):
     """PL-5: steps filtered by variant globs; T0 is the boot; `after`."""
-    sc = _sc([{"at": 0, "do": "platform.power.boot"},
+    sc = _sc([{"at": 0, "do": "platform.power.boot",
+               "assert_no_tm": ["0x5A1:1:8"]},
               {"at": 5, "do": "fault.inject", "variants": ["fault_*"],
                "args": {"id": "x"}},
               {"after": 2, "do": "fault.clear",
@@ -1537,18 +1550,29 @@ def t_scn_pause_abort(env):
 
     def boom(w, a):
         raise VerbError(409, "STIX is off")
-    w = FakeWorld(on_cmd={"fault.inject": boom})
-    r, res = _run(_sc([{"at": 1, "do": "fault.inject",
-                        "args": {"id": "x"}}], duration_s=3), w)
-    check(_verdicts(res) == ["error"] and "STIX is off" in
-          res["steps"][0]["why"] and scenario.exit_code(res) == 2,
-          "a failed do %r" % res)
+    for power, verdict, code in (("running", "fail", 1),
+                                 ("off", "error", 3)):
+        w = FakeWorld(on_cmd={"fault.inject": boom})
+        w.power = power
+        r, res = _run(_sc([{"at": 1, "do": "fault.inject",
+                            "args": {"id": "x"},
+                            "await_tm": ["0x5E5:3:25@1"]}],
+                          duration_s=3), w)
+        check(_verdicts(res) == [verdict] and "STIX is off" in
+              res["steps"][0]["why"] and scenario.exit_code(res) == code,
+              "N1: a 409 with power %s: %r" % (power, res))
+    w = FakeWorld(on_cmd={"fault.inject": lambda w, a: (_ for _ in ()).throw(
+        VerbError(404, "no fault"))})
+    r, res = _run(_sc([{"at": 1, "do": "fault.inject", "args": {"id": "x"},
+                        "await_tm": ["0x5E5:3:25@1"]}], duration_s=3), w)
+    check(scenario.exit_code(res) == 2, "a 404 stays a scenario error")
 
     def infra(w, a):
         raise VerbError(500, "QMP gone")
     w = FakeWorld(on_cmd={"fault.inject": infra})
     r, res = _run(_sc([{"at": 1, "do": "fault.inject",
-                        "args": {"id": "x"}}], duration_s=3), w)
+                        "args": {"id": "x"},
+                        "await_tm": ["0x5E5:3:25@1"]}], duration_s=3), w)
     check(scenario.exit_code(res) == 3, "a 5xx is infra %r" % res)
     for status, code in ((409, 3), (400, 2)):
         def refuse(w, a, status=status):
@@ -1611,7 +1635,9 @@ SCN_PASS = {"api": 1, "name": "fake-pass", "duration_s": 3,
 SCN_FAIL = {"api": 1, "name": "fake-fail", "duration_s": 2,
             "variants": ["nominal", "fault_x"],
             "setup": [{"do": "platform.power.on"}],
-            "steps": [{"at": 0, "do": "platform.power.boot"},
+            "steps": [{"at": 0, "do": "platform.power.boot",
+                       "await_state": [{"path": "platform.power",
+                                        "eq": "running", "timeout_s": 1}]},
                       {"at": 0.2, "variants": ["fault_*"],
                        "await_tm": ["0x5A7:5:1:142d@1"]}],
             "teardown": [{"do": "platform.power.off"}]}
@@ -1762,6 +1788,189 @@ def t_runmode(env):
     check(runmode.run_all(config_mod.load(overrides=o), out=out2.append)
           == 1 and sum("fake-fail" in x for x in out2) == 1,
           "the variant filter: %r" % out2)
+
+
+def t_scn_review(env):
+    """PL-5 review: an unexpected power-off is infra (S1); the wall-clock
+    ceiling (S3); a variant without checks is an error (S5); seed is no
+    bool (N7); expect_cuc mod_s/offset_s (S6); a QMP error reading the
+    OBT is the check's error, not a crash (B1)."""
+    from .qmp import QmpError
+
+    def died(w):
+        w.power = "off"
+        w.rec("power", "platform.power", {"event": "off", "state": "off",
+                                           "why": "QEMU exited unexpectedly"})
+
+    def off_cmd(w, a):
+        if w.power == "off":
+            raise VerbError(409, "power is off (needs running)")
+        w.power = "off"
+        w.rec("power", "platform.power", {"event": "off", "state": "off",
+                                           "why": "power off"})
+        return {}
+    w = FakeWorld(script=[(2, died)],
+                  on_cmd={"platform.power.off": off_cmd})
+    sc = _sc([{"at": 0, "await_tm": ["0x5E5:3:25@20"]}],
+             teardown=[{"do": "platform.power.off"}], duration_s=30)
+    r, res = _run(sc, w)
+    check(res["infra"] and scenario.exit_code(res) == 3 and
+          "unexpectedly" in (res["aborted"] or "") and w.t < 3 * NS and
+          "teardown_error" not in res,
+          "S1: QEMU died: %r (t %.1f)" % (res, w.t / NS))
+    # a power-off a step's own verb caused is not one
+    w = FakeWorld(on_cmd={"platform.power.off": off_cmd})
+    sc = _sc([{"at": 1, "do": "platform.power.off",
+               "await_state": [{"path": "p", "eq": 1, "timeout_s": 1}]},
+              {"at": 2, "await_tm": ["0x5E5:3:25@1"]}], duration_s=4)
+    w.states["p"] = 1
+    r, res = _run(sc, w)
+    check(not res["infra"] and res["aborted"] is None and
+          _verdicts(res) == ["pass", "timeout"], "S1: an own off %r" % res)
+    # S3: the sim clock stands still, the wall clock does not
+    w = FakeWorld(pauses=[(1, 10 ** 6)])
+    r = scenario.Runner(_sc([{"at": 0, "await_tm": ["0x5E5:3:25@5"]}],
+                            duration_s=10), None, w, tick_s=0.1,
+                        wall_s=20)
+    res = r.run()
+    check(scenario.exit_code(res) == 3 and "wall-clock" in res["aborted"]
+          and 20 <= w.wall < 21, "S3: %r (wall %.1f)" % (res, w.wall))
+    check(scenario.wall_ceiling(_sc([{"at": 0, "await_tm": [
+        "0x5E5:3:25@5"]}], duration_s=100)) ==
+        3 * 100 + scenario.BOOT_SLACK_S, "3 x duration_s + boot slack")
+    # S5 and N7
+    for bad in ([{"at": 0, "do": "log.mark", "args": {"text": "x"}}],
+                [{"at": 0, "variants": ["b"],
+                  "await_tm": ["0x5E5:3:25@5"]}]):
+        e = raises(scenario.ScenarioError, _sc, bad, variants=["a", "b"])
+        check("no check" in str(e) and "'a'" in str(e), "S5: %s" % e)
+    raises(scenario.ScenarioError, _sc, [{"at": 0, "await_tm": [
+        "0x5E5:3:25@5"]}], seed=True)
+    _sc([{"at": 0, "await_tm": ["0x5E5:3:25@5"]}], seed=3)
+    # S6: the CUC against the OBT modulo 64 s
+    w = FakeWorld(script=[
+        (1, lambda w: w.tm(0x5E5, 3, 25, b"\x04",
+                           cuc=w.obt() + (32 << 16) + (64 << 20))),
+        (3, lambda w: w.tm(0x5E5, 3, 25, b"\x04",
+                           cuc=w.obt() + 0x1000)),
+        (5, lambda w: w.tm(0x5E5, 3, 25, b"\x04",
+                           cuc=w.obt() + (63 << 16) + 0xF000))])
+    sc = _sc([{"at": 0, "expect_cuc": [{"apid": "0x5E5", "mod_s": 64,
+                                        "offset_s": 32, "within_s": 0.3,
+                                        "timeout_s": 2}]},
+              {"at": 2, "expect_cuc": [{"apid": "0x5E5", "mod_s": 64,
+                                        "offset_s": 32, "within_s": 0.3,
+                                        "timeout_s": 2}]},
+              {"at": 4, "expect_cuc": [{"apid": "0x5E5", "mod_s": 64,
+                                        "within_s": 0.3,
+                                        "timeout_s": 2}]}], duration_s=7)
+    r, res = _run(sc, w)
+    diffs = [st["checks"][0]["evidence"].get("diff_s")
+             for st in res["steps"]]
+    check(_verdicts(res) == ["pass", "fail", "pass"] and
+          abs(diffs[2] + 0.0623) < 0.01,
+          "S6: mod 64 %r %r" % (_verdicts(res), diffs))
+    for bad in ({"mod_s": 0}, {"mod_s": True}, {"offset_s": "1"},
+                {"mod": 64}):
+        spec = {"apid": "0x5E5", "within_s": 0.3, "timeout_s": 1}
+        spec.update(bad)
+        if spec.get("within_s") is None:
+            spec.pop("within_s")
+        raises(scenario.ScenarioError, _sc, [{"at": 0, "expect_cuc":
+                                              [spec]}])
+    # B1: QmpError from the OBT read
+
+    def no_obt():
+        raise QmpError("QMP closed")
+    w = FakeWorld(script=[(1, lambda w: w.tm(0x5E5, 3, 25, b"\x04"))])
+    w.read_obt = no_obt
+    r, res = _run(_sc([{"at": 0, "expect_cuc": [
+        {"apid": "0x5E5", "within_s": 0.3, "timeout_s": 2}]}],
+        duration_s=3), w)
+    check(_verdicts(res) == ["error"] and "QMP closed" in
+          res["steps"][0]["why"], "B1: QmpError %r" % res)
+
+
+def t_runmode_review(env):
+    """PL-5 review: a crashing Runner is infra and the bench still goes
+    off (B1); KeyboardInterrupt too; an unknown verb is exit 2 before
+    anything runs and a ScenarioError in run_one exit 2 (S4); SIGTERM
+    aborts as infra (N6); the verb registry is the dispatcher's."""
+    import signal
+    from . import runmode, verbs as verbs_mod
+    from .qmp import QmpError
+    d = _scn_dir(env)
+    root = os.path.join(env.tmp, "runs-root-r%d" % env.n)
+
+    def cfg(scns, **over):
+        o = env.overrides(**over)
+        o["mode"] = "run"
+        o.setdefault("run", {}).update(scenario_dir=d, scenarios=scns)
+        o["retention"] = {"run_root": root, "min_free_mb": 1}
+        return config_mod.load(overrides=o)
+    sc = scenario.load(os.path.join(d, "fake-pass.json"))
+    real = scenario.Runner.run
+    for exc in (QmpError("boom"), RuntimeError("bug")):
+        def bad(self, exc=exc):
+            self.ctx.command("platform.power.on", {})
+            raise exc
+        scenario.Runner.run = bad
+        rd = env.run_dir()
+        try:
+            res = runmode.run_one(cfg([]), sc, "default", rd)
+        finally:
+            scenario.Runner.run = real
+        check(scenario.exit_code(res) == 3 and str(exc) in res["why"],
+              "B1: %r" % res)
+        ctl = core_mod.Controller(cfg([]), run_dir=rd)   # the lock is free
+        ctl.shutdown()
+
+    def intr(self):
+        self.ctx.command("platform.power.on", {})
+        raise KeyboardInterrupt
+    scenario.Runner.run = intr
+    rd = env.run_dir()
+    try:
+        raises(KeyboardInterrupt, runmode.run_one, cfg([]), sc, "default",
+               rd)
+    finally:
+        scenario.Runner.run = real
+    ctl = core_mod.Controller(cfg([]), run_dir=rd)
+    ctl.shutdown()
+    # S4
+    with open(os.path.join(d, "typo.json"), "w") as f:
+        json.dump(dict(SCN_PASS, name="typo", setup=[
+            {"do": "platform.power.onn"}]), f)
+    os.makedirs(os.path.join(root, "runs"), exist_ok=True)
+    n = len(os.listdir(os.path.join(root, "runs")))
+    out = []
+    check(runmode.run_all(cfg(["fake-pass.json", "typo.json"]),
+                          out=out.append) == 2 and
+          len(os.listdir(os.path.join(root, "runs"))) == n and
+          any("platform.power.onn" in x for x in out),
+          "S4: an unknown verb: %r" % out)
+    res = runmode.run_one(cfg([]), sc, "nope", env.run_dir())
+    check(scenario.exit_code(res) == 2 and not res.get("infra"),
+          "S4: a ScenarioError in run_one %r" % res)
+    ctl = env.controller()
+    try:
+        check(set(ctl.dispatcher.verbs) == verbs_mod.VERBS,
+              "the registry: %r" % (set(ctl.dispatcher.verbs) ^
+                                    verbs_mod.VERBS))
+    finally:
+        ctl.shutdown()
+    # N6: SIGTERM mid-run
+    t = threading.Timer(2.0, os.kill, (os.getpid(), signal.SIGTERM))
+    t.start()
+    t0 = time.monotonic()
+    out = []
+    rc = runmode.run_all(cfg(["fake-long.json", "fake-pass.json"]),
+                         out=out.append)
+    t.join()
+    check(rc == 3 and time.monotonic() - t0 < 20 and
+          not any(x.startswith("PASS fake-pass") for x in out) and
+          signal.getsignal(signal.SIGTERM) == signal.SIG_DFL,
+          "N6: SIGTERM: rc %d %r" % (rc, out))
 
 
 def t_relay(env):
@@ -2518,6 +2727,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("scenario: pause, abort, errors", t_scn_pause_abort),
          ("scenario: state and CUC", t_scn_state_cuc),
          ("scenario verbs", t_scn_verbs),
+         ("scenario: review fixes", t_scn_review),
+         ("run mode: review fixes", t_runmode_review),
          ("platform state leaves", t_platform_leaves),
          ("run mode", t_runmode),
          ("TM relay + TC proxy", t_relay),

@@ -59,6 +59,7 @@ class Controller:
         self.last_snapshot = None   # bench time of the last snapshot
         self.server = None
         self.runner = None
+        self.scn_thread = None      # only for scenario.run (interactive)
         self.scn_lock = threading.Lock()
         self._register()
         from .plat import Platform
@@ -377,12 +378,14 @@ class Controller:
         r = self.runner
         if r is not None and r.state["phase"] != "done":
             r.abort("controller shutdown")
-            self.scn_thread.join(timeout=30)
+            if self.scn_thread is not None:
+                self.scn_thread.join(timeout=30)
         if self.power.state != power_mod.OFF:
             try:
                 self.power.off()
-            except VerbError:
-                pass
+            except Exception as e:      # the close below must still run
+                self.log.emit("ctl", "log", "controller.stop.power",
+                              {"error": "%s: %s" % (type(e).__name__, e)})
         self.stopping.set()
         if self.server is not None:
             self.server.shutdown()

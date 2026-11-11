@@ -40,6 +40,7 @@ import time
 
 from . import probe_lib
 from .dispatch import VerbError
+from .qmp import QmpError
 
 API = 1
 NS = 1_000_000_000
@@ -55,6 +56,13 @@ STEP_KEYS = {"at", "after", "name", "note", "do", "args", "variants",
              "await_tm", "await_event", "await_uart", "await_state",
              "assert_no_tm", "assert_no_event", "assert_silence",
              "assert_consistent", "expect_cuc"}
+CHECK_KEYS = ("await_tm", "await_event", "await_uart", "await_state",
+              "assert_no_tm", "assert_no_event", "assert_silence",
+              "expect_cuc")
+CUC_KEYS = {"apid", "within_s", "outside_s", "timeout_s", "mod_s",
+            "offset_s"}
+# run mode's wall-clock ceiling: 3 x duration_s plus this (review S3)
+BOOT_SLACK_S = 120
 PREDICATES = ("eq", "ne", "lt", "gt", "within", "in_set", "changed",
               "stable_for")
 # what a scenario may change in the controller config for its run
@@ -150,7 +158,8 @@ def validate(obj):
           all(isinstance(v, str) and NAME_RE.match(v) for v in vs) and
           len(set(vs)) == len(vs), "variants must be distinct names")
     sc["variants_declared"] = declared
-    _need(sc.get("seed") is None or isinstance(sc["seed"], int),
+    _need(sc.get("seed") is None or (isinstance(sc["seed"], int) and
+                                     not isinstance(sc["seed"], bool)),
           "seed is an integer")
     _config_ok(sc.setdefault("config", {}), "config")
     vc = sc.setdefault("variant_config", {})
@@ -164,7 +173,24 @@ def validate(obj):
     _need(isinstance(steps, list) and steps, "steps is a non-empty list")
     for i, st in enumerate(steps):
         _step(st, "steps[%d]" % i, vs)
+    for v in vs:
+        _need(any(k in st for st in steps if runs_in(st, v)
+                  for k in CHECK_KEYS),
+              "variant %r has no check: it could only pass vacuously" % v)
     return sc
+
+
+def check_verbs(sc, known):
+    """ScenarioError naming the first action whose verb is not in
+    @known (the registry, verbs.VERBS, or a live dispatcher's)."""
+    for a in sc["setup"] + sc["steps"] + sc["teardown"]:
+        _need("do" not in a or a["do"] in known, "%s: no verb %r"
+              % (sc["name"], a.get("do")))
+
+
+def wall_ceiling(sc):
+    """Run mode's wall-clock limit for one variant (monotonic seconds)."""
+    return 3 * sc["duration_s"] + BOOT_SLACK_S
 
 
 def _step(st, where, variants):
@@ -259,6 +285,12 @@ def _step(st, where, variants):
         w = "%s.expect_cuc[%d]" % (where, i)
         _need(isinstance(c, dict) and isinstance(c.get("apid"), str),
               "%s needs apid" % w)
+        _need(set(c) <= CUC_KEYS, "%s: unknown keys %s"
+              % (w, sorted(set(c) - CUC_KEYS)))
+        _need("mod_s" not in c or (_num(c["mod_s"]) and c["mod_s"] > 0),
+              "%s: mod_s > 0" % w)
+        _need("offset_s" not in c or _num(c["offset_s"]),
+              "%s: offset_s is a number" % w)
         try:
             int(c["apid"], 0)
         except ValueError:
@@ -492,11 +524,14 @@ class ExpectCuc(Await):
             return
         try:
             obt, at = self.ctx.read_obt()
-        except (VerbError, OSError) as e:
+        except (VerbError, OSError, QmpError) as e:
             self.final("error", "no OBT: %s" % e, rec["seq"], rec["seq"])
             return
         obt_rec = obt + (rec["sim_time"] - at) * 65536 // NS
-        diff = (d["cuc"] - obt_rec) / 65536
+        diff = (d["cuc"] - obt_rec) / 65536 - self.spec.get("offset_s", 0)
+        m = self.spec.get("mod_s")
+        if m:
+            diff = (diff + m / 2) % m - m / 2     # in [-m/2, m/2)
         self.ev["diff_s"] = diff
         if "within_s" in self.spec:
             ok = abs(diff) <= self.spec["within_s"] and not d["unsynced"]
@@ -582,7 +617,7 @@ def _checks(st, ctx):
 
 # -- the runner ------------------------------------------------------------
 class Runner:
-    def __init__(self, sc, variant, ctx, tick_s=0.05):
+    def __init__(self, sc, variant, ctx, tick_s=0.05, wall_s=None):
         if variant is None:
             _need(not sc["variants_declared"], "%s has variants %r: pick "
                   "one" % (sc["name"], sc["variants"]))
@@ -591,15 +626,16 @@ class Runner:
               % (sc["name"], variant, sc["variants"]))
         verbs = getattr(ctx, "verbs", None)
         if verbs is not None:
-            known = verbs()
-            for a in sc["setup"] + sc["steps"] + sc["teardown"]:
-                _need("do" not in a or a["do"] in known, "%s: no verb %r"
-                      % (sc["name"], a.get("do")))
+            check_verbs(sc, verbs())
         self.sc = sc
         self.variant = variant
         self.ctx = ctx
         self.tick_s = tick_s
+        self.wall_s = wall_s
+        self.mono = getattr(ctx, "mono", time.monotonic)
         self.aborted = None
+        self.infra = None           # why the bench (not the FSW) failed
+        self.verb_spans = []        # (seq before, seq after) of each verb
         self.steps = [dict(st, index=i) for i, st in enumerate(sc["steps"])
                       if runs_in(st, variant)]
         self.path = "scenario.%s" % sc["name"]
@@ -607,8 +643,16 @@ class Runner:
         self.state = {"name": sc["name"], "variant": variant,
                       "phase": "new", "step": None}
 
-    def abort(self, why="aborted"):
-        self.aborted = why or "aborted"
+    def abort(self, why="aborted", infra=False):
+        why = why or "aborted"
+        if infra and self.infra is None:
+            self.infra = why
+        if self.aborted is None:
+            self.aborted = why
+
+    def _power(self):
+        fn = getattr(self.ctx, "power_state", None)
+        return fn() if fn is not None else None
 
     def _emit(self, kind, data, path=None):
         d = {"scenario": self.sc["name"], "variant": self.variant}
@@ -618,14 +662,28 @@ class Runner:
     def _do(self, verb, args, setup=False):
         """None, or (verdict, why, infra) of a failed verb. A 5xx is an
         infrastructure failure; in the setup a 409 is too (the bench
-        could not be brought up: a refused binary, a run-dir check),
-        while 400/403/404 stay the scenario's own error."""
+        could not be brought up: a refused binary, a run-dir check). In
+        a step a 409 is infra when the bench is off, else the step's
+        fail (the state the scenario expected is not there, review N1);
+        400/403/404 stay the scenario's own error."""
+        before = self.ctx.last_seq()
         try:
             self.ctx.command(verb, args or {})
         except VerbError as e:
-            infra = e.status >= 500 or (setup and e.status == 409)
-            return "error", "%s: %s (%d)" % (verb, e, e.status), infra
+            why = "%s: %s (%d)" % (verb, e, e.status)
+            if e.status >= 500 or (setup and e.status == 409):
+                return "error", why, True
+            if e.status == 409:
+                if self._power() == "off":
+                    return "error", why, True
+                return "fail", why, False
+            return "error", why, False
+        finally:
+            self.verb_spans.append((before, self.ctx.last_seq()))
         return None
+
+    def _own(self, seq):
+        return any(lo < seq <= hi for lo, hi in self.verb_spans)
 
     def run(self):
         ctx, sc = self.ctx, self.sc
@@ -633,6 +691,7 @@ class Runner:
                "seed": sc.get("seed"), "verdict": None, "aborted": None,
                "infra": False, "steps": [], "setup_error": None}
         self.seq = ctx.last_seq()
+        self.mono0 = self.mono()
         res["seq_from"] = self.seq
         self._emit("log", {"phase": "start"})
         self.state["phase"] = "setup"
@@ -654,6 +713,10 @@ class Runner:
         prev_start = self.t0
         self.state["phase"] = "steps"
         while res["setup_error"] is None:
+            if self.wall_s is not None and \
+                    self.mono() - self.mono0 > self.wall_s:
+                self.abort("the wall-clock ceiling of %.0f s passed (the "
+                           "sim clock stalled?)" % self.wall_s, infra=True)
             if self.aborted:
                 break
             now = ctx.now()
@@ -686,6 +749,8 @@ class Runner:
                         for c in cs:
                             c.final("error", "the step's verb failed",
                                     self.seq)
+                        if err[2]:
+                            self.abort(err[1], infra=True)
                     elif st["do"] == "platform.power.boot":
                         self.t0 = ctx.now()
                         prev_start = self.t0
@@ -712,10 +777,14 @@ class Runner:
         self.state["phase"] = "teardown"
         for a in sc["teardown"]:
             err = self._do(a["do"], a.get("args"))
+            if err and a["do"] == "platform.power.off" and \
+                    self._power() == "off":
+                continue            # already off (QEMU died): fine
             if err:
                 res["teardown_error"] = err[1]
                 res["infra"] = res["infra"] or err[2]
         res["aborted"] = self.aborted
+        res["infra"] = res["infra"] or self.infra is not None
         res["steps"] = [reports[st["index"]] for st in self.steps]
         for rep in res["steps"]:
             rep.pop("_closed", None)
@@ -740,6 +809,12 @@ class Runner:
     def _drain(self, open_checks, now):
         for rec in self.ctx.records(self.seq):
             self.seq = max(self.seq, rec["seq"])
+            if rec["kind"] == "power" and \
+                    rec["data"].get("event") == "off" and \
+                    not self._own(rec["seq"]):
+                # no step's verb did this: QEMU exited (review S1)
+                self.abort("power off that no step caused: %s"
+                           % rec["data"].get("why"), infra=True)
             for c in open_checks:
                 if c.verdict is None:
                     c.feed(rec, now)
@@ -799,6 +874,9 @@ class CtlCtx:
 
     def verbs(self):
         return set(self.ctl.dispatcher.verbs)
+
+    def power_state(self):
+        return self.ctl.power.state
 
     def sleep(self, s):
         time.sleep(s)
