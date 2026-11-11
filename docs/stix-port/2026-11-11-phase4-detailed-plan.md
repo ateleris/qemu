@@ -192,7 +192,17 @@ Revised after the validation and the document review (sections at the end).
   - hold to 175 s.
   - Do not forbid 0x142E: the boot-armed TC20 timer fires at about +29 s, a
     no-op in SAFE.
-- accepted-diffs §26: the gate record.
+- accepted-diffs §27: the gate record.
+- **As built (live finding).** On this build every HK persistence count is
+  255, not 3. ParamMgmt_init (ParamMgmt.c:34-36) passes value, then min,
+  then max to HKMonitor_updateParameter, and the count branch
+  (HKMonitor.c:960-964) ignores the type, so max (255) wins.
+  - The gate therefore sends TC(236,10) `<mask> 22 00000003`
+    (*_CONSECUTIVE_MEASUREMENTS = 3) before each limit TC.
+  - 0x14A3 is required by @25, because a TC(236,10) before it cancels the
+    auto-enable.
+  - `--negative` injects 2048 and must miss exactly the 9449/D420
+    expectations.
 
 ### P4-4: HK HW protection
 - The comparator, the registers, the unlock register and irq_hk (D-P4d).

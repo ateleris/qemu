@@ -1578,3 +1578,138 @@ after TM(5,1) 0x14A3 (§27).
 
 `ctrl-irq-lines` asserts that stixctrl is no longer under
 /machine/unattached. Both failed on the pre-P4-2 binary.
+
+## 27. Fault gate: HK limit trips and time-code loss (baseline: none)
+
+**Purpose:** `scripts/stix/fault-smoke.sh` is the SAFE-mode fault gate
+(P4-3). It boots the model on a fresh flash with a QMP socket in the run
+dir (`-qmp unix:<run dir>/qmp.sock,server=on,wait=off`), drives faults
+through the §26 injection and the stixspw `timecodes` property, and
+expects the FSW's own reports. It stays in SAFE: every trip signals a
+move to SAFE, which is harmless there.
+
+**Probe extension it relies on:** `--qmp PATH` and `--qmp-cmd JSON`. A
+QMP command is a send group like `--send-hex`: it takes the preceding
+`--send-at`, the expectations and forbids after it attach to it, and
+the TM already buffered is drained before it runs (as for a TC). The
+probe connects at the first due command (it starts before QEMU), does
+the greeting and `qmp_capabilities`, and skips async events until the
+`return`. An `error` reply, a closed socket or no reply within 5 s
+fails the run with `QMP ERROR: ...` (rc 1). A bad JSON or a
+`--qmp-cmd` without `--qmp` is an argument error (rc 2). The
+self-test covers success, an error reply, events before the return, a
+close, a timeout, and run_gate with a QMP group (pass, and an error
+reply that fails at once).
+
+**Sequence** (seconds from the TMTC connect):
+
+| at | action | expected |
+|---|---|---|
+| connect | — | TM(5,1) `14A3` within 30 s; TM(1,2) and TM(1,8) forbidden for the whole run |
+| 35 | TC(236,10) `00080000 22 00000003` (1V5_V count = 3) | TM(1,1), TM(1,7) `1DACC001`, 5 s |
+| 37 | TC(236,10) `00080000 01 0000079F` (1V5_V low = 1951) | TM(1,1), TM(1,7) `1DACC002`, 5 s |
+| 40 | `adc-inject[24]` = 1800 | TM(5,3) `9449 07 0708 079F`, TM(5,4) `D420 00080000`, 10 s |
+| 55 | `adc-inject[24]` cleared | — |
+| 58 | TC(236,10) `00100000 22 00000003` (PSU_T count = 3) | TM(1,1), TM(1,7) `1DACC003`, 5 s |
+| 60 | TC(236,10) `00100000 02 00000ED8` (PSU_T upper = 3800) | TM(1,1), TM(1,7) `1DACC004`, 5 s |
+| 65 | `adc-inject[40]` = 3900 | `9449 17 0F3C 0ED8`, `D420 00100000`, 10 s |
+| 80 | `adc-inject[40]` cleared | — |
+| 85 | stixspw `timecodes` = false | TM(5,2) `542B` within 90 s; TM(5,3) `9449` forbidden from here on |
+| 180 | `timecodes` = true | TM(5,1) `1429` within 10 s |
+| 200 | end (`--hold`) | — |
+
+The TC(236,10) application data is `fdirMask u32, paramType u8,
+value u32` (TCData.h:151-153). paramType is the FDIR.h enum position:
+1V5 low limit = 1, PSU upper limit = 2, and `*_CONSECUTIVE_MEASUREMENTS`
+= 34 (0x22) in both enums. The TC units use the CRC routine that
+reproduces the other gates' TCs exactly. A TC(236,10) before 0x14A3
+cancels the automatic FDIR enable (FDIR.c:1022), so 0x14A3 must come
+within 30 s and the first TC goes at +35 s. If the TC came first,
+0x14A3 would never arrive and the gate would fail loudly. 0x14A3 was
+seen about 14 s after the connect, so a host running at half speed
+still passes. 0x142E
+(the boot-armed TC20 timer) is not forbidden.
+
+**FSW bug found by this gate: the persistence count is 255 after boot,
+not 3.** ParamMgmtDef.h gives every `HKMON_OUT_OF_BOUNDS_TRIGGERED_*`
+the value 3 (range 1..255). But `ParamMgmt_init` (ParamMgmt.c:34-36)
+calls `HKMonitor_updateParameter` three times per parameter: value,
+then min, then max. The count branch (HKMonitor.c:960-964) ignores the
+type and stores whatever it gets, so the max (255) wins. A line must
+therefore stay out of limits for 255 consecutive 1 s checks before
+0x9449.
+- Seen live on the gate ELF, through QMP `human-monitor-command`
+  `xp`:
+  - every `hkLineLimits[].count` (0x40083344) is 0xFF;
+  - after TC(236,10) the 1V5_V entry is `079F 0FFF 000000FF`;
+  - `paramsOutOfBoundsCount[7]` went 4 → 11 under injection, with no
+    TM.
+- The first gate run (limit TC only) failed:
+  `not matched: 0x5A7:5:3:9449070708079f@10 0x5A7:5:4:d42000080000@10`.
+  A trace showed the FSW reading 0x708 on channel 24 once a second.
+- The gate therefore sets the count to 3 by TC first. That TC goes
+  through `ParamMgmt_setParamValue` (type OTHER), which stores the
+  value. TCVerifDynamic.c:511/562 allows 1..255.
+- The model is not involved. Whether flight contexts hide this (a
+  context load calls the same setters) is open.
+
+**Gate record** (2026-11-11, worktree build at 6734968e7b plus this
+change, normal ELF, fresh flash per run, under the 21000 flock). These
+runs used the pre-review schedule, 10 s earlier, with the TC acks on
+the 20 s default window. The lead's rerun on the final schedule
+follows below.
+- **Positive** (`STIX_FAULT_RUN_DIR=/tmp/stix-p4-fault-pos2`): PASS,
+  2 min 48 s. The CUC coarse of each TM is in parentheses; SCET ≈
+  connect + 1 s.
+  - Boot: 0x0022, `0021 00 02 01`, `8030 01 01`, 0x0032, then 0x14A3
+    (16) about 14 s after the connect, and 0x142E (32).
+  - The four TC(236,10): TM(1,1) and TM(1,7) in the same second each
+    (26, 28, 48, 50).
+  - 1V5_V: TM(5,3) `9449 07 0708 079F` and TM(5,4) `D420 00080000`
+    (33). That is 2-3 s after the injection, i.e. the third check.
+  - PSU_T: `9449 17 0F3C 0ED8` and `D420 00100000` (59), 3 s after
+    the injection.
+  - Time-code loss: TM(5,2) `542B` with no parameters (0x8000008B),
+    about 61 s after `timecodes` = false. That is the 60 s timeout
+    plus the check period. From then on the CUC carries bit 31.
+  - Recovery: TM(5,1) `1429` (0x8000009C) within 1 s of
+    `timecodes` = true. The next heartbeat has bit 31 clear (0x9D).
+  - No 9449 after +75 s; no TM(1,2) or TM(1,8).
+- **Only observed, not checked:**
+  - the UART prints `Transitioning to safe mode (FDIR.c:629)` once per
+    trip (00:00:31 and 00:00:55);
+  - no mode-transition TM follows (already in SAFE);
+  - TM(5,4) carries the line's FDIR function mask, not the line;
+  - 0x0032 at boot.
+- **Negative** (`--negative`, `/tmp/stix-p4-fault-neg`): PASS,
+  39 s. `adc-inject[24]` = 2048 (inside 1951..4095). 0x14A3 and the
+  first two TCs' acks matched, and the probe failed at +40 s with
+  exactly `not matched: 0x5A7:5:3:9449070708079f@10
+  0x5A7:5:4:d42000080000@10`. Negative mode passes only on that set,
+  with no forbidden TM and no QMP error.
+- **Shared flash:** the `/tmp/stix-uprev-run/flash.bin` mtime is
+  still 2026-11-10 13:05, and the `/tmp/stix-baseline-run/flash.bin`
+  mtime is still 2026-11-09 15:30.
+
+**Lead rerun on the final schedule** (after review; the same build;
+`/tmp/stix-p4-fault-lead`, under the flock): fault-smoke PASS;
+`--negative` PASS, with exactly `not matched: 0x5A7:5:3:9449070708079f@10
+0x5A7:5:4:d42000080000@10`. The four 5 s ack windows had expired by
+then, so the acks are enforced. In the same session: probe self-test,
+boot-smoke, tc-smoke, and nominal-smoke in both modes, all PASS with the
+refactored probe. The `/tmp/stix-uprev-run/flash.bin` mtime is
+unchanged (2026-11-10 13:05:54).
+
+Exit codes as nominal-smoke.sh (0 pass or SKIP/dry-run/check-guard, 1
+a failed expectation, a forbidden TM, a QMP error, a closed connection
+or a failed UART check, 2 environment problem). The run-dir guard is
+nominal-smoke's (realpath, refuse the shared run dirs, their parents
+and /). It also refuses a run dir whose `qmp.sock` path would be 108
+bytes or more. `STIX_FAULT_SECONDS` (default 200) must be at least
+200. A failed QMP connect (`QMP ERROR: cannot connect`) is an
+environment problem, rc 2.
+
+The probe refactor changes one behaviour: a malformed `--expect` or
+`--forbid` is now an argument error (rc 2, "bad arguments"). It used to
+be a traceback with rc 1. tc-smoke and nominal-smoke never pass a
+malformed spec.

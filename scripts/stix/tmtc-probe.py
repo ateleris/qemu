@@ -29,17 +29,29 @@ the run with "FORBIDDEN TM: ...". It arms at its group's send (the
 connect group arms at connect) and stays armed; a match before its
 group's send is ignored. Forbids take no @window suffix.
 
+QMP groups (--qmp PATH, --qmp-cmd JSON; P4-3): a send group can be a
+QMP command instead of a TC unit, e.g. a qom-set that injects a fault.
+It takes the preceding --send-at, collects the expectations and
+forbids that follow, and drains the TM already buffered before it
+runs, exactly like a --send-hex. The probe connects to the QMP socket
+at the first due --qmp-cmd (it starts before QEMU), does the greeting
+and qmp_capabilities, and for each command skips async events until
+the "return". An "error" reply, a closed socket or no reply within 5 s
+fails the run with "QMP ERROR: ...".
+
 Usage:
   tmtc-probe.py [--port PORT] [--seconds N]
       logs raw chunks (prints 'NO TM OBSERVED', exits 1 if none)
-  tmtc-probe.py [--port P] [--seconds N] --window W [--hold]
-      [--send-at S] --send-hex HEX [--expect APID:TYPE:SUBTYPE[:DATAHEX]]...
+  tmtc-probe.py [--port P] [--seconds N] --window W [--hold] [--qmp PATH]
+      [--send-at S] (--send-hex HEX | --qmp-cmd JSON)
+      [--expect APID:TYPE:SUBTYPE[:DATAHEX]]...
       [--forbid APID:TYPE:SUBTYPE[:DATAHEX]]...
       TC ingress gate
   tmtc-probe.py --self-test
       runs the framer self-test and exits 0/1
 """
 import argparse
+import json
 import os
 import socket
 import sys
@@ -185,9 +197,9 @@ class Forbid(Expect):
 
 
 class OpAction(argparse.Action):
-    """Record --send-at/--send-hex/--expect in command-line order, so
-    --send-at applies to the following --send-hex and --expect attaches
-    to the most recent --send-hex."""
+    """Record --send-at/--send-hex/--qmp-cmd/--expect in command-line
+    order, so --send-at applies to the following --send-hex or
+    --qmp-cmd and --expect attaches to the most recent of them."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         ops = getattr(namespace, "ops", None) or []
@@ -195,16 +207,148 @@ class OpAction(argparse.Action):
         namespace.ops = ops
 
 
+def is_send(g):
+    """A send group (a TC or a QMP command, sent at g["at"]) versus the
+    connect-time group, which has no send offset (P4-3)."""
+    return g["at"] is not None
+
+
+def parse_qmp_cmd(text):
+    """--qmp-cmd JSON: one QMP command object with an "execute" key,
+    validated when the groups are built so a typo fails before any
+    boot (ValueError, like a bad --expect)."""
+    try:
+        cmd = json.loads(text)
+    except ValueError as e:
+        raise ValueError("--qmp-cmd is not JSON: %s (%s)" % (text, e))
+    if not isinstance(cmd, dict) or "execute" not in cmd:
+        raise ValueError("--qmp-cmd needs a JSON object with an "
+                         "\"execute\" key: %s" % text)
+    return cmd
+
+
+class QmpError(Exception):
+    """A QMP failure: an error reply, a closed socket or a timeout."""
+
+
+class QmpClient:
+    """A minimal synchronous QMP client (P4-3).
+
+    QMP is newline-delimited JSON: the server greets with {"QMP": ...},
+    the client must send {"execute": "qmp_capabilities"} before any
+    other command, and every command gets exactly one {"return": ...}
+    or {"error": ...}. Asynchronous {"event": ...} messages can come at
+    any time — before the greeting reply, between commands — and are
+    skipped (printed). The connection is made lazily, on the first
+    execute(), because the probe starts before QEMU. @sock (an already
+    connected socket) is for the self-test; @timeout bounds each
+    command's wait for its reply (and the connect retries).
+    """
+
+    def __init__(self, path=None, sock=None, timeout=5.0):
+        self.path = path
+        self.sock = sock
+        self.timeout = timeout
+        self.buf = bytearray()
+        self.ready = False
+
+    def _connect(self):
+        deadline = time.monotonic() + self.timeout
+        if self.sock is None:
+            while True:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    s.connect(self.path)
+                    self.sock = s
+                    break
+                except OSError as e:
+                    s.close()
+                    if time.monotonic() >= deadline:
+                        raise QmpError("cannot connect to %s: %s"
+                                       % (self.path, e))
+                    time.sleep(0.2)
+        greeting = self._read_msg(deadline)
+        if "QMP" not in greeting:
+            raise QmpError("no QMP greeting: %s" % json.dumps(greeting))
+        self.ready = True
+        self.execute({"execute": "qmp_capabilities"})
+
+    def _read_msg(self, deadline):
+        """The next JSON message (one line), events included."""
+        while True:
+            nl = self.buf.find(b"\n")
+            if nl >= 0:
+                line = bytes(self.buf[:nl]).strip()
+                del self.buf[:nl + 1]
+                if not line:
+                    continue
+                try:
+                    return json.loads(line)
+                except ValueError:
+                    raise QmpError("bad JSON from QMP: %r" % line[:200])
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise QmpError("no reply within %.1f s" % self.timeout)
+            self.sock.settimeout(left)
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                raise QmpError("no reply within %.1f s" % self.timeout)
+            except OSError as e:
+                raise QmpError("socket error: %s" % e)
+            if not chunk:
+                raise QmpError("connection closed")
+            self.buf += chunk
+
+    def execute(self, cmd):
+        """Send one command; return its "return" value, skipping events.
+        Raises QmpError on an "error" reply, a close or a timeout."""
+        if not self.ready:
+            self._connect()
+        try:
+            self.sock.sendall(json.dumps(cmd).encode() + b"\n")
+        except OSError as e:
+            raise QmpError("send failed: %s" % e)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            msg = self._read_msg(deadline)
+            if "event" in msg:
+                print(f"{ts()} QMP event {msg.get('event')} (skipped)",
+                      flush=True)
+                continue
+            if "return" in msg:
+                return msg["return"]
+            if "error" in msg:
+                err = msg["error"]
+                raise QmpError("%s: %s (command %s)" % (
+                    err.get("class", "?"), err.get("desc", "?"),
+                    json.dumps(cmd)))
+            raise QmpError("unexpected QMP message: %s" % json.dumps(msg))
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+
+
 def build_groups(args):
     """Group the ordered options into send groups (+ a connect-time
-    group for expectations and forbids given before any --send-hex)."""
+    group for expectations and forbids given before any send). A send
+    group is a --send-hex TC unit or a --qmp-cmd QMP command (P4-3);
+    both take the preceding --send-at and collect the expectations and
+    forbids that follow."""
     groups = [{"at": None, "hex": None, "expects": [], "forbids": []}]
     current_at = 20.0
     for op, val in args.ops:
         if op == "--send-at":
             current_at = float(val)
         elif op == "--send-hex":
-            groups.append({"at": current_at, "hex": val, "expects": [],
+            groups.append({"at": current_at, "hex": val, "qmp": None,
+                           "expects": [], "forbids": [], "sent": False,
+                           "t_sent": None})
+        elif op == "--qmp-cmd":
+            groups.append({"at": current_at, "hex": None,
+                           "qmp": parse_qmp_cmd(val), "expects": [],
                            "forbids": [], "sent": False, "t_sent": None})
         elif op == "--expect":
             groups[-1]["expects"].append(Expect(val))
@@ -219,7 +363,7 @@ def setup_mode(args):
     """Plain mode (no gate options) gets one connect-time group and
     gate=False; gate mode returns the send groups."""
     groups = build_groups(args)
-    gate = any(g["hex"] is not None for g in groups) or \
+    gate = any(is_send(g) for g in groups) or \
         any(g["expects"] for g in groups) or \
         any(g["forbids"] for g in groups)
     return groups, gate
@@ -256,6 +400,17 @@ def make_parser():
                          "--send-hex (or the connect group) and arms at "
                          "that group's send; a match before the send is "
                          "ignored. No @window suffix (repeatable)")
+    ap.add_argument("--qmp", metavar="PATH",
+                    help="QEMU QMP unix socket for the --qmp-cmd groups "
+                         "(connected at the first due --qmp-cmd)")
+    ap.add_argument("--qmp-cmd", action=OpAction, metavar="JSON",
+                    help="a QMP command object executed at the preceding "
+                         "--send-at, e.g. '{\"execute\": \"qom-set\", "
+                         "\"arguments\": {...}}'. A send group like "
+                         "--send-hex: the expectations and forbids that "
+                         "follow attach to it. An error reply, a closed "
+                         "socket or no reply within 5 s fails the run "
+                         "with 'QMP ERROR: ...' (repeatable, needs --qmp)")
     ap.add_argument("--hold", action="store_true",
                     help="gate mode: keep listening until --seconds even "
                          "after every expectation matched, so a later "
@@ -284,12 +439,12 @@ def verdict(groups, group_window, now, t0):
     all_matched = True
     failed = []
     for g in groups:
-        if g["hex"] is not None and not g["sent"]:
+        if is_send(g) and not g["sent"]:
             all_matched = False
         # m2 of the P2-6 review: the connect-time group binds to t0
         # with its own window
-        start = g["t_sent"] if g["hex"] is not None else t0
-        ready = g["sent"] if g["hex"] is not None else True
+        start = g["t_sent"] if is_send(g) else t0
+        ready = g["sent"] if is_send(g) else True
         for e in g["expects"]:
             if not e.ok:
                 all_matched = False
@@ -331,14 +486,14 @@ def match_unit(unit, groups):
         return [], None
     newly_ok = []
     for g in groups:
-        if g["hex"] is not None and not g["sent"]:
+        if is_send(g) and not g["sent"]:
             continue  # m3/P3-2: its TC has not gone out yet; not armed
         for e in g["expects"]:
             if not e.ok and e.matches(unit):
                 e.ok = True
                 newly_ok.append(e)
     for g in groups:
-        if g["hex"] is not None and not g["sent"]:
+        if is_send(g) and not g["sent"]:
             continue
         for f in g["forbids"]:
             if f.matches(unit):
@@ -371,12 +526,13 @@ def handle_chunk(chunk, groups, pending):
     return None
 
 
-def run_gate(sock, args, groups):
-    """The --send-hex/--expect/--forbid mode: send at the offsets, match
-    the framed TM stream. Returns 0 when every expectation matched
-    within its window — immediately, or at --seconds under --hold; a
-    forbidden unit, an expired expectation or (under --hold) a closed
-    connection returns 1."""
+def run_gate(sock, args, groups, qmp=None):
+    """The --send-hex/--qmp-cmd/--expect/--forbid mode: send at the
+    offsets, match the framed TM stream. Returns 0 when every
+    expectation matched within its window — immediately, or at
+    --seconds under --hold; a forbidden unit, an expired expectation, a
+    QMP failure or (under --hold) a closed connection returns 1. @qmp
+    is the QmpClient the --qmp-cmd groups use."""
     t0 = time.monotonic()
     pending = bytearray()
     total = 0
@@ -385,7 +541,7 @@ def run_gate(sock, args, groups):
     while True:
         now = time.monotonic()
         for g in groups:
-            if g["hex"] is not None and not g["sent"] and now - t0 >= g["at"]:
+            if is_send(g) and not g["sent"] and now - t0 >= g["at"]:
                 # review m1: drain what is already buffered BEFORE
                 # marking the group sent — units that arrived earlier
                 # are matched with the group still unarmed, so they
@@ -404,6 +560,20 @@ def run_gate(sock, args, groups):
                     print(f"FORBIDDEN TM: {forbidden}", flush=True)
                     print(f"# total {total} bytes")
                     return 1
+                if g.get("qmp") is not None:
+                    # P4-3: a QMP group; any failure ends the run
+                    try:
+                        ret = qmp.execute(g["qmp"])
+                    except QmpError as e:
+                        print(f"QMP ERROR: {e}", flush=True)
+                        print(f"# total {total} bytes")
+                        return 1
+                    g["sent"] = True
+                    g["t_sent"] = time.monotonic()
+                    print(f"{ts()} >> qmp {json.dumps(g['qmp'])} -> "
+                          f"return {json.dumps(ret)} at +{g['at']:.0f}s",
+                          flush=True)
+                    continue
                 payload = bytes.fromhex(g["hex"])
                 sock.sendall(payload)
                 g["sent"] = True
@@ -695,11 +865,11 @@ def self_test():
     # review m2: run_gate itself, over a socketpair (the peer plays the
     # model: it reads the probe's TC byte, then writes TM units). Each
     # case stays under ~2 s.
-    def gate_in_thread(sock, pargs, pgroups):
+    def gate_in_thread(sock, pargs, pgroups, qmp=None):
         box = {}
 
         def target():
-            box["rc"] = run_gate(sock, pargs, pgroups)
+            box["rc"] = run_gate(sock, pargs, pgroups, qmp)
 
         th = threading.Thread(target=target)
         th.start()
@@ -750,6 +920,146 @@ def self_test():
     assert not th.is_alive()
     assert box["rc"] == 1
 
+    # ---- P4-3: QMP groups ----
+    # --qmp-cmd is a send group like --send-hex: it takes the preceding
+    # --send-at and collects the following expects/forbids; a bad JSON
+    # or a missing "execute" is rejected when the groups are built.
+    qset = ('{"execute": "qom-set", "arguments": {"path": '
+            '"/machine/stixctrl", "property": "adc-inject[24]", '
+            '"value": 1800}}')
+    p = make_parser().parse_args([
+        "--qmp", "/x/qmp.sock",
+        "--expect", "0x5A7:5:1:14a3",
+        "--send-at", "25", "--send-hex", "40", "--expect", "0x5A1:1:7",
+        "--send-at", "30", "--qmp-cmd", qset,
+        "--expect", "0x5A7:5:3:9449", "--forbid", "0x5A1:1:8",
+    ])
+    groups, gate = setup_mode(p)
+    assert gate is True and p.qmp == "/x/qmp.sock"
+    assert [g["at"] for g in groups] == [None, 25.0, 30.0]
+    assert groups[1]["qmp"] is None and groups[1]["hex"] == "40"
+    assert groups[2]["hex"] is None
+    assert groups[2]["qmp"]["arguments"]["value"] == 1800
+    assert [len(g["expects"]) for g in groups] == [1, 1, 1]
+    assert [len(g["forbids"]) for g in groups] == [0, 0, 1]
+    # a QMP-only gate is a gate
+    groups, gate = setup_mode(make_parser().parse_args(
+        ["--qmp", "/x", "--qmp-cmd", qset]))
+    assert gate is True and is_send(groups[1])
+    for bad in ('{"execute": ', '["qom-set"]', '{"arguments": {}}'):
+        try:
+            setup_mode(make_parser().parse_args(["--qmp-cmd", bad]))
+            raise AssertionError("bad --qmp-cmd accepted: %s" % bad)
+        except ValueError:
+            pass
+
+    greet = (b'{"QMP": {"version": {"qemu": {"major": 11}}, '
+             b'"capabilities": ["oob"]}}\r\n')
+    ok_ret = b'{"return": {}}\r\n'
+
+    def fake_qmp(peer, script):
+        """Play QEMU's side over @peer: greet, then for each step read
+        one command line and answer with @reply bytes (None: close)."""
+        def target():
+            f = peer.makefile("rb")
+            peer.sendall(greet)
+            for reply in script:
+                line = f.readline()
+                if not line:
+                    return
+                box.setdefault("cmds", []).append(json.loads(line))
+                if reply is None:
+                    # shutdown, not close: the makefile keeps the fd
+                    # open, and the client must see EOF
+                    peer.shutdown(socket.SHUT_RDWR)
+                    return
+                peer.sendall(reply)
+            box["done"] = True
+        box = {}
+        th = threading.Thread(target=target)
+        th.start()
+        return th, box
+
+    def qmp_case(script, timeout=1.0):
+        a, b = socket.socketpair()
+        th, box = fake_qmp(b, script)
+        c = QmpClient(sock=a, timeout=timeout)
+        t_start = time.monotonic()
+        try:
+            ret = c.execute(json.loads(qset))
+            err = None
+        except QmpError as e:
+            ret, err = None, str(e)
+        elapsed = time.monotonic() - t_start
+        th.join(timeout=3)
+        assert not th.is_alive()
+        assert elapsed < 2.0, elapsed
+        a.close()
+        b.close()
+        return ret, err, box
+
+    # q1. success: greeting, qmp_capabilities first, then the command
+    ret, err, box = qmp_case([ok_ret, b'{"return": {"x": 1}}\r\n'])
+    assert err is None and ret == {"x": 1}, (ret, err)
+    assert [m["execute"] for m in box["cmds"]] == \
+        ["qmp_capabilities", "qom-set"]
+    # q2. an error reply raises, with the QMP class and desc
+    ret, err, box = qmp_case([ok_ret, (
+        b'{"error": {"class": "GenericError", "desc": "Property '
+        b'adc-inject[24] value 4096 out of range"}}\r\n')])
+    assert ret is None and "GenericError" in err and "4096" in err, err
+    # q3. async events before the return (one split across two writes
+    #     would be the same bytes on the stream) are skipped
+    ev = (b'{"timestamp": {"seconds": 1, "microseconds": 2}, '
+          b'"event": "RTC_CHANGE", "data": {"offset": 0}}\r\n')
+    ret, err, box = qmp_case([ev + ok_ret, ev + ev + ok_ret])
+    assert err is None and ret == {}, (ret, err)
+    # q4. the socket closes instead of answering
+    ret, err, box = qmp_case([ok_ret, None])
+    assert ret is None and "closed" in err, err
+    # q5. no reply at all: the (shortened) timeout fires
+    ret, err, box = qmp_case([ok_ret, b""], timeout=0.4)
+    assert ret is None and "no reply" in err, err
+
+    # q6. run_gate with a QMP group: the command goes out at its
+    #     offset, its expectation arms then and matches the TM unit
+    #     the TMTC peer writes afterwards; rc 0 at the deadline
+    qargs = ["--hold", "--seconds", "1", "--window", "1",
+             "--send-at", "0", "--qmp-cmd", qset,
+             "--expect", "0x5A1:1:1"]
+    pargs = make_parser().parse_args(qargs)
+    groups, gate = setup_mode(pargs)
+    qa, qb = socket.socketpair()
+    qth, qbox = fake_qmp(qb, [ok_ret, ok_ret])
+    a, b = socket.socketpair()
+    th, box = gate_in_thread(a, pargs, groups,
+                             QmpClient(sock=qa, timeout=1.0))
+    qth.join(timeout=3)
+    b.sendall(tm11)
+    th.join(timeout=3)
+    assert not th.is_alive() and qbox.get("done")
+    assert box["rc"] == 0
+    for s_ in (a, b, qa, qb):
+        s_.close()
+
+    # q7. run_gate with an error reply: rc 1 at once (QMP ERROR)
+    pargs = make_parser().parse_args(qargs)
+    groups, gate = setup_mode(pargs)
+    qa, qb = socket.socketpair()
+    qth, qbox = fake_qmp(qb, [ok_ret, (
+        b'{"error": {"class": "GenericError", "desc": "nope"}}\r\n')])
+    a, b = socket.socketpair()
+    t_start = time.monotonic()
+    th, box = gate_in_thread(a, pargs, groups,
+                             QmpClient(sock=qa, timeout=1.0))
+    th.join(timeout=3)
+    qth.join(timeout=3)
+    assert not th.is_alive()
+    assert box["rc"] == 1
+    assert time.monotonic() - t_start < 0.9  # before the deadline
+    for s_ in (a, b, qa, qb):
+        s_.close()
+
     print("SELF-TEST: PASS")
     return 0
 
@@ -760,7 +1070,17 @@ def main():
     if args.self_test:
         return self_test()
 
-    groups, gate = setup_mode(args)
+    try:
+        groups, gate = setup_mode(args)
+    except ValueError as e:
+        print(f"bad arguments: {e}")
+        return 2
+    qmp = None
+    if any(g.get("qmp") is not None for g in groups):
+        if not args.qmp:
+            print("bad arguments: --qmp-cmd needs --qmp PATH")
+            return 2
+        qmp = QmpClient(args.qmp)
 
     deadline = time.monotonic() + args.seconds
     # Retry connect for a few seconds in case QEMU is still binding.
@@ -780,7 +1100,7 @@ def main():
     sock.settimeout(1.0)
 
     if gate:
-        return run_gate(sock, args, groups)
+        return run_gate(sock, args, groups, qmp)
 
     saw_any = False
     total = 0
