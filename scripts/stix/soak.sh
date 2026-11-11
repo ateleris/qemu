@@ -67,6 +67,7 @@ QEMU_BIN="$(realpath -e "$QEMU_BIN_ARG")" || {
 . "$REPO_ROOT/scripts/stix/lib/slot.sh"
 stix_slot_setup
 RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
+stix_run_dir_guard "$RUN_DIR"
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
     echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?${STIX_SLOT_TAG}"
     exit 2

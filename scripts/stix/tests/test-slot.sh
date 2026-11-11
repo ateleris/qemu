@@ -285,6 +285,86 @@ out="$(cd "$WORK/run" && helper \
 check "flash copy: legacy mode leaves flash.bin alone" $? "$out"
 rm -f "$WORK/run/flash.bin"
 
+# --- review B1/B2: every guard runs before any byte is written ---
+# a recording cp: proves whether a copy was attempted at all
+printf '#!/bin/sh\ntouch %s/cp.called\ncp --sparse=always "$1" "$2"\n' \
+    "$WORK" > "$WORK/cp-rec"
+chmod +x "$WORK/cp-rec"
+mkdir -p "$WORK/empty"
+nowrite() { # dir: no copy attempted and the dir still empty
+    [ ! -e "$WORK/cp.called" ] && [ -z "$(ls -A "$1")" ]
+}
+rm -f "$WORK/cp.called"
+out="$(cd "$WORK/empty" && helper 'stix_slot_setup > /dev/null
+    stix_flash_private' STIX_PORT_BASE=1 STIX_CP_CMD="$WORK/cp-rec" \
+    STIX_FLASH_MASTER="$WORK/master/dense.bin" STIX_FLASH_MAX_ALLOC_KB=1024)"
+rc=$?
+[ "$rc" -eq 2 ] && nowrite "$WORK/empty" &&
+    echo "$out" | grep -q "refusing to copy the master .*(a dense flash)"
+check "B1: a dense master is refused before any copy (nothing written)" $? \
+    "rc=$rc: $out; left: $(ls -A "$WORK/empty" "$WORK/cp.called" 2>&1)"
+for d in /mnt /proc; do
+    rm -f "$WORK/cp.called"
+    out="$(cd "$d" && helper 'stix_slot_setup > /dev/null; stix_flash_copy' \
+        STIX_CP_CMD="$WORK/cp-rec" STIX_FLASH_MASTER="$M")"
+    rc=$?
+    [ "$rc" -eq 2 ] && [ ! -e "$WORK/cp.called" ] &&
+        echo "$out" | grep -q "refusing the flash copy into $d"
+    check "B1: a copy into $d (/mnt or a non-ext filesystem) is refused" $? \
+        "rc=$rc: $out"
+done
+# B2: ./flash.bin is the master (a symlinked -s<k> dir, a symlinked file)
+ln -sfn "$WORK/master" "$WORK/sym-s1"
+out="$(cd "$WORK/sym-s1" && helper 'stix_slot_setup > /dev/null
+    stix_flash_private' STIX_PORT_BASE=1 STIX_FLASH_MASTER="$M")"
+rc=$?
+[ "$rc" -eq 2 ] && [ "$(stat -c '%Y %i %b %s' "$M")" = "$before" ] &&
+    echo "$out" | grep -q "is the master"
+check "B2: a symlinked -s<k> dir onto the master's dir is refused" $? \
+    "rc=$rc: $out"
+mkdir -p "$WORK/symf"
+ln -sf "$M" "$WORK/symf/flash.bin"
+out="$(cd "$WORK/symf" && helper 'stix_slot_setup > /dev/null
+    stix_flash_private' STIX_PORT_BASE=1 STIX_FLASH_MASTER="$M")"
+rc=$?
+[ "$rc" -eq 2 ] && [ "$(stat -c '%Y %i %b %s' "$M")" = "$before" ]
+check "B2: a flash.bin symlinked to the master is refused" $? "rc=$rc: $out"
+# B2: the realpath guard on the shared dirs (synthetic, via STIX_SHARED_DIRS)
+SH="$WORK/master $WORK/frozen"
+mkdir -p "$WORK/frozen"
+out="$(cd "$WORK/sym-s1" && helper 'stix_slot_setup > /dev/null
+    stix_flash_private' STIX_PORT_BASE=1 STIX_FLASH_MASTER="$M" \
+    STIX_SHARED_DIRS="$SH")"
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "inside the shared flash dir"
+check "B2: a dir resolving into the master's dir is refused (realpath)" $? \
+    "rc=$rc: $out"
+ln -sfn "$WORK/frozen" "$WORK/frz"
+out="$(helper "stix_run_dir_guard '$WORK/frz/sub'; echo REACHED" \
+    STIX_SHARED_DIRS="$SH")"
+rc=$?
+[ "$rc" -eq 2 ] && ! echo "$out" | grep -q REACHED
+check "B2: legacy: below the frozen dir (via a symlink) is refused" $? \
+    "rc=$rc: $out"
+out="$(helper "stix_run_dir_guard '$WORK/master'; echo REACHED" \
+    STIX_SHARED_DIRS="$SH")"
+[ "$out" = REACHED ]
+check "B2: legacy: the uprev master's dir stays allowed for boot gates" $? \
+    "$out"
+out="$(helper "stix_run_dir_guard '$WORK/master' strict; echo REACHED" \
+    STIX_SHARED_DIRS="$SH")"
+rc=$?
+[ "$rc" -eq 2 ]
+check "B2: strict: the uprev master's dir is refused" $? "rc=$rc: $out"
+out="$(helper "stix_slot_setup > /dev/null
+    stix_run_dir_guard '$WORK/master-s1'; echo REACHED" \
+    STIX_PORT_BASE=1 STIX_SHARED_DIRS="$SH")"
+[ "$out" = REACHED ]
+check "B2: slot mode: <master dir>-s1 is its own dir, allowed" $? "$out"
+[ "$(stat -c '%Y %i %b %s' "$M")" = "$before" ]
+check "B1/B2: the synthetic master is untouched" $? "$(stat "$M")"
+
+
 # --- the disk guard (STIX_DF_CMD faked; df prints KiB) ---
 printf '#!/bin/sh\necho Avail\necho 2097152\n' > "$WORK/df-low"
 printf '#!/bin/sh\necho Avail\necho 20971520\n' > "$WORK/df-high"
@@ -359,7 +439,8 @@ qt() { # args... -> qt.sh with the fake build and suite
     env -u STIX_PORT_BASE STIX_SLOT_LOCK_DIR="$LOCKS" \
         STIX_QT_MAKE="${STIX_QT_MAKE:-true}" \
         STIX_QT_SUITE="$WORK/fake-suite" STIX_FLASH_MASTER="$M" \
-        STIX_QT_BASELINE_DIR="$WORK/qt-base" bash "$QT" "$@" 2>&1
+        STIX_QT_BASELINE_DIR="${STIX_QT_BASELINE_DIR:-$WORK/qt-base}" \
+        bash "$QT" "$@" 2>&1
 }
 out="$(qt)"
 rc=$?
@@ -391,6 +472,12 @@ rc=$?
     echo "$out" | grep -q "^ok 2 flash=8388608\$" &&
     [ "$(du -k "$WORK/qt-base/flash.bin" | cut -f1)" -lt 1024 ]
 check "qt.sh --baseline: slot 0, the wrapper, a sparse flash in its dir" $? \
+    "rc=$rc: $out"
+out="$(STIX_QT_BASELINE_DIR="$WORK/master" qt --baseline)"
+rc=$?
+[ "$rc" -eq 2 ] && ! echo "$out" | grep -q "^ok" &&
+    [ "$(stat -c '%Y %i %b %s' "$M")" = "$before" ]
+check "B2: qt.sh --baseline in the master's dir is refused" $? \
     "rc=$rc: $out"
 out="$(STIX_QT_MAKE=false qt)"
 rc=$?

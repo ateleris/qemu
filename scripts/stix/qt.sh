@@ -61,6 +61,7 @@ if [ "$BASELINE" -eq 1 ]; then
         exit 2
     }
     echo "slot: 0 base $(stix_slot_base 0) (5.2 baseline)"
+    stix_run_dir_guard "${STIX_QT_BASELINE_DIR:-/tmp/stix-qt-baseline}" strict
     mkdir -p "${STIX_QT_BASELINE_DIR:-/tmp/stix-qt-baseline}"
     cd "${STIX_QT_BASELINE_DIR:-/tmp/stix-qt-baseline}" || exit 2
     stix_flash_copy

@@ -323,6 +323,30 @@ rc=$?
 [ "$rc" -eq 2 ] && [ ! -s "$W/miss.argv" ]
 check "slot: missing master => exit 2, no QEMU" $? "rc=$rc out=$out"
 
+# B2: the gates refuse a run dir that resolves into a shared flash dir
+# (synthetic shared dirs; a symlinked dir), before QEMU or any write
+mkdir -p "$W/frozen" "$W/uprevm"
+ln -sfn "$W/frozen" "$W/frz"
+for sc in boot-smoke.sh soak.sh tc-smoke.sh; do
+    : > "$W/frz.argv"
+    out="$(env STIX_SHARED_DIRS="$W/uprevm $W/frozen" STIX_RUN_DIR="$W/frz" \
+        FAKE_QEMU_ARGV_FILE="$W/frz.argv" STIX_TMTC_PROBE="$FPROBE" \
+        bash "$S/$sc" "$FAKE" 2>&1)"
+    rc=$?
+    [ "$rc" -eq 2 ] && [ ! -s "$W/frz.argv" ] && [ -z "$(ls -A "$W/frozen")" ] &&
+        echo "$out" | grep -q "inside the shared flash dir"
+    check "B2: $sc refuses a run dir resolving into the frozen dir" $? \
+        "rc=$rc: $out"
+done
+ln -sfn "$W/uprevm" "$W/upl-s1"
+: > "$W/upl.argv"
+out="$(slotenv STIX_SHARED_DIRS="$W/uprevm $W/frozen" STIX_RUN_DIR="$W/upl" \
+    FAKE_QEMU_ARGV_FILE="$W/upl.argv" bash "$S/boot-smoke.sh" "$FAKE" 2>&1)"
+rc=$?
+[ "$rc" -eq 2 ] && [ ! -s "$W/upl.argv" ] && [ -z "$(ls -A "$W/uprevm")" ]
+check "B2: slot mode refuses a -s1 dir symlinked to the uprev dir" $? \
+    "rc=$rc: $out"
+
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

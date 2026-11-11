@@ -28,7 +28,9 @@
 # Test hooks: STIX_SLOT_LOCK_DIR (default /tmp), STIX_FLASH_MASTER
 # (default /tmp/stix-uprev-run/flash.bin), STIX_FLASH_MAX_ALLOC_KB
 # (65536), STIX_CP_CMD (default "cp --sparse=always"), STIX_DF_CMD (the
-# df command whose last line's last field is the free KiB).
+# df command whose last line's last field is the free KiB),
+# STIX_SHARED_DIRS (default "/tmp/stix-uprev-run /tmp/stix-baseline-run":
+# the uprev master's dir first, then the frozen baseline's).
 
 STIX_SLOT=0
 STIX_SLOT_MODE=0
@@ -188,16 +190,81 @@ stix_flash_private() {
     stix_flash_copy
 }
 
-# Refresh ./flash.bin as a private sparse copy of the master. The master
-# must exist (a missing one would make QEMU create a fresh flash and take
-# the first-boot write path). The copy must stay sparse: allocated <
-# STIX_FLASH_MAX_ALLOC_KB and apparent == master's.
+# Refuse a run dir that is, or is inside, a shared flash dir (after
+# resolving symlinks): the frozen baseline dir always, the uprev master's
+# dir in slot mode or when "strict" is given. Legacy boot gates run in the
+# uprev dir by design; slot mode and copies never do. Also refuses /.
+stix_run_dir_guard() { # dir [strict]
+    local d shared first=1
+    d="$(realpath -m -- "$1")"
+    if [ "$d" = / ]; then
+        echo "slot: refusing run dir / ($1)"
+        exit 2
+    fi
+    for shared in ${STIX_SHARED_DIRS:-/tmp/stix-uprev-run /tmp/stix-baseline-run}; do
+        if [ "$first" -eq 1 ] && [ "$STIX_SLOT_MODE" -eq 0 ] &&
+                [ "${2:-}" != strict ]; then
+            first=0
+            continue
+        fi
+        first=0
+        shared="$(realpath -m -- "$shared")"
+        case "$d" in
+            "$shared" | "$shared"/*)
+                echo "slot: refusing run dir $1 (resolves to $d, at or" \
+                    "inside the shared flash dir $shared)"
+                exit 2 ;;
+        esac
+    done
+}
+
+# Refresh ./flash.bin as a private sparse copy of the master. Every guard
+# runs before anything is written:
+# - the master must exist (a missing one would make QEMU create a fresh
+#   flash and take the first-boot write path);
+# - the CWD must not be a shared flash dir, and ./flash.bin must not be
+#   the master itself (a symlinked dir or file);
+# - the CWD must be a local Linux filesystem that keeps holes (not under
+#   /mnt, i.e. not the Windows disk);
+# - the master's own allocation must be below STIX_FLASH_MAX_ALLOC_KB, so
+#   a dense master (the frozen baseline is 16.5 GB allocated) is never
+#   copied.
+# After the copy, the copy must be sparse (allocated below the cap) and
+# its apparent size the master's: a second line of defence.
 stix_flash_copy() {
     local master="${STIX_FLASH_MASTER:-/tmp/stix-uprev-run/flash.bin}"
     local max_kb="${STIX_FLASH_MAX_ALLOC_KB:-65536}" alloc size msize
+    local here fstype malloc
     if [ ! -f "$master" ]; then
         echo "slot: the master flash $master is missing;" \
             "run capture-golden.sh first"
+        exit 2
+    fi
+    stix_run_dir_guard . strict
+    if [ -e flash.bin ] && [ flash.bin -ef "$master" ]; then
+        echo "slot: refusing the flash copy: ./flash.bin is the master" \
+            "$master itself"
+        exit 2
+    fi
+    here="$(realpath .)"
+    case "$here" in
+        /mnt | /mnt/*)
+            echo "slot: refusing the flash copy into $here (under /mnt:" \
+                "the Windows disk keeps no holes)"
+            exit 2 ;;
+    esac
+    fstype="$(stat -f -c %T .)"
+    case "$fstype" in
+        ext2/ext3 | ext4 | tmpfs | btrfs | xfs) ;;
+        *)
+            echo "slot: refusing the flash copy into $here (filesystem" \
+                "$fstype; only ext2/3/4, tmpfs, btrfs or xfs keep holes)"
+            exit 2 ;;
+    esac
+    malloc="$(du -kL -- "$master" | cut -f1)"
+    if [ "$malloc" -ge "$max_kb" ]; then
+        echo "slot: refusing to copy the master $master: it allocates" \
+            "${malloc} KiB, limit ${max_kb} KiB (a dense flash)"
         exit 2
     fi
     stix_disk_guard
