@@ -2722,3 +2722,221 @@ plus this change, normal ELF, every QEMU run under the 21000 flock):
     fresh flash): both PASS with 0 timeouts and `R1..R12 = 32` delivered
     write address blocks each (R3 = 64);
   - the shared flash mtimes are unchanged.
+
+## 33. Detector smoke gate and the probe's full-packet dump (baseline: none)
+
+**Baseline:** no gate looked at the detector model through the FSW. The
+probe logged at most 48 bytes of each unit, so no QL TM(21,6) could be
+decoded, and a successful ASIC verification left no evidence at all.
+
+Detector plan D-3 (`docs/stix-port/2026-11-11-detector-plan.md`,
+"### D-3", Key facts "QL TM decode for the gates" and "The TCs the
+gates use", Validation R1/R2). Scripts only; no model change.
+
+**`tmtc-probe.py --dump-apid APID:FILE`** (repeatable, one file per
+APID): every framed TM unit of that APID is appended to FILE as its
+whole CCSDS packet (no 4-byte SpW header, so the SSID is byte 16), hex,
+one per line, flushed per line. It works in gate and plain mode and
+changes nothing else (the 48-byte log lines stay). Bad specs (no file,
+bad or out-of-range APID, an APID twice) are exit 2. The self-test
+adds a case: a 68-byte QL unit split across two chunks is dumped once,
+whole, only when complete; an ack APID goes to its own file; an
+undumped APID is not written; the bad specs are rejected. A second
+case drives the plain mode (`run_plain`, factored out of `main`) over
+a socketpair and checks the same dump line.
+
+**`ql-check.py`** (new, stdlib only) decodes such a dump:
+- packet checks: APID 0x5DC, TM (not TC), TM(21,6), the CCSDS length
+  equals the line length, a QL SSID 30-34, and the SSID body consumes
+  every byte (truncation and trailing bytes are errors; every band,
+  trigger and RCR block must repeat the first block's N);
+- segmentation (CCSDS byte 2 bits 7:6, `TMData.h:89-92`): STANDALONE,
+  or FIRST, CONT…, LAST per SSID; each segment is a full packet with
+  its own header (`TMForm_nextSegmentationGroupingFlagQL`), so a
+  product's samples are concatenated; an empty LAST (the termination
+  packet) is tolerated and flagged; CONT/LAST without FIRST, FIRST
+  while open and a product never closed are errors;
+- sequence counts: the 0x5DC counter is one per APID
+  (`TM_21.c:780`, `TMForm_SequenceCounters.APID_93_12`), shared by all
+  QL SSIDs, so one product's segments interleave with other SSIDs'
+  packets and are not contiguous among themselves (the flush above
+  counts 0..4 across five SSIDs). So the dump as a whole must count up
+  by one (mod 2^14; a gap is a lost packet), and within a FIRST..LAST
+  group the counts must strictly increase;
+- S0 (M = 3) compress and decode, the decode printed as a lower and an
+  upper bound;
+- the SSID 30-34 layouts of `TM_21.c:315-647`, the field names carrying
+  their index space and SSID 34's offset 7 keeping the FSW name
+  `delta_time_seconds` (`deltaTimeSeconds`, `TM_21.c:624`, 0.1 s
+  units) (`det_mask_subcol`, `lower_edge_mask_ebin`,
+  `energy_mask_ebin`, `subcol N ebin[0..31]`, `pix_mask`);
+- `--samples` prints every sample; `--expect-zero-flush SECONDS` is the
+  gate check (below).
+- `--self-test`: the S0 vectors of the plan (0, 15, 16, 100 → 0x24,
+  1000 → 0x3F, **2160 → 0x48** decoding to [2048, 2304), 10000 → 0x59,
+  65535 → 0x6F) and monotonicity; the worked example built as an
+  SSID 30 packet (6 `ebin` × 12 `pix` × 30 `subcol` = 2160, band-0 N at
+  rel. 22, the byte 0x48 at rel. 24); one packet per SSID 30-34; the
+  SSID 32 sample layout; FIRST/CONT/LAST reassembly interleaved with
+  another SSID and a FIRST + empty-LAST pair; eight known-bad inputs
+  that must raise; and the zero-flush check catching a nonzero byte, a
+  missing SSID, wrong sample counts, a duplicated `subcol` and a
+  non-default mask. Mutation checked: a wrong S0 exponent, a dropped
+  LAST and a disabled nonzero check each fail the self-test.
+
+**`detector-smoke.sh`** (new), built like nominal-smoke with the
+fault-smoke QMP socket (unused here; for D-4/D-6) and the same run-dir
+guard (`STIX_DETECTOR_RUN_DIR`, default `/tmp/stix-detector-run`),
+fresh flash, `--dry-run`, `--check-guard`, `--negative`; the probe runs
+with `--hold`, 240 s (`STIX_DETECTOR_SECONDS`, ≥ 235). The port is
+20000 + uid, as in the other gates. Timeline (seconds from connect):
+- connect: 0x8030, 0x0022, 0x14A3, 0x142E (nominal-smoke's group);
+- @50 TC(236,1) `04 00`: TM(1,1), `0021 02 04`, TM(1,7); forbid
+  `0021 04 02`;
+- @60 TC(236,6) `07 04 00 00` and @62 TC(236,6) `02 02 00 1E`
+  (verification period 30 s; seq 3, CRC 8AE9): TM(1,1), TM(1,7) each;
+- @70 TC(236,1) `05 00` (seq 4, CRC 0E3C): `0021 04 05` within 10 s
+  (T_nom). Forbidden from here to the end: 0x542E, 0x9438, 0x142C,
+  0x9433, 0x1427, 0x942E, 0x5437, `0021 05 02`, TM(1,8), 0x142E (the
+  TM(5,x) subtype from the EID's severity nibble);
+- @215 TC(236,1) `04 00` (seq 5, CRC D62E): `0021 05 04` within 10 s
+  (T_exit) and the flush `0x5DC:21:6:1e`…`:22` within 15 s; forbid
+  `0021 04 02`.
+
+After the run every check runs and records its name, so the report is
+complete:
+- **probe**: every expectation matched, no forbid fired;
+- **ql**: `ql-check.py --expect-zero-flush (T_exit − T_nom)`: exactly
+  one product per SSID 30-34; the default headers (int time 39/79/319/
+  39/39, det mask 0xFFFFFCFF, pixel mask 0x0FFF, SKM 0x2B, edges
+  0x10821082 with no upper edge, E = 5, samples per value 40, energy
+  mask 0x7FFE0000); every value byte 0; SSID 30/33/34 within ±2 of
+  window/4 and SSID 31 of window/8; SSID 32 exactly the 32 `subcol`
+  0..31 once each. The window is taken from the two TM arrival times,
+  not from 215 − T_nom, which is the same quantity measured;
+- **uart**: "init: SAFE mode"; none of "storing new context[01]
+  failed", "packet sequence error", "RotBuf overrun", "UNKNOWN
+  RB-BLOCK", "TOO MANY RB-BLOCKS";
+- **uart-idefx**: no `XrayDetFDIR.c:731` and no "failed to read
+  register" (`XrayDetFDIR.c:613`);
+- **trace-verif** (`scripts/stix/idefx-trace-check.py`, stdlib): QEMU
+  runs with `-msg timestamp=on -trace
+  enable=stixdet_idefx_cmd,file=<run>/idefx.trace`, so each trace line
+  has a UTC ISO time. Delivered read address blocks (`word & 0xFC07F ==
+  0x84000`, reg 1..12, `delivered_grp_mask != 0`) are clustered by a
+  gap > 5 s. Each cluster must be exactly 384, with every register
+  read on every `grp` 0..15 (`grp` = `fpga_det`/2) exactly twice; it
+  must lie in [T_nom − 2, T_exit + 2] s (the probe's local HH:MM:SS
+  converted to epoch, anchored at the run start); there must be ≥ 3;
+  an undelivered read address block is a failure too. A missing or
+  unreadable trace is exit 2. Its `--self-test` builds synthetic lines:
+  three runs of 384 pass; 383 blocks, an undelivered block, a run
+  outside the window, one `grp` read for another's register (`grp` 7
+  ×4, `grp` 3 ×0, still 384 in total) and only two runs each fail;
+  `--expect-none` accepts only an empty trace; a probe time after
+  midnight lands on the next day.
+
+**`--negative`** adds `-global grlib-stixctrl.det-idefx=off` (§32).
+Per Validation R1 (option 1; the `det-idefx-readback=zero` TM-level
+knob was rejected) no TM fault is expected. The gate passes only if
+the failed set is exactly {uart-idefx, trace-verif}, with exactly 384
+write timeouts and "failed to read register" lines a multiple of 12
+(one per register per run, `XrayDetFDIR.c:611-615`), at least 36 (3
+runs). trace-verif counts as failed as planned only when
+`idefx-trace-check.py --expect-none` finds the trace present and with
+no IDeF-X command words at all (the trace is empty: with det-idefx off
+no `stixdet_idefx_cmd` fires). A missing, unreadable or non-empty trace
+records a different check (`trace-not-empty`), so the negative FAILS;
+it is not the vacuous branch of the positive check. The probe (all
+forbids quiet, the flush seen), ql and uart must still pass.
+
+**Exit codes:** 0 pass, 1 fail, 2 environment, **77 SKIP** (no ELF),
+the convention for new gates (README "Gate exit codes"; the older
+gates keep 0 on SKIP as legacy).
+
+**Design choices:**
+- The trace time stamps come from QEMU's own `-msg timestamp=on`
+  (`qemu_log` prefixes the ISO time); no model or trace-event change.
+  Clustering by time rather than by sequence keeps the check correct
+  if NOMINAL-entry writes or other `grp` traffic interleave.
+- Per-cluster exact 384 and per-register 32 rather than a total
+  ≥ 1152, so one long run or a partial run cannot pass.
+- The flush SSIDs are probe expectations (timed) and ql-check checks
+  their content; the dump keeps everything for the D-4/D-6 gates.
+- No interactive hold flag: the plan's `--hold` is the probe's.
+
+**Observed QL TM** (positive run): the exit flush is five standalone
+packets, in the order SSID 33, 30, 31, 34, 32 (sequence counts 0..4),
+of 74, 297, 146, 132 and 1151 bytes (SSID 32: 16 + 15 + 32 × 35).
+NOMINAL lasted 139 s (T_nom 16:35:02, T_exit 16:37:21):
+- SSID 30: 35 samples (139/4 = 34.75), all band, trigger and RCR bytes
+  0; int time 39, `det_mask_subcol` 0xFFFFFCFF, `pix_mask` 0x0FFF, LC
+  and TA SKM 0x2B, `lower_edge_mask_ebin` 0x10821082, E = 5;
+- SSID 31: 17 samples (17.4), all 0; int time 79;
+- SSID 32: one dump, 32 samples, `subcol` 0..31 in order, every `ebin`
+  count and trigger 0, int offset 0; int time 319;
+- SSID 33: 35 values, all 0; samples per value 40, `energy_mask_ebin`
+  0x7FFE0000;
+- SSID 34: 35 status triplets, all 0.
+The TM(5,x) set is that of nominal-smoke (0x8030, 0x0022, 0x14A3,
+0x142E, `0021 00 02`, `0021 02 04`, `0021 04 05`, `0021 05 04`, the
+0x542C p1 = 1 of the empty LUT flash, 0x0032); no forbidden EID. The
+UART has 59 lines (58 newline-terminated plus the unterminated last
+one; `wc -l` says 58).
+
+**ASIC verification** (positive): 4 runs of 384 delivered read address
+blocks at T_nom +20.1, +50.9, +83.5 and +114.9 s, each 0.03-0.04 s
+long. The spacing is 30.8-32.6 s of host time for the 30 s period
+(the FSW counts its 1 s FDIR ticks; the host-time spread is the
+emulation's, not checked). The first came 20 s into NOMINAL, not at
+entry: the FDIR counter fires in every mode and resets on each fire
+(`FDIR.c:479-486`), while `XrayDetFDIR_verifyASICreg` returns outside
+NOMINAL (`XrayDetFDIR.c:310-315`). The counter was already past 30
+when the TC set the period at +62, so it fired in CONF the next second
+(skipped), and the next fire was 30 s later, about 20 s after T_nom
+[C, consistent with the timing]. The plan's "the first may land within
+1 s of the TC" is the CONF fire, which leaves no trace; the window
+check allows a run at entry too.
+
+**Gate record** (2026-11-11, worktree `stix-uprev-tc` at 93438dfa3b
+plus this change, normal ELF, every QEMU run under the 21000 flock):
+- `ql-check.py --self-test` and `tmtc-probe.py --self-test`: PASS.
+- **detector-smoke positive** (`/tmp/stix-d3-pos`, fresh flash):
+  `DETECTOR-SMOKE: PASS` (above).
+- **detector-smoke `--negative`** (`/tmp/stix-d3-neg`, fresh flash):
+  `DETECTOR-SMOKE (negative): PASS (failed exactly as planned: 384
+  write timeouts, 48 read failures = 4 verification runs, no IDeF-X
+  command words at all; the trace is empty)` (wording of the review
+  rerun). The trace file is empty (with det-idefx off no
+  `stixdet_idefx_cmd` fires); NOMINAL lasted 135 s; the flush and its
+  decode are identical in content to the positive run (35/17/32/35/35
+  samples, all 0); no forbid fired.
+- The full qtest suite: 54 ok. boot-smoke (`/tmp/stix-uprev-run`):
+  PASS, the normalized UART matches the golden.
+- nominal-smoke positive (`/tmp/stix-d3-nominal`, fresh flash): PASS,
+  0 `XrayDetFDIR.c:731`, R1..R12 = 32 delivered write address blocks
+  (R3 = 64), as in §32.
+- The shared flash mtimes are unchanged: `/tmp/stix-uprev-run`
+  2026-11-10 13:05:54 and `/tmp/stix-baseline-run` 2026-11-09 15:30:10.
+- **After the implementation review** (the trace analyser moved to
+  `idefx-trace-check.py` with the per-`grp` check and `--expect-none`;
+  ql-check sequence-count checks and the SSID 34 field name; the
+  plain-mode dump self-test; SKIP 77; docs):
+  - `ql-check.py --self-test`, `idefx-trace-check.py --self-test` and
+    `tmtc-probe.py --self-test`: PASS. Replayed on the first runs'
+    files, the analyser gives the same 4 × 384 (17136 command words, 0
+    undelivered) and `--expect-none` passes on the empty negative trace;
+    a missing trace is exit 2.
+  - detector-smoke positive (`/tmp/stix-d3r-pos`): PASS; NOMINAL 139 s,
+    the same flush (35/17/32/35/35, all 0); 4 runs × 384 at T_nom
+    +21.5, +53.4, +89.3, +124.0 s.
+  - detector-smoke `--negative` (`/tmp/stix-d3r-neg`): PASS, 384 write
+    timeouts, 48 read failures, `CHECK trace-verif: FAIL as planned
+    (the trace is empty: no IDeF-X command words at all)`.
+  - **The negative with no trace** (`/tmp/stix-d3r-negdel`):
+    `idefx.trace` was deleted ~5 s after QEMU created it. The analyser
+    reported exit 2 (cannot read), the check was recorded as
+    `trace-not-empty`, and the gate printed `DETECTOR-SMOKE (negative):
+    FAIL (failed checks: 'uart-idefx trace-not-empty', ...)`, rc 1, as
+    required.
+  - The shared flash mtimes are unchanged.

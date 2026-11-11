@@ -39,6 +39,13 @@ and qmp_capabilities, and for each command skips async events until
 the "return". An "error" reply, a closed socket or no reply within 5 s
 fails the run with "QMP ERROR: ...".
 
+Full-packet dump (--dump-apid APID:FILE; detector plan D-3): the TM
+lines above show at most 48 bytes of a unit. A dump APPENDS every framed
+TM unit of that APID to FILE as one whole CCSDS packet per line, in hex,
+WITHOUT the 4-byte SpW header (so a TM's SSID / first application byte
+is at byte 16), flushed per line. It works in both modes and changes
+nothing else; repeatable for different APIDs (one file each).
+
 Usage:
   tmtc-probe.py [--port PORT] [--seconds N]
       logs raw chunks (prints 'NO TM OBSERVED', exits 1 if none)
@@ -47,6 +54,7 @@ Usage:
       [--expect APID:TYPE:SUBTYPE[:DATAHEX]]...
       [--forbid APID:TYPE:SUBTYPE[:DATAHEX]]...
       TC ingress gate
+  either mode also takes [--dump-apid APID:FILE]...
   tmtc-probe.py --self-test
       runs the framer self-test and exits 0/1
 """
@@ -63,6 +71,45 @@ import time
 # never exceed 4 + 65542 bytes.
 TC_HDR_LEN = 10
 TC_UNIT_MAX = 4 + 65542
+
+
+class PacketDump:
+    """--dump-apid APID:FILE (D-3): append each framed TM unit of APID
+    to FILE as its CCSDS packet (unit[4:], no SpW header) in hex, one
+    per line, flushed per line so a killed probe keeps what it saw."""
+
+    def __init__(self, specs, opener=open):
+        self.files = {}
+        for spec in specs or []:
+            apid_s, sep, path = spec.partition(":")
+            if not sep or not path:
+                raise ValueError("--dump-apid wants APID:FILE: %s" % spec)
+            try:
+                apid = int(apid_s, 0)
+            except ValueError:
+                raise ValueError("--dump-apid: bad APID in %s" % spec)
+            if not 0 <= apid <= 0x7FF:
+                raise ValueError("--dump-apid: APID out of range: %s" % spec)
+            if apid in self.files:
+                raise ValueError("--dump-apid: APID 0x%03X given twice" % apid)
+            self.files[apid] = opener(path, "a")
+
+    def write(self, unit):
+        """Dump @unit when its APID is dumped; returns True if written."""
+        sp = unit[4:]
+        if len(sp) < 6:
+            return False
+        f = self.files.get(((sp[0] << 8) | sp[1]) & 0x7FF)
+        if f is None:
+            return False
+        f.write(sp.hex() + "\n")
+        f.flush()
+        return True
+
+    def close(self):
+        for f in self.files.values():
+            f.close()
+        self.files = {}
 
 
 def frame_units(stream):
@@ -416,6 +463,11 @@ def make_parser():
                          "after every expectation matched, so a later "
                          "mode change cannot be missed (without it the "
                          "run exits on the last match)")
+    ap.add_argument("--dump-apid", action="append", default=[],
+                    metavar="APID:FILE",
+                    help="append every TM unit of APID to FILE as a "
+                         "whole CCSDS packet (no SpW header), hex, one "
+                         "per line (repeatable, one file per APID)")
     ap.add_argument("--self-test", action="store_true",
                     help="run the framer self-test and exit")
     # B1 of the P2-6 review: ops must exist even when no gate option is
@@ -501,15 +553,18 @@ def match_unit(unit, groups):
     return newly_ok, None
 
 
-def handle_chunk(chunk, groups, pending):
+def handle_chunk(chunk, groups, pending, dump=None):
     """Frame and match one received chunk: extends @pending, prints the
     raw line, the TM lines and the newly satisfied expectations, and
     returns the first forbidden unit the chunk carried (or None).
-    Factored so the send-side drain (review m1) shares the matcher."""
+    Factored so the send-side drain (review m1) shares the matcher.
+    @dump (a PacketDump) gets every framed unit before it is matched."""
     pending += chunk
     print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()}", flush=True)
     units, _ = frame_units(pending)
     for unit in units:
+        if dump is not None:
+            dump.write(unit)
         fields = unit_fields(unit)
         if fields is None:
             continue
@@ -526,13 +581,43 @@ def handle_chunk(chunk, groups, pending):
     return None
 
 
-def run_gate(sock, args, groups, qmp=None):
+def run_plain(sock, deadline, dump=None):
+    """The plain mode: log raw chunks until @deadline or a close; with a
+    @dump (--dump-apid), also frame the stream and dump the units.
+    Returns 1 when no TM arrived (prints 'NO TM OBSERVED'), else 0."""
+    saw_any = False
+    total = 0
+    pending = bytearray()
+    while time.monotonic() < deadline:
+        try:
+            chunk = sock.recv(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break  # server closed
+        if not chunk:
+            break
+        saw_any = True
+        total += len(chunk)
+        print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()}")
+        if dump is not None and dump.files:
+            pending += chunk
+            for unit in frame_units(pending)[0]:
+                dump.write(unit)
+    if not saw_any:
+        print("NO TM OBSERVED")
+        return 1
+    print(f"# total {total} bytes")
+    return 0
+
+
+def run_gate(sock, args, groups, qmp=None, dump=None):
     """The --send-hex/--qmp-cmd/--expect/--forbid mode: send at the
     offsets, match the framed TM stream. Returns 0 when every
     expectation matched within its window — immediately, or at
     --seconds under --hold; a forbidden unit, an expired expectation, a
     QMP failure or (under --hold) a closed connection returns 1. @qmp
-    is the QmpClient the --qmp-cmd groups use."""
+    is the QmpClient the --qmp-cmd groups use; @dump the PacketDump."""
     t0 = time.monotonic()
     pending = bytearray()
     total = 0
@@ -555,7 +640,7 @@ def run_gate(sock, args, groups, qmp=None):
                     if not chunk:
                         break
                     total += len(chunk)
-                    forbidden = handle_chunk(chunk, groups, pending)
+                    forbidden = handle_chunk(chunk, groups, pending, dump)
                 if forbidden is not None:
                     print(f"FORBIDDEN TM: {forbidden}", flush=True)
                     print(f"# total {total} bytes")
@@ -588,7 +673,7 @@ def run_gate(sock, args, groups, qmp=None):
             chunk = None
         if chunk:
             total += len(chunk)
-            forbidden = handle_chunk(chunk, groups, pending)
+            forbidden = handle_chunk(chunk, groups, pending, dump)
             if forbidden is not None:
                 print(f"FORBIDDEN TM: {forbidden}", flush=True)
                 print(f"# total {total} bytes")
@@ -1060,6 +1145,72 @@ def self_test():
     for s_ in (a, b, qa, qb):
         s_.close()
 
+    # D-3 --dump-apid: whole packets of the dumped APID only, without
+    # the SpW header, one hex line each, across split chunks, in both
+    # handle_chunk (gate) use and the parser
+    import io
+
+    class KeepOpen(io.StringIO):
+        def close(self):
+            pass
+
+    sinks = {}
+
+    def opener(path, mode):
+        assert mode == "a"
+        sinks[path] = KeepOpen()
+        return sinks[path]
+
+    pargs = make_parser().parse_args(
+        ["--dump-apid", "0x5DC:ql.hex", "--dump-apid", "1441:ack.hex"])
+    dump = PacketDump(pargs.dump_apid, opener)
+    assert sorted(dump.files) == [0x5A1, 0x5DC]
+    # a 68-byte QL TM(21,6) unit (longer than the 48-byte log lines):
+    # 64-byte CCSDS packet, length field 64 - 7 = 57
+    ql_sp = bytes([0x0D, 0xDC, 0xC0, 0x07, 0x00, 57, 0x10, 21, 6, 0]) + \
+        bytes(6) + bytes([0x1E]) + bytes(range(47))
+    ql_unit = bytes([0x49, 0x02, 0x00, 0x00]) + ql_sp
+    assert frame_units(bytearray(ql_unit))[0] == [ql_unit]
+    pend = bytearray()
+    stream = tm172 + ql_unit + tm11
+    # split inside the QL unit: the dump sees it only once it is whole
+    handle_chunk(stream[:30], [], pend, dump)
+    assert sinks["ql.hex"].getvalue() == ""
+    handle_chunk(stream[30:], [], pend, dump)
+    ql_lines = sinks["ql.hex"].getvalue().splitlines()
+    assert ql_lines == [ql_sp.hex()], ql_lines
+    assert bytes.fromhex(ql_lines[0])[16] == 0x1E   # SSID at byte 16
+    assert sinks["ack.hex"].getvalue().splitlines() == [tm11[4:].hex()]
+    assert dump.write(tm172) is False               # 0x5A7: not dumped
+    dump.close()
+    for bad in ("0x5DC", "0x5DC:", "zz:f", "0x800:f"):
+        try:
+            PacketDump([bad], opener)
+        except ValueError:
+            continue
+        raise AssertionError(f"--dump-apid {bad} accepted")
+    # plain mode (run_plain) dumps too: the same stream over a
+    # socketpair (two writes, cut inside the QL unit; recv may join
+    # them), then a close ends the run
+    sinks.clear()
+    dump = PacketDump(["0x5DC:plain.hex"], opener)
+    a, b = socket.socketpair()
+    a.settimeout(0.2)
+    b.sendall(stream[:30])
+    b.sendall(stream[30:])
+    b.close()
+    rc = run_plain(a, time.monotonic() + 2.0, dump)
+    a.close()
+    assert rc == 0
+    assert sinks["plain.hex"].getvalue().splitlines() == [ql_sp.hex()]
+    dump.close()
+    try:
+        PacketDump(["0x5DC:a", "1500:b"], opener)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("--dump-apid: a duplicate APID accepted")
+
     print("SELF-TEST: PASS")
     return 0
 
@@ -1072,8 +1223,12 @@ def main():
 
     try:
         groups, gate = setup_mode(args)
+        dump = PacketDump(args.dump_apid)
     except ValueError as e:
         print(f"bad arguments: {e}")
+        return 2
+    except OSError as e:
+        print(f"bad arguments: --dump-apid: {e}")
         return 2
     qmp = None
     if any(g.get("qmp") is not None for g in groups):
@@ -1100,27 +1255,9 @@ def main():
     sock.settimeout(1.0)
 
     if gate:
-        return run_gate(sock, args, groups, qmp)
+        return run_gate(sock, args, groups, qmp, dump)
 
-    saw_any = False
-    total = 0
-    while time.monotonic() < deadline:
-        try:
-            chunk = sock.recv(4096)
-        except socket.timeout:
-            continue
-        except OSError:
-            break  # server closed
-        if not chunk:
-            break
-        saw_any = True
-        total += len(chunk)
-        print(f"{ts()} +{len(chunk):4d}B {chunk[:48].hex()}")
-    if not saw_any:
-        print("NO TM OBSERVED")
-        return 1
-    print(f"# total {total} bytes")
-    return 0
+    return run_plain(sock, deadline, dump)
 
 
 if __name__ == "__main__":

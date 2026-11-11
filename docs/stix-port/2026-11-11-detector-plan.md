@@ -1030,9 +1030,34 @@ binary at their first new assertion, and green after.
     No TM fault is expected: a read timeout is not a mismatch (Key facts).
     It must fail exactly on the UART check (384 `XrayDetFDIR.c:731`
     lines plus the "failed to read register" TRACE_ERRORs) and on the
-    trace check (no read-back answers). The TM forbids must stay quiet.
+    trace check (no IDeF-X command words at all; the trace is empty).
+    The TM forbids must stay quiet.
 - Gates: the full set plus detector-smoke, positive and negative.
 - accepted-diffs §33 (gate record).
+- **As built (2026-11-11, accepted-diffs §33):**
+  - the trace check is `scripts/stix/idefx-trace-check.py` (with a
+    self-test) on `-msg timestamp=on` +
+    `-trace enable=stixdet_idefx_cmd,file=<run>/idefx.trace`; clusters
+    split at a > 5 s gap, each exactly 384 (every register on every
+    `grp` 0..15 twice), inside [T_nom − 2, T_exit + 2] s; the negative
+    requires the trace present and empty (`--expect-none`), so a
+    missing trace fails it;
+  - SKIP exits 77 (new-gate convention);
+  - ql-check: SSID 34 offset 7 is `delta_time_seconds` (FSW
+    `deltaTimeSeconds`); the APID-wide sequence counter makes the dump
+    contiguous, not a product's segments (they interleave with other
+    SSIDs), so the dump is checked for gaps and each group for
+    increasing counts;
+  - the flush sample counts are checked against T_exit − T_nom (both TM
+    arrival times), ±2;
+  - `--negative` passes only on the failed set {uart-idefx,
+    trace-verif}, with exactly 384 `:731` lines and "failed to read
+    register" lines 12 × k, k ≥ 3 (observed 48, 4 runs);
+  - the plan's `--hold` is the probe's; the script has no hold flag;
+  - observed: 4 verification runs at T_nom +20, +51, +84, +115 s (the
+    first counter fire after the +62 s TC came in CONF and was skipped,
+    `XrayDetFDIR.c:310-315`); flush order SSID 33, 30, 31, 34, 32, all
+    standalone, 35/17/32/35/35 samples for a 139 s NOMINAL, all zero.
 
 ### D-4: synthetic sky and the flare switch (tier 2)
 - D-Df: the template, PRNG, Poisson, per-tick gating and exposure; the

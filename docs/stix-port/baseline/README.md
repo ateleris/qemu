@@ -113,6 +113,15 @@ python3 scripts/stix/tmtc-probe.py --seconds 60
 #    within 10 s, then a corrupt-CRC TC and expects TM(1,2)):
 STIX_ASW_ELF=/path/to/ASW_em.elf bash scripts/stix/tc-smoke.sh \
     build/qemu-system-sparc          # add --dry-run to only print
+
+# 7. Detector gate (detector plan D-3, accepted-diffs §33; needs the ELF,
+#    a fresh run dir of its own and the 21000 flock; ~4.5 min):
+STIX_DETECTOR_RUN_DIR=/tmp/stix-detector-run \
+    flock /tmp/stix-qtest-21000.lock bash scripts/stix/detector-smoke.sh \
+    build/qemu-system-sparc          # add --negative, --dry-run
+# its stdlib checkers, also usable on their own:
+python3 scripts/stix/ql-check.py --self-test          # QL TM(21,6) decode
+python3 scripts/stix/idefx-trace-check.py --self-test # verification runs
 ```
 
 Notes:
@@ -133,6 +142,29 @@ Notes:
   (correction 5), never on the 0x49 SpW header byte (findings F1). QEMU
   is stopped when the probe finishes; `flash.bin` stays in place.
   `--dry-run` prints the commands without booting.
+- Detector gate: `detector-smoke.sh` (see step 7). **PASS** means the
+  FSW went SAFE -> CONF -> NOMINAL -> CONF with the ASIC verification
+  period at 30 s, no verification/SEU/noisy-detector/fallback TM fired,
+  the NOMINAL-exit flush carried all five QL SSIDs 30-34 with the
+  zero-sky content (`ql-check.py` on the probe's `--dump-apid` file),
+  the UART had no IDeF-X, context or ROTB error, and the trace showed
+  >= 3 verification runs of exactly 384 read address blocks
+  (`idefx-trace-check.py`). `--negative` (`det-idefx=off`) passes only
+  when exactly the UART IDeF-X check and the trace check fail, the
+  trace being present and empty.
+- **Gate exit codes:**
+
+  | Code | Meaning |
+  |---|---|
+  | 0 | PASS (also `--dry-run` / `--check-guard` done) |
+  | 1 | FAIL: an expectation, a forbid, a closed connection or a post-run check |
+  | 2 | environment problem (port busy, QEMU died, bad arguments, refused run dir) |
+  | 77 | SKIP: the ASW ELF is absent. **The convention for new gates** (`detector-smoke.sh` and later), as automake/meson treat 77. |
+
+  Legacy: `boot-smoke.sh`, `soak.sh`, `tc-smoke.sh`, `nominal-smoke.sh`
+  and `fault-smoke.sh` still exit 0 on SKIP (they print `SKIP:`); they
+  keep that for now. The checkers `ql-check.py` and
+  `idefx-trace-check.py` exit 0 pass, 1 fail, 2 unreadable input.
 - The wrapper locates the old binary via `STIX_OLD_QEMU`
   (default `/tmp/qemu-stix-baseline/build/sparc-softmmu/qemu-system-sparc`).
 - `qemu-stdout.golden.log` (the `stix*` trace-event stream, captured with
@@ -159,6 +191,7 @@ From Windows the same files are at `\\wsl$\<distro>\tmp\stix-uprev-run\`.
 | `boot-smoke.sh` | `uart.smoke.raw` (+ `.norm`) | `qemu-stdout.smoke.log` | `tm.smoke.log` (`--with-tm`) |
 | `tc-smoke.sh` | `uart.tc.raw` | `qemu-stdout.tc.log` | `tc.smoke.probe.log` (framed units + expectations) |
 | `nominal-smoke.sh` | `uart.nominal.raw` (+ `.txt`) | `qemu-stdout.nominal.log` | `nominal.probe.log` |
+| `detector-smoke.sh` | `uart.detector.raw` (+ `.txt`) | `qemu-stdout.detector.log`; `idefx.trace` (timestamped `stixdet_idefx_cmd`) | `detector.probe.log`; `ql.dump.hex` (whole 0x5DC packets), `ql.check.log` (decoded QL TM) |
 | `capture-golden.sh` | `uart.golden.raw` | `qemu-stdout.golden.log` | — |
 
 All of these are in the run directory. Each run overwrites its own files.
