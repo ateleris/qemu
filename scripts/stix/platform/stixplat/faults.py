@@ -4,13 +4,24 @@
 A named failure records the *intent*: an id from the JSON catalogue,
 its resolved params and seed, and its expected detection, as one
 `fault` record per inject and per clear. The action itself reuses the
-platform switches and the forcing hooks; a fault changes `presented`
-only.
+platform switches and the forcing hooks.
+
+Lifecycle (PL-4 review SF4):
+- everything is validated before anything is marked;
+- `at_sim` arms the fault; `fault.clear` disarms an armed fault (also a
+  non-reversible one, which has not happened yet);
+- an apply that fails at its trigger (in the poller) is a `fault`
+  record with the error, and leaves nothing armed or active;
+- `until_cleared` and `until_write` faults are *active* until cleared;
+  `transient` and `permanent` ones are one-shot events, never active,
+  and may be injected again;
+- apply returns the state it replaced, and undo restores exactly that.
 """
 
 import json
 import os
 import random
+import re
 import threading
 
 from .dispatch import VerbError
@@ -20,45 +31,74 @@ DEFAULT_CATALOGUE = os.path.normpath(os.path.join(
     HERE, "..", "catalogue", "faults-v1.json"))
 CLASSES = ("component", "signal", "link", "memory", "timing")
 PERSISTENCE = ("transient", "until_cleared", "permanent", "until_write")
+LASTING = ("until_cleared", "until_write")
 ACTIONS = ("link_down", "timecodes_off", "timecode_inject", "obt_jump",
            "keepalive_off", "adc")
 TRIGGERS = ("now", "at_sim")
 REQUIRED = ("id", "class", "target", "mode", "params", "persistence",
             "reversible", "action", "preconditions", "expected_detection")
+ADC_TARGET = re.compile(r"^instrument\.hk_adc\.(\d+)$")
+HK_CHANNELS = 128
 
 
 class CatalogueError(Exception):
     pass
 
 
+def _need(cond, msg):
+    if not cond:
+        raise CatalogueError(msg)
+
+
 def validate(cat):
-    """The schema check of a catalogue (start-up and self-test)."""
-    if not isinstance(cat, dict) or cat.get("api") != 1:
-        raise CatalogueError("catalogue: \"api\": 1 is required")
+    """The schema check of a catalogue (start-up and self-test); every
+    problem, also a wrong type, is a CatalogueError naming the entry."""
+    _need(isinstance(cat, dict) and cat.get("api") == 1,
+          "catalogue: \"api\": 1 is required")
+    faults = cat.get("faults", [])
+    _need(isinstance(faults, list), "catalogue: \"faults\" is not a list")
     seen = set()
-    for f in cat.get("faults", []):
+    for i, f in enumerate(faults):
+        _need(isinstance(f, dict), "fault #%d is not an object" % i)
         for k in REQUIRED:
-            if k not in f:
-                raise CatalogueError("fault %r lacks %r" % (f.get("id"), k))
+            _need(k in f, "fault %r lacks %r" % (f.get("id"), k))
         fid = f["id"]
-        if fid in seen:
-            raise CatalogueError("duplicate fault id %r" % fid)
+        _need(isinstance(fid, str) and fid, "fault #%d: id is not a "
+              "string" % i)
+        _need(fid not in seen, "duplicate fault id %r" % fid)
         seen.add(fid)
-        if f["class"] not in CLASSES:
-            raise CatalogueError("%s: class %r" % (fid, f["class"]))
-        if f["persistence"] not in PERSISTENCE:
-            raise CatalogueError("%s: persistence %r"
-                                 % (fid, f["persistence"]))
-        if f["action"].get("kind") not in ACTIONS:
-            raise CatalogueError("%s: action %r" % (fid, f["action"]))
+        _need(f["class"] in CLASSES, "%s: class %r" % (fid, f["class"]))
+        _need(f["persistence"] in PERSISTENCE, "%s: persistence %r"
+              % (fid, f["persistence"]))
+        _need(isinstance(f["reversible"], bool), "%s: reversible is not "
+              "a boolean" % fid)
+        _need(isinstance(f["target"], str), "%s: target is not a string"
+              % fid)
+        act = f["action"]
+        _need(isinstance(act, dict) and act.get("kind") in ACTIONS,
+              "%s: action %r" % (fid, act))
+        _need(isinstance(f["params"], dict), "%s: params is not an object"
+              % fid)
         for name, p in f["params"].items():
-            if p.get("type") != "integer" or "default" not in p:
-                raise CatalogueError("%s: param %s needs type integer and "
-                                     "a default" % (fid, name))
+            _need(isinstance(p, dict) and p.get("type") == "integer" and
+                  isinstance(p.get("default"), int), "%s: param %s needs "
+                  "type integer and an integer default" % (fid, name))
+        _need(isinstance(f["preconditions"], list), "%s: preconditions "
+              "is not a list" % fid)
+        _need(isinstance(f["expected_detection"], list), "%s: "
+              "expected_detection is not a list" % fid)
         for d in f["expected_detection"]:
-            if "tm" not in d or "within_s" not in d:
-                raise CatalogueError("%s: expected_detection needs tm and "
-                                     "within_s" % fid)
+            _need(isinstance(d, dict) and "tm" in d and "within_s" in d,
+                  "%s: expected_detection needs tm and within_s" % fid)
+        if act["kind"] == "adc":
+            ch = act.get("ch")
+            _need(isinstance(ch, int) and 0 <= ch < HK_CHANNELS,
+                  "%s: action ch %r is not 0..%d" % (fid, ch,
+                                                     HK_CHANNELS - 1))
+            m = ADC_TARGET.match(f["target"])
+            _need(m and int(m.group(1)) == ch, "%s: target %r is not "
+                  "instrument.hk_adc.%d (the action's ch)"
+                  % (fid, f["target"], ch))
     return cat
 
 
@@ -81,12 +121,15 @@ def _no_constant(name):
 
 class Faults:
     def __init__(self, cat, log, clock, actions):
-        """@actions: {kind: (apply(entry, params), undo(entry, params))}."""
+        """@actions: {kind: (apply(entry, params) -> prior state,
+        undo(entry, params, prior))}."""
         self.cat = {f["id"]: f for f in cat["faults"]}
         self.log = log
         self.clock = clock
         self.actions = actions
-        self.active = {}
+        self.active = {}            # lasting faults, applied
+        self.armed = {}             # at_sim faults, not yet applied
+        self.token = 0
         self.lock = threading.Lock()
 
     def catalogue(self):
@@ -94,6 +137,8 @@ class Faults:
                 "active": self.status()}
 
     def _params(self, entry, given):
+        if not isinstance(given, dict):
+            raise VerbError(400, "params must be an object")
         out = {}
         for k in given:
             if k not in entry["params"]:
@@ -107,27 +152,43 @@ class Faults:
             out[name] = v
         return out
 
+    def _trigger(self, trigger):
+        trigger = trigger or {"at": "now"}
+        if not isinstance(trigger, dict) or \
+                trigger.get("at", "now") not in TRIGGERS:
+            raise VerbError(400, "trigger.at is now or at_sim")
+        if trigger.get("at") == "at_sim":
+            t = trigger.get("sim_time")
+            if isinstance(t, bool) or not isinstance(t, int) or t < 0:
+                raise VerbError(400, "trigger.sim_time (ns) is required")
+        return trigger
+
     def inject(self, id, params=None, trigger=None, seed=None):
         entry = self.cat.get(id)
         if entry is None:
             raise VerbError(404, "no fault %r in the catalogue" % id)
         params = self._params(entry, params or {})
-        trigger = trigger or {"at": "now"}
-        if trigger.get("at", "now") not in TRIGGERS:
-            raise VerbError(400, "trigger.at is now or at_sim")
+        trigger = self._trigger(trigger)
         if seed is None:
             seed = random.SystemRandom().randrange(1 << 31)
+        lasting = entry["persistence"] in LASTING
         with self.lock:
-            if id in self.active:
+            if id in self.armed:
+                raise VerbError(409, "fault %s is already armed" % id)
+            if lasting and id in self.active:
                 raise VerbError(409, "fault %s is already active" % id)
-            if entry["persistence"] != "transient":
+            if trigger.get("at") == "at_sim":
+                self.token += 1
+                tok = self.token
+                self.armed[id] = {"params": params, "seed": seed,
+                                  "trigger": trigger, "token": tok}
+            elif lasting:
+                # held while applying, so a concurrent inject gets 409
                 self.active[id] = {"params": params, "seed": seed,
                                    "pending": True}
         if trigger.get("at") == "at_sim":
-            t = trigger.get("sim_time")
-            if not isinstance(t, int):
-                raise VerbError(400, "trigger.sim_time (ns) is required")
-            self.clock.at(t, lambda: self._apply(entry, params, seed))
+            self.clock.at(trigger["sim_time"],
+                          lambda: self._fire(entry, params, seed, tok))
             self.log.emit("api", "fault", "fault." + id,
                           {"action": "armed", "params": params,
                            "seed": seed, "trigger": trigger})
@@ -140,30 +201,60 @@ class Faults:
             raise
         return {"id": id, "params": params, "seed": seed}
 
+    def _fire(self, entry, params, seed, tok):
+        """The at_sim trigger (the poller thread)."""
+        fid = entry["id"]
+        with self.lock:
+            a = self.armed.get(fid)
+            if a is None or a["token"] != tok:
+                return              # disarmed (or re-armed)
+            del self.armed[fid]
+            if entry["persistence"] in LASTING:
+                self.active[fid] = {"params": params, "seed": seed,
+                                    "pending": True}
+        try:
+            self._apply(entry, params, seed)
+        except Exception as e:
+            with self.lock:
+                self.active.pop(fid, None)
+            self.log.emit("ctl", "fault", "fault." + fid,
+                          {"action": "error", "params": params,
+                           "seed": seed, "error": "%s: %s"
+                           % (type(e).__name__, e)})
+
     def _apply(self, entry, params, seed):
         apply_fn, _ = self.actions[entry["action"]["kind"]]
-        apply_fn(entry, params)
+        prior = apply_fn(entry, params)
         with self.lock:
             if entry["id"] in self.active:
-                self.active[entry["id"]]["pending"] = False
+                self.active[entry["id"]].update(pending=False, prior=prior)
         self.log.emit("api", "fault", "fault." + entry["id"],
                       {"action": "inject", "target": entry["target"],
                        "mode": entry["mode"], "params": params,
-                       "seed": seed,
+                       "seed": seed, "persistence": entry["persistence"],
                        "expected_detection": entry["expected_detection"]})
 
     def clear(self, id):
         entry = self.cat.get(id)
         if entry is None:
             raise VerbError(404, "no fault %r in the catalogue" % id)
-        if not entry["reversible"]:
-            raise VerbError(409, "fault %s is not reversible" % id)
         with self.lock:
-            st = self.active.pop(id, None)
-        if st is None:
-            raise VerbError(409, "fault %s is not active" % id)
+            armed = self.armed.pop(id, None)
+        if armed is not None:
+            self.log.emit("api", "fault", "fault." + id,
+                          {"action": "disarm", "params": armed["params"],
+                           "seed": armed["seed"]})
+            return {"id": id, "disarmed": True}
+        if entry["persistence"] not in LASTING or not entry["reversible"]:
+            raise VerbError(409, "fault %s is a one-shot event or not "
+                            "reversible: nothing to clear" % id)
+        with self.lock:
+            st = self.active.get(id)
+            if st is None or st.get("pending"):
+                raise VerbError(409, "fault %s is not active" % id)
+            del self.active[id]
         _, undo = self.actions[entry["action"]["kind"]]
-        undo(entry, st["params"])
+        undo(entry, st["params"], st.get("prior"))
         self.log.emit("api", "fault", "fault." + id,
                       {"action": "clear", "params": st["params"],
                        "seed": st["seed"]})
@@ -171,7 +262,12 @@ class Faults:
 
     def status(self):
         with self.lock:
-            return {k: dict(v) for k, v in self.active.items()}
+            out = {k: {kk: vv for kk, vv in v.items() if kk != "prior"}
+                   for k, v in self.active.items()}
+            for k, v in self.armed.items():
+                out[k] = {"params": v["params"], "seed": v["seed"],
+                          "pending": True, "trigger": v["trigger"]}
+            return out
 
     def active_targets(self):
         """{target path: [fault ids]} for the state tree (D-PLo)."""

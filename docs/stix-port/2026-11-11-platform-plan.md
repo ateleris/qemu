@@ -961,6 +961,18 @@ TCP TMTC server: off (-global grlib-stixspw.tmtc-server=off)
     expected detection) for reports.
 - **Every inject and clear is a `fault` log record** with the resolved
   params and seed, so a run can be replayed from its log (D-PLs).
+- **The lifecycle (PL-4 review SF4):** everything is validated before
+  anything is marked; `at_sim` arms a fault and `fault.clear` disarms
+  it; an apply that fails at its trigger is a `fault` record with
+  `action: "error"` and leaves nothing armed or active;
+  `until_cleared`/`until_write` faults are *active* until cleared,
+  while `transient` and `permanent` ones (`obt.jump`) are one-shot
+  events, never active, and may be injected again; apply returns the
+  state it replaced and clear restores exactly that (a fault on a link
+  the operator had taken down leaves it down).
+- **The catalogue check** reports every problem, a wrong type too, as a
+  catalogue error naming the entry, and cross-checks an `adc` action's
+  `ch` against its `instrument.hk_adc.<ch>` target.
 - A fault changes `presented` only (D-PLo). The comparison view then
   shows it as `fault` straight away.
 

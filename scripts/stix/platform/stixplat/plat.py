@@ -294,22 +294,26 @@ class Platform:
 
     # -- fault actions (D-PLq) ------------------------------------------------
     def _fault_actions(self):
-        saved = {}
-
+        """{kind: (apply -> prior, undo(prior))}: undo puts back what the
+        apply replaced (SF4), so a fault on a link the operator had
+        already taken down leaves it down when cleared."""
         def link(entry, p):
-            saved["link"] = self.link_down
+            prior = self.link_down
             self.v_link("down")
+            return prior
 
-        def link_undo(entry, p):
-            self.v_link("down" if saved.get("link") else "up")
+        def link_undo(entry, p, prior):
+            self.v_link("down" if prior else "up")
 
         def tc_off(entry, p):
-            saved["tc"] = self.timecodes
+            prior = self.timecodes
             self.v_tc_enable(False)
+            return prior
 
-        def tc_off_undo(entry, p):
-            self.v_tc_enable(True if saved.get("tc") is None
-                             else saved["tc"])
+        def tc_off_undo(entry, p, prior):
+            # None: the operator never set it, so QEMU's default (on)
+            self.v_tc_enable(True if prior is None else prior)
+            self.timecodes = prior
 
         def tc_inject(entry, p):
             self.v_tc_inject(p["timecnt"])
@@ -320,22 +324,30 @@ class Platform:
                           & 0xFFFFFFFFFFFF)
 
         def ka_off(entry, p):
-            saved["ka"] = self.keepalive.enabled
+            prior = self.keepalive.enabled
             self.v_keepalive(enabled=False)
+            return prior
 
-        def ka_undo(entry, p):
-            self.v_keepalive(enabled=saved.get("ka", True))
+        def ka_undo(entry, p, prior):
+            self.v_keepalive(enabled=prior)
+
+        def adc_path(entry):
+            return "instrument.hk_adc.%d" % entry["action"]["ch"]
 
         def adc(entry, p):
-            self.forcing.set("instrument.hk_adc.%d" % entry["action"]["ch"],
-                             p["value"], why="fault " + entry["id"])
+            prior = self.forcing.status().get(adc_path(entry))
+            self.forcing.set(adc_path(entry), p["value"],
+                             why="fault " + entry["id"])
+            return prior
 
-        def adc_undo(entry, p):
-            self.forcing.clear("instrument.hk_adc.%d"
-                               % entry["action"]["ch"],
-                               why="fault " + entry["id"] + " cleared")
+        def adc_undo(entry, p, prior):
+            why = "fault " + entry["id"] + " cleared"
+            if prior is None:
+                self.forcing.clear(adc_path(entry), why=why)
+            else:
+                self.forcing.set(adc_path(entry), prior, why=why)
 
-        def nothing(entry, p):
+        def nothing(entry, p, prior=None):
             pass
 
         return {"link_down": (link, link_undo),

@@ -1352,12 +1352,107 @@ def t_platform_tcs(env):
         ctl.shutdown()
 
 
+def _fault_rig():
+    t = [0.0]
+    clk = SimClock(mono_fn=lambda: t[0])
+    clk.process_started()
+    clk.resumed()
+    clk.sample(0)
+    lg = log_mod.RecordLog(None, clk.now)
+    calls = []
+    fail = {"v": False}
+
+    def apply(entry, p):
+        if fail["v"]:
+            raise VerbError(409, "STIX is off")
+        calls.append(("apply", entry["id"]))
+        return "prior-" + entry["id"]
+
+    def undo(entry, p, prior):
+        calls.append(("undo", entry["id"], prior))
+    acts = {k: (apply, undo) for k in faults_mod.ACTIONS}
+    f = faults_mod.Faults(faults_mod.load(), lg, clk, acts)
+
+    def recs():
+        return [r.obj["data"] for r in lg.since(0) if r.kind == "fault"]
+    return clk, f, calls, fail, recs
+
+
+def t_fault_lifecycle(env):
+    """SF4: validate before active; an armed fault can be disarmed; an
+    apply failure at its trigger is logged and leaves nothing pending;
+    permanent and transient faults are one-shot events; undo gets the
+    state saved at apply."""
+    clk, f, calls, fail, recs = _fault_rig()
+    e = raises(VerbError, f.inject, "spw.link.disconnect",
+               trigger={"at": "at_sim"})
+    check(e.status == 400 and f.status() == {}, "a bad trigger left %r"
+          % f.status())
+    f.inject("spw.link.disconnect")         # not 409: nothing was left
+    check(calls == [("apply", "spw.link.disconnect")], "applied %r" % calls)
+    f.clear("spw.link.disconnect")
+    check(calls[-1] == ("undo", "spw.link.disconnect",
+                        "prior-spw.link.disconnect"),
+          "undo with the saved prior state %r" % (calls[-1],))
+    # armed, then disarmed by clear
+    r = f.inject("keepalive.missing",
+                 trigger={"at": "at_sim", "sim_time": 2 * NS})
+    check(r["armed"] and f.status()["keepalive.missing"]["pending"],
+          "armed %r" % f.status())
+    f.clear("keepalive.missing")
+    clk.sample(3 * NS)
+    clk.run_due()
+    check(("apply", "keepalive.missing") not in calls and
+          f.status() == {}, "a disarmed fault applied: %r" % calls)
+    check(recs()[-1]["action"] == "disarm", "disarm record %r" % recs()[-1])
+    # an apply failure at the trigger (the poller thread)
+    fail["v"] = True
+    f.inject("timecode.missing",
+             trigger={"at": "at_sim", "sim_time": 4 * NS})
+    clk.sample(5 * NS)
+    clk.run_due()
+    last = recs()[-1]
+    check(last["action"] == "error" and "STIX is off" in last["error"] and
+          f.status() == {}, "apply failure %r / %r" % (last, f.status()))
+    fail["v"] = False
+    # permanent and transient faults are events: not active, repeatable
+    for fid in ("obt.jump", "obt.jump", "timecode.wrong_value"):
+        f.inject(fid)
+    check(f.status() == {} and f.active_targets() == {},
+          "one-shot faults listed as active %r" % f.status())
+    e = raises(VerbError, f.clear, "obt.jump")
+    check(e.status == 409, "clear of a one-shot fault")
+    # a non-reversible fault armed in the future can still be disarmed
+    f.inject("obt.jump", trigger={"at": "at_sim", "sim_time": 9 * NS})
+    f.clear("obt.jump")
+    n = calls.count(("apply", "obt.jump"))
+    clk.sample(10 * NS)
+    clk.run_due()
+    check(calls.count(("apply", "obt.jump")) == n, "disarmed obt.jump ran")
+
+
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
     cat = faults_mod.load()
     check(len(cat["faults"]) >= 8, "v1 catalogue")
-    for broken in ({"api": 2, "faults": []},
+    for broken in ({"api": 1, "faults": {}},
+                   {"api": 1, "faults": ["x"]},
+                   {"api": 1, "faults": [dict(cat["faults"][0],
+                                              params=[])]},
+                   {"api": 1, "faults": [dict(cat["faults"][0],
+                                              action="link_down")]},
+                   {"api": 1, "faults": [dict(cat["faults"][0],
+                                              expected_detection={})]},
+                   {"api": 1, "faults": [dict(cat["faults"][5],
+                                              target="instrument.hk_adc.5")
+                                         ]},
+                   {"api": 1, "faults": [dict(cat["faults"][5],
+                                              action={"kind": "adc",
+                                                      "ch": 200},
+                                              target="instrument.hk_adc.200")
+                                         ]},
+                   {"api": 2, "faults": []},
                    {"api": 1, "faults": [{"id": "x"}]},
                    {"api": 1, "faults": [dict(cat["faults"][0],
                                               **{"class": "nope"})]},
@@ -1369,6 +1464,16 @@ def t_faults(env):
         cmd = ctl.command
         cmd("platform.power.on", {})
         cmd("platform.power.boot", {})
+        # SF4: undo restores the operator's state from before the fault
+        cmd("platform.spw.link", {"state": "down"})
+        cmd("platform.timecode.enable", {"enabled": False})
+        for fid in ("spw.link.disconnect", "timecode.missing"):
+            cmd("fault.inject", {"id": fid})
+            cmd("fault.clear", {"id": fid})
+        check(ctl.plat.link_down and ctl.plat.timecodes is False,
+              "undo forced the operator's down/off back to up/on")
+        cmd("platform.spw.link", {"state": "up"})
+        cmd("platform.timecode.enable", {"enabled": True})
         r = cmd("fault.inject", {"id": "thermal.psu.overtemp",
                                  "params": {"value": 3900}, "seed": 7})
         check(r["seed"] == 7, "seed")
@@ -1379,7 +1484,6 @@ def t_faults(env):
         sets = ctl.power.qmp.execute("x-fake-set-log")
         check(["/machine/stixctrl", "adc-inject[40]", 3900] in sets,
               "adc-inject[40] set: %r" % sets)
-        check(ctl.state.get("instrument.hk_adc.40") is None or True, "")
         e = raises(VerbError, cmd, "fault.inject",
                    {"id": "thermal.psu.overtemp"})
         check(e.status == 409, "double inject")
@@ -1717,6 +1821,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("keep-alive: rx trace filter", t_keepalive_trace),
          ("TM relay + TC proxy", t_relay),
          ("platform TCs (9/20, R2)", t_platform_tcs),
+         ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),

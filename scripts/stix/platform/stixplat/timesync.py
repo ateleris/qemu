@@ -67,7 +67,7 @@ class TimeSync:
         self.autostart = autostart
         self.auto_armed = False
 
-    # -- the automatic sync (B2), once per boot ---------------------------------
+    # -- the automatic sync (B2), once per boot --------------------------
     def on_boot(self):
         """A boot or a guest reset: arm the automatic sync; "boot"
         sends it now, "first_tm" at the first TM."""
