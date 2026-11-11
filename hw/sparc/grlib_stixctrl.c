@@ -512,21 +512,18 @@ static const uint16_t stixctrl_hk_adc_table[STIXCTRL_HK_CHANNELS] = {
 };
 
 /*
- * The ADC value for one channel: the static nominal table plus the
- * overrides that follow the CURRENT commanded register state (hkCmdSta
- * and idefxConfig, as they stand when the hkAdc write happens).
- * POWERSTAT (hkCmdSta bits 9:5) is not consulted: the values follow
- * the commanded enables, which POWERSTAT mirrors (stixctrl_hkcmdsta).
+ * The "truth" ADC value for one channel (platform plan D-PLo, PL-2a):
+ * the static nominal table plus the overrides that follow the CURRENT
+ * commanded register state (hkCmdSta and idefxConfig, as they stand
+ * when the hkAdc write happens), without any injection. POWERSTAT
+ * (hkCmdSta bits 9:5) is not consulted: the values follow the
+ * commanded enables, which POWERSTAT mirrors (stixctrl_hkcmdsta).
+ * Pure: no register or state is written.
  */
-static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
+static uint32_t stixctrl_hk_truth(STIXCTRL *s, uint32_t ch)
 {
     uint32_t cmdsta;
     uint32_t spwen;
-
-    /* P4-2: an injection beats the table and the state overrides */
-    if (s->adc_inject[ch] != STIXCTRL_ADC_INJECT_NONE) {
-        return s->adc_inject[ch];
-    }
 
     cmdsta = s->reg.hkCmdSta;
     spwen = (cmdsta >> STIXCTRL_HKCMDSTA_SPWEN) & STIXCTRL_HKCMDSTA_SPWEN_MASK;
@@ -562,6 +559,19 @@ static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
     default:
         return stixctrl_hk_adc_table[ch];
     }
+}
+
+/*
+ * The value the FSW reads (the "presented" value, D-PLo): P4-2's
+ * injection beats the table and the state overrides; otherwise the
+ * truth. Identical to the pre-split stixctrl_hk_value.
+ */
+static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
+{
+    if (s->adc_inject[ch] != STIXCTRL_ADC_INJECT_NONE) {
+        return s->adc_inject[ch];
+    }
+    return stixctrl_hk_truth(s, ch);
 }
 
 /*
