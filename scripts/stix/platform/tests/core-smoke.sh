@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # core-smoke: the live gate of the platform controller core (PL-3).
-# curl only (no browser); the controller on 127.0.0.1:21520, QEMU UDP on
-# 21521/21522, run dir /tmp/stix-plat/core-smoke (a fresh sparse flash
-# made by QEMU). Checks, in order:
+# curl only (no browser). Ports and run dir from plat-slot.sh: legacy
+# (STIX_PORT_BASE unset) the controller on 127.0.0.1:21520, QEMU UDP on
+# 21521/21522, run dir /tmp/stix-plat/core-smoke; in slot k the slot's
+# band and /tmp/stix-plat/core-smoke-s<k>. A fresh sparse flash made by
+# QEMU. Checks, in order:
 #   power on: frozen, flash.bin sparse; an SSE client collects records
 #   timecodes=false set while frozen (raw QMP via debug.qmp) survives cont
 #   boot: the UART banner within 20 s, as uart records
@@ -15,23 +17,33 @@
 #   SIGTERM: the controller powers QEMU off with quit, rc 0
 #   the SSE records equal the log.jsonl lines (same seqs, same bytes)
 #
-# Usage: core-smoke.sh <qemu-binary>   (STIX_ASW_ELF as in boot-smoke.sh)
-# Run it under flock /tmp/stix-qtest-21000.lock like every QEMU gate.
+# Usage: core-smoke.sh [--dry-run] <qemu-binary>   (STIX_ASW_ELF as in
+# boot-smoke.sh). Legacy: run it under flock /tmp/stix-qtest-21000.lock;
+# STIX_PORT_BASE=auto|k takes a slot (lib/slot.sh). --dry-run prints the
+# ports and run dir and starts nothing.
 # Exit codes: 0 pass (or SKIP), 1 a check failed, 2 environment problem.
 set -euo pipefail
 
-QEMU_BIN="$(realpath -e "${1:?usage: core-smoke.sh <qemu-binary>}")" || exit 2
+DRY=0
+if [ "${1:-}" = --dry-run ]; then DRY=1; shift; fi
+USAGE="usage: core-smoke.sh [--dry-run] <qemu-binary>"
+QEMU_BIN="$(realpath -e "${1:?$USAGE}")" || exit 2
 ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CTL="$HERE/../stixplat.py"
-RUN=/tmp/stix-plat/core-smoke
-PORT=21520
+# shellcheck source=plat-slot.sh
+. "$HERE/plat-slot.sh"
+if [ "$DRY" = 1 ] || [ ! -f "$ASW_ELF" ]; then
+    plat_slot_setup core-smoke 21520 peek
+    [ "$DRY" = 0 ] || { plat_print_ports; exit 0; }
+    echo "SKIP: ASW ELF absent ($ASW_ELF)"
+    exit 0
+fi
+plat_slot_setup core-smoke 21520
+RUN="$PLAT_RUN"
+PORT="$PLAT_API"
 API="http://127.0.0.1:$PORT/api/v1"
-
-[ -f "$ASW_ELF" ] || { echo "SKIP: ASW ELF absent ($ASW_ELF)"; exit 0; }
-for p in 21520 21521 21522; do
-    if ss -lntu | grep -q ":$p "; then echo "port $p busy"; exit 2; fi
-done
+plat_ports_free
 
 mkdir -p "$RUN"
 cat > "$RUN/core-smoke.toml" <<EOF
@@ -44,8 +56,11 @@ binary = "$QEMU_BIN"
 elf = "$ASW_ELF"
 [ports]
 api = $PORT
-qemu_tm = 21521
-qemu_tc = 21522
+qemu_tm = $PLAT_QEMU_TM
+qemu_tc = $PLAT_QEMU_TC
+gs_tc = $PLAT_GS_TC
+[gs]
+tm_dests = ["127.0.0.1:$PLAT_SINK"]
 [power]
 off_time_s = 2.0
 [debug]
@@ -61,7 +76,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-fail() { echo "CORE-SMOKE: FAIL: $*"; exit 1; }
+fail() { echo "CORE-SMOKE: FAIL: $*${STIX_SLOT_TAG}"; exit 1; }
 ok() { echo "ok   $*"; }
 post() {
     local body='{}'
@@ -212,4 +227,4 @@ print("ok   SSE: %d records equal log.jsonl seqs %d..%d byte for byte"
       % (len(sse), lo, hi))
 EOF
 
-echo "CORE-SMOKE: PASS"
+echo "CORE-SMOKE: PASS${STIX_SLOT_TAG}"

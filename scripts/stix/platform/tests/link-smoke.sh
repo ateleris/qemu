@@ -3,7 +3,8 @@
 # link-smoke: the live gate of the platform link (PL-4): the TM relay, the
 # TC proxy, the keep-alive, the time sync, the time-code switches and the
 # first fault, against the real ASW. REST through the controller's API, a
-# fake GS UDP listener for the relayed TM. Ports: the API on 21525, QEMU
+# fake GS UDP listener for the relayed TM. Ports and run dir from
+# plat-slot.sh; legacy (STIX_PORT_BASE unset): the API on 21525, QEMU
 # TM/TC 21526/21527, GS TC 21528, the fake GS on 21531; run dir
 # /tmp/stix-plat/link-smoke (a fresh sparse flash made by QEMU). Checks:
 #   boot: the boot report TM (EID 0x0022) reaches the fake GS
@@ -22,19 +23,30 @@
 #   relay: the fake GS got byte-identical bare SPs, one per tm.jsonl line
 #
 # Usage: link-smoke.sh <qemu-binary>   (STIX_ASW_ELF as in boot-smoke.sh)
-# Run it under flock /tmp/stix-qtest-21000.lock like every QEMU gate.
+# Legacy: run it under flock /tmp/stix-qtest-21000.lock; STIX_PORT_BASE=
+# auto|k takes a slot (lib/slot.sh, band and run dir -s<k>). --dry-run
+# (first argument) prints the ports and run dir and starts nothing.
 # Exit codes: 0 pass (or SKIP), 1 a check failed, 2 environment problem.
 set -euo pipefail
 
-QEMU_BIN="$(realpath -e "${1:?usage: link-smoke.sh <qemu-binary>}")" || exit 2
+DRY=0
+if [ "${1:-}" = --dry-run ]; then DRY=1; shift; fi
+USAGE="usage: link-smoke.sh [--dry-run] <qemu-binary>"
+QEMU_BIN="$(realpath -e "${1:?$USAGE}")" || exit 2
 ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN=/tmp/stix-plat/link-smoke
-
-[ -f "$ASW_ELF" ] || { echo "SKIP: ASW ELF absent ($ASW_ELF)"; exit 0; }
-for p in 21525 21526 21527 21528 21531; do
-    if ss -lntu | grep -q ":$p "; then echo "port $p busy"; exit 2; fi
-done
+# shellcheck source=plat-slot.sh
+. "$HERE/plat-slot.sh"
+if [ "$DRY" = 1 ] || [ ! -f "$ASW_ELF" ]; then
+    plat_slot_setup link-smoke 21525 peek
+    [ "$DRY" = 0 ] || { plat_print_ports; exit 0; }
+    echo "SKIP: ASW ELF absent ($ASW_ELF)"
+    exit 0
+fi
+plat_slot_setup link-smoke 21525
+RUN="$PLAT_RUN"
+export STIX_SLOT_TAG
+plat_ports_free
 
 mkdir -p "$RUN"
 cat > "$RUN/link-smoke.toml" <<EOF
@@ -46,12 +58,12 @@ fresh = true
 binary = "$QEMU_BIN"
 elf = "$ASW_ELF"
 [ports]
-api = 21525
-qemu_tm = 21526
-qemu_tc = 21527
-gs_tc = 21528
+api = $PLAT_API
+qemu_tm = $PLAT_QEMU_TM
+qemu_tc = $PLAT_QEMU_TC
+gs_tc = $PLAT_GS_TC
 [gs]
-tm_dests = ["127.0.0.1:21531"]
+tm_dests = ["127.0.0.1:$PLAT_SINK"]
 tc_during_link_down = "drop"
 [power]
 off_time_s = 2.0
@@ -73,9 +85,10 @@ PKG, RUN = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.path.dirname(PKG))
 from stixplat import decode, tcbuild          # noqa: E402
 
-API = "http://127.0.0.1:21525/api/v1"
-GS = ("127.0.0.1", 21531)
-GS_TC = ("127.0.0.1", 21528)
+API = "http://127.0.0.1:%s/api/v1" % os.environ["PLAT_API"]
+GS = ("127.0.0.1", int(os.environ["PLAT_SINK"]))
+GS_TC = ("127.0.0.1", int(os.environ["PLAT_GS_TC"]))
+TAG = os.environ.get("STIX_SLOT_TAG", "")
 NS = 1_000_000_000
 
 
@@ -418,7 +431,7 @@ def run():
         main(gs, ctl)
         finish(gs, ctl)
     except Fail as e:
-        print("LINK-SMOKE: FAIL: %s" % e)
+        print("LINK-SMOKE: FAIL: %s%s" % (e, TAG))
         return 1
     finally:
         if ctl.poll() is None:
@@ -428,7 +441,7 @@ def run():
             except subprocess.TimeoutExpired:
                 ctl.kill()
         gs.stop = True
-    print("LINK-SMOKE: PASS")
+    print("LINK-SMOKE: PASS" + TAG)
     return 0
 
 

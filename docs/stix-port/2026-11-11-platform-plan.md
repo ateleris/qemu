@@ -2071,12 +2071,16 @@ defaults that the user can override.
   `stixplat/verbs.py`), S5 (a variant without a check is an error), S6
   (above), N1-N7. Not done: a live QEMU-killed run (S1 is tested with
   the scripted world and the self-test's run-mode cases).
-- **TODO (on the rebase onto gate-ports):** move
-  `scripts/stix/platform/tests/core-smoke.sh`, `link-smoke.sh` and
-  `run-smoke.sh` to the gate slot scheme (`scripts/stix/lib/slot.sh`: a
-  slot run dir, slot ports, the shared slot lock) instead of their fixed
-  ports (core-smoke 21520-21522; link-smoke 21525-21528 and the fake GS
-  on 21531; run-smoke 21535-21538 and the TM sink 21541) and
-  `/tmp/stix-plat/core-smoke`, `/tmp/stix-plat/link-smoke`,
-  `/tmp/stix-plat/run-smoke`. gate-ports is not merged yet (PL-3 review
-  S7).
+- **Gate ports (done after the rebase onto gate-ports, §41):**
+  core-smoke, link-smoke and run-smoke source `tests/plat-slot.sh` on
+  top of `scripts/stix/lib/slot.sh`. Unset `STIX_PORT_BASE` keeps the
+  old fixed ports and `/tmp/stix-plat/<gate>` (legacy, under the 21000
+  lock); `auto` or k takes slot k: UDP TM/TC on B+1/B+2 (the band's
+  reserved pair), the API B+3, GS TC B+4, the fake GS or TM sink B+5,
+  run dir `/tmp/stix-plat/<gate>-s<k>`, `slot=… busy=… load=…` on the
+  verdict line. B+0 stays unused (tmtc-server=off). Each gate's
+  `--dry-run` prints its ports; `tests/test-plat-slot.sh` (also the
+  self-test case "gate ports from the slot band") checks legacy and
+  slots 1/2. The platform gates boot a fresh flash in their own run dir
+  (QEMU makes it sparse after the binary guard), never the shared
+  master, so they need no private flash copy.

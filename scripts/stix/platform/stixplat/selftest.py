@@ -2698,6 +2698,19 @@ def t_verbs_doc(env):
           "doc %r" % (api, doc))
 
 
+def t_gate_slots(env):
+    """§41: the platform gates' ports come from the slot band (their
+    --dry-run, a temp lock dir and a fake df; nothing boots)."""
+    import subprocess
+    t = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                     "tests", "test-plat-slot.sh")
+    env_ = {k: v for k, v in os.environ.items() if k != "STIX_PORT_BASE"}
+    r = subprocess.run(["bash", t], capture_output=True, text=True,
+                       timeout=60, env=env_)
+    check(r.returncode == 0 and "PLAT-SLOT: PASS" in r.stdout,
+          "test-plat-slot.sh: %s%s" % (r.stdout, r.stderr))
+
+
 def t_probe_lib(env):
     p = probe_lib.load()
     units = list(p.frame_units(bytes.fromhex("fe0201") + b"\x00" * 6))
@@ -2745,7 +2758,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("fault model: truth|presented, qom", t_fault_model),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
-         ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]
+         ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),
+         ("gate ports from the slot band", t_gate_slots)]
 
 
 def main(only=None):

@@ -1,28 +1,40 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# run-smoke: the live gate of mode = "run" (PL-5). Ports: QEMU TM/TC
-# 21536/21537, GS TC 21538, relayed TM to 21541 (nobody listens); run root
-# /tmp/stix-plat/run-smoke. Checks:
+# run-smoke: the live gate of mode = "run" (PL-5). Ports and run root
+# from plat-slot.sh: legacy (STIX_PORT_BASE unset) QEMU TM/TC
+# 21536/21537, GS TC 21538, relayed TM to 21541 (nobody listens), run
+# root /tmp/stix-plat/run-smoke; in slot k the slot's band and
+# /tmp/stix-plat/run-smoke-s<k>. Checks:
 #   1. run mode over the gate scenarios (gate-spw-link x3, gate-keepalive,
 #      gate-timesync x3) exits 0 and every run's report says pass
 #   2. gate-negative alone exits 1, with exactly one failed check: the
 #      await_event 142d of the step before the clear
 # STIX_RUN_SMOKE_LONG=1 adds the optional gate-timecode-loss to 1.
 #
-# Usage: run-smoke.sh <qemu-binary>   (STIX_ASW_ELF as in boot-smoke.sh)
-# Run it under flock /tmp/stix-qtest-21000.lock like every QEMU gate.
+# Usage: run-smoke.sh [--dry-run] <qemu-binary>   (STIX_ASW_ELF as in
+# boot-smoke.sh). Legacy: run it under flock /tmp/stix-qtest-21000.lock;
+# STIX_PORT_BASE=auto|k takes a slot (lib/slot.sh). --dry-run prints the
+# ports and run root and starts nothing.
 # Exit codes: 0 pass (or SKIP), 1 a check failed, 2 environment problem.
 set -euo pipefail
 
-QEMU_BIN="$(realpath -e "${1:?usage: run-smoke.sh <qemu-binary>}")" || exit 2
+DRY=0
+if [ "${1:-}" = --dry-run ]; then DRY=1; shift; fi
+USAGE="usage: run-smoke.sh [--dry-run] <qemu-binary>"
+QEMU_BIN="$(realpath -e "${1:?$USAGE}")" || exit 2
 ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT=/tmp/stix-plat/run-smoke
-
-[ -f "$ASW_ELF" ] || { echo "SKIP: ASW ELF absent ($ASW_ELF)"; exit 0; }
-for p in 21536 21537 21538 21541; do
-    if ss -lntu | grep -q ":$p "; then echo "port $p busy"; exit 2; fi
-done
+# shellcheck source=plat-slot.sh
+. "$HERE/plat-slot.sh"
+if [ "$DRY" = 1 ] || [ ! -f "$ASW_ELF" ]; then
+    plat_slot_setup run-smoke 21535 peek
+    [ "$DRY" = 0 ] || { plat_print_ports; exit 0; }
+    echo "SKIP: ASW ELF absent ($ASW_ELF)"
+    exit 0
+fi
+plat_slot_setup run-smoke 21535
+ROOT="$PLAT_RUN"
+plat_ports_free
 
 mkdir -p "$ROOT"
 CFG="$ROOT/run-smoke.toml"
@@ -32,12 +44,12 @@ mode = "run"
 binary = "$QEMU_BIN"
 elf = "$ASW_ELF"
 [ports]
-api = 21535
-qemu_tm = 21536
-qemu_tc = 21537
-gs_tc = 21538
+api = $PLAT_API
+qemu_tm = $PLAT_QEMU_TM
+qemu_tc = $PLAT_QEMU_TC
+gs_tc = $PLAT_GS_TC
 [gs]
-tm_dests = ["127.0.0.1:21541"]
+tm_dests = ["127.0.0.1:$PLAT_SINK"]
 [retention]
 run_root = "$ROOT"
 keep_flash = "never"
@@ -93,5 +105,6 @@ print("%s negative: exit %s, verdict %s, unmatched %r"
 sys.exit(0 if ok else 1)
 PYEOF
 
-if [ "$fail" = 0 ]; then echo "RUN-SMOKE: PASS"; else echo "RUN-SMOKE: FAIL"; fi
+if [ "$fail" = 0 ]; then echo "RUN-SMOKE: PASS${STIX_SLOT_TAG}"
+else echo "RUN-SMOKE: FAIL${STIX_SLOT_TAG}"; fi
 exit "$fail"
