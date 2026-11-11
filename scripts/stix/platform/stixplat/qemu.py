@@ -88,7 +88,7 @@ def probe_binary(binary, timeout=10.0):
             {"execute": "quit"}]
     inp = "".join(json.dumps(c) + "\n" for c in cmds)
     try:
-        r = subprocess.run([real, "-M", "none", "-S", "-display", "none",
+        r = subprocess.run([real, "-M", "none", "-nodefaults", "-S", "-display", "none",
                             "-monitor", "none", "-qmp", "stdio"],
                            input=inp.encode(), capture_output=True,
                            timeout=timeout)

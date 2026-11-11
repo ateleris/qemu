@@ -85,6 +85,16 @@ class SimClock:
                 self.vclock = vclock_ns
             self.sample_mono = self.mono()
 
+    def correct(self, vclock_ns):
+        """A real reading taken while the VM is stopped: it replaces the
+        estimate made at STOP, also downwards. Reported times still never
+        go backwards (now() clamps)."""
+        with self.lock:
+            if self.mode == OFF:
+                return
+            self.vclock = vclock_ns
+            self.sample_mono = self.mono()
+
     def _vclock_now(self):
         if self.vclock is None:
             return 0

@@ -21,6 +21,7 @@ from .state import StateTree
 
 TRACE_NAME_RE = re.compile(r"^(?:\d+@\d+\.\d+:)?(\w+) ")
 DEBUG_QMP = ("qom-get", "qom-set", "query-status")
+DEBUG_PATHS = ("/machine/stixspw", "/machine/stixctrl")
 
 
 class Controller:
@@ -45,11 +46,14 @@ class Controller:
         self.power.lock_fd = self.lock_fd
         self.power.on_line = self._qemu_line
         self.power.on_change = self._power_changed
+        self.power.on_snapshot = self._event_snapshot
         self.dispatcher = Dispatcher(self.log)
         self.stopping = threading.Event()
         self.poller = None
         self.last_state_poll = 0.0
         self.last_poll_error = None
+        self.debug_used = False
+        self.snap_lock = threading.Lock()
         self.last_sparse = time.monotonic()
         self.last_snapshot = None   # bench time of the last snapshot
         self.server = None
@@ -84,8 +88,7 @@ class Controller:
                                 "enum": list(DEBUG_QMP)},
                     "arguments": {"type": "object"}},
               doc="a raw QMP command (dev and gates only)",
-              enabled=lambda: None if self.cfg["debug"]["raw_qmp"]
-              else "debug.qmp needs [debug] raw_qmp = true")
+              enabled=self._debug_enabled)
 
     def command(self, verb, args, source="api"):
         res = self.dispatcher.run(verb, args, source=source)
@@ -97,14 +100,37 @@ class Controller:
                             {"text": text, "data": data or {}})
         return {"seq": rec.seq}
 
+    def _debug_enabled(self):
+        dbg = self.cfg["debug"]
+        if not dbg["raw_qmp"]:
+            return "debug.qmp needs [debug] raw_qmp = true"
+        if self.cfg["mode"] == "run" and not dbg["allow_in_run"]:
+            return ("debug.qmp is refused in run mode unless the scenario "
+                    "or gate sets [debug] allow_in_run = true")
+        return None
+
     def _debug_qmp(self, command, arguments=None):
+        arguments = arguments or {}
+        if command in ("qom-get", "qom-set"):
+            path = arguments.get("path")
+            if path not in DEBUG_PATHS:
+                raise VerbError(403, "debug.qmp path %r is not one of %s"
+                                % (path, ", ".join(DEBUG_PATHS)))
         q = self.power.qmp
         if q is None:
             raise VerbError(409, "power is off")
+        self.debug_used = True          # sticky: reports print it
         try:
-            return {"return": q.execute(command, arguments)}
+            ret = q.execute(command, arguments or None)
         except QmpError as e:
+            self.log.emit("api", "debug", "debug.qmp",
+                          {"command": command, "arguments": arguments,
+                           "error": str(e)})
             raise VerbError(400, str(e))
+        self.log.emit("api", "debug", "debug.qmp",
+                      {"command": command, "arguments": arguments,
+                       "return": ret})
+        return {"return": ret}
 
     # -- QEMU output --
     def _qemu_line(self, kind, text):
@@ -132,7 +158,7 @@ class Controller:
             self.log.emit("ctl", "state", path, {"old": old, "new": new})
 
     # -- polling (D-PLr, D-PLo) --
-    def poll_state(self):
+    def poll_state(self, snapshot=True):
         """Sample both hw-states; never raises (S3): a failure is one
         poller.error record (repeats of the same error are not logged)."""
         q = self.power.qmp
@@ -156,7 +182,8 @@ class Controller:
         except Exception as e:
             return self._poll_error("state", e)
         self._emit_changes(changes)
-        self._maybe_snapshot(sim)
+        if snapshot:
+            self._maybe_snapshot(sim)
         self._poll_ok()
 
     def _poll_error(self, where, e):
@@ -172,18 +199,36 @@ class Controller:
             self.last_poll_error = None
 
     def _maybe_snapshot(self, sim):
-        """A full `state` record (path "snapshot") every snapshot_s of
-        bench time, so the log alone can rebuild the volatile leaves
-        that change records skip."""
+        """A periodic snapshot every snapshot_s of bench time, so the log
+        alone can rebuild the volatile leaves that change records skip.
+        The poller and commands both poll: one lock makes the decision,
+        so an interval gets one snapshot."""
         every = int(self.cfg["clock"]["snapshot_s"] * 1e9)
-        if every <= 0 or (self.last_snapshot is not None and
-                          sim - self.last_snapshot < every):
+        if every <= 0:
             return
-        self.last_snapshot = sim
+        with self.snap_lock:
+            if self.last_snapshot is not None and \
+                    sim - self.last_snapshot < every:
+                return
+            self.last_snapshot = sim
+            self._emit_snapshot("periodic")
+
+    def _event_snapshot(self, reason):
+        """At boot, at pause and just before power-off (Power calls it,
+        with the QMP connection still up)."""
+        self.poll_state(snapshot=False)
+        with self.snap_lock:
+            self.last_snapshot = self.clock.exact_sim()
+            self._emit_snapshot(reason)
+
+    def _emit_snapshot(self, reason):
         with self.state.lock:
             leaves = {p: {"truth": lf["truth"], "presented": lf["presented"]}
                       for p, lf in sorted(self.state.leaves.items())}
-        self.log.emit("ctl", "state", "snapshot", {"leaves": leaves})
+        # kind state, path = the state root (""), data.snapshot = true
+        self.log.emit("ctl", "state", "", {"snapshot": True,
+                                           "reason": reason,
+                                           "leaves": leaves})
 
     def _poll_loop(self):
         period = 1.0 / self.cfg["clock"]["sample_hz"]
@@ -238,6 +283,7 @@ class Controller:
                 "on_guest_reset": self.cfg["qemu"]["on_guest_reset"],
                 "qmp_rtt_s": None if q is None else
                 {"min": q.rtt_min, "max": q.rtt_max, "last": q.rtt_last},
+                "debug_used": self.debug_used,
                 "faults": [], "forcings": [], "scenario": None}
 
     # -- lifecycle --

@@ -44,7 +44,9 @@ DEFAULTS = {
     "retention": {"run_root": "/tmp/stix-plat/runs-root", "keep_runs": 10,
                   "keep_failed_days": 7, "max_total_mb": 2048,
                   "min_free_mb": 1024, "keep_flash": "failed"},
-    "debug": {"raw_qmp": False},     # debug.qmp: dev and gate use only
+    # debug.qmp: dev and gate use only; in mode = "run" also needs
+    # allow_in_run (a scenario or gate sets it explicitly)
+    "debug": {"raw_qmp": False, "allow_in_run": False},
 }
 
 CHOICES = {

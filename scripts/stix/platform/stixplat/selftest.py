@@ -415,6 +415,12 @@ def t_simclock(env):
     check(clk.run_due() == [], "no firing while paused")
     clk.sample(5_000_000_000)                  # even a late sample
     check(clk.run_due() == [] and not fired, "no firing while paused (2)")
+    clk.correct(4_000_000_000)                 # the real vclock is lower
+    check(clk.exact_sim() == 5_000_000_000 and
+          clk.now()[0] == 5_000_000_000, "correct() lowers the exact time")
+    clk.correct(1_000_000_000)
+    check(clk.now()[0] == 5_000_000_000, "reported time never goes back")
+    clk.correct(5_000_000_000)
     clk.resumed()
     t[0] = 200.1
     clk.sample(5_100_000_000)
@@ -459,6 +465,9 @@ def t_power(env):
         wait_for(lambda: any(r.obj["path"] == "trace.stixspw_timecode_emit"
                              for r in ctl.log.since(0)), what="trace record")
         cmd("sim.pause", {})
+        real = ctl.power.qmp.qom_get("/machine/stixspw", "vclock-ns")
+        check(ctl.clock.vclock == real, "the clock after pause is the real "
+              "vclock (%r != %r)" % (ctl.clock.vclock, real))
         s1 = ctl.clock.now()[0]
         time.sleep(0.3)
         check(ctl.clock.now()[0] - s1 < 50_000_000, "paused clock moved")
@@ -467,10 +476,16 @@ def t_power(env):
                  what="state poll")
         check(ctl.state.get("instrument.hk_adc.5")["truth"] == 100,
               "state leaf")
-        snaps = [x.obj["data"]["leaves"] for x in ctl.log.since(0)
-                 if x.kind == "state" and x.obj["path"] == "snapshot"]
-        check(snaps and "idpu.scet.coarse" in snaps[0] and
-              "platform.obt" in snaps[0], "state snapshot record")
+        snaps = [x.obj["data"] for x in ctl.log.since(0)
+                 if x.kind == "state" and x.obj["data"].get("snapshot")]
+        check(snaps and all(x["path"] == "" for x in
+                            (r.obj for r in ctl.log.since(0)
+                             if r.obj["data"].get("snapshot") is True)) and
+              "idpu.scet.coarse" in snaps[-1]["leaves"] and
+              "platform.obt" in snaps[-1]["leaves"], "state snapshot record")
+        reasons = [x["reason"] for x in snaps]
+        check("boot" in reasons and "pause" in reasons,
+              "snapshots at boot and pause: %r" % reasons)
         dq = [x for x in ctl.log.since(0) if x.obj["path"] == "debug.qmp"]
         check(not dq, "debug.qmp records before any call")
         sim_before = ctl.clock.now()[0]
@@ -487,6 +502,14 @@ def t_power(env):
               "OBT continuity: %r" % obt_logs)
         r = cmd("platform.power.off", {})
         check(r["method"] == "quit" and ctl.power.state == "off", "off")
+        last = [x.obj for x in ctl.log.since(0)
+                if x.obj["data"].get("snapshot") is True][-1]
+        offrec = [x.obj for x in ctl.log.since(0) if x.kind == "power" and
+                  x.obj["data"].get("event") == "off"][-1]
+        check(last["data"]["reason"] == "off" and
+              last["seq"] < offrec["seq"] and
+              "idpu.scet.coarse" in last["data"]["leaves"],
+              "a snapshot just before power-off")
         check(ctl.state.get("idpu") is None, "idpu state after off")
         raises(VerbError, cmd, "platform.power.off", {})
         raises(VerbError, cmd, "sim.pause", {})
@@ -494,6 +517,11 @@ def t_power(env):
         check(e.status == 403, "debug.qmp is gated")
         e = raises(VerbError, cmd, "platform.power.cycle", {"bogus": 1})
         check(e.status == 400, "unknown arg")
+        tail = [x.obj for x in ctl.log.since(0)][-2:]
+        check([x["kind"] for x in tail] == ["cmd", "result"] and
+              tail[0]["data"]["args"] == {"bogus": 1} and
+              tail[1]["data"]["cmd_seq"] == tail[0]["seq"],
+              "a refused command logs cmd then result: %r" % tail)
         e = raises(VerbError, cmd, "no.such", {})
         check(e.status == 404, "unknown verb")
         recs = [x.obj for x in ctl.log.since(0)]
@@ -521,11 +549,36 @@ def t_power(env):
             "path": "/machine/stixspw", "property": "obt"}})
         check(r["return"] == 5 << 16, "debug.qmp round trip")
         dq = [x.obj for x in ctl.log.since(0) if x.obj["path"] == "debug.qmp"]
-        check([x["kind"] for x in dq] == ["cmd", "result"] * 2 and
-              dq[0]["data"]["args"]["command"] == "qom-set",
-              "every debug.qmp call is logged: %r" % dq)
+        check([x["kind"] for x in dq] == ["cmd", "debug", "result"] * 2 and
+              dq[0]["data"]["args"]["command"] == "qom-set" and
+              dq[1]["data"]["arguments"]["property"] == "obt",
+              "every debug.qmp call is a debug record: %r"
+              % [x["kind"] for x in dq])
+        check(ctl.status()["debug_used"] is True, "the taint flag")
         e = raises(VerbError, ctl.command, "debug.qmp", {"command": "quit"})
         check(e.status == 400, "debug.qmp allowlist")
+        for path in ("/machine", "/machine/stixflash", "/objects/x",
+                     "/machine/stixspw/../stixflash"):
+            e = raises(VerbError, ctl.command, "debug.qmp", {
+                "command": "qom-get", "arguments": {
+                    "path": path, "property": "x"}})
+            check(e.status == 403, "debug.qmp path %s: %s" % (path, e))
+    finally:
+        ctl.shutdown()
+    ctl = env.controller(debug={"raw_qmp": True})
+    try:
+        check(ctl.status()["debug_used"] is False, "taint before use")
+    finally:
+        ctl.shutdown()
+    ctl = env.controller(debug={"raw_qmp": True})
+    ctl.cfg["mode"] = "run"
+    try:
+        ctl.command("platform.power.on", {})
+        e = raises(VerbError, ctl.command, "debug.qmp",
+                   {"command": "query-status"})
+        check(e.status == 403 and "run" in str(e), "run mode: %s" % e)
+        ctl.cfg["debug"]["allow_in_run"] = True
+        ctl.command("debug.qmp", {"command": "query-status"})
     finally:
         ctl.shutdown()
 
@@ -681,6 +734,33 @@ def t_sparse_poll(env):
                if r.obj["path"] == "platform.power.sparse" and
                not r.obj["data"].get("ok", True)]
         check(why and "not sparse" in why[-1]["error"], "sparse record")
+    finally:
+        ctl.shutdown()
+
+
+def t_snapshot_race(env):
+    """Q2: the poller and commands share one snapshot decision, so a
+    periodic snapshot is logged once per interval."""
+    ctl = env.controller(clock={"snapshot_s": 0.2, "state_hz": 50.0,
+                                "sample_hz": 100.0})
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        stop = time.monotonic() + 1.5
+
+        def hammer():
+            while time.monotonic() < stop:
+                ctl.poll_state()
+        ts = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        sims = [r.obj["sim_time"] for r in ctl.log.since(0)
+                if r.obj["data"].get("reason") == "periodic"]
+        check(len(sims) >= 3, "periodic snapshots: %r" % sims)
+        gaps = [b - a for a, b in zip(sims, sims[1:])]
+        check(min(gaps) >= 150_000_000, "duplicate snapshots: %r" % gaps)
     finally:
         ctl.shutdown()
 
@@ -969,6 +1049,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("run-dir lock + PDEATHSIG", t_run_lock),
          ("poller + command robustness", t_poller_robust),
          ("periodic sparse check", t_sparse_poll),
+         ("snapshot race", t_snapshot_race),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]

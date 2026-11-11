@@ -82,9 +82,11 @@ class Dispatcher:
         try:
             args = check_args(v["args"], args if args is not None else {})
         except VerbError as e:
+            # the refused command is still a command: cmd, then result
+            cmd = self.log.emit(source, "cmd", verb, {"args": args})
             self.log.emit(source, "result", verb,
                           {"ok": False, "status": e.status,
-                           "error": str(e), "args": args})
+                           "error": str(e), "cmd_seq": cmd.seq})
             raise
         cmd = self.log.emit(source, "cmd", verb, {"args": args})
         try:

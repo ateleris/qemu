@@ -50,6 +50,7 @@ class Power:
         self.hooks = []            # on_power(event, power) (D-PLk)
         self.on_line = None        # (kind, text) from the QEMU readers
         self.on_change = None      # () after any power state change
+        self.on_snapshot = None    # (reason) at boot, pause, before off
         self.last_obt = None       # (obt, bench time of the sample)
         self.t0 = None             # bench time of the last boot
         self.events = queue.Queue()
@@ -175,6 +176,7 @@ class Power:
             self.t0 = self.clock.exact_sim()
             self._set(RUNNING)
             self._record("boot", t0=self.t0)
+            self._snapshot("boot")
             return {"t0": self.t0, "boot_id": self.clock.boot_id}
 
     def off(self):
@@ -185,6 +187,8 @@ class Power:
     def _off_locked(self, why):
         self.stopping = True
         self._sample_final()
+        if self.qmp_alive():
+            self._snapshot("off")
         method = "quit"
         try:
             self.qmp.execute("quit", timeout=2.0)
@@ -248,12 +252,26 @@ class Power:
                 self.boot()
             return {"boot_id": self.clock.boot_id, "booted": boot}
 
+    def _stopped_exact(self):
+        """After a stop: replace the clock's estimate by the real vclock."""
+        self.clock.stopped()
+        try:
+            self.clock.correct(self.qmp.qom_get(qemu_mod.STIXSPW,
+                                                "vclock-ns", timeout=2))
+        except (QmpError, AttributeError):
+            pass
+
+    def _snapshot(self, reason):
+        if self.on_snapshot is not None:
+            self.on_snapshot(reason)
+
     def pause(self):
         with self.lock:
             self._need(RUNNING)
             self.qmp.execute("stop")
-            self.clock.stopped()
+            self._stopped_exact()
             self._set(PAUSED)
+            self._snapshot("pause")
             return {"sim_time": self.clock.exact_sim()}
 
     def resume(self):
@@ -312,7 +330,7 @@ class Power:
                 return
             policy = self.cfg["qemu"]["on_guest_reset"]
             if ev == "STOP":
-                self.clock.stopped()
+                self._stopped_exact()
                 if self.state == RUNNING:
                     self._set(PAUSED)
             elif ev == "RESUME":

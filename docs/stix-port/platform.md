@@ -46,7 +46,7 @@ lists exactly these verbs and arguments.
 | `sim.pause` | | QMP `stop`: the virtual clock, the OBT and the codes freeze |
 | `sim.resume` | | QMP `cont` |
 | `log.mark` | `text`, `data` | a marker record in the log |
-| `debug.qmp` | `command`, `arguments` | one raw `qom-get`, `qom-set` or `query-status`; refused (403) unless `[debug] raw_qmp = true` (dev and gate use only) |
+| `debug.qmp` | `command`, `arguments` | one raw `qom-get` or `qom-set` on `/machine/stixspw` or `/machine/stixctrl`, or `query-status`; refused (403) unless `[debug] raw_qmp = true`, and in run mode also `[debug] allow_in_run = true`; every call is a `debug` record and sets the sticky `status.debug_used` taint (dev and gate use only) |
 <!-- verbs:end -->
 
 ### Records
@@ -67,11 +67,16 @@ lists exactly these verbs and arguments.
   `vclock-ns` samples.
 - A `state` record is logged when a leaf changes. Volatile leaves (the
   SCET, the watchdog count, the OBT and the last time code) are left out
-  of these change records. Instead, every `[clock] snapshot_s` of bench
-  time (default 10 s, 0 = off) a `state` record with path `snapshot`
-  carries every leaf, so the log alone can rebuild them.
-- Every `debug.qmp` call is logged as `cmd` and `result` records, like
-  any other verb.
+  of these change records. A snapshot carries every leaf instead: a
+  `state` record with path `""` (the state root) and
+  `data = {"snapshot": true, "reason": ..., "leaves": {...}}`. It is
+  logged at boot, at pause, just before power-off, and every
+  `[clock] snapshot_s` of bench time (default 10 s, 0 = off). So the log
+  alone can rebuild every leaf.
+- Every `debug.qmp` call is logged as `cmd`, `debug` (the command, its
+  arguments and its return or error) and `result` records.
+- A refused command (bad arguments) is still logged: `cmd`, then a
+  `result` with `ok: false`.
 - Topics: `cmd` and `result` map to `cmd`; `state` and `power` map to
   `state`; `fault` and `force` map to `fault`; `debug` maps to `log`.
   Every other kind is its own topic.
