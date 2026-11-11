@@ -2038,6 +2038,10 @@ defaults that the user can override.
   - link-smoke checks "link-down set while frozen survives cont" in a
     second boot at its end, so the first boot's boot report is checked
     with the link up.
+- **PL-4 review fixes** are on top as separate commits: B1 (keep-alive
+  125 ms), B2 (automatic time sync), SF1-SF9 and the NITs; see D-PLd,
+  D-PLe, D-PLo, D-PLq and P-1 for the as-built text. Left as a
+  follow-up: the synchronous warm-reset re-apply (P-1).
 - **TODO (on the rebase onto gate-ports):** move
   `scripts/stix/platform/tests/core-smoke.sh` and `link-smoke.sh` to the
   gate slot scheme (`scripts/stix/lib/slot.sh`: a slot run dir, slot
