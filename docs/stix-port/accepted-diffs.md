@@ -3278,14 +3278,21 @@ att) can run their gates at the same time without the global 21000 lock.
   run-dir guard runs on the suffixed path.
 - `tmtc-hermetic` holds an ephemeral port (`tmtc-port=<held>`): the
   `tmtc-port=0` default path is no longer exercised by it. On the 5.2
-  baseline it SKIPs explicitly (no `tmtc-port` property).
+  baseline it SKIPs explicitly (no `tmtc-port` property), and only there:
+  on any other binary a missing property fails it.
 - Suite QEMU ports come from the slot band B+3..B+99 when a slot is held
-  (`STIX_PORT_BASE` = B, exported by `scripts/stix/qt.sh`). Without a
+  (`STIX_QTEST_PORT_BASE` = B, exported by `lib/slot.sh`; a set but
+  unusable value fails the test). `STIX_PORT_BASE` stays the selector. Without a
   slot, the old ephemeral release-then-bind window remains.
 - `scripts/stix/qt.sh --baseline` runs the 5.2 wrapper in slot 0 from
   `/tmp/stix-qt-baseline` with a sparse copy of the master: the wrapper
   strips `flash-file`, and the 5.2 model writes a full 16.5 GB flash.bin
-  into a CWD that has none.
+  into a CWD that has none. It is for `tmtc-hermetic` and other tests
+  that do not read flash content: the master is stored inverted (D-I),
+  which the 5.2 model reads as all-0x00 flash, so flash-content tests
+  fail there spuriously. By default it runs only
+  `STIX_QT_BASELINE_TESTS` (`tmtc-hermetic`); `--full` runs the whole
+  suite anyway.
 - **Fresh-flash gates pre-create flash.bin.** nominal-, fault- and
   detector-smoke delete flash.bin per run and then
   `truncate -s 17716740096 flash.bin`, in legacy and slot mode, so no

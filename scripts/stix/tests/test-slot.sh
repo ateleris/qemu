@@ -79,7 +79,8 @@ check "unset: legacy port, no lock, no output" $? "$out"
 
 # --- auto never takes slot 0, free or held ---
 B1=$((UIDB + 100))
-out="$(helper 'stix_slot_setup; echo "$STIX_SLOT $STIX_QTEST_PORT_BASE $TMTC_PORT $STIX_PORT_BASE"' \
+out="$(helper 'stix_slot_setup
+    echo "$STIX_SLOT $STIX_QTEST_PORT_BASE $TMTC_PORT $STIX_PORT_BASE"' \
     STIX_PORT_BASE=auto)"
 [ "$out" = "$(printf 'slot: 1 base %s\n1 %s %s auto' "$B1" "$B1" "$B1")" ]
 check "auto, slot 0 free: slot 1, not 0; the selector is kept" $? "$out"
@@ -480,6 +481,20 @@ rc=$?
     [ "$(du -k "$WORK/qt-base/flash.bin" | cut -f1)" -lt 1024 ]
 check "qt.sh --baseline: slot 0, the wrapper, a sparse flash in its dir" $? \
     "rc=$rc: $out"
+# review S2: the 5.2 model reads the inverted master as all-0x00 flash, so
+# --baseline runs only the non-flash filter unless --full is given
+echo "$out" | grep -q \
+    "args=--tap -p /sparc-52-wrapper.sh/sparc/stix/tmtc-hermetic\$"
+check "S2: qt.sh --baseline runs only the non-flash filter by default" $? \
+    "$out"
+out="$(qt --baseline --full)"
+rc=$?
+[ "$rc" -eq 0 ] && echo "$out" | grep -q "^ok 1 .* args=--tap\$"
+check "S2: qt.sh --baseline --full runs the whole suite" $? "rc=$rc: $out"
+out="$(qt --full)"
+rc=$?
+[ "$rc" -eq 2 ] && ! echo "$out" | grep -q "^ok"
+check "S2: --full without --baseline => exit 2" $? "rc=$rc: $out"
 out="$(STIX_QT_BASELINE_DIR="$WORK/master" qt --baseline)"
 rc=$?
 [ "$rc" -eq 2 ] && ! echo "$out" | grep -q "^ok" &&

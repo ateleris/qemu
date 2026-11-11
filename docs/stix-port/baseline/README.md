@@ -78,17 +78,23 @@ REPAIRED old model.
   - **Legacy (`STIX_PORT_BASE` unset):** port 21000, the default run
     dirs, the QEMU command line unchanged. The caller holds slot 0's lock
     by convention: `flock /tmp/stix-qtest-21000.lock <gate> ...`. No
-    script takes it itself.
+    gate script takes it itself; only `scripts/stix/qt.sh --baseline`
+    does (it waits for it).
   - **Slot 0 is reserved** for legacy, manual and 5.2-wrapper runs (the
     5.2 device always binds 21000). `auto` never takes it.
   - **`STIX_PORT_BASE=auto`:** the first free slot in 1..`STIX_SLOTS`
-    (default 3; counts reaching the GS ports 21500-21502 are refused),
+    (default 3; counts reaching the GS ports 21500-21502 or a band past
+    65535 are refused),
     waiting up to `STIX_SLOT_WAIT` s (1800). A number k >= 1 takes exactly
     slot k or exits 2. The gate passes `-global
     grlib-stixspw.tmtc-port=B`, runs in `<run dir>-s<k>` (for example
     `/tmp/stix-uprev-run-s1`; an explicit `STIX_*RUN_DIR` gets the suffix
     too) and appends `slot=k busy=<other held slots> load=<1 min>` to its
     verdict lines. The CPU cap is N slot runs plus one legacy run.
+    `STIX_PORT_BASE` stays the selector; the slot's base port is exported
+    as `TMTC_PORT` and `STIX_QTEST_PORT_BASE` (the qtest suite's band).
+    Keep any `STIX_GS_QMP` tcp port, like the GS ports, out of
+    21000-21499 (slots 0-4).
   - **Slot mode never opens the shared flash.** boot-smoke, soak and
     tc-smoke boot a private `cp --sparse=always` copy of
     `/tmp/stix-uprev-run/flash.bin` (refreshed every run, under a shared
@@ -104,7 +110,8 @@ REPAIRED old model.
     shrinks) shows less than `STIX_DISK_MIN_GB` (3) GB free.
   - The qtest suite: `scripts/stix/qt.sh [test-name]` builds, takes a
     slot and runs the suite or one test; `scripts/stix/qt.sh --baseline`
-    runs the 5.2 wrapper in slot 0 (see step 3).
+    runs the 5.2 wrapper in slot 0 (see step 3), for non-flash tests
+    only.
 - Capture uses `-display none -monitor none -serial file:` so guest UART and
   QEMU prints never mix.
 
@@ -130,8 +137,13 @@ git worktree add /tmp/qemu-stix-baseline stix-emul-repairs   # see build-old.sh
 bash scripts/stix/baseline/build-old.sh                       # ~5 min, Docker
 #    Slot 0 (the 5.2 device binds 21000), run in /tmp/stix-qt-baseline
 #    with a sparse copy of the master flash: the 5.2 model would write a
-#    full 16.5 GB flash.bin into a CWD that has none.
-scripts/stix/qt.sh --baseline      # tmtc-hermetic SKIPs there (no tmtc-port)
+#    full 16.5 GB flash.bin into a CWD that has none. Only for
+#    tmtc-hermetic and other tests that do not read flash content: the
+#    master is stored inverted (D-I), which the 5.2 model reads as all
+#    0x00, so flash-content tests fail there spuriously. By default it
+#    runs STIX_QT_BASELINE_TESTS (tmtc-hermetic, which SKIPs there: no
+#    tmtc-port); --full runs the whole suite anyway.
+scripts/stix/qt.sh --baseline      # or: --baseline <test-name> | --full
 
 # 4. Boot smoke against either build (needs the ASW ELF; skips politely
 #    without it; compares the boot sequence against the golden):
