@@ -1966,6 +1966,20 @@ defaults that the user can override.
 
 - **PL-1..PL-3** are on `stix-uprev-platform`. accepted-diffs P-1 holds
   the C-side record.
+- **PL-4** is on `stix-uprev-platform` (no C change). Deviations:
+  - `decode.py` decodes the HK TM(3,25) SID and mode only. **The SID 2
+    TC(20,128) count is left to PL-8's IDB-based decoder**: in the FSW's
+    SID 2 layout it sits after many variable-length fields, so a
+    hand-written offset would be fragile.
+  - `tc.platform.send` takes services 9 and 20 from source 14 only (403
+    otherwise), and a TC(9,129) gets 409 while a time sync is pending
+    (review R2), the same as a second `platform.timesync.send`.
+  - The fake QEMU stores the platform `qom-set`s and returns them
+    (`x-fake-set-log`), so the self-test checks the QMP side of faults,
+    forcing and the warm-reset re-apply.
+  - link-smoke checks "link-down set while frozen survives cont" in a
+    second boot at its end, so the first boot's boot report is checked
+    with the link up.
 - **TODO (on the rebase onto gate-ports):** move
   `scripts/stix/platform/tests/core-smoke.sh` to the gate slot scheme
   (`scripts/stix/lib/slot.sh`: a slot run dir, slot ports, the shared

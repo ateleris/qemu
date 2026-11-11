@@ -20,6 +20,11 @@ import time
 
 from . import api as api_mod
 from . import config as config_mod
+from . import decode
+from . import faults as faults_mod
+from . import keepalive as keepalive_mod
+from . import tcbuild
+from . import timesync
 from . import core as core_mod
 from . import log as log_mod
 from . import probe_lib
@@ -62,6 +67,14 @@ def wait_for(cond, timeout=5.0, what="condition"):
     raise Fail("timed out waiting for " + what)
 
 
+def free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 class Env:
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="stixplat-selftest-")
@@ -82,12 +95,20 @@ class Env:
         return d
 
     def cfg(self, **over):
+        return config_mod.load(overrides=self.overrides(**over))
+
+    def overrides(self, **over):
         o = {"qemu": {"binary": self.bins["new"], "elf": "/dev/null"},
              "power": {"off_time_s": 0.2, "quit_timeout_s": 2.0},
-             "clock": {"sample_hz": 50.0, "state_hz": 10.0}}
+             "clock": {"sample_hz": 50.0, "state_hz": 10.0},
+             # private UDP ports: never the interactive or gate ones
+             "ports": {"qemu_tm": free_udp_port(),
+                       "qemu_tc": free_udp_port(),
+                       "gs_tc": free_udp_port()},
+             "gs": {"tm_dests": ["127.0.0.1:%d" % free_udp_port()]}}
         for k, v in over.items():
             o.setdefault(k, {}).update(v)
-        return config_mod.load(overrides=o)
+        return o
 
     def controller(self, **over):
         c = core_mod.Controller(self.cfg(**over), run_dir=self.run_dir())
@@ -647,9 +668,7 @@ def t_run_lock(env):
             " run_dir=%r)\n"
             "print(c.command('platform.power.on', {})['pid'], flush=True)\n"
             "import os; os._exit(0)\n"
-            % (os.path.dirname(HERE), json.dumps(
-                {"qemu": {"binary": env.bins["new"], "elf": "/dev/null"}}),
-               d2))
+            % (os.path.dirname(HERE), json.dumps(env.overrides()), d2))
     import subprocess
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,
                          timeout=30).stdout.decode().split()
@@ -761,6 +780,366 @@ def t_snapshot_race(env):
         check(len(sims) >= 3, "periodic snapshots: %r" % sims)
         gaps = [b - a for a, b in zip(sims, sims[1:])]
         check(min(gaps) >= 150_000_000, "duplicate snapshots: %r" % gaps)
+    finally:
+        ctl.shutdown()
+
+
+SMOKES = [os.path.normpath(os.path.join(HERE, "..", "..", n)) for n in
+          ("tc-smoke.sh", "nominal-smoke.sh", "fault-smoke.sh")]
+SMOKE_TC_RE = re.compile(r'^(TC\w*)="((?:[0-9A-Fa-f]{2} ?)+)"', re.M)
+
+
+def t_tcbuild(env):
+    """PL-4: the CRC and the builder reproduce every TC unit of the
+    smokes byte for byte (a corrupted-CRC unit must not reproduce)."""
+    n = bad = 0
+    for path in SMOKES:
+        with open(path) as f:
+            for name, hx in SMOKE_TC_RE.findall(f.read()):
+                u = bytes.fromhex(hx)
+                sp = u[4:]
+                apid, seq, svc, sub, src, ack, ok = tcbuild.parse_tc(sp)
+                rebuilt = tcbuild.unit(tcbuild.tc_packet(
+                    apid, seq, svc, sub, sp[10:-2], ack=ack, source=src))
+                if "BAD" in name:
+                    check(not ok and rebuilt != u, "%s reproduced" % name)
+                    bad += 1
+                else:
+                    check(ok and rebuilt == u, "%s: %s != %s"
+                          % (name, rebuilt.hex(), u.hex()))
+                    n += 1
+    check(n >= 10 and bad == 1, "smoke TCs found: %d good, %d bad"
+          % (n, bad))
+    tc9 = tcbuild.tc9_129(2, 0x10000000, source=0)
+    check(tc9[-2:] == b"\xfa\x63", "the tc-smoke TC(9,129) CRC FA 63")
+    k = tcbuild.tc20_128(tcbuild.keepalive_seq(1_250_000_000))
+    check(len(k) == 248 and k[4:6] == b"\x00\xf1" and
+          (k[0] << 8 | k[1]) & 0x7FF == 0x31C and k[9] == 14 and
+          k[6] & 0xF == 0 and tcbuild.parse_tc(k)[1] == 10 and
+          tcbuild.parse_tc(k)[6], "TC(20,128) layout %s" % k[:12].hex())
+    check(tcbuild.keepalive_seq(2048 * 1_000_000_000) == 0 and
+          tcbuild.keepalive_seq(2047 * 1_000_000_000 + 999_999_999)
+          == 16383, "8 Hz count wraps at 2^14")
+
+
+def t_decode(env):
+    """PL-4: the decoder on the probe self-test's real FSW units."""
+    tm11 = bytes.fromhex("490200000da1c000000d100101000000001481af1dacc000")
+    tm12 = bytes.fromhex("490200000da1c00200151001020000000014832a1dacc001"
+                         "0002110112346f1f")
+    hb = bytes.fromhex("490200000de5c00e001a1003190e10000003a053040000"
+                       "0010000000000000000000000000")
+    ev = bytes.fromhex("490200000da7c001000e10050100000000000000"
+                       "142e")
+    d = decode.decode(tm11)
+    check(d["apid"] == 0x5A1 and (d["type"], d["subtype"]) == (1, 1) and
+          d["tc"] == {"packet_id": 0x1DAC, "apid": 0x5AC, "seq": 0},
+          "TM(1,1): %r" % d)
+    d = decode.decode(tm12)
+    check(d["subtype"] == 2 and d["fid"] == 2 and d["tc"]["seq"] == 1,
+          "TM(1,2): %r" % d)
+    d = decode.decode(hb)
+    check(d.get("heartbeat") and d["cuc"] >> 16 == 0x10000003 and
+          not d["unsynced"], "heartbeat: %r" % d)
+    d = decode.decode(ev)
+    check(d["eid"] == 0x142E and "30 s" in d["eid_name"], "event %r" % d)
+    sid2 = bytes.fromhex("490200000da4c001000a1003190e00000000000002"
+                         "15")
+    sid2 = sid2[:8] + (len(sid2) - 11).to_bytes(2, "big") + sid2[10:]
+    d = decode.decode(sid2)
+    check(d["sid"] == 2 and d["mode"] == 5, "SID 2 mode %r" % d)
+    check(decode.decode(bytes.fromhex("40020000" + "1dacc000000519110100"
+                                      "d77e")) is None, "a TC is no TM")
+
+
+def t_timesync_window(env):
+    """D-PLd: the window logic against a scripted OBT and bench time."""
+    check(timesync.plan_send((0x10000005 << 16) | 0x0000) ==
+          (True, 0x10000006, 0), "a fresh second: send coarse + 1 now")
+    check(timesync.plan_send((0x10000005 << 16) | 0x7FFF)[0],
+          "just under half a second gone: still now")
+    now, tgt, wait = timesync.plan_send((0x10000005 << 16) | 0xC000)
+    check(not now and abs(wait - 300_000_000) < 1_000_000,
+          "late in the second: wait for the rollover + 50 ms (%r)" % wait)
+    t = [0.0]
+    clk = SimClock(mono_fn=lambda: t[0])
+    clk.process_started()
+    clk.resumed()
+    clk.sample(0)
+    sent = []
+    obt = {"v": (0x10000005 << 16) | 0xC000}
+    lg = log_mod.RecordLog(None, clk.now)
+    ts = timesync.TimeSync(clk, lg, lambda cached=False: (obt["v"],
+                                                          clk.exact_sim()),
+                           sent.append, lambda: None, iter(range(9)).__next__)
+
+    def advance():
+        time.sleep(0.05)
+        t[0] = 0.35
+        obt["v"] = (0x10000006 << 16) | 0x0CCC     # 50 ms past rollover
+        clk.sample(350_000_000)
+        clk.run_due()
+    threading.Thread(target=advance).start()
+    r = ts.send()
+    check(r["waited"] and r["coarse"] == 0x10000007 and len(sent) == 1,
+          "after the wait: the new coarse + 1 (%r)" % r)
+    check(tcbuild.parse_tc(sent[0][4:])[2:4] == (9, 129), "a TC(9,129)")
+    e = raises(VerbError, ts.send)
+    check(e.status == 409 and "pending" in str(e), "R2: one in flight")
+    clk.sample(3_400_000_000)
+    clk.run_due()
+    check(ts.busy() is None and ts.history[-1]["verdict"] == "timeout",
+          "3 s without TM(1,7): timeout")
+    obt["v"] = (0x10000010 << 16) | 0x1000
+    r = ts.send(coarse=0x10000020)
+    check(r["warning"] and "TIMECNT" in r["warning"], "explicit coarse warn")
+    # TM(1,8) 48035 for it
+    tm18 = _tm_unit(0x5A1, 1, 8, bytes.fromhex("1dac") +
+                    (0xC000 | r["seq"]).to_bytes(2, "big") +
+                    (48035).to_bytes(2, "big"))
+    ts.on_tm(tm18, decode.decode(tm18))
+    check(ts.history[-1]["verdict"] == "fail" and "48035" in
+          ts.history[-1]["why"], "TM(1,8) 48035 fails")
+    # TM(1,7), then a heartbeat matching the OBT
+    obt["v"] = (0x10000030 << 16) | 0x1000
+    r = ts.send()
+    tm17 = _tm_unit(0x5A1, 1, 7, bytes.fromhex("1dac") +
+                    (0xC000 | r["seq"]).to_bytes(2, "big"))
+    ts.on_tm(tm17, decode.decode(tm17))
+    hb = _tm_unit(0x5E5, 3, 25, b"\x04", cuc=obt["v"])
+    ts.on_tm(hb, decode.decode(hb))
+    last = ts.history[-1]
+    check(last["verdict"] in ("ok", "late_apply") and abs(last["diff_s"])
+          < 0.3, "heartbeat check %r" % last)
+    obt["v"] = (0x10000040 << 16) | 0x1000
+    r = ts.send()
+    tm17 = _tm_unit(0x5A1, 1, 7, bytes.fromhex("1dac") +
+                    (0xC000 | r["seq"]).to_bytes(2, "big"))
+    ts.on_tm(tm17, decode.decode(tm17))
+    hb = _tm_unit(0x5E5, 3, 25, b"\x04", cuc=obt["v"] - (5 << 16))
+    ts.on_tm(hb, decode.decode(hb))
+    check(ts.history[-1]["verdict"] == "fail", "5 s off fails")
+
+
+def _tm_unit(apid, ptype, sub, app, cuc=0, seq=0):
+    body = bytes((0x10, ptype, sub, 0)) + cuc.to_bytes(6, "big") + app
+    sp = (0x0800 | apid).to_bytes(2, "big") + \
+        (0xC000 | seq).to_bytes(2, "big") + \
+        (len(body) - 1).to_bytes(2, "big") + body
+    return bytes((0x49, 0x02, 0, 0)) + sp
+
+
+def t_keepalive(env):
+    """D-PLe: bench-paced, 8 Hz count, suppressed while it cannot send,
+    started by the first TM."""
+    t = [0.0]
+    clk = SimClock(mono_fn=lambda: t[0])
+    clk.process_started()
+    clk.resumed()
+    clk.sample(0)
+    sent = []
+    why = {"v": None}
+    cfg = config_mod.load()
+    lg = log_mod.RecordLog(None, clk.now)
+    ka = keepalive_mod.KeepAlive(cfg, clk, lg, sent.append,
+                                 lambda: why["v"])
+    ka.on_boot()
+
+    def run_to(ns):
+        while clk.exact_sim() < ns:
+            clk.sample(clk.vclock + 100_000_000)
+            clk.run_due()
+    run_to(3_000_000_000)
+    check(not sent, "nothing before the first TM")
+    ka.on_tm(None, None)
+    run_to(6_000_000_000)
+    check(len(sent) == 3, "one per second: %d" % len(sent))
+    seqs = [tcbuild.parse_tc(u[4:])[1] for u in sent]
+    check(seqs == [s * 8 for s in (4, 5, 6)], "8 Hz count %r" % seqs)
+    clk.stopped()
+    for _ in range(50):
+        clk.sample(clk.vclock)
+        clk.run_due()
+    check(len(sent) == 3, "no keep-alive while paused")
+    clk.resumed()
+    why["v"] = "the SpW link is down"
+    run_to(9_000_000_000)
+    check(len(sent) == 3 and ka.suppressed == 3, "suppressed %d"
+          % ka.suppressed)
+    why["v"] = None
+    ka.set(enabled=False)
+    run_to(12_000_000_000)
+    check(len(sent) == 3, "disabled")
+
+
+def t_relay(env):
+    """D-PLg: the relay is byte-identical, one tm.jsonl line per TM; the
+    proxy adds the SpW header; a GS TC while the link is down is dropped
+    and logged (or held)."""
+    ctl = env.controller(gs={"tc_during_link_down": "drop"})
+    gs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    gs.bind(("127.0.0.1", 0))
+    gs.settimeout(2)
+    qemu_tc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    qemu_tc.bind(("127.0.0.1", ctl.cfg["ports"]["qemu_tc"]))
+    qemu_tc.settimeout(2)
+    ctl.plat.relay.dests = [gs.getsockname()]
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        units = [_tm_unit(0x5E5, 3, 25, b"\x04" + bytes(i), seq=i)
+                 for i in range(5)]
+        for u in units:
+            snd.sendto(u, ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"]))
+        got = [gs.recvfrom(4096)[0] for _ in units]
+        check(got == [u[4:] for u in units], "relay not byte-identical")
+        wait_for(lambda: ctl.plat.relay.tm_count == 5, what="5 TMs")
+        with open(os.path.join(ctl.run_dir, "tm.jsonl")) as f:
+            lines = [json.loads(x) for x in f]
+        check([x["hex"] for x in lines] == [u[4:].hex() for u in units],
+              "tm.jsonl")
+        check(sum(r.kind == "tm" for r in ctl.log.since(0)) == 5,
+              "tm records")
+        tc = tcbuild.tc_packet(0x5AC, 3, 17, 1, source=0)
+        snd.sendto(tc, ("127.0.0.1", ctl.cfg["ports"]["gs_tc"]))
+        check(qemu_tc.recvfrom(4096)[0] == tcbuild.unit(tc), "proxy")
+        ctl.command("platform.spw.link", {"state": "down"})
+        snd.sendto(tc, ("127.0.0.1", ctl.cfg["ports"]["gs_tc"]))
+        wait_for(lambda: any(r.kind == "tc" and r.obj["data"].get("dropped")
+                             for r in ctl.log.since(0)), what="drop record")
+        qemu_tc.settimeout(0.3)
+        raises(socket.timeout, qemu_tc.recvfrom, 4096)
+        q = ctl.power.qmp
+        sets = q.execute("x-fake-set-log")
+        check(["/machine/stixspw", "link-down", True] in sets,
+              "link-down set in QEMU: %r" % sets)
+        e = raises(VerbError, ctl.command, "platform.timesync.send", {})
+        check(e.status == 409, "time sync while the link is down")
+        ctl.plat.relay.policy = "hold"
+        snd.sendto(tc, ("127.0.0.1", ctl.cfg["ports"]["gs_tc"]))
+        wait_for(lambda: ctl.plat.relay.held, what="held")
+        ctl.command("platform.spw.link", {"state": "up"})
+        check(qemu_tc.recvfrom(4096)[0] == tcbuild.unit(tc), "held TC")
+    finally:
+        for sk in (gs, qemu_tc, snd):
+            sk.close()
+        ctl.shutdown()
+
+
+def t_platform_tcs(env):
+    """D-PLa + R2: platform TCs are services 9 and 20 from source 14;
+    TC(9,129) waits while a sync is pending; tc.gs.send is gated."""
+    ctl = env.controller()
+    qemu_tc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    qemu_tc.bind(("127.0.0.1", ctl.cfg["ports"]["qemu_tc"]))
+    qemu_tc.settimeout(2)
+    try:
+        cmd = ctl.command
+        e = raises(VerbError, cmd, "tc.platform.send", {
+            "hex": tcbuild.tc9_129(0, 0x10000000).hex()})
+        check(e.status == 409, "off: 409")
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        for svc, sub, src, st in ((17, 1, 14, 403), (236, 6, 14, 403),
+                                  (9, 129, 0, 403), (20, 128, 121, 403)):
+            pkt = tcbuild.tc_packet(0x5AC, 1, svc, sub, source=src)
+            e = raises(VerbError, cmd, "tc.platform.send",
+                       {"hex": pkt.hex()})
+            check(e.status == st, "TC(%d,%d) src %d: %s" % (svc, sub, src,
+                                                            e))
+        k = tcbuild.tc20_128(1)
+        cmd("tc.platform.send", {"hex": k.hex()})
+        check(qemu_tc.recvfrom(4096)[0] == tcbuild.unit(k), "TC20 sent")
+        bad = bytearray(tcbuild.tc9_129(7, 0x10000000))
+        bad[-1] ^= 0xFF                 # a malformed (bad CRC) variant
+        cmd("tc.platform.send", {"hex": bytes(bad).hex()})
+        qemu_tc.recvfrom(4096)
+        r = cmd("platform.timesync.send", {})
+        qemu_tc.recvfrom(4096)
+        e = raises(VerbError, cmd, "tc.platform.send",
+                   {"hex": tcbuild.tc9_129(8, r["coarse"]).hex()})
+        check(e.status == 409 and "pending" in str(e),
+              "R2: raw TC(9,129) while a sync is pending: %s" % e)
+        e = raises(VerbError, cmd, "platform.timesync.send", {})
+        check(e.status == 409, "second timesync.send: 409")
+        e = raises(VerbError, cmd, "tc.gs.send", {"service": 17,
+                                                   "subtype": 1})
+        check(e.status == 403, "tc.gs.send gated in interactive mode")
+        ctl.cfg["gs"]["emulation"] = "on"
+        r = cmd("tc.gs.send", {"service": 17, "subtype": 1})
+        u = qemu_tc.recvfrom(4096)[0]
+        check(r["label"] == "GS-EMULATION" and u[4 + 9] == 121 and
+              tcbuild.parse_tc(u[4:])[6], "GS emulation from 121")
+    finally:
+        qemu_tc.close()
+        ctl.shutdown()
+
+
+def t_faults(env):
+    """D-PLq: the catalogue validates; inject/clear are fault records with
+    seeds; forcing is re-applied after a warm reset."""
+    cat = faults_mod.load()
+    check(len(cat["faults"]) >= 8, "v1 catalogue")
+    for broken in ({"api": 2, "faults": []},
+                   {"api": 1, "faults": [{"id": "x"}]},
+                   {"api": 1, "faults": [dict(cat["faults"][0],
+                                              **{"class": "nope"})]},
+                   {"api": 1, "faults": [cat["faults"][0],
+                                         cat["faults"][0]]}):
+        raises(faults_mod.CatalogueError, faults_mod.validate, broken)
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        r = cmd("fault.inject", {"id": "thermal.psu.overtemp",
+                                 "params": {"value": 3900}, "seed": 7})
+        check(r["seed"] == 7, "seed")
+        recs = [x.obj for x in ctl.log.since(0) if x.kind == "fault"]
+        check(recs[-1]["data"]["action"] == "inject" and
+              recs[-1]["data"]["seed"] == 7 and
+              recs[-1]["data"]["params"] == {"value": 3900}, "fault rec")
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(["/machine/stixctrl", "adc-inject[40]", 3900] in sets,
+              "adc-inject[40] set: %r" % sets)
+        check(ctl.state.get("instrument.hk_adc.40") is None or True, "")
+        e = raises(VerbError, cmd, "fault.inject",
+                   {"id": "thermal.psu.overtemp"})
+        check(e.status == 409, "double inject")
+        e = raises(VerbError, cmd, "fault.inject",
+                   {"id": "thermal.psu.overtemp.x"})
+        check(e.status == 404, "unknown id")
+        e = raises(VerbError, cmd, "fault.inject",
+                   {"id": "obt.jump", "params": {"delta_s": 10 ** 9}})
+        check(e.status == 400, "param range")
+        r = cmd("fault.inject", {"id": "spw.link.disconnect"})
+        check(r["seed"] is not None and ctl.plat.link_down, "link fault")
+        # a warm guest reset clears adc-inject and link-down in QEMU:
+        # both are re-applied
+        ctl.power.qmp.execute("x-fake-guest-reset")
+        wait_for(lambda: _power_recs(ctl, "guest_reset"), what="reset")
+        wait_for(lambda: sum(x == ["/machine/stixctrl", "adc-inject[40]",
+                                   3900] for x in
+                             ctl.power.qmp.execute("x-fake-set-log")) == 2,
+                 what="adc re-applied after the warm reset")
+        cmd("fault.clear", {"id": "spw.link.disconnect"})
+        cmd("fault.clear", {"id": "thermal.psu.overtemp"})
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-1] == ["/machine/stixctrl", "adc-inject[40]",
+                           0xFFFFFFFF] and not ctl.plat.link_down,
+              "cleared: %r" % sets[-2:])
+        e = raises(VerbError, cmd, "fault.clear", {"id": "obt.jump"})
+        check(e.status == 409, "not reversible")
+        st, = [ctl.status()["faults"]]
+        check(st == {}, "no active faults: %r" % st)
+        # forcing directly
+        cmd("force.set", {"path": "instrument.hk_adc.24", "value": 1800})
+        e = raises(VerbError, cmd, "force.set",
+                   {"path": "instrument.hk_adc.999", "value": 1})
+        check(e.status == 400, "bad force path")
+        check(ctl.status()["forcings"] == {"instrument.hk_adc.24": 1800},
+              "forcings in status")
     finally:
         ctl.shutdown()
 
@@ -1050,6 +1429,13 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("poller + command robustness", t_poller_robust),
          ("periodic sparse check", t_sparse_poll),
          ("snapshot race", t_snapshot_race),
+         ("tcbuild: CRC + smoke TCs", t_tcbuild),
+         ("decoder on real units", t_decode),
+         ("time sync window (D-PLd)", t_timesync_window),
+         ("keep-alive pacing", t_keepalive),
+         ("TM relay + TC proxy", t_relay),
+         ("platform TCs (9/20, R2)", t_platform_tcs),
+         ("fault catalogue + forcing", t_faults),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]

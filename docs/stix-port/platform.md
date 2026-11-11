@@ -26,6 +26,7 @@ The path prefix is `/api/v1`. Read endpoints:
 | `GET /state`, `GET /state/<path>` | the state tree (D-PLo), or one subtree or leaf |
 | `GET /log?since=<seq>&kinds=a,b` | a JSONL slice of the record ring |
 | `GET /stream?topics=a,b` | SSE: `id` = seq, `event` = topic, `data` = the record line; resume with `Last-Event-ID` |
+| `GET /faults` | the fault catalogue and the active faults |
 | `GET /verbs` | the command vocabulary with argument schemas |
 
 Every state change is `POST /api/v1/cmd/<verb>` with a JSON object of
@@ -46,6 +47,19 @@ lists exactly these verbs and arguments.
 | `sim.pause` | | QMP `stop`: the virtual clock, the OBT and the codes freeze |
 | `sim.resume` | | QMP `cont` |
 | `log.mark` | `text`, `data` | a marker record in the log |
+| `platform.spw.link` | `state` | `up` or `down` (QEMU `link-down`); while down, GS TCs are dropped and logged, platform TCs are not sent |
+| `platform.timecode.enable` | `enabled` | the periodic time codes on or off |
+| `platform.timecode.once` | | one correct code at the next rollover (409 while the link is down or TR = 0) |
+| `platform.timecode.inject` | `timecnt` | one code now with this TIMECNT (0..63), a wrong-value tool |
+| `platform.obt.set` | `coarse`, `fine` | jump the platform OBT (`obt` mode only) |
+| `platform.timesync.send` | `coarse` | TC(9,129) timed to the next code; `"auto"` or an explicit coarse (warned when its 6 LSBs miss); 409 while one is pending |
+| `platform.keepalive.set` | `enabled`, `period_s` | the TC(20,128) keep-alive, paced on bench time |
+| `force.set` | `path`, `value` | force a presented value: `instrument.hk_adc.<ch>` (adc-inject) |
+| `force.clear` | `path` | clear a forcing |
+| `fault.inject` | `id`, `params`, `trigger`, `seed` | a catalogue fault (`GET /faults`); logged as `fault` with its params and seed |
+| `fault.clear` | `id` | clear an active, reversible fault |
+| `tc.platform.send` | `hex` | a raw platform TC space packet: source 14, services 9 and 20 only (403 otherwise); TC(9,129) gets 409 while a sync is pending |
+| `tc.gs.send` | `service`, `subtype`, `data`, `ack` | GS emulation: an operator TC from source 121, labelled GS-EMULATION; needs `[gs] emulation` (on in run mode by default) |
 | `debug.qmp` | `command`, `arguments` | one raw `qom-get` or `qom-set` on `/machine/stixspw` or `/machine/stixctrl`, or `query-status`; refused (403) unless `[debug] raw_qmp = true`, and in run mode also `[debug] allow_in_run = true`; every call is a `debug` record and sets the sticky `status.debug_used` taint (dev and gate use only) |
 <!-- verbs:end -->
 

@@ -117,6 +117,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, ctl.status())
         if path == PREFIX + "/time":
             return self._send(200, ctl.time_info())
+        if path == PREFIX + "/faults":
+            return self._send(200, ctl.plat.faults.catalogue())
         if path == PREFIX + "/verbs":
             return self._send(200, {"verbs": ctl.dispatcher.describe()})
         if path == PREFIX + "/state" or path.startswith(PREFIX + "/state/"):

@@ -58,6 +58,10 @@ class Controller:
         self.last_snapshot = None   # bench time of the last snapshot
         self.server = None
         self._register()
+        from .plat import Platform
+        self.plat = Platform(self)
+        self.plat.register(self.dispatcher)
+        self.state.fault_ids = self.plat.faults.active_targets
         self.log.emit("ctl", "log", "controller.start",
                       {"run_dir": self.run_dir, "fresh_removed":
                        self.removed, "config": _public(cfg)})
@@ -152,6 +156,10 @@ class Controller:
         if self.power.state == power_mod.OFF:
             self.state.clear_hw()
         self._emit_changes(changes)
+
+    def state_platform(self, values):
+        self._emit_changes(self.state.set_platform(values,
+                                                   self.clock.now()[0]))
 
     def _emit_changes(self, changes):
         for path, (old, new) in sorted(changes.items()):
@@ -284,7 +292,9 @@ class Controller:
                 "qmp_rtt_s": None if q is None else
                 {"min": q.rtt_min, "max": q.rtt_max, "last": q.rtt_last},
                 "debug_used": self.debug_used,
-                "faults": [], "forcings": [], "scenario": None}
+                "platform": self.plat.status(),
+                "faults": self.plat.faults.status(),
+                "forcings": self.plat.forcing.status(), "scenario": None}
 
     # -- lifecycle --
     def start(self, serve=True):
@@ -313,6 +323,7 @@ class Controller:
             self.server.server_close()
         if self.poller is not None:
             self.poller.join(timeout=2)
+        self.plat.close()
         self.log.close()
         if self.lock_fd is not None:
             os.close(self.lock_fd)

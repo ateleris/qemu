@@ -78,6 +78,7 @@ class StateTree:
     def __init__(self):
         self.lock = threading.Lock()
         self.leaves = {}
+        self.fault_ids = None       # () -> {target path: [fault ids]}
 
     def set_platform(self, values, t_sim):
         """Controller-owned truth (power, mode ...): {path: value}."""
@@ -119,10 +120,16 @@ class StateTree:
     def get(self, prefix=None):
         """The leaves under @prefix (a dotted path) as a nested dict;
         None if nothing matches."""
+        faults = self.fault_ids() if self.fault_ids else {}
         with self.lock:
             items = sorted((p, dict(lf)) for p, lf in self.leaves.items()
                            if prefix is None or p == prefix or
                            p.startswith(prefix + "."))
+        for p, lf in items:
+            ids = [f for t, fs in faults.items() for f in fs
+                   if p == t or p.startswith(t + ".")]
+            if ids:
+                lf["fault_ids"] = ids
         if not items:
             return None
         if prefix is not None and len(items) == 1 and items[0][0] == prefix:

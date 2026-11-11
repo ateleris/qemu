@@ -29,7 +29,16 @@ DEFAULTS = {
         "api": 8080,
         "qemu_tm": 21511,   # QEMU sends TM here (the controller binds it)
         "qemu_tc": 21512,   # QEMU binds TC here (127.0.0.1)
+        "gs_tc": 21502,     # the controller takes GS TCs here (D-PLg)
     },
+    # D-PLg/D-PLa: the GS side of the relay and the proxy
+    "gs": {"tm_dests": ["127.0.0.1:21501"], "bind": "127.0.0.1",
+           "tc_during_link_down": "drop",   # "drop" | "hold"
+           "emulation": "auto",    # tc.gs.send: "auto" (run mode) | on | off
+           "emulation_source": 121},
+    "keepalive": {"enabled": True, "period_s": 1.0,
+                  "autostart": "first_tm"},   # "first_tm" | "boot" | "off"
+    "faults": {"catalogue": ""},              # "" = the v1 catalogue
     # bind: loopback only, unless container = true (PL-7: inside a
     # container that is published on 127.0.0.1 only, D-PLj)
     "api": {"bind": "127.0.0.1", "container": False},
@@ -55,6 +64,9 @@ CHOICES = {
     ("qemu", "obt_continuity"): ("aligned", "exact"),
     ("qemu", "on_guest_reset"): ("warm", "cold", "halt"),
     ("retention", "keep_flash"): ("failed", "never", "always"),
+    ("gs", "tc_during_link_down"): ("drop", "hold"),
+    ("gs", "emulation"): ("auto", "on", "off"),
+    ("keepalive", "autostart"): ("first_tm", "boot", "off"),
 }
 
 
@@ -97,6 +109,12 @@ def _check(cfg):
             raise ConfigError("ports.%s = %r is out of range" % (k, p))
     if not 0 <= cfg["qemu"]["obt_epoch"] < (1 << 48):
         raise ConfigError("qemu.obt_epoch is wider than the 48-bit CUC")
+    for d in cfg["gs"]["tm_dests"]:
+        host, _, port = str(d).rpartition(":")
+        if not host or not port.isdigit() or not 0 < int(port) < 65536:
+            raise ConfigError("gs.tm_dests entry %r is not host:port" % d)
+    if not 0.125 <= cfg["keepalive"]["period_s"] <= 3600:
+        raise ConfigError("keepalive.period_s is 0.125..3600")
     if cfg["clock"]["snapshot_s"] < 0:
         raise ConfigError("clock.snapshot_s < 0")
     if cfg["api"]["bind"] not in LOOPBACK and not cfg["api"]["container"]:

@@ -39,15 +39,19 @@ def check_args(schema, args):
                 out[name] = spec["default"]
             continue
         v = args[name]
-        t = ARG_TYPES[spec["type"]]
-        if isinstance(v, bool) and spec["type"] != "boolean":
-            raise VerbError(400, "%s: expected %s" % (name, spec["type"]))
-        if not isinstance(v, t):
-            raise VerbError(400, "%s: expected %s" % (name, spec["type"]))
+        types = spec["type"] if isinstance(spec["type"], list) \
+            else [spec["type"]]
+        want = " or ".join(types)
+        if isinstance(v, bool) and "boolean" not in types:
+            raise VerbError(400, "%s: expected %s" % (name, want))
+        if not any(isinstance(v, ARG_TYPES[t]) for t in types):
+            raise VerbError(400, "%s: expected %s" % (name, want))
         if "enum" in spec and v not in spec["enum"]:
             raise VerbError(400, "%s: not one of %s"
                             % (name, "|".join(map(str, spec["enum"]))))
-        if "min" in spec and v < spec["min"]:
+        if isinstance(v, str) and ("min" in spec or "max" in spec):
+            pass
+        elif "min" in spec and v < spec["min"]:
             raise VerbError(400, "%s: below %s" % (name, spec["min"]))
         if "max" in spec and v > spec["max"]:
             raise VerbError(400, "%s: above %s" % (name, spec["max"]))

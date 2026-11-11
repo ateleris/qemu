@@ -177,6 +177,8 @@ class Power:
             self._set(RUNNING)
             self._record("boot", t0=self.t0)
             self._snapshot("boot")
+            for h in self.hooks:
+                h("boot", self)
             return {"t0": self.t0, "boot_id": self.clock.boot_id}
 
     def off(self):
@@ -237,6 +239,8 @@ class Power:
         self.clock.process_ended()
         self._set(OFF)
         self._record("off", why=why, method=method, rc=rc)
+        for h in self.hooks:
+            h("off", self)
 
     def cycle(self, off_time_s=None, boot=None):
         off_time_s = self.cfg["power"]["off_time_s"] if off_time_s is None \

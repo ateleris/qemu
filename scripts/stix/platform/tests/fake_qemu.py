@@ -24,6 +24,8 @@ import time
 
 PROPS_NEW = ["flash-file", "inverted-storage"]
 PROPS_OLD = ["flash-file"]
+SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject") + \
+    tuple("adc-inject[%d]" % ch for ch in range(128))
 
 
 def greeting():
@@ -74,6 +76,8 @@ class Fake:
         self.halt = "reboot=shutdown,shutdown=pause" in args
         self.qmp_path = None
         self.uart_append = False
+        self.props = {}
+        self.set_log = []
         for i, a in enumerate(args):
             nxt = args[i + 1] if i + 1 < len(args) else ""
             if a == "-qmp" and nxt.startswith("unix:"):
@@ -200,13 +204,23 @@ class Fake:
             if prop == "hw-state":
                 return json.dumps(self.hw_ctrl() if "ctrl" in a["path"]
                                   else self.hw_spw())
+            if (a["path"], prop) in self.props:
+                return self.props[(a["path"], prop)]
             raise KeyError("Property '%s' not found" % prop)
         if ex == "qom-set":
-            if a.get("property") == "obt":
+            prop = a.get("property")
+            if prop == "obt":
                 self.obt_base = a["value"]
                 self.obt_vbase = self.vclock()
                 return {}
-            raise KeyError("Property '%s' not found" % a.get("property"))
+            if prop in SETTABLE:
+                # a plain store; the self-test reads it back
+                self.props[(a["path"], prop)] = a["value"]
+                self.set_log.append((a["path"], prop, a["value"]))
+                return {}
+            raise KeyError("Property '%s' not found" % prop)
+        if ex == "x-fake-set-log":
+            return [list(x) for x in self.set_log]
         if ex == "x-fake-guest-reset":
             threading.Timer(0.05, self.guest_reset).start()
             return {}
