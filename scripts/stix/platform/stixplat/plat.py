@@ -48,6 +48,7 @@ class Platform:
             faults_mod.load(cfg["faults"]["catalogue"] or None),
             self.log, self.clock, self._fault_actions())
         self.relay.listeners += [self.keepalive.on_tm, self.timesync.on_tm]
+        ctl.trace_filters.append(self.keepalive.trace_filter)
         self.power.hooks.append(self._on_power)
 
     # -- helpers --------------------------------------------------------------

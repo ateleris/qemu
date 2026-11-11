@@ -429,6 +429,16 @@ bench**.
   "first_tm" | "boot" | "off"`.
 - Suppressed while the link is down or STIX is off. So an outage longer
   than 30 s gives 0x142E, which is real and the point of the bench.
+- **No drift (PL-4 review SF9):** each deadline is the previous one plus
+  the period, so the poller's sampling jitter does not stretch it; slots
+  missed in a host stall are counted (`missed`), not sent as a burst.
+- **Aggregate logging (SF9):** at 8 Hz a record per TC would flood the
+  log, so `platform.keepalive` gets a summary record (`data.summary`)
+  for the first send of a run, every `summary_every` sends (default 80
+  = 10 s), the last of a run (ended by a disable, a suppression, a boot
+  or an off) and the first failure of a failing stretch. The
+  `stixspw_rx_deliver` trace of each TC20 (a 252-byte unit while one is
+  outstanding) is counted in the summary instead of logged.
 
 ### D-PLf: the power model (controller)
 - **Power on:** spawn QEMU with `-S`. The device is realized, the machine

@@ -38,7 +38,9 @@ DEFAULTS = {
            "emulation_source": 121},
     # D-PLe: a TC(20,128) every 125 ms (user decision), configurable
     "keepalive": {"enabled": True, "period_s": 0.125,
-                  "autostart": "first_tm"},   # "first_tm" | "boot" | "off"
+                  "autostart": "first_tm",    # "first_tm" | "boot" | "off"
+                  # one summary record per N sends (80 = 10 s at 125 ms)
+                  "summary_every": 80},
     "faults": {"catalogue": ""},              # "" = the v1 catalogue
     # bind: loopback only, unless container = true (PL-7: inside a
     # container that is published on 127.0.0.1 only, D-PLj)
@@ -116,6 +118,8 @@ def _check(cfg):
             raise ConfigError("gs.tm_dests entry %r is not host:port" % d)
     if not 0.125 <= cfg["keepalive"]["period_s"] <= 3600:
         raise ConfigError("keepalive.period_s is 0.125..3600")
+    if cfg["keepalive"]["summary_every"] < 1:
+        raise ConfigError("keepalive.summary_every must be >= 1")
     if cfg["clock"]["snapshot_s"] < 0:
         raise ConfigError("clock.snapshot_s < 0")
     if cfg["api"]["bind"] not in LOOPBACK and not cfg["api"]["container"]:

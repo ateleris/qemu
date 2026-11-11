@@ -40,6 +40,8 @@ FAKE = os.path.normpath(os.path.join(HERE, "..", "tests", "fake_qemu.py"))
 DOCS = os.path.normpath(os.path.join(HERE, "..", "..", "..", "..", "docs",
                                      "stix-port", "platform.md"))
 
+NS = 1_000_000_000
+
 
 class Fail(Exception):
     pass
@@ -976,6 +978,103 @@ def t_keepalive(env):
     check(len(sent) == 24, "disabled")
 
 
+def _ka_rig(**kcfg):
+    t = [0.0]
+    clk = SimClock(mono_fn=lambda: t[0])
+    clk.process_started()
+    clk.resumed()
+    clk.sample(0)
+    sent = []
+    cfg = config_mod.load(overrides={"keepalive": kcfg} if kcfg else None)
+    lg = log_mod.RecordLog(None, clk.now)
+    ka = keepalive_mod.KeepAlive(cfg, clk, lg, lambda u: sent.append(u),
+                                 lambda: None)
+    return clk, lg, ka, sent
+
+
+def _ka_recs(lg):
+    return [r.obj["data"] for r in lg.since(0)
+            if r.kind == "tc" and r.obj["path"] == "platform.keepalive"]
+
+
+def t_keepalive_drift(env):
+    """SF9: re-armed from the previous deadline, so irregular samples
+    (70 ms here, the poller runs at 20 Hz) do not stretch the period."""
+    clk, lg, ka, sent = _ka_rig(autostart="boot")
+    ka.on_boot()
+    while clk.exact_sim() < 10 * NS:
+        clk.sample(clk.vclock + 70_000_000)
+        clk.run_due()
+    check(79 <= len(sent) <= 80, "80 TC20 in 10 s at 125 ms, got %d"
+          % len(sent))
+    # a stall (a slow host) is not caught up with a burst
+    n = len(sent)
+    clk.sample(clk.vclock + 2 * NS)
+    clk.run_due()
+    check(len(sent) == n + 1, "a 2 s stall gave %d TCs" % (len(sent) - n))
+    check(ka.status()["missed"] >= 15, "missed slots counted %r"
+          % ka.status())
+
+
+def t_keepalive_log(env):
+    """SF9: aggregate logging, one summary every N sends plus the first
+    and the last of each run and any failure, never one per TC."""
+    clk, lg, ka, sent = _ka_rig(autostart="boot", summary_every=80)
+    ka.on_boot()
+    while clk.exact_sim() < 30 * NS + NS // 100:
+        clk.sample(clk.vclock + 5_000_000)
+        clk.run_due()
+    recs = _ka_recs(lg)
+    check(len(sent) == 240, "240 sent: %d" % len(sent))
+    check(all(r.get("summary") for r in recs), "a per-TC record: %r"
+          % [r for r in recs if not r.get("summary")][:1])
+    check([r["reason"] for r in recs] == ["first", "every", "every",
+                                          "every"],
+          "summaries %r" % [r["reason"] for r in recs])
+    check(recs[1]["sent"] == 80 and recs[3]["sent"] == 240 and
+          recs[3]["last_seq"] == tcbuild.parse_tc(sent[-1][4:])[1],
+          "summary counts %r" % recs[3])
+    ka.set(enabled=False)
+    recs = _ka_recs(lg)
+    check(recs[-1]["reason"] == "last" and recs[-1]["sent"] == 240,
+          "the last of the run %r" % recs[-1])
+    # a failure is logged at once
+    clk2, lg2, ka2, _ = _ka_rig(autostart="boot")
+
+    def broken(u):
+        raise OSError("ENETUNREACH")
+    ka2.send_unit = broken
+    ka2.on_boot()
+    for _ in range(40):
+        clk2.sample(clk2.vclock + 5_000_000)
+        clk2.run_due()
+    fails = [r for r in _ka_recs(lg2) if r["reason"] == "failure"]
+    check(len(fails) == 1 and "ENETUNREACH" in fails[0]["error"],
+          "one failure record per failing run %r" % _ka_recs(lg2))
+
+
+def t_keepalive_trace(env):
+    """SF9: the RX-delivery trace of each TC20 is not logged (only
+    counted); any other unit's is."""
+    ctl = env.controller(keepalive={"autostart": "boot"})
+    try:
+        ka = ctl.plat.keepalive
+        line = ("stixspw_rx_deliver RX unit delivered: len=%d ctrl=0x10f8 "
+                "sel=3 vclock_ns=5")
+        with ka.lock:
+            ka.outstanding = 1
+        ctl._qemu_line("trace", line % 252)
+        ctl._qemu_line("trace", line % 252)     # no TC20 outstanding
+        ctl._qemu_line("trace", line % 22)
+        lens = [r.obj["data"]["line"] for r in ctl.log.since(0)
+                if r.obj["path"] == "trace.stixspw_rx_deliver"]
+        check(len(lens) == 2 and "len=22" in lens[1],
+              "logged rx_deliver %r" % lens)
+        check(ka.status()["rx_deliver"] == 1, "counted %r" % ka.status())
+    finally:
+        ctl.shutdown()
+
+
 def t_relay(env):
     """D-PLg: the relay is byte-identical, one tm.jsonl line per TM; the
     proxy adds the SpW header; a GS TC while the link is down is dropped
@@ -1437,6 +1536,9 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("decoder on real units", t_decode),
          ("time sync window (D-PLd)", t_timesync_window),
          ("keep-alive pacing", t_keepalive),
+         ("keep-alive: no drift", t_keepalive_drift),
+         ("keep-alive: aggregate log", t_keepalive_log),
+         ("keep-alive: rx trace filter", t_keepalive_trace),
          ("TM relay + TC proxy", t_relay),
          ("platform TCs (9/20, R2)", t_platform_tcs),
          ("fault catalogue + forcing", t_faults),

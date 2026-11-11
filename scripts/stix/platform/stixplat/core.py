@@ -59,6 +59,7 @@ class Controller:
         self.server = None
         self._register()
         from .plat import Platform
+        self.trace_filters = []     # fn(name, line) -> True drops it
         self.plat = Platform(self)
         self.plat.register(self.dispatcher)
         self.state.fault_ids = self.plat.faults.active_targets
@@ -142,9 +143,11 @@ class Controller:
             self.log.emit("fsw", "uart", "uart", {"line": text})
         elif kind == "trace":
             m = TRACE_NAME_RE.match(text)
-            self.log.emit("qemu", "log", "trace." + (m.group(1) if m
-                                                     else "?"),
-                          {"line": text})
+            name = m.group(1) if m else "?"
+            for f in self.trace_filters:
+                if f(name, text):
+                    return
+            self.log.emit("qemu", "log", "trace." + name, {"line": text})
         else:
             self.log.emit("qemu", "log", "qemu.stderr", {"line": text})
 
