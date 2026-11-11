@@ -3708,6 +3708,10 @@ unless a test or the platform controller does.
   dropped (traced, `stixspw_timecode_once_drop`) by `link-down = true`,
   by any `timecodes` write and by a `false` write. It survives a reset;
   with TR = 0 after the reset it is consumed with nothing emitted.
+  Likewise, a `timecode-once` that QMP accepted is **silently consumed**
+  (only the `stixspw_timecode_manual … emitted=0` trace shows it) if the
+  guest clears control.TR before the rollover: the set returns success
+  and no code reaches the FSW.
 - **`timecode-inject`** (runtime write-only uint32, 0..63): one code now
   with that TIMECNT through the same TR/TQ/IE path and D-M latch as the
   timer (`stixspw_tc_emit`, factored out of the timer). 64 and above,
@@ -3737,7 +3741,8 @@ unless a test or the platform controller does.
   `stixctrl_hkcmdsta` composes them, per line `enabled`/`good`);
   `hk_adc` keyed by `ch` for every channel with a table entry: `truth`,
   `presented`, `injected` and `last` (the last guest conversion's value
-  and `vclock_ns`, null since reset); `hk_prot` (IRQEN, PROTSTAT,
+  and `vclock_ns`, null since reset), plus any channel with an active
+  injection even when its table entry is 0 (truth 0); `hk_prot` (IRQEN, PROTSTAT,
   HOTSAMPLE and the 9 lines with `line`, `ch`, `bit`, `threshold`,
   `prot_en`); `watchdog` (running, count, reload); `scet` (coarse,
   fine, `unsynced`); `det.quarter_on[quarter]` (idefxConfig 3:0; the
@@ -3748,7 +3753,9 @@ unless a test or the platform controller does.
   `status`, `control` (raw, TR/TQ/IE/LI); `timecode` (source, enabled,
   once_pending, last TIMECNT and its `vclock_ns` from any emitted code,
   the next due `vclock_ns` from the pending timer, null when none);
-  `obt`; `rx_queued`; `counters` (tm_dropped, rx_dropped, tc_resync,
+  `obt` with `obt_kind` (`platform` in obt mode; `scet` when it is the
+  IDPU's own SCET, which must never be labelled the platform OBT);
+  `rx_queued`; `counters` (tm_dropped, rx_dropped, tc_resync,
   tmtc_connected).
 - **`/machine/stixspw` `vclock-ns`** (read-only uint64):
   `qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)`, the controller's time master.
@@ -3756,6 +3763,13 @@ unless a test or the platform controller does.
   model state directly and never call an MMIO handler (the CTRL read
   handler stores the SCET and the watchdog into reg on every read); no
   register, timer, queue or IRQ is touched.
+- **The contract (binding for later additions):** `hw-state` is **pure
+  reads only**. The controller polls it at 2 Hz, so every accessor it
+  calls (the detector's `det` section, the attenuator's truth/presented
+  getters, any later module) must be a side-effect-free read: no MMIO
+  handler, no register write, no timer, IRQ, queue or counter change.
+  The ctrl-hw-state qtest's equal-reads and no-io_read-trace check is
+  the guard.
 - **Scripts (PL-2b and PL-2):** the probe's `--qmp` and `QmpClient` take
   `tcp:HOST:PORT` as well as a unix path (a bad address exits 2);
   `run-qemu-gs.sh` `STIX_GS_QMP` takes `tcp:127.0.0.1:PORT` or
@@ -3771,7 +3785,17 @@ UNSYNCED flag after a 0xC8/0xCC commit with bit 31; two reads equal and
 no `stixctrl_io_read`/`stixspw_io_read` trace line while the getters
 run, with an MMIO read as the positive control), `spw-hw-state` and
 `vclock-ns`. RED before PL-2: `hw-state` and `vclock-ns` are unknown
-properties. The probe self-test gains q8 (a real TCP fake-QMP listener)
+properties.
+
+**Review fixes (PL-1/PL-2 review):** qtests `plat-realize-error`
+(timecode-source `utc` and obt-epoch 2^48 refused at realize, named in
+the error) and `plat-review-extras` (`timecode-once=false` cancels; a
+once survives a reset and is consumed with `emitted=0` while TR = 0;
+once and inject in obt mode; `obt_kind`; an injected unused channel in
+`hk_adc`). RED before the fixes: `obt_kind` missing. The probe connects
+TCP with `socket.create_connection` and takes `tcp:[::1]:N`;
+`run-qemu-gs.sh` takes host 127.0.0.1, localhost or [::1] (`::1` is
+bracketed for QEMU), port 1..65535, and refuses any comma. The probe self-test gains q8 (a real TCP fake-QMP listener)
 and q9 (the address forms); RED before PL-2b: "cannot connect to
 tcp:127.0.0.1:N: No such file or directory". `scripts/stix/tests/
 test-run-qemu-gs.sh` runs the script against an argv-recording stub

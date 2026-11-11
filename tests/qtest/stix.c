@@ -8099,6 +8099,174 @@ static void test_vclock_ns(void)
     stix_qtest_cleanup();
 }
 
+/* ---- PL-1/PL-2 review: the extras and the nits ---- */
+
+#define PLAT_TEST_GLOBAL_ENV "STIX_TEST_PLAT_GLOBAL"
+
+static void test_plat_realize_error_subprocess(void)
+{
+    const char *global = g_getenv(PLAT_TEST_GLOBAL_ENV);
+    const char *flash = g_getenv(TMTC_TEST_FLASH_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(global);
+    g_assert_nonnull(flash);
+    /* qtest_init aborts: QEMU realize fails and exits */
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s -global %s",
+                      flash, global);
+    qtest_quit(qts);
+}
+
+/*
+ * D-PLb: realize refuses a timecode-source other than scet/obt and an
+ * obt-epoch wider than the 48-bit CUC (2^48), naming the value.
+ */
+static void test_plat_realize_error(void)
+{
+    static const struct {
+        const char *global;
+        const char *pattern;
+    } cases[] = {
+        { "grlib-stixspw.timecode-source=utc",
+          "*timecode-source 'utc' is not 'scet' or 'obt'*" },
+        { "grlib-stixspw.obt-epoch=281474976710656",
+          "*obt-epoch 0x1000000000000 is wider than the 48-bit CUC*" },
+    };
+    g_autofree gchar *path = NULL;
+    g_autofree gchar *sub = stix_test_path("plat-realize-error/subprocess");
+    int fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+    size_t i;
+
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+    g_setenv(TMTC_TEST_FLASH_ENV, path, TRUE);
+    for (i = 0; i < G_N_ELEMENTS(cases); i++) {
+        g_setenv(PLAT_TEST_GLOBAL_ENV, cases[i].global, TRUE);
+        g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+        g_test_trap_assert_failed();
+        g_test_trap_assert_stderr(cases[i].pattern);
+    }
+    close(fd);
+    g_unlink(path);
+}
+
+static gchar *plat_read_log(const char *path)
+{
+    gchar *text = NULL;
+
+    g_assert(g_file_get_contents(path, &text, NULL, NULL));
+    return text;
+}
+
+/*
+ * D-PLc extras: timecode-once=false cancels a pending once (traced);
+ * a pending once survives a system reset and, with TR = 0 after the
+ * reset, is consumed at the rollover with nothing emitted (traced
+ * emitted=0); once and inject in obt mode follow the OBT. The nits:
+ * spw hw-state names obt_kind (scet vs platform), and ctrl hw-state
+ * lists a channel with an active injection even when its table entry
+ * is 0. RED before the review fixes: obt_kind and ch 5 are missing.
+ */
+static void test_plat_review_extras(void)
+{
+    const char *spw = "/machine/stixspw";
+    g_autofree gchar *log = NULL;
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *text = NULL;
+    QTestState *qts;
+    QDict *st, *ch;
+    bool ok, v;
+    int fd;
+
+    fd = g_file_open_tmp("stix-plat-trace-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixspw_timecode_manual "
+                            "-trace stixspw_timecode_once_drop -D %s", log);
+    qts = stix_qtest_new_extra(extra);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    g_assert(stix_qom_set_bool(qts, spw, "timecodes", false));
+    spw_to_clear(qts);
+
+    /* a. the nits, scet mode: obt_kind "scet" */
+    st = plat_hw_state(qts, spw);
+    g_assert_cmpstr(qdict_get_try_str(st, "obt_kind"), ==, "scet");
+    qobject_unref(st);
+
+    /* b. timecode-once=false cancels: no code at the rollover */
+    g_assert(stix_qom_set_bool(qts, spw, "timecode-once", true));
+    g_assert(stix_qom_set_bool(qts, spw, "timecode-once", false));
+    v = stix_qom_get_bool(qts, spw, "timecode-once", &ok);
+    g_assert(ok && !v);
+    tc_step_rollover(qts);
+    g_assert(!spw_to(qts));
+
+    /*
+     * c. a once survives a reset; TR = 0 after it, so the rollover
+     * consumes it with nothing emitted
+     */
+    g_assert(stix_qom_set_bool(qts, spw, "timecode-once", true));
+    qtest_system_reset(qts);
+    v = stix_qom_get_bool(qts, spw, "timecode-once", &ok);
+    g_assert(ok && v);
+    tc_step_rollover(qts);
+    g_assert(!spw_to(qts));
+    v = stix_qom_get_bool(qts, spw, "timecode-once", &ok);
+    g_assert(ok && !v);
+    qtest_quit(qts);
+    text = plat_read_log(log);
+    g_assert_nonnull(strstr(text, "pending timecode-once dropped: cancel"));
+    g_assert_nonnull(strstr(text, "kind=once"));
+    g_assert_nonnull(strstr(text, "emitted=0"));
+    stix_qtest_cleanup();
+    unlink(log);
+
+    /* d. obt mode: once at the OBT rollover, inject now, obt_kind */
+    g_free(extra);
+    extra = g_strdup_printf("-global grlib-stixspw.timecode-source=obt "
+                            "-global grlib-stixspw.obt-epoch=%" PRIu64,
+                            OBT_CUC(0x10000005u, 0));
+    qts = stix_qtest_new_extra(extra);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    g_assert(stix_qom_set_bool(qts, spw, "timecodes", false));
+    spw_to_clear(qts);
+    st = plat_hw_state(qts, spw);
+    g_assert_cmpstr(qdict_get_try_str(st, "obt_kind"), ==, "platform");
+    qobject_unref(st);
+    g_assert(stix_qom_set_bool(qts, spw, "timecode-once", true));
+    obt_step_rollover(qts);
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME) & 63u, ==,
+                     0x10000006u & 63u);
+    v = stix_qom_get_bool(qts, spw, "timecode-once", &ok);
+    g_assert(ok && !v);
+    spw_to_clear(qts);
+    obt_step_rollover(qts);
+    g_assert(!spw_to(qts)); /* exactly one */
+    g_assert(stix_qom_set_u64(qts, spw, "timecode-inject", 17));
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME), ==, 17);
+    spw_to_clear(qts);
+
+    /*
+     * e. ctrl hw-state lists an injected channel even when its table
+     * entry is 0 (ch 5 is unused): truth 0, presented the injection
+     */
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    g_assert(!qdict_haskey(qdict_get_qdict(st, "hk_adc"), "5"));
+    qobject_unref(st);
+    g_assert_true(adc_inject_set(qts, 5, 77));
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    ch = plat_hk_ch(st, 5);
+    g_assert_cmpint(qdict_get_int(ch, "truth"), ==, 0);
+    g_assert_cmpint(qdict_get_int(ch, "presented"), ==, 77);
+    g_assert(qdict_get_bool(ch, "injected"));
+    qobject_unref(st);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_platform_register(void)
 {
     qtest_add_func("/sparc/stix/spw-obt", test_spw_obt);
@@ -8108,6 +8276,12 @@ static void stix_platform_register(void)
     qtest_add_func("/sparc/stix/ctrl-hw-state", test_ctrl_hw_state);
     qtest_add_func("/sparc/stix/spw-hw-state", test_spw_hw_state);
     qtest_add_func("/sparc/stix/vclock-ns", test_vclock_ns);
+    qtest_add_func("/sparc/stix/plat-realize-error/subprocess",
+                   test_plat_realize_error_subprocess);
+    qtest_add_func("/sparc/stix/plat-realize-error",
+                   test_plat_realize_error);
+    qtest_add_func("/sparc/stix/plat-review-extras",
+                   test_plat_review_extras);
 }
 
 int main(int argc, char **argv)

@@ -1353,6 +1353,11 @@ static char *grlib_stixspw_get_hw_state(Object *obj, Error **errp)
     } else {
         qdict_put_null(root, "obt");
     }
+    /*
+     * what "obt" is: the platform OBT, or in scet mode the IDPU's own
+     * SCET, which the controller must never label as the platform time
+     */
+    qdict_put_str(root, "obt_kind", s->obt_mode ? "platform" : "scet");
     qdict_put_int(root, "rx_queued", s->rx_count);
 
     qdict_put_int(cnt, "tm_dropped", s->tmtc.tm_dropped);

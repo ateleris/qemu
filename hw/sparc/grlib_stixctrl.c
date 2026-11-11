@@ -1258,12 +1258,16 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     qdict_put(sup, "lines", lines);
     qdict_put(root, "supplies", sup);
 
-    /* every channel with a table entry (the used ones), keyed by ch */
+    /*
+     * every channel with a table entry (the used ones) or an active
+     * injection, keyed by ch
+     */
     for (ch = 0; ch < STIXCTRL_HK_CHANNELS; ch++) {
         g_autofree char *key = NULL;
         QDict *c;
 
-        if (stixctrl_hk_adc_table[ch] == 0) {
+        if (stixctrl_hk_adc_table[ch] == 0 &&
+            s->adc_inject[ch] == STIXCTRL_ADC_INJECT_NONE) {
             continue;
         }
         c = qdict_new();
