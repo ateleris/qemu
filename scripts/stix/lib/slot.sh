@@ -20,8 +20,10 @@
 #   k >= 1       exactly slot k; exit 2 if its lock is held
 # Slot 0 is never taken here: it is legacy, manual and 5.2-wrapper use.
 #
-# In slot mode the helper exports STIX_SLOT, STIX_PORT_BASE (= B_k) and
-# TMTC_PORT, prints one "slot: k base B" line, and keeps the lock fd open
+# In slot mode the helper exports STIX_SLOT, TMTC_PORT (= B_k) and
+# STIX_QTEST_PORT_BASE (= B_k, read by tests/qtest/stix.c for its port
+# band); STIX_PORT_BASE keeps the caller's selector (auto or k). It
+# prints one "slot: k base B" line, and keeps the lock fd open
 # for the caller's lifetime (inherited by QEMU and the probe, so the
 # kernel frees it when the last of them exits, SIGKILL included).
 #
@@ -46,11 +48,16 @@ stix_slot_lock() { # k -> lock file path
     echo "${STIX_SLOT_LOCK_DIR:-/tmp}/stix-qtest-$(stix_slot_base "$1").lock"
 }
 
-# Refuse any slot count whose bands would overlap the GS ports.
+# Refuse any slot count whose bands would overlap the GS ports or pass
+# port 65535.
 stix_slot_check_gs() { # highest slot index in use
     local k b p
     for ((k = 1; k <= $1; k++)); do
         b="$(stix_slot_base "$k")"
+        if [ $((b + 99)) -gt 65535 ]; then
+            echo "slot: slot $k band $b..$((b + 99)) passes port 65535"
+            return 2
+        fi
         for p in "${STIX_GS_TM_PORT:-21500}" "${STIX_GS_UDP_TM_PORT:-21501}" \
                  "${STIX_GS_UDP_TC_PORT:-21502}"; do
             if [ "$p" -ge "$b" ] && [ "$p" -le $((b + 99)) ]; then
@@ -165,14 +172,14 @@ stix_slot_setup() {
     fi
     STIX_SLOT="$k"
     STIX_SLOT_MODE=1
-    STIX_PORT_BASE="$(stix_slot_base "$k")"
-    TMTC_PORT="$STIX_PORT_BASE"
-    export STIX_SLOT STIX_PORT_BASE TMTC_PORT
+    TMTC_PORT="$(stix_slot_base "$k")"
+    STIX_QTEST_PORT_BASE="$TMTC_PORT"
+    export STIX_SLOT TMTC_PORT STIX_QTEST_PORT_BASE
     STIX_SLOT_QEMU_ARGS=(-global "grlib-stixspw.tmtc-port=$TMTC_PORT")
     # D-G6: appended to every verdict line in slot mode
     STIX_SLOT_TAG=" slot=$k busy=$(stix_slot_busy)"
     STIX_SLOT_TAG="$STIX_SLOT_TAG load=$(cut -d' ' -f1 /proc/loadavg)"
-    echo "slot: $k base $STIX_PORT_BASE"
+    echo "slot: $k base $TMTC_PORT"
 }
 
 # The run dir for this mode: unchanged in legacy, <dir>-s<k> in slot mode.

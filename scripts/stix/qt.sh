@@ -8,10 +8,10 @@
 #   e.g. scripts/stix/qt.sh flash-error-paths
 #
 # Default: STIX_PORT_BASE=auto (or a slot number from the caller) takes a
-# slot in 1..STIX_SLOTS and exports its base port, so the suite's
-# QEMU-bound ports come from the slot band B+3..B+99 (tests/qtest/stix.c
-# stix_free_*_port). Both the suite and single tests take a slot, so they
-# stay inside the CPU cap. No global 21000 lock and no ss check.
+# slot in 1..STIX_SLOTS and exports its base port as STIX_QTEST_PORT_BASE,
+# so the suite's QEMU-bound ports come from the slot band B+3..B+99
+# (tests/qtest/stix.c stix_free_*_port). Both the suite and single tests
+# take a slot, so they stay inside the CPU cap. No global 21000 lock and no ss check.
 #
 # --baseline: QTEST_QEMU_BINARY is the 5.2 wrapper
 # (baseline/qemu-system-sparc-52-wrapper.sh). The 5.2 device always binds
@@ -51,7 +51,7 @@ SUITE="${STIX_QT_SUITE:-$REPO_ROOT/build/tests/qtest/stix}"
 
 . "$REPO_ROOT/scripts/stix/lib/slot.sh"
 if [ "$BASELINE" -eq 1 ]; then
-    unset STIX_PORT_BASE
+    unset STIX_PORT_BASE STIX_QTEST_PORT_BASE
     QTEST_QEMU_BINARY="$REPO_ROOT/scripts/stix/baseline"
     export QTEST_QEMU_BINARY="$QTEST_QEMU_BINARY/qemu-system-sparc-52-wrapper.sh"
     stix_disk_guard

@@ -170,20 +170,26 @@ static int stix_hold_free_tcp_port(int *port)
 }
 
 /*
- * Gate-ports plan D-G4: when the suite runs in a slot (STIX_PORT_BASE = the
- * slot's base port B, exported by scripts/stix/qt.sh), the ports QEMU must
+ * Gate-ports plan D-G4: when the suite runs in a slot (STIX_QTEST_PORT_BASE
+ * = the slot's base port B, exported by scripts/stix/lib/slot.sh; the
+ * scripts' STIX_PORT_BASE stays the slot selector), the ports QEMU must
  * bind itself come from the slot's suite band B+3..B+99. The slot lock
  * makes the band exclusive, so the release-then-bind window below cannot
  * race another suite or probe. Returns B, or 0 outside a slot.
  */
 static int stix_slot_band_base(void)
 {
-    const char *env = getenv("STIX_PORT_BASE");
+    const char *env = getenv("STIX_QTEST_PORT_BASE");
     long base;
 
-    if (!env || qemu_strtol(env, NULL, 10, &base) != 0 ||
-        base <= 0 || base > 65535 - 99) {
+    if (!env || !*env) {
         return 0;
+    }
+    /* set but unusable: fail loudly, never fall back to ephemeral ports */
+    if (qemu_strtol(env, NULL, 10, &base) != 0 ||
+        base < 1024 || base + 99 > 65535) {
+        g_error("STIX_QTEST_PORT_BASE='%s': not a port base B with "
+                "1024 <= B and B+99 <= 65535", env);
     }
     return (int)base;
 }
@@ -1732,6 +1738,10 @@ static void test_tmtc_hermetic(void)
     qtest_quit(qts);
     stix_qtest_cleanup();
     if (!has_port) {
+        g_autofree gchar *bin = g_path_get_basename(qtest_qemu_binary(NULL));
+
+        /* only the 5.2 baseline (via its wrapper) may lack the property */
+        g_assert_cmpstr(bin, ==, "qemu-system-sparc-52-wrapper.sh");
         g_test_skip("5.2 baseline: no tmtc-port property, the hermetic "
                     "check does not apply");
         return;

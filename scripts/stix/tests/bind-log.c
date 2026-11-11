@@ -32,6 +32,14 @@ int bind(int fd, const struct sockaddr *addr, socklen_t len)
     if (!real_bind) {
         real_bind = (int (*)(int, const struct sockaddr *, socklen_t))
             dlsym(RTLD_NEXT, "bind");
+        if (!real_bind) {
+            static const char msg[] = "bind-log: dlsym(bind) failed\n";
+
+            if (write(2, msg, sizeof(msg) - 1) < 0) {
+                /* nothing more to report */
+            }
+            abort();
+        }
     }
     if (addr && addr->sa_family == AF_INET &&
         len >= (socklen_t)sizeof(struct sockaddr_in)) {

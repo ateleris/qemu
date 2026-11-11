@@ -79,10 +79,10 @@ check "unset: legacy port, no lock, no output" $? "$out"
 
 # --- auto never takes slot 0, free or held ---
 B1=$((UIDB + 100))
-out="$(helper 'stix_slot_setup; echo "$STIX_SLOT $STIX_PORT_BASE $TMTC_PORT"' \
+out="$(helper 'stix_slot_setup; echo "$STIX_SLOT $STIX_QTEST_PORT_BASE $TMTC_PORT $STIX_PORT_BASE"' \
     STIX_PORT_BASE=auto)"
-[ "$out" = "$(printf 'slot: 1 base %s\n1 %s %s' "$B1" "$B1" "$B1")" ]
-check "auto, slot 0 free: takes slot 1, not 0" $? "$out"
+[ "$out" = "$(printf 'slot: 1 base %s\n1 %s %s auto' "$B1" "$B1" "$B1")" ]
+check "auto, slot 0 free: slot 1, not 0; the selector is kept" $? "$out"
 hold 0
 out="$(helper 'stix_slot_setup; echo "$STIX_SLOT"' STIX_PORT_BASE=auto)"
 [ "$(echo "$out" | tail -1)" = 1 ]
@@ -164,6 +164,13 @@ out="$(helper 'stix_slot_setup' STIX_PORT_BASE=1 \
 rc=$?
 [ "$rc" -eq 2 ]
 check "STIX_GS_TM_PORT inside slot 1 (number): exit 2" $? "rc=$rc: $out"
+# a band end past 65535 (a high uid): stix_slot_base is overridden
+out="$(helper 'stix_slot_base() { echo $((65450 + 100 * ($1 - 1))); }
+    stix_slot_setup; echo REACHED' STIX_PORT_BASE=1)"
+rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q "passes port 65535" &&
+    ! echo "$out" | grep -q REACHED
+check "a slot band ending past 65535: exit 2" $? "rc=$rc: $out"
 out="$(helper 'stix_slot_setup' STIX_PORT_BASE=auto STIX_SLOTS=0)"
 rc=$?
 [ "$rc" -eq 2 ]
@@ -428,9 +435,9 @@ QT="$REPO_ROOT/scripts/stix/qt.sh"
 # lock (slot 0's outside a slot) is held, the QEMU binary and the CWD
 {
     echo '#!/bin/sh'
-    echo "l=\"$LOCKS/stix-qtest-\${STIX_PORT_BASE:-$UIDB}.lock\""
+    echo "l=\"$LOCKS/stix-qtest-\${STIX_QTEST_PORT_BASE:-$UIDB}.lock\""
     echo 'if flock -n "$l" true; then held=free; else held=held; fi'
-    echo 'echo "ok 1 base=${STIX_PORT_BASE:-unset} lock=$held" \'
+    echo 'echo "ok 1 base=${STIX_QTEST_PORT_BASE:-unset} lock=$held" \'
     echo '    "qemu=$(basename "$QTEST_QEMU_BINARY") cwd=$(pwd) args=$*"'
     echo '[ ! -e flash.bin ] || echo "ok 2 flash=$(stat -c %s flash.bin)"'
 } > "$WORK/fake-suite"
@@ -447,7 +454,7 @@ rc=$?
 [ "$rc" -eq 0 ] && echo "$out" | grep -q "^slot: 1 base $B1\$" &&
     echo "$out" | grep -q "^ok 1 base=$B1 lock=held qemu=qemu-system-sparc " &&
     echo "$out" | grep -q "^exit=0 slot=1 busy=0 load="
-check "qt.sh: the suite runs in slot 1 with STIX_PORT_BASE exported" $? \
+check "qt.sh: the suite runs in slot 1, STIX_QTEST_PORT_BASE exported" $? \
     "rc=$rc: $out"
 out="$(qt flash-error-paths)"
 echo "$out" | grep -q "args=--tap -p /sparc/sparc/stix/flash-error-paths\$" &&
