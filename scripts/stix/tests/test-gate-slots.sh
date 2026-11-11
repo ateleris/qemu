@@ -425,9 +425,10 @@ check "peek: a real nominal run still runs the disk guard" $? "rc=$rc: $out"
 for p in "${PEEKH[@]}"; do kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
 
 # --- detector-smoke: per-mode run dirs, slot args in every mode (G-2b) ---
-# each mode has its own run dir (-neg, -flare, -flareneg), legacy and slot
+# each mode has its own run dir (-neg, -flare, -flareneg, -norotb), legacy
+# and slot
 for m in "--negative:-neg" "--flare:-flare" "--flare --negative:-flareneg" \
-    ":"; do
+    "--no-rotb:-norotb" ":"; do
     args="${m%%:*}"
     sfx="${m#*:}"
     # shellcheck disable=SC2086 # $args is a list of flags
@@ -449,6 +450,17 @@ out="$(slotenv STIX_DETECTOR_RUN_DIR="$W/det" bash "$S/detector-smoke.sh" \
     "$FAKE" --flare --dry-run 2>&1)"
 echo "$out" | grep -q -- "--qmp $W/det-flare-s1/qmp.sock "
 check "detector slot --flare: the probe's QMP socket is the slot's" $? "$out"
+for bad in "--no-rotb --flare" "--negative --no-rotb"; do
+    # shellcheck disable=SC2086 # $bad is a list of flags
+    out="$(bash "$S/detector-smoke.sh" "$FAKE" $bad --dry-run 2>&1)"
+    rc=$?
+    [ "$rc" -eq 2 ] && echo "$out" | grep -q "combines with neither"
+    check "detector: '$bad' is refused" $? "rc=$rc: $out"
+done
+out="$(bash "$S/detector-smoke.sh" "$FAKE" --no-rotb --dry-run 2>&1)"
+echo "$out" | grep -q -- "-global grlib-stixctrl.det-rotb=off" &&
+    echo "$out" | grep -q -- "-global grlib-stixctrl.det-source=zero"
+check "detector --no-rotb: the zero sky with det-rotb=off" $? "$out"
 
 # a fake run to the verdict: canned probe lines (T_nom = T_exit, no TM
 # failure) and a one-packet QL dump that the real ql-check rejects

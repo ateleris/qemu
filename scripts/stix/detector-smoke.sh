@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # DETECTOR smoke: the detector-model gate for tiers 0+1 (detector plan
-# D-3, docs/stix-port/2026-11-11-detector-plan.md) and, with --flare,
-# for the synthetic sky and the flare switch (tier 2, D-4). Boots the
+# D-3, docs/stix-port/2026-11-11-detector-plan.md), with --flare for the
+# synthetic sky and the flare switch (tier 2, D-4), and in every mode for
+# the nominal integration's ROTB science chunks (tier 3, D-5). Boots the
 # STIX model on a FRESH flash (an empty run dir: a NOMINAL entry writes
 # a flash context, as in nominal-smoke.sh), with a QMP socket in the
 # run dir (the --flare mode flips det-flare through it), and QEMU
@@ -78,6 +79,29 @@
 # --flare --negative sends det-flare false at @135 (no flip; the QMP
 # path stays exercised) and passes only when exactly ql-contrast
 # fails.
+# ROTB science chunks (D-5), in every mode: QEMU also traces
+# stixdet_scene, stixdet_nominal_swap, stixdet_chunk, stixdet_chunk_drop
+# and stixctrl_rotb_cmd into the same trace file, and
+# chunk-trace-check.py checks (all on the virtual clock and tick counts
+# the model writes into the lines, never the wall clock): every nominal
+# swap made a 49-block chunk, none dropped; every quiet integration took
+# exactly 200 ticks (the FSW's max time, 20 s), at least 5 of them (1
+# with --flare, whose quiet stretches are short); the chunks come at the
+# integration cadence; and GETBLOCK >= 49 x (chunks - 1), i.e. the FSW
+# drained the ring (check "chunk"). --flare adds "chunk-flare": at least
+# 40 integrations inside the flare window, each exactly 10 ticks (the
+# min time, 1 s; the 1800 events come within a tick). The UART must show
+# "Skipped first Det data chunk" (ArchiveManager.c:140, the chunk reached
+# the archive) exactly once, and no *E line from the chunk path, the
+# archive or the filesystem (check "uart-chunk"). The flash.bin space
+# allocated by the run is printed for the NAND cost record.
+# --no-rotb runs the zero sky with -global grlib-stixctrl.det-rotb=off:
+# the nominal swaps go on but no chunk is made. It passes only when
+# exactly the two chunk checks fail as planned: "uart-chunk" (no "Skipped
+# first Det data chunk") and "chunk" (chunk-trace-check.py --expect-none:
+# >= 3 nominal swaps, no chunk at all).
+# --flare --negative must now fail exactly ql-contrast and chunk-flare
+# (no flip, so neither the LC contrast nor the 1 s integrations).
 # --negative alone runs QEMU with -global grlib-stixctrl.det-idefx=off
 # (CmdReady 0, accepted-diffs §32). A read timeout is not a mismatch
 # (XrayDetFDIR.c:611-615), so no TM fault is expected: the probe must
@@ -97,14 +121,16 @@
 # TMTC port, <run dir>-s<k>, and slot=k busy= load= on the verdict.
 #
 # Usage: detector-smoke.sh <qemu-binary> [--flare] [--negative]
-#                           [--dry-run] [--check-guard]
+#                           [--no-rotb] [--dry-run] [--check-guard]
+#   --no-rotb combines with neither --flare nor --negative.
 #   STIX_ASW_ELF            as in tc-smoke.sh
 #   STIX_DETECTOR_RUN_DIR   run dir (default /tmp/stix-detector-run).
 #                           Canonicalised, then anything at or above
 #                           /tmp/stix-uprev-run or /tmp/stix-baseline-run
 #                           (or /) is refused, as in nominal-smoke.sh.
 #                           Each mode adds its suffix (-neg, -flare,
-#                           -flareneg; none for the positive), then slot
+#                           -flareneg, -norotb; none for the positive),
+#                           then slot
 #                           mode -s<k>. A run that did not PASS leaves
 #                           .unfinished; the next run moves that dir aside
 #                           to <dir>.fail-<date>-<pid>, never reusing it.
@@ -126,9 +152,10 @@
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: detector-smoke.sh <qemu-binary> \
-[--flare] [--negative] [--dry-run] [--check-guard]}"
+[--flare] [--negative] [--no-rotb] [--dry-run] [--check-guard]}"
 NEGATIVE=0
 FLARE=0
+NO_ROTB=0
 DRY_RUN=0
 CHECK_GUARD=0
 for a in "${@:2}"; do
@@ -139,6 +166,9 @@ for a in "${@:2}"; do
         --flare)
             [ "$FLARE" -eq 0 ] || { echo "--flare given twice"; exit 2; }
             FLARE=1 ;;
+        --no-rotb)
+            [ "$NO_ROTB" -eq 0 ] || { echo "--no-rotb given twice"; exit 2; }
+            NO_ROTB=1 ;;
         --dry-run)
             [ "$DRY_RUN" -eq 0 ] || { echo "--dry-run given twice"; exit 2; }
             DRY_RUN=1 ;;
@@ -149,6 +179,11 @@ for a in "${@:2}"; do
         *) echo "unknown argument: $a"; exit 2 ;;
     esac
 done
+if [ "$NO_ROTB" -eq 1 ] && { [ "$FLARE" -eq 1 ] || [ "$NEGATIVE" -eq 1 ]; }
+then
+    echo "--no-rotb combines with neither --flare nor --negative"
+    exit 2
+fi
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
 ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
@@ -158,6 +193,7 @@ DURATION="${STIX_DETECTOR_SECONDS:-240}"
 PROBE="${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}"
 QLCHECK="$REPO_ROOT/scripts/stix/ql-check.py"
 TRACECHECK="$REPO_ROOT/scripts/stix/idefx-trace-check.py"
+CHUNKCHECK="$REPO_ROOT/scripts/stix/chunk-trace-check.py"
 # Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
 # and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
 . "$REPO_ROOT/scripts/stix/lib/slot.sh"
@@ -209,6 +245,7 @@ MODE_SFX=""
 [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-neg"
 [ "$FLARE" -eq 1 ] && MODE_SFX="-flare"
 [ "$FLARE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-flareneg"
+[ "$NO_ROTB" -eq 1 ] && MODE_SFX="-norotb"
 RUN_DIR="$(stix_slot_dir "$RUN_DIR$MODE_SFX")"
 guard_shared
 QMP_SOCK="$RUN_DIR/qmp.sock"
@@ -335,10 +372,14 @@ if [ "$FLARE" -eq 0 ]; then
     if [ "$NEGATIVE" -eq 1 ]; then
         QEMU_ARGS+=(-global grlib-stixctrl.det-idefx=off)
     fi
+    if [ "$NO_ROTB" -eq 1 ]; then
+        QEMU_ARGS+=(-global grlib-stixctrl.det-rotb=off)
+    fi
 fi
 MODE="positive"
 [ "$NEGATIVE" -eq 1 ] && MODE="negative"
 [ "$FLARE" -eq 1 ] && MODE="flare $MODE"
+[ "$NO_ROTB" -eq 1 ] && MODE="no-rotb"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY RUN — the commands detector-smoke would run ($MODE):"
@@ -380,12 +421,16 @@ touch .unfinished
 # appended to, so it must start empty.
 rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
-      ql.contrast.log trace.check.log qmp.sock
+      ql.contrast.log trace.check.log chunk.check.log chunk-flare.check.log \
+      qmp.sock
 truncate -s 17716740096 flash.bin
 # the trace events: the IDeF-X words, and the FSM strobes that mark the
 # NOMINAL window in the same file (one -trace option: a second one would
-# reset the trace file)
-printf 'stixdet_idefx_cmd\nstixdet_fsm_strobe\n' > idefx.events
+# reset the trace file); for the D-5 chunk checks the scene (the flare
+# window), the nominal swaps, the chunks, the drops and the ROTB commands
+printf '%s\n' stixdet_idefx_cmd stixdet_fsm_strobe stixdet_scene \
+    stixdet_nominal_swap stixdet_chunk stixdet_chunk_drop \
+    stixctrl_rotb_cmd > idefx.events
 
 PROBE_PID=""
 QEMU_PID=""
@@ -647,6 +692,29 @@ else
         "failures; expected 0)"
     FAILED+=(uart-idefx)
 fi
+# D-5: the first chunk reached the archive, which drops it with this
+# TRACE_ERROR (ArchiveManager.c:140); later chunks are archived silently
+SKIPPED_FIRST="$(grep -c 'Skipped first Det data chunk' uart.detector.txt \
+    || true)"
+# ... and no error from the chunk path, the archive or the filesystem on
+# the fresh flash (the FSW TRACE_TAGs of RotAccumulator.c,
+# RotAccuCompactor.c, ArchiveManager.c and MemoryMgmt/)
+CHUNK_TAGS='Archive|RotAccuComp|RotAccumulator|FS|FSapi|MemStream|MemCommon|FIFO'
+CHUNK_ERR="$(grep -E "^[[:space:]]*[0-9:.]+ +($CHUNK_TAGS) +\\*E" \
+    uart.detector.txt | grep -v 'Skipped first Det data chunk' | head -3 ||
+    true)"
+if [ -n "$CHUNK_ERR" ]; then
+    echo "CHECK uart-chunk: FAIL (chunk/archive/filesystem error:" \
+        "$(echo "$CHUNK_ERR" | head -1 | cut -c1-120))"
+    FAILED+=(uart-chunk)
+elif [ "$SKIPPED_FIRST" -eq 1 ]; then
+    echo "CHECK uart-chunk: ok ('Skipped first Det data chunk' once, no" \
+        "chunk/archive/filesystem error)"
+else
+    echo "CHECK uart-chunk: FAIL ($SKIPPED_FIRST 'Skipped first Det data" \
+        "chunk' lines; expected 1)"
+    FAILED+=(uart-chunk)
+fi
 
 # 4. the ASIC verification runs in the trace (idefx-trace-check.py).
 # Positive: >= 3 runs of exactly 384. Negative: the trace must exist
@@ -683,6 +751,55 @@ else
     FAILED+=(trace-verif)
 fi
 
+# 5. the ROTB science chunks (D-5), from the same trace: every swap
+# made a chunk, quiet integrations at the max time, the FSW drained the
+# ring. --no-rotb: swaps but no chunk at all (det-rotb=off), which counts
+# as failed as planned.
+CHUNK_ARGS=(idefx.trace)
+if [ "$NO_ROTB" -eq 1 ]; then
+    CHUNK_ARGS+=(--expect-none)
+elif [ "$FLARE" -eq 1 ]; then
+    CHUNK_ARGS+=(--min-quiet 1)
+fi
+set +e
+python3 "$CHUNKCHECK" "${CHUNK_ARGS[@]}" > chunk.check.log 2>&1
+CHUNK_RC=$?
+set -e
+cat chunk.check.log
+if [ "$NO_ROTB" -eq 1 ]; then
+    if [ "$CHUNK_RC" -eq 0 ]; then
+        echo "CHECK chunk: FAIL as planned (nominal swaps, no chunk)"
+        FAILED+=(chunk)
+    else
+        echo "CHECK chunk: FAIL (rc=$CHUNK_RC; --no-rotb wants nominal" \
+            "swaps and no chunk)"
+        FAILED+=(chunk-not-none)
+    fi
+elif [ "$CHUNK_RC" -eq 0 ]; then
+    echo "CHECK chunk: ok"
+else
+    echo "CHECK chunk: FAIL (rc=$CHUNK_RC; see chunk.check.log)"
+    FAILED+=(chunk)
+fi
+# 5b. --flare: the integrations inside the flare window end at 1 s
+if [ "$FLARE" -eq 1 ]; then
+    set +e
+    python3 "$CHUNKCHECK" idefx.trace --flare > chunk-flare.check.log 2>&1
+    CHUNKF_RC=$?
+    set -e
+    grep '^  ' chunk-flare.check.log || true
+    if [ "$CHUNKF_RC" -eq 0 ]; then
+        echo "CHECK chunk-flare: ok"
+    else
+        echo "CHECK chunk-flare: FAIL (rc=$CHUNKF_RC; see" \
+            "chunk-flare.check.log)"
+        FAILED+=(chunk-flare)
+    fi
+fi
+# the NAND cost record (D-5): what the run wrote to its sparse flash
+[ -f flash.bin ] && echo "flash: $(du -k flash.bin | cut -f1) KiB" \
+    "allocated in flash.bin ($MODE)"
+
 GOT="${FAILED[*]:-}"
 # PASS: the run dir may be reused; in slot mode drop the flash copy and
 # the trace (legacy keeps everything)
@@ -692,16 +809,30 @@ pass_cleanup() {
 }
 if [ "$FLARE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
     # PASS only when the missing flip is all that fails: the LC
-    # contrast check; the sky, probe, UART and trace checks must pass.
-    if [ "$GOT" = "ql-contrast" ]; then
+    # contrast check and the 1 s flare integrations; the sky, probe,
+    # UART, trace and quiet chunk checks must pass.
+    if [ "$GOT" = "ql-contrast chunk-flare" ]; then
         echo "DETECTOR-SMOKE (flare negative): PASS (failed exactly as" \
-            "planned: no flare switch, no LC contrast; everything else" \
-            "passed)${STIX_SLOT_TAG}"
+            "planned: no flare switch, no LC contrast, no 1 s" \
+            "integrations; everything else passed)${STIX_SLOT_TAG}"
         pass_cleanup
         exit 0
     fi
     echo "DETECTOR-SMOKE (flare negative): FAIL (failed checks:" \
-        "'${GOT}', want 'ql-contrast'$WHY_QL)${STIX_SLOT_TAG}"
+        "'${GOT}', want 'ql-contrast chunk-flare'$WHY_QL)${STIX_SLOT_TAG}"
+    exit 1
+fi
+if [ "$NO_ROTB" -eq 1 ]; then
+    # PASS only when exactly the two chunk checks fail as planned
+    if [ "$GOT" = "uart-chunk chunk" ]; then
+        echo "DETECTOR-SMOKE (no-rotb): PASS (failed exactly as planned:" \
+            "nominal swaps but no chunk, nothing archived; everything" \
+            "else passed)${STIX_SLOT_TAG}"
+        pass_cleanup
+        exit 0
+    fi
+    echo "DETECTOR-SMOKE (no-rotb): FAIL (failed checks: '${GOT}', want" \
+        "'uart-chunk chunk'$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
 if [ "$NEGATIVE" -eq 1 ]; then
