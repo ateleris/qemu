@@ -6,9 +6,17 @@ localhost, 127.0.0.1 or [::1] (with an optional port) is refused (DNS
 rebinding); every state change is a POST with application/json AND
 `X-Stix-Platform: 1` (CSRF: a form or a simple cross-site request can
 set neither); no CORS headers; SSE is GET-only and read-only.
+
+The web UI (PL-6) is one static file served at `/`, behind the same
+filter. Its Content-Security-Policy allows exactly its own inline script
+and style (by hash), and network access to this origin only, so neither
+an injected script nor an external resource can load.
 """
 
+import base64
+import hashlib
 import json
+import os
 import re
 import threading
 import urllib.parse
@@ -17,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .dispatch import VerbError
 
 PREFIX = "/api/v1"
+UI_PAGE = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "ui", "index.html"))
 HOST_RE = re.compile(r"^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?$")
 SSE_KEEPALIVE_S = 15.0
 
@@ -35,6 +45,45 @@ def filter_request(method, headers):
         if headers.get("X-Stix-Platform") != "1":
             return 403, "POST needs X-Stix-Platform: 1"
     return None
+
+
+def _hashes(page, tag):
+    return " ".join("'sha256-%s'" % base64.b64encode(
+        hashlib.sha256(m.encode()).digest()).decode()
+        for m in re.findall(r"<%s>(.*?)</%s>" % (tag, tag), page, re.S))
+
+
+def page_csp(page):
+    """The CSP for @page: its inline <script> and <style> blocks by
+    hash, fetch/EventSource to this origin, nothing else."""
+    return ("default-src 'none'; script-src %s; style-src %s; "
+            "connect-src 'self'; img-src 'self' data:; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'"
+            % (_hashes(page, "script"), _hashes(page, "style")))
+
+
+def scenario_list(ctl):
+    """GET /api/v1/scenarios: the scenario dir's files; a broken one is
+    listed with its error (the UI shows it, scenario.run refuses it)."""
+    from . import scenario as scn
+    d = ctl.scenario_dir()
+    out = []
+    try:
+        names = sorted(f for f in os.listdir(d) if f.endswith(".json"))
+    except OSError as e:
+        return {"dir": d, "scenarios": [], "error": str(e)}
+    for f in names:
+        try:
+            sc = scn.load(os.path.join(d, f))
+        except scn.ScenarioError as e:
+            out.append({"file": f, "error": str(e)})
+            continue
+        out.append({"file": f, "name": sc["name"],
+                    "description": sc.get("description", ""),
+                    "duration_s": sc["duration_s"],
+                    "variants": sc["variants"],
+                    "variants_declared": sc["variants_declared"]})
+    return {"dir": d, "scenarios": out}
 
 
 def sse_frame(rec):
@@ -75,13 +124,16 @@ class Handler(BaseHTTPRequestHandler):
         pass  # the record log is the log
 
     # -- plumbing -------------------------------------------------------------
-    def _send(self, status, body, ctype="application/json"):
+    def _send(self, status, body, ctype="application/json", extra=()):
         if not isinstance(body, bytes):
             body = (json.dumps(body, separators=(",", ":")) + "\n").encode()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for k, v in extra:
+            self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
@@ -113,6 +165,12 @@ class Handler(BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(url.query)
         path = url.path.rstrip("/")
         ctl = self.ctl
+        if path in ("", "/index.html"):
+            return self._page()
+        if path == "/favicon.ico":          # none: no console error
+            return self._send(204, b"", "image/x-icon")
+        if path == PREFIX + "/scenarios":
+            return self._send(200, scenario_list(ctl))
         if path == PREFIX + "/status":
             return self._send(200, ctl.status())
         if path == PREFIX + "/time":
@@ -138,6 +196,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == PREFIX + "/stream":
             return self._stream(q)
         return self._err(404, "no such endpoint")
+
+    def _page(self):
+        try:
+            with open(UI_PAGE, encoding="utf-8") as f:
+                page = f.read()
+        except OSError as e:
+            return self._err(500, "the UI page: %s" % e)
+        self._send(200, page.encode(), "text/html; charset=utf-8",
+                   (("Content-Security-Policy", page_csp(page)),
+                    ("X-Frame-Options", "DENY"),
+                    ("Referrer-Policy", "no-referrer")))
 
     def _stream(self, q):
         topics = _csv(q.get("topics"))

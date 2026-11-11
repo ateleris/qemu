@@ -2711,6 +2711,202 @@ def t_gate_slots(env):
           "test-plat-slot.sh: %s%s" % (r.stdout, r.stderr))
 
 
+UI_VERBS = {"platform.power.on", "platform.power.boot", "platform.power.off",
+            "platform.power.cycle", "sim.pause", "sim.resume",
+            "platform.spw.link", "platform.timecode.enable",
+            "platform.timecode.once", "platform.timecode.inject",
+            "platform.timesync.send", "platform.keepalive.set",
+            "platform.obt.set", "fault.inject", "fault.clear", "force.set",
+            "force.clear", "scenario.run", "scenario.abort"}
+UI_ENDPOINTS = {"status", "time", "faults", "verbs", "state", "log",
+                "stream", "scenarios", "cmd"}
+
+
+def _csp_hashes(page, tag):
+    import base64
+    import hashlib
+    return {"'sha256-%s'" % base64.b64encode(hashlib.sha256(
+        m.encode()).digest()).decode()
+        for m in re.findall(r"<%s>(.*?)</%s>" % (tag, tag), page, re.S)}
+
+
+def t_ui_server(env):
+    """PL-6: the page at / (and /index.html) behind the same Host filter,
+    with a CSP that allows exactly its own inline script and style
+    (hashes) and the same origin; GET /api/v1/scenarios lists the
+    scenario dir (a broken file is listed with its error)."""
+    d = _scn_dir(env)
+    ctl = env.controller(run={"scenario_dir": d})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        with open(api_mod.UI_PAGE, encoding="utf-8") as f:
+            page = f.read()
+        for path in ("/", "/index.html"):
+            st, hd, body = _http(port, "GET", path)
+            check(st == 200 and body.decode() == page, "GET %s: %d" %
+                  (path, st))
+            check(hd["Content-Type"] == "text/html; charset=utf-8" and
+                  hd["X-Content-Type-Options"] == "nosniff" and
+                  hd["X-Frame-Options"] == "DENY" and
+                  hd["Cache-Control"] == "no-store", "headers %r" % hd)
+            csp = hd["Content-Security-Policy"]
+            pol = {x.split()[0]: set(x.split()[1:])
+                   for x in csp.split(";") if x.strip()}
+            check(pol["default-src"] == {"'none'"} and
+                  pol["connect-src"] == {"'self'"} and
+                  pol["frame-ancestors"] == {"'none'"} and
+                  pol["script-src"] == _csp_hashes(page, "script") and
+                  pol["style-src"] == _csp_hashes(page, "style") and
+                  pol["script-src"] and pol["style-src"], "CSP %r" % csp)
+        st, _, _ = _http(port, "GET", "/", headers={"Host": "evil.example"})
+        check(st == 403, "the page behind the Host filter: %d" % st)
+        st, _, _ = _http(port, "GET", "/favicon.ico")
+        check(st == 204, "no favicon, no error: %d" % st)
+        st, _, _ = _http(port, "GET", "/ui/../core.py")
+        check(st == 404, "no other file is served: %d" % st)
+        st, _, body = _http(port, "GET", "/api/v1/scenarios")
+        lst = json.loads(body)["scenarios"]
+        by = {x["file"]: x for x in lst}
+        check(st == 200 and by["fake-fail.json"]["variants"] ==
+              ["nominal", "fault_x"] and by["fake-pass.json"]["name"] ==
+              "fake-pass" and "PL-8" in by["broken.json"]["error"] and
+              sorted(by) == sorted(f for f in os.listdir(d)
+                                   if f.endswith(".json")),
+              "scenarios %r" % lst)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
+class _UiParser(__import__("html.parser").parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.verbs = []
+        self.attrs = []
+        self.scripts = []
+        self._in = None
+        self.rows = []          # (verb, input names) of each ctl button
+        self._ctl = []          # [depth, names, buttons] of open .ctl
+        self._depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        self.attrs.append((tag, a))
+        if tag == "div":
+            self._depth += 1
+            if "ctl" in (a.get("class") or "").split():
+                self._ctl.append([self._depth, [], []])
+        if self._ctl and a.get("name") and tag in ("input", "select"):
+            self._ctl[-1][1].append(a["name"])
+        if self._ctl and "data-verb" in a and "data-args" not in a:
+            self._ctl[-1][2].append((a["data-verb"], a.get("data-only")))
+        if "data-verb" in a:
+            self.verbs.append((a["data-verb"], a.get("data-args")))
+        if tag in ("script", "style"):
+            self._in = tag
+
+    def handle_endtag(self, tag):
+        self._in = None
+        if tag == "div":
+            if self._ctl and self._ctl[-1][0] == self._depth:
+                _, names, buttons = self._ctl.pop()
+                for verb, only in buttons:
+                    keep = None if only is None else \
+                        {x for x in only.split(",") if x}
+                    self.rows.append((verb, [n for n in names if keep is
+                                             None or n in keep]))
+            self._depth -= 1
+
+    def handle_data(self, data):
+        if self._in == "script":
+            self.scripts.append(data)
+
+
+def t_ui_page(env):
+    """PL-6 gate (no browser): every data-verb in index.html exists in
+    GET /api/v1/verbs, with data-args a JSON object of known args; the
+    panels cover the plan's verbs; no browser storage, no external URL,
+    no inline handlers or style attributes (the CSP would block them),
+    no innerHTML (TM and UART text is untrusted); every API path the
+    script names is a served endpoint."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/api/v1/verbs")
+        verbs = {v["verb"]: set(v["args"]) for v in
+                 json.loads(body)["verbs"]}
+        st, _, page = _http(port, "GET", "/")
+        page = page.decode()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    p = _UiParser()
+    p.feed(page)
+    used = {v for v, _ in p.verbs}
+    check(used and used <= set(verbs), "unknown data-verb %r"
+          % (used - set(verbs)))
+    check(UI_VERBS <= used, "panels miss %r" % (UI_VERBS - used))
+    for v, a in p.verbs:
+        if a is None:
+            continue
+        try:
+            args = json.loads(a)
+        except ValueError:
+            raise Fail("data-args of %s is not JSON: %r" % (v, a))
+        check(isinstance(args, dict) and set(args) <= verbs[v],
+              "data-args of %s: %r" % (v, a))
+    low = page.lower()
+    for bad in ("localstorage", "sessionstorage", "indexeddb",
+                "document.cookie", "innerhtml", "outerhtml",
+                "insertadjacenthtml", "document.write", "eval(",
+                "new function"):
+        check(bad not in low, "the page uses %s" % bad)
+    check(not re.search(r"(https?:)?//[a-z0-9.-]+\.[a-z]{2,}", low) and
+          "http:" not in low and "https:" not in low,
+          "an external URL in the page")
+    for tag, a in p.attrs:
+        on = [k for k in a if k.startswith("on")]
+        check(not on and "style" not in a, "<%s %r>: inline handler or "
+              "style attribute" % (tag, a))
+        for k in ("src", "href", "action"):
+            check(not a.get(k) or a[k].startswith("#"),
+                  "<%s %s=%r>: a resource" % (tag, k, a.get(k)))
+    # a button without data-args posts the named inputs of its .ctl row
+    # (less a data-only list): those names must be args of its verb
+    for verb, names in p.rows:
+        top = {n.split(".")[0] for n in names}
+        check(top <= verbs[verb], "%s posts %r, not all args of it"
+              % (verb, sorted(top)))
+    js = "\n".join(p.scripts)
+    # every request is getJSON("<endpoint>...") or API + "<endpoint>...",
+    # with API the v1 prefix; nothing else may name a URL
+    check(re.search(r'const API = "/api/v1/";', js) and
+          js.count("/api/v1") == 1, "one API prefix")
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node:            # the script at least parses (no browser needed)
+        import subprocess
+        with tempfile.NamedTemporaryFile("w", suffix=".js",
+                                         delete=False) as f:
+            f.write(js)
+        try:
+            r = subprocess.run([node, "--check", f.name],
+                               capture_output=True, text=True, timeout=30)
+        finally:
+            os.unlink(f.name)
+        check(r.returncode == 0, "the page's script: %s" % r.stderr)
+    paths = set(re.findall(r"""(?:getJSON\(|API \+ )["']([a-z]+)""", js))
+    check(len(re.findall(r"\bfetch\(|EventSource\(", js)) ==
+          len(re.findall(r"\bfetch\(API \+|EventSource\(API \+", js)),
+          "a fetch or EventSource not on API")
+    check(paths and paths <= UI_ENDPOINTS and
+          {"status", "stream", "cmd", "verbs", "faults", "scenarios",
+           "state"} <= paths, "API paths %r" % paths)
+
+
 def t_probe_lib(env):
     p = probe_lib.load()
     units = list(p.frame_units(bytes.fromhex("fe0201") + b"\x00" * 6))
@@ -2759,7 +2955,9 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),
-         ("gate ports from the slot band", t_gate_slots)]
+         ("gate ports from the slot band", t_gate_slots),
+         ("UI: served at /, CSP, scenarios", t_ui_server),
+         ("UI: the page (no browser)", t_ui_page)]
 
 
 def main(only=None):

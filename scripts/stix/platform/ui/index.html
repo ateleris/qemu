@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<!--
+  SPDX-License-Identifier: GPL-2.0-or-later
+
+  The STIX platform controller's web UI (platform plan PL-6). One file:
+  plain HTML, CSS and JS, no build, no CDN. It is a client of the API
+  only: every control posts /api/v1/cmd/<verb> (the data-verb of the
+  element), and everything shown comes from /api/v1/status, /state,
+  /faults, /scenarios, /log or the SSE stream, so a reload loses
+  nothing. The server sends a CSP that allows exactly the inline script
+  and style below (by hash): no inline handlers, no style attributes,
+  and text from the bench (TM, UART) is only ever set as textContent.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STIX platform</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5d6677;
+  --line: #d9dde5; --accent: #2457c5; --ok: #1d7a46; --warn: #a86400;
+  --bad: #b3261e; --chip: #eef1f6; --mono: ui-monospace, "SF Mono",
+  "Cascadia Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12151b; --panel: #1a1e26; --ink: #e3e7ef; --muted: #98a1b3;
+    --line: #2c3340; --accent: #7aa2ff; --ok: #4cc47f; --warn: #e0a339;
+    --bad: #ff6b60; --chip: #232936;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  position: sticky; top: 0; z-index: 2; background: var(--panel);
+  border-bottom: 1px solid var(--line); padding: 8px 16px;
+  display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+}
+header h1 { font-size: 15px; margin: 0 8px 0 0; }
+.chip {
+  font: 12px var(--mono); background: var(--chip); border-radius: 4px;
+  padding: 2px 7px; white-space: nowrap;
+}
+.chip b { font-weight: 600; }
+.on, .up, .ok, .running { color: var(--ok); }
+.off, .down, .fail, .halted { color: var(--bad); }
+.frozen, .paused, .pending, .warn { color: var(--warn); }
+main {
+  display: grid; gap: 12px; padding: 12px 16px;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+}
+section {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 10px 12px; min-width: 0;
+}
+section.wide { grid-column: 1 / -1; }
+h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--muted); margin: 0 0 8px;
+}
+.ctl { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+       margin: 6px 0; }
+.ctl > span.lbl { color: var(--muted); min-width: 92px; }
+button {
+  font: inherit; font-size: 13px; padding: 3px 10px; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--chip); color: var(--ink);
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button.danger:hover { border-color: var(--bad); color: var(--bad); }
+button:disabled { opacity: .45; cursor: default; }
+input, select {
+  font: 13px var(--mono); padding: 2px 5px; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+}
+input[type=number] { width: 7em; }
+input.wide { width: 14em; }
+table { border-collapse: collapse; width: 100%; font: 12px var(--mono); }
+th, td { text-align: left; padding: 2px 6px; border-bottom:
+         1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
+     background: var(--panel); }
+.scroll { max-height: 340px; overflow: auto; }
+.tall { max-height: 520px; }
+.log { font: 12px/1.35 var(--mono); white-space: pre-wrap;
+       word-break: break-all; }
+.log div { border-bottom: 1px dotted var(--line); padding: 1px 0; }
+.k-tm { color: var(--ink); }
+.k-ev { color: var(--accent); font-weight: 600; }
+.k-cmd, .k-result { color: var(--muted); }
+.k-err { color: var(--bad); }
+.k-fault, .k-force { color: var(--warn); }
+.k-power, .k-state { color: var(--ok); }
+.muted { color: var(--muted); }
+.diff { color: var(--warn); font-weight: 600; }
+#toast { min-height: 1.4em; font: 12px var(--mono); }
+.desc { color: var(--muted); font-size: 12px; margin: 2px 0 6px; }
+.row { border-top: 1px solid var(--line); padding: 6px 0; }
+.row:first-child { border-top: 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>STIX platform</h1>
+  <span class="chip">power <b id="s-power">?</b></span>
+  <span class="chip">boot <b id="s-boot">?</b></span>
+  <span class="chip">sim <b id="s-sim">?</b></span>
+  <span class="chip">OBT <b id="s-obt">?</b></span>
+  <span class="chip">SpW <b id="s-link">?</b></span>
+  <span class="chip">time codes <b id="s-tc">?</b></span>
+  <span class="chip">keep-alive <b id="s-ka">?</b></span>
+  <span class="chip">time sync <b id="s-ts">?</b></span>
+  <span class="chip">TM <b id="s-tm">?</b></span>
+  <span class="chip">scenario <b id="s-scn">none</b></span>
+  <span class="chip">mode <b id="s-mode">?</b></span>
+  <span id="toast" class="muted"></span>
+</header>
+<main>
+<section>
+  <h2>Power and simulation</h2>
+  <div class="ctl">
+    <button data-verb="platform.power.on">on</button>
+    <button data-verb="platform.power.boot">boot</button>
+    <button data-verb="platform.power.off" data-confirm="Power off STIX?"
+            class="danger">off</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">cycle</span>
+    <input type="number" name="off_time_s" min="0" max="3600" step="0.5"
+           value="2" data-type="number" title="off time, s">
+    <label><input type="checkbox" name="boot" checked
+                  data-type="bool"> boot</label>
+    <button data-verb="platform.power.cycle"
+            data-confirm="Power-cycle STIX?" class="danger">cycle</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">all time</span>
+    <button data-verb="sim.pause">pause</button>
+    <button data-verb="sim.resume">resume</button>
+  </div>
+</section>
+
+<section>
+  <h2>SpW link and time codes</h2>
+  <div class="ctl">
+    <span class="lbl">SpW link</span>
+    <button data-verb="platform.spw.link" data-args='{"state": "up"}'>up</button>
+    <button data-verb="platform.spw.link" data-args='{"state": "down"}'
+            class="danger">down</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">time codes</span>
+    <button data-verb="platform.timecode.enable"
+            data-args='{"enabled": true}'>on</button>
+    <button data-verb="platform.timecode.enable"
+            data-args='{"enabled": false}' class="danger">off</button>
+    <button data-verb="platform.timecode.once">once</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">inject</span>
+    <input type="number" name="timecnt" min="0" max="63" value="0"
+           data-type="int" title="TIMECNT 0..63">
+    <button data-verb="platform.timecode.inject">send code</button>
+  </div>
+</section>
+
+<section>
+  <h2>Time sync, keep-alive, OBT</h2>
+  <div class="ctl">
+    <span class="lbl">TC(9,129)</span>
+    <input name="coarse" value="auto" class="wide" data-type="auto-int"
+           title="auto, or the coarse time">
+    <button data-verb="platform.timesync.send">send</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">keep-alive</span>
+    <button data-verb="platform.keepalive.set"
+            data-args='{"enabled": true}'>on</button>
+    <button data-verb="platform.keepalive.set"
+            data-args='{"enabled": false}' class="danger">off</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">period</span>
+    <input type="number" name="period_s" min="0.125" max="3600"
+           step="0.125" value="0.125" data-type="number"
+           title="seconds">
+    <button data-verb="platform.keepalive.set">set period</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">OBT set</span>
+    <input type="number" name="coarse" min="0" max="4294967295"
+           data-type="int" class="wide" title="coarse (s)">
+    <input type="number" name="fine" min="0" max="65535" value="0"
+           data-type="int" title="fine (1/65536 s)">
+    <button data-verb="platform.obt.set" class="danger">jump</button>
+  </div>
+  <div class="desc" id="ts-last"></div>
+</section>
+
+<section>
+  <h2>Faults</h2>
+  <div id="faults" class="scroll"><span class="muted">loading…</span></div>
+  <template id="t-fault">
+    <div class="row">
+      <div class="ctl">
+        <b class="f-id"></b>
+        <span class="chip f-state"></span>
+      </div>
+      <div class="desc f-desc"></div>
+      <div class="ctl f-params"></div>
+      <div class="ctl">
+        <button data-verb="fault.inject">inject</button>
+        <button data-verb="fault.clear">clear</button>
+      </div>
+    </div>
+  </template>
+</section>
+
+<section>
+  <h2>Forcings</h2>
+  <div class="ctl">
+    <select name="path" id="force-path" class="wide"
+            title="a forceable state leaf"></select>
+    <input type="number" name="value" data-type="int" title="raw value">
+    <button data-verb="force.set" class="danger">force</button>
+    <button data-verb="force.clear" data-only="path">clear</button>
+  </div>
+  <div id="forcings" class="desc"></div>
+</section>
+
+<section>
+  <h2>Scenarios</h2>
+  <div class="ctl">
+    <select name="file" id="scn-file" class="wide"></select>
+    <select name="variant" id="scn-variant"></select>
+    <button data-verb="scenario.run">run</button>
+    <button data-verb="scenario.abort" data-only="" class="danger">abort</button>
+  </div>
+  <div class="desc" id="scn-desc"></div>
+  <div class="desc" id="scn-state"></div>
+</section>
+
+<section>
+  <h2>Any verb</h2>
+  <div class="desc">Generated from GET /api/v1/verbs (the same
+    vocabulary and checks as the panels and scenarios).</div>
+  <div class="ctl">
+    <select id="any-verb" class="wide"></select>
+    <button id="any-send">send</button>
+  </div>
+  <div class="desc" id="any-doc"></div>
+  <div class="ctl" id="any-args"></div>
+</section>
+
+<section class="wide">
+  <h2>Events
+    <span class="muted">
+      <label><input type="checkbox" class="topic" value="tm" checked> TM</label>
+      <label><input type="checkbox" class="topic" value="tc" checked> TC</label>
+      <label><input type="checkbox" class="topic" value="cmd" checked> cmd</label>
+      <label><input type="checkbox" class="topic" value="state" checked> state</label>
+      <label><input type="checkbox" class="topic" value="fault" checked> fault</label>
+      <label><input type="checkbox" class="topic" value="expect" checked> expect</label>
+      <label><input type="checkbox" class="topic" value="log"> log</label>
+      <label><input type="checkbox" id="follow" checked> follow</label>
+    </span>
+  </h2>
+  <div id="events" class="log scroll tall"></div>
+</section>
+
+<section class="wide">
+  <h2>UART <label class="muted"><input type="checkbox" id="uart-follow"
+    checked> follow</label></h2>
+  <div id="uart" class="log scroll"></div>
+</section>
+
+<section class="wide">
+  <h2>State <input id="state-filter" placeholder="filter, e.g. idpu.spw"
+                   class="wide"></h2>
+  <div class="scroll tall">
+    <table>
+      <thead><tr><th>path</th><th>truth</th><th>presented</th>
+        <th>status</th><th>unit</th><th>faults</th></tr></thead>
+      <tbody id="state"></tbody>
+    </table>
+  </div>
+</section>
+</main>
+<script>
+"use strict";
+const API = "/api/v1/";
+const MAX_LINES = 2000;
+const $ = (id) => document.getElementById(id);
+let lastSeq = 0;
+let catalogue = [];
+
+function text(el, s) { el.textContent = s == null ? "" : String(s); }
+function cls(el, c) { el.className = c || ""; }
+function toast(s, bad) { text($("toast"), s); cls($("toast"), bad ? "k-err" : "muted"); }
+
+async function getJSON(path) {
+  const r = await fetch(API + path, { cache: "no-store" });
+  if (!r.ok) throw new Error(path + ": " + r.status);
+  return r.json();
+}
+
+async function post(verb, args) {
+  const r = await fetch(API + "cmd/" + verb, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Stix-Platform": "1" },
+    body: JSON.stringify(args || {}),
+  });
+  let body = {};
+  try { body = await r.json(); } catch (e) { /* not JSON */ }
+  if (!r.ok || !body.ok) {
+    throw new Error(verb + ": " + (body.error || r.status));
+  }
+  return body;
+}
+
+/* the named inputs under @scope as args (a name like params.x nests),
+   typed by data-type */
+function collect(scope, args, only) {
+  for (const el of scope.querySelectorAll("[name]")) {
+    if (el.disabled || (only && !only.includes(el.name))) continue;
+    let v;
+    const t = el.dataset.type || "string";
+    if (t === "bool") v = el.checked;
+    else if (el.value === "") continue;
+    else if (t === "int") v = parseInt(el.value, 10);
+    else if (t === "number") v = parseFloat(el.value);
+    else if (t === "auto-int") v = /^\d+$/.test(el.value) ? parseInt(el.value, 10) : el.value;
+    else if (t === "json") v = JSON.parse(el.value);
+    else v = el.value;
+    const parts = el.name.split(".");
+    let node = args;
+    for (const p of parts.slice(0, -1)) node = node[p] = node[p] || {};
+    node[parts[parts.length - 1]] = v;
+  }
+  return args;
+}
+
+/* the args of a control: its data-args if it has them, else the inputs
+   of its .ctl row (only those in data-only when it is set); a fault row's buttons carry the fault id, and inject
+   also takes the row's params */
+function argsOf(btn) {
+  if (btn.dataset.id) {
+    const args = { id: btn.dataset.id };
+    if (btn.dataset.verb === "fault.inject") {
+      const p = collect(btn.closest(".row").querySelector(".f-params"), {});
+      if (p.params) args.params = p.params;
+    }
+    return args;
+  }
+  if (btn.dataset.args) return JSON.parse(btn.dataset.args);
+  const scope = btn.closest(".ctl");
+  const only = btn.dataset.only == null ? null :
+    btn.dataset.only.split(",").filter((x) => x);
+  return scope ? collect(scope, {}, only) : {};
+}
+
+document.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-verb]");
+  if (!btn) return;
+  if (btn.dataset.confirm && !window.confirm(btn.dataset.confirm)) return;
+  const verb = btn.dataset.verb;
+  btn.disabled = true;
+  try {
+    const args = argsOf(btn);
+    const res = await post(verb, args);
+    toast(verb + " ok " + JSON.stringify(res.result));
+  } catch (e) {
+    toast(String(e.message || e), true);
+  } finally {
+    btn.disabled = !!btn.dataset.off;
+    refresh();
+  }
+});
+
+/* ---- status strip and the per-panel status ---- */
+function fmtS(ns) { return ns == null ? "?" : (ns / 1e9).toFixed(3) + " s"; }
+function fmtObt(cuc) {
+  if (cuc == null) return "?";
+  return (Math.floor(cuc / 65536)).toString(16).toUpperCase() + ":" +
+    (cuc % 65536).toString(16).padStart(4, "0");
+}
+function chip(id, value, c) { text($(id), value); cls($(id), c || String(value)); }
+
+async function refresh() {
+  let st;
+  try { st = await getJSON("status"); } catch (e) { toast(String(e), true); return; }
+  const p = st.platform || {};
+  chip("s-power", st.power);
+  chip("s-boot", st.boot_id, "");
+  chip("s-sim", fmtS(st.time && st.time.sim_time), "");
+  chip("s-obt", fmtObt(st.time && st.time.obt) +
+       (st.time && st.time.obt_kind ? " (" + st.time.obt_kind + ")" : ""), "");
+  chip("s-link", p.link);
+  chip("s-tc", p.timecodes ? "on" : "off");
+  const ka = p.keepalive || {};
+  chip("s-ka", (ka.enabled ? "on" : "off") + " " + ka.period_s + " s, " +
+       ka.sent + " sent", ka.enabled ? "on" : "off");
+  const ts = p.timesync || {};
+  const last = ts.last || {};
+  chip("s-ts", ts.pending ? "pending" : (last.verdict || "none"),
+       ts.pending ? "pending" : (last.verdict || "muted"));
+  text($("ts-last"), ts.last ? "last: " + JSON.stringify(ts.last) : "");
+  chip("s-tm", p.tm_count, "");
+  chip("s-mode", st.mode, "");
+  const scn = st.scenario;
+  chip("s-scn", scn ? scn.name + "/" + scn.variant + " " + scn.phase +
+       (scn.verdict ? " " + scn.verdict : "") : "none",
+       scn ? (scn.verdict === "pass" ? "ok" : scn.verdict ? "fail" : "pending") : "muted");
+  text($("scn-state"), scn ? JSON.stringify(scn) : "");
+  renderFaultState(st.faults || {});
+  const f = st.forcings || {};
+  text($("forcings"), Object.keys(f).length ?
+       "active: " + Object.entries(f).map(([k, v]) => k + " = " +
+         JSON.stringify(v)).join(", ") : "no forcing active");
+}
+
+/* ---- faults, generated from the catalogue ---- */
+async function loadFaults() {
+  const c = await getJSON("faults");
+  catalogue = c.catalogue || [];
+  const box = $("faults");
+  box.replaceChildren();
+  const tpl = $("t-fault");
+  for (const f of catalogue) {
+    const row = tpl.content.firstElementChild.cloneNode(true);
+    row.dataset.fault = f.id;
+    text(row.querySelector(".f-id"), f.id);
+    text(row.querySelector(".f-desc"), f.class + ", " + f.mode + " on " +
+         f.target + " (" + f.changes + ", " + f.persistence + ")");
+    const ps = row.querySelector(".f-params");
+    for (const [name, spec] of Object.entries(f.params || {})) {
+      const lbl = document.createElement("label");
+      text(lbl, name + (spec.unit ? " [" + spec.unit + "] " : " "));
+      const inp = document.createElement("input");
+      inp.type = "number";
+      inp.name = "params." + name;
+      inp.dataset.type = "int";
+      if (spec.min != null) inp.min = spec.min;
+      if (spec.max != null) inp.max = spec.max;
+      inp.value = spec.default;
+      lbl.append(inp);
+      ps.append(lbl);
+    }
+    for (const b of row.querySelectorAll("button[data-verb]")) {
+      b.dataset.id = f.id;
+    }
+    box.append(row);
+  }
+  if (!catalogue.length) text(box, "the catalogue is empty");
+}
+
+function renderFaultState(active) {
+  for (const row of document.querySelectorAll("[data-fault]")) {
+    const a = active[row.dataset.fault];
+    const s = row.querySelector(".f-state");
+    text(s, a ? (a.pending ? "armed" : "active") : "idle");
+    cls(s, "chip f-state " + (a ? (a.pending ? "pending" : "fail") : "muted"));
+  }
+}
+
+/* ---- forcings: the forceable leaves from the state tree ---- */
+function leaves(tree, prefix, out) {
+  for (const [k, v] of Object.entries(tree || {})) {
+    const p = prefix ? prefix + "." + k : k;
+    if (v && typeof v === "object" && "truth" in v) out.push([p, v]);
+    else if (v && typeof v === "object") leaves(v, p, out);
+  }
+  return out;
+}
+
+let stateRows = [];
+async function loadState() {
+  let tree;
+  try { tree = await getJSON("state"); } catch (e) { return; }
+  stateRows = leaves(tree, "", []);
+  renderState();
+  const sel = $("force-path");
+  const want = stateRows.map(([p]) => p).filter((p) => /^instrument\.hk_adc\.\d+$/.test(p));
+  const have = [...sel.options].map((o) => o.value);
+  if (want.join() !== have.join()) {
+    const keep = sel.value;
+    sel.replaceChildren(...want.map((p) => new Option(p, p)));
+    if (want.includes(keep)) sel.value = keep;
+  }
+}
+
+function show(v) { return v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v); }
+
+function renderState() {
+  const flt = $("state-filter").value.trim();
+  const body = $("state");
+  const rows = [];
+  for (const [p, lf] of stateRows) {
+    if (flt && !p.includes(flt)) continue;
+    const tr = document.createElement("tr");
+    const cells = [p, show(lf.truth), show(lf.presented), lf.status,
+                   lf.unit || "", (lf.fault_ids || []).join(" ")];
+    cells.forEach((c, i) => {
+      const td = document.createElement("td");
+      text(td, c);
+      if (i === 2 && show(lf.truth) !== show(lf.presented)) cls(td, "diff");
+      if (i === 3) cls(td, lf.status);
+      tr.append(td);
+    });
+    rows.push(tr);
+  }
+  body.replaceChildren(...rows);
+}
+$("state-filter").addEventListener("input", renderState);
+
+/* ---- the vocabulary: tooltips, disabled verbs, the any-verb form ---- */
+let vocab = [];
+async function loadVerbs() {
+  vocab = (await getJSON("verbs")).verbs || [];
+  const by = Object.fromEntries(vocab.map((v) => [v.verb, v]));
+  for (const b of document.querySelectorAll("button[data-verb]")) {
+    const v = by[b.dataset.verb];
+    b.title = v ? b.dataset.verb + ": " + v.doc : b.dataset.verb + ": unknown";
+    b.dataset.off = !v || !v.enabled ? "1" : "";
+    b.disabled = !!b.dataset.off;
+  }
+  const sel = $("any-verb");
+  sel.replaceChildren(...vocab.filter((v) => v.enabled)
+    .map((v) => new Option(v.verb, v.verb)));
+  anyChanged();
+}
+function anyChanged() {
+  const v = vocab.find((x) => x.verb === $("any-verb").value);
+  const box = $("any-args");
+  box.replaceChildren();
+  text($("any-doc"), v ? v.doc : "");
+  for (const [name, spec] of Object.entries((v && v.args) || {})) {
+    const lbl = document.createElement("label");
+    text(lbl, name + (spec.required ? "* " : " "));
+    let inp;
+    const types = [].concat(spec.type || "string");
+    if (spec.enum) {
+      inp = document.createElement("select");
+      inp.replaceChildren(...spec.enum.map((e) => new Option(e, e)));
+    } else if (types.includes("boolean")) {
+      inp = document.createElement("input");
+      inp.type = "checkbox";
+      inp.dataset.type = "bool";
+    } else {
+      inp = document.createElement("input");
+      inp.dataset.type = types.includes("object") ? "json" :
+        types.includes("integer") && types.includes("string") ? "auto-int" :
+        types.includes("integer") ? "int" :
+        types.includes("number") ? "number" : "string";
+      if (spec.default != null) inp.value = spec.default;
+    }
+    inp.name = name;
+    lbl.append(inp);
+    box.append(lbl);
+  }
+}
+$("any-verb").addEventListener("change", anyChanged);
+$("any-send").addEventListener("click", async () => {
+  const verb = $("any-verb").value;
+  try {
+    const res = await post(verb, collect($("any-args"), {}, null));
+    toast(verb + " ok " + JSON.stringify(res.result));
+  } catch (e) {
+    toast(String(e.message || e), true);
+  }
+  refresh();
+});
+
+/* ---- scenarios ---- */
+let scenarios = [];
+async function loadScenarios() {
+  const r = await getJSON("scenarios");
+  scenarios = r.scenarios || [];
+  const sel = $("scn-file");
+  const keep = sel.value;
+  sel.replaceChildren(...scenarios.map((s) => {
+    const o = new Option(s.file + (s.error ? " (invalid)" : ""), s.file);
+    o.disabled = !!s.error;
+    return o;
+  }));
+  if (scenarios.some((s) => s.file === keep)) sel.value = keep;
+  scenarioChanged();
+}
+function scenarioChanged() {
+  const s = scenarios.find((x) => x.file === $("scn-file").value);
+  const vs = $("scn-variant");
+  vs.replaceChildren(...(s && s.variants_declared ? s.variants : [])
+    .map((v) => new Option(v, v)));
+  vs.disabled = !(s && s.variants_declared);
+  text($("scn-desc"), s ? (s.error || (s.duration_s + " s. " + (s.description || ""))) : "");
+}
+$("scn-file").addEventListener("change", scenarioChanged);
+
+/* ---- the event log and the UART tail, from /log then the stream ---- */
+function trim(box) {
+  while (box.childElementCount > MAX_LINES) box.firstElementChild.remove();
+}
+function follow(box, id) { if ($(id).checked) box.scrollTop = box.scrollHeight; }
+
+function shown(topic) {
+  const t = document.querySelector('.topic[value="' + topic + '"]');
+  return t ? t.checked : false;
+}
+
+function summary(r) {
+  const d = r.data || {};
+  if (r.kind === "tm") {
+    const dec = d.decoded || {};
+    if (dec.type === 5) return ["k-ev", d.text || d.hex];
+    if (dec.type === 1 && (dec.subtype % 2 === 0)) return ["k-err", d.text || d.hex];
+    return ["k-tm", d.text || d.hex];
+  }
+  if (r.kind === "result") return [d.ok === false || d.error ? "k-err" : "k-result",
+                                   r.path + " " + show(d.error || d.result)];
+  if (r.kind === "cmd") return ["k-cmd", r.path + " " + show(d.args)];
+  if (r.kind === "expect") return [d.verdict && d.verdict !== "pass" ? "k-err" : "k-result",
+                                   r.path + " " + show(d)];
+  if (r.kind === "state" && d.snapshot) {
+    return ["k-state", "snapshot (" + d.reason + ", " +
+            Object.keys(d.leaves || {}).length + " leaves)"];
+  }
+  return ["k-" + r.kind, r.path + " " + show(d)];
+}
+
+function onRecord(r) {
+  if (r.seq <= lastSeq) return;
+  lastSeq = r.seq;
+  if (r.kind === "uart") {
+    const box = $("uart");
+    const line = document.createElement("div");
+    text(line, (r.data && r.data.line) || "");
+    box.append(line);
+    trim(box);
+    follow(box, "uart-follow");
+    return;
+  }
+  const box = $("events");
+  const [c, s] = summary(r);
+  const line = document.createElement("div");
+  line.dataset.topic = topicOf(r.kind);
+  cls(line, c);
+  line.hidden = !shown(line.dataset.topic);
+  text(line, fmtS(r.sim_time).padStart(13) + "  #" + r.seq + " b" + r.boot_id + "  " +
+       r.kind.padEnd(6) + " " + s);
+  box.append(line);
+  trim(box);
+  follow(box, "follow");
+  if (r.kind === "fault" || r.kind === "force" || r.kind === "power") refresh();
+}
+
+const TOPIC = { cmd: "cmd", result: "cmd", state: "state", power: "state",
+                fault: "fault", force: "fault", debug: "log" };
+function topicOf(kind) { return TOPIC[kind] || kind; }
+
+for (const t of document.querySelectorAll(".topic")) {
+  t.addEventListener("change", () => {
+    for (const l of $("events").children) l.hidden = !shown(l.dataset.topic);
+  });
+}
+
+async function backfill(seq) {
+  const from = Math.max(0, seq - MAX_LINES);
+  const r = await fetch(API + "log?since=" + from, { cache: "no-store" });
+  const body = await r.text();
+  for (const l of body.split("\n")) if (l) onRecord(JSON.parse(l));
+}
+
+function stream() {
+  const es = new EventSource(API + "stream?since=" + lastSeq);
+  const topics = ["cmd", "state", "tm", "tc", "fault", "expect", "mismatch", "uart", "log"];
+  for (const t of topics) {
+    es.addEventListener(t, (ev) => onRecord(JSON.parse(ev.data)));
+  }
+  es.addEventListener("gap", (ev) => {
+    const g = JSON.parse(ev.data);
+    onRecord({ seq: g.to, kind: "log", path: "gap",
+               data: { dropped: g.from + ".." + g.to }, sim_time: null,
+               boot_id: "?" });
+  });
+  es.onerror = () => toast("stream: reconnecting…", true);
+  es.onopen = () => toast("stream connected");
+}
+
+async function main() {
+  let st = { seq: 0 };
+  try { st = await getJSON("status"); } catch (e) { toast(String(e), true); }
+  try { await backfill(st.seq || 0); } catch (e) { toast(String(e), true); }
+  stream();
+  await Promise.allSettled([refresh(), loadVerbs(), loadFaults(),
+                            loadScenarios(), loadState()]);
+  setInterval(refresh, 1000);
+  setInterval(loadState, 2000);
+  setInterval(loadScenarios, 10000);
+}
+main();
+</script>
+</body>
+</html>
