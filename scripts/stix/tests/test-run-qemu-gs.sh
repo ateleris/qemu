@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Tests for scripts/stix/gs/run-qemu-gs.sh STIX_GS_QMP (P4-6, PL-2): the
 # script is run against a stub "QEMU" that records its argv, never a real
 # QEMU (no flash, no ports). The unix form must produce the same -qmp
