@@ -1395,7 +1395,9 @@ reporting LV/HV/SpW **off** in NOMINAL, because POWERSTAT (hkCmdSta
 bits 9:5) stays unmodelled at 0 (D-P3a; since §25 it follows the
 enables). The gate counts the 384
 timeouts and prints the number; another count is a `WARN:` line, not a
-failure. The UART must contain "init: SAFE mode" and must not match
+failure. **Updated by D-2 (§32):** the IDeF-X interface is now modelled,
+so the 384 writes complete and the expected count is **0** in both
+modes; any other count is a `FAIL` (exit 1). The UART must contain "init: SAFE mode" and must not match
 `storing new context[01] failed`.
 
 Exit codes as tc-smoke.sh: 0 pass (or SKIP/dry-run/check-guard), 1 a
@@ -2409,3 +2411,314 @@ plus this change, normal ELF, under the 21000 flock):
     boot writes no read-only detector register.
 - The shared flash mtimes are unchanged: `/tmp/stix-uprev-run`
   2026-11-10 13:05:54 and `/tmp/stix-baseline-run` 2026-11-09 15:30:10.
+
+## 32. IDeF-X interface, ASIC register store and index tables (baseline: plain storage, CmdReady 0)
+
+**Baseline:** CTRL stored ideFxCmdSta, idefxModeData and idefxWriteMask
+as plain registers, so CmdReady (ideFxCmdSta bit 31) read 0 and every
+FSW transmission timed out after 1000 polls (`Detectors.c:627-639`). At
+boot, `Detectors_resetReg` × 16 (`OpModeMgmt.c:1061-1064`) timed out
+silently: the trace golden had 16000 `addr = 0x0, regval = 0x0` polls.
+At NOMINAL entry the 384 register writes
+(`XrayDetFDIR_resetASICregistersToDefault`, `OpModeMgmt.c:576`) each
+logged `XrayDetFDIR.c:731` (§23). The periodic ASIC verification only
+passed because a read timeout is skipped, not compared
+(`XrayDetFDIR.c:611-615`).
+
+Detector plan D-2 (`docs/stix-port/2026-11-11-detector-plan.md`,
+decision D-De, the D-Dh reset value and "Index spaces"). **CmdReady and
+the register store land in this one commit**, as §24 and the plan
+require: CmdReady alone would make every read-back return zeros, and
+the verification would then mark every ASIC ignored for good.
+
+**Index spaces (one table set, `stix_det.c`):** the FSW tables,
+transcribed number for number, each with its file:line:
+- `subcol` of each `fpga_det` (`utils_subcolIdFromFpgaId`,
+  `utils.c:113-119`) and the inverse (`utils_fpgaIdFromSubcolId`,
+  `utils.c:121-127`);
+- `fe_sc` (1..32) of each `fpga_det` (`Detectors_frontendFromFpga`,
+  `Detectors.c:528-534`) and `fpga_det` of `fe_sc` − 1
+  (`Detectors_fpgaFromFrontendMinusOne`, `Detectors.c:536-540`, equal to
+  `utils_oldSubcolIdToFpgaId`, `utils.c:129-133`);
+- the `dete_data` columns `fpga_det`, `grp`, `asic` and `quarter`,
+  indexed by `subcol` as in the FSW (`utils.c:74-107`);
+- `asic_ch` of each `pix` 0..12 (`utils_pixelId2channelId`,
+  `utils.c:50-53`) and the inverse (`utils_channelId2pixelId`,
+  `utils.c:56-62`, 255 = none).
+
+The code uses the identities `fpga_det = 2·grp + asic` and
+`quarter = grp / 4` through two helpers. **The realize-time self-check**
+(`stix_det_index_selfcheck`) proves the set is **consistent**, not that
+it is faithful to the FSW (a consistent but wrong transcription would
+pass):
+- every entry is in range (< 32, `fe_sc` 1..32, `pix` < 13 or 255)
+  before any is used as an index; a bad entry is reported through errp
+  with its table, index and value;
+- every forward/inverse pair composes to the identity both ways;
+- every `dete_data` row agrees with the `subcol` table and with both
+  identities;
+- `pix` → `asic_ch` is injective, and only those 13 `asic_ch` have a
+  `pix`.
+
+A failure is a realize error, so QEMU does not start. A mutation check
+(one `dete_data` quarter changed from 1 to 2) made QEMU exit with
+`stix_det: dete_data disagrees with the index identities at subcol 2`;
+the file was restored. **Fidelity** was checked value by value
+against the FSW tree with a scripted dev aid kept outside the repo
+(`check-index-tables.py` in the session scratchpad): all 7 FSW tables
+plus the 4 `dete_data` columns MATCH, and a mutated copy is reported
+as DIFF. An independent review found the same. No qtest drives the
+self-check: it cannot fail on
+the committed tables, and every qtest starts QEMU through it. D-2 uses
+only `grp`, `asic`, `quarter` and `fpga_det`; the `subcol`, `fe_sc` and
+`pix` tables are there for D-4 to D-7.
+
+**Model (D-De), at the FSW-visible register level:**
+- **ideFxCmdSta (0x00):** a write executes at once. It stores GrpAddr
+  (23:20), CmdCounter (19:16) and CmdData (15:0); reserved 30:24 read 0.
+  CmdReady (bit 31) always reads 1. Reset value 0x80000000 (D-Dh).
+- **idefxModeData (0x04):** ReadMode (31:16, `grp` bits) is R/W. 15:0 is
+  read-only: the response of the last command.
+- **idefxWriteMask (0x08):** the mask (31:16, `grp` bits) is R/W.
+  Reserved 15:0 read 0 (the FSW writes them 0).
+- **idefxConfig (0x0C):** stored as before (DET_C still reads it, §22).
+  A quarter-power 0 → 1 edge (bits 3:0) resets the ASIC registers of
+  that `quarter`'s four `grp` and idles their decoders (a power-on
+  reset).
+- **Delivery:** a word goes to every `grp` in WriteMask, or to GrpAddr's
+  `grp` when WriteMask is 0 (lenient). A `grp` takes part only if its
+  `quarter` is powered, its Enable bit (idefxConfig 19:4) is set and its
+  ReadMode bit is 0 [D, RP-0067]. Otherwise the word is ignored and
+  CmdReady stays 1. The response comes from GrpAddr's `grp`, or is 0.
+- **The per-`grp` decoder:**
+  - cmd 0 (RESET) and cmd 4 (SCEND) end the transaction.
+  - cmd 11 (SCINITSEQ) latches RD (bit 9), SC (8), All (7) and the
+    address (6:4). RD = 0, SC = 1 opens slow control: address 3 is `asic`
+    0, address 7 is `asic` 1, and All = 1 addresses both (the FSW word
+    is `0xBFD30 | asic << 6`: `asic` 2 sets All). RD = SC = 1 resets
+    the **addressed** ASIC to the defaults, both with All [A, below].
+    RD = 1, SC = 0 (readout) is not modelled. Every SCINITSEQ first
+    idles the decoder.
+  - The first cmd 8 is the address block: R/W in bit 14, the register in
+    13:7. Each further cmd 8 is a data block. A write shifts byte 14:7
+    into the register; a read answers the next byte.
+  - cmd 1 answers by context: A = 0x900 for the first cmd 1 after a
+    reg-13 read address block, B = 0x700 for the cmd 1 after the
+    following data block, else the baseline 1850. cmd 2 and 3 answer
+    1850. Every other command answers 0.
+- **Registers:**
+  - 32 ASICs (`fpga_det`) × registers 1..12, sizes 2, 3, 192, 32, 4,
+    2, 5, 2, 2, 3, 3, 32 bits (`commonFSW.h:251-262`).
+  - Each is an N-bit shift register that keeps the last N bits written
+    (IDeF-X DS). A read emits the N bits MSB first, left-aligned and
+    zero padded, so a short register reads `value << (8 − N)`, which
+    `readReg` shifts back (`Detectors.c:838-841`). Bytes past the end
+    read 0.
+  - R3 is stored raw, in wire order (the FSW reorders it on both sides,
+    `utils.c:663-677`, self-inverse).
+  - R0 (TEST) and R13 (TEMP) store nothing. R13 only sets the ADC
+    context.
+- **Defaults** (`ParamMgmtDef.h:525-536`; the DS table agrees): R1 1,
+  R2 0, R3 62 on every `asic_ch` (raw FB EF BE × 8), R4 0, R5 15, R6 1,
+  R7 0, R8 3, R9 0, R10 3, R11 3, R12 0xFFFFFFFF. They load at device
+  reset, on the RD = SC = 1 command and on a quarter-power edge.
+- **Device reset (det-model on):** ideFxCmdSta = 0x80000000, the other
+  detector registers as §31; every decoder idles (a half-open
+  transaction is dropped) and all 32 ASICs take the defaults (the IDPU
+  reset cuts the ASIC supply [I]).
+- **`det-idefx`** (qdev bool, default on): off keeps 0x00-0x0C plain
+  storage with CmdReady 0, which reproduces the 384 timeouts. The rest
+  of the detector model stays on; the reset writes ideFxCmdSta 0.
+- **Re-entrancy:** the decoder runs in the MMIO write path only and
+  touches no guest RAM, timer or IRQ.
+
+**Design choices and deviations:**
+- **Boot `resetReg` × 16 is a no-op.** The boot powers nothing and
+  disables every `grp` first (`OpModeMgmt.c:1057-1064`), so the words
+  are ignored, as RP-0067 says commands to a disabled `grp` are
+  (plan Doc vs code 9). The registers already hold the defaults from
+  the device reset. The result is never logged, so this is invisible.
+- **A read with All = 1, or of no ASIC, answers 0.** The FSW never does
+  this (`readReg` allows `asic` ≤ 1, `Detectors.c:800`); the DS gives
+  All a readout meaning only.
+- **Reads are non-destructive** and restart at byte 0 with each
+  SCINITSEQ (which idles the decoder).
+- **RD = SC = 1 resets only the addressed ASIC** [A]. The IDeF-X DS
+  says "(1,1) resets the registers of all ASICs". But the FSW resets one
+  ASIC per `subcol`: `XRayADCsCtrl_resetASIC` calls
+  `Detectors_resetReg(grp, 0 or 1)` once per masked `subcol`
+  (`XRayADCsCtrl.c:833`). Resetting the sibling too would make the next
+  verification report it (0x542E), a TM the hardware most likely does
+  not produce. The model follows the FSW's intent and the address
+  field; the boot's `resetReg(grp, 2)` (All) still resets both. This is
+  a doc-vs-code item; the code's reading wins.
+- **A disabled `grp` in a powered `quarter` reads zeros.** If a TC
+  clears a `grp`'s Enable bit while its `quarter` stays powered (ReadMode
+  does not matter: `readReg` clears it itself), the verification still reads that `grp`, because
+  `dmask` is built per powered quarter (`XrayDetFDIR.c:151-163`). The
+  reads answer 0, so the FSW reports 0x542E, rewrites (also ignored),
+  then sends 0x9438 and puts the ASICs into `CALISTE_IGNORE_FLAGS` for
+  good. This is plausibly hardware-faithful (RP-0067: commands to a
+  disabled `grp` are ignored; the FSW's TC procedures note that
+  "QUARTER POWER & GROUP ENABLED is tested elsewehere (TC)",
+  `XRayADCsCtrl.c:519`, also :1023, :1258, :1539). No gate disables
+  a `grp`; it is stated here so that a later TC gate expects it.
+- **ADC answers are canned:** readTemp gives A − B = 0x200, adcRead and
+  the on-demand reads give 1850 (a known limit, plan "TC-driven
+  procedures stay unmodelled").
+- **No SEU** (QuarterSeu stays 0, §31).
+- **The ALIMON (R12) and R4 per-`asic_ch` bit order is not used.** It is
+  undefined in the code; D-2 only stores bytes (plan Doc vs code 12).
+
+**Doc vs code** (the code wins; the plan's numbering):
+- 1: the HSWICD's "busy, active low, reset 1" means 1 = ready, as in the
+  FSW and the TSIM model. The model reads 1.
+- 8: the DSS manual never documents slow-control read-back; the FSW's
+  verification depends on it, so it is modelled.
+- 9: the boot register reset is a no-op on hardware (see above).
+- New: the DS's RD = SC = 1 "all ASICs" versus the FSW's per-ASIC
+  `resetReg` (see Design choices). The model resets the addressed ASIC.
+
+**Traces:**
+- `stixdet_idefx_cmd(grp, word, delivered_grp_mask, response)`, one per
+  ideFxCmdSta write. `word` is the FSW's 20-bit form (`cmd << 16 |
+  data`), so a verification read address block shows as
+  `word 0x84000|reg<<7`; `grp` is GrpAddr.
+- `stixdet_idefx_reg(fpga_det, reg, is_read, byte_idx, byte)`, one per
+  data block per addressed ASIC.
+- `stixdet_idefx_defaults(fpga_det_mask, why)`: device reset,
+  RD=SC=1, or quarter power on.
+
+**Tests** (RED first on d2c6cae28a, then green):
+- `det-idefx-ready`: reset reads 0x80000000; CmdReady 1 before and after
+  every word of the boot's resetReg × 16 (unpowered), a write/read, a
+  resetReg, a readTemp and the undecoded cmd 5/9/12/15; the command
+  fields read back (0x7FF5ABCD → 0x80F5ABCD); idefxModeData 15:0 and
+  idefxWriteMask 15:0 are not writable; 0x80000000 again after
+  `system_reset`. RED: `0x00000000 == 0x80000000`.
+- `det-idefx-roundtrip`: registers 1..12 on both `asic` of `grp` 3 and
+  12 through the FSW's writeReg/readReg; the neighbouring `grp` 2 and
+  13 keep their defaults; R1 0x01 reads 0x40 on the wire and R7 0x15
+  reads 0xA8; R4 and R12 as u32; overlong writes keep the last N bits
+  (R4 five bytes, R1 and R7 two bytes). RED: CmdReady 0 at the first
+  word.
+- `det-idefx-broadcast`: `asic` 2 writes R5 and the 24 bytes of R3 into
+  both ASICs, and not into the neighbours. RED: as above.
+- `det-idefx-reset`: resetReg(grp, 0) restores asic 0 only and
+  resetReg(grp, 1) asic 1 only (each sibling keeps its value);
+  resetReg(grp, 2) (All) restores both. A quarter power 1 → 0 → 1 edge
+  restores only that quarter and idles its decoders (a half-open write
+  across the edge writes nothing). A write of the already powered mask
+  does not reset. `system_reset` restores all and drops a half-open
+  transaction. RED: as above. The edge-idle assertion was mutation
+  checked: without the idle it read 3, not 15.
+- `det-idefx-gating`: a disabled `grp`, ReadMode = 1 and an unpowered
+  `quarter` each ignore the command, with CmdReady 1 and response 0;
+  WriteMask 0 delivers to GrpAddr; a WriteMask naming another `grp`
+  delivers there, and the response from a GrpAddr outside the mask is 0.
+  With two `grp` in WriteMask holding different R5 values, a read
+  answers GrpAddr's value (0x40 for `grp` 6, 0x50 for `grp` 7). ReadMode
+  gates reads too: `grp` 6 in readout mode answers 0, alone or next to
+  `grp` 7, while `grp` 7 still answers. RED: as above.
+- `det-idefx-adc`: readTemp gives A 0x900 then B 0x700 and leaves the
+  registers alone; adcRead gives 1850 in rx[1] and 0 elsewhere; cmd 2
+  and 3 give 1850. RED: as above.
+- `det-idefx-off`: CmdReady 0 (a transmission would time out); the three
+  registers store raw; the reset still runs (ideFxCmdSta 0,
+  testPulseCmdSta Busy). RED: the property is unknown.
+- `det-reg-reset` now expects ideFxCmdSta 0x80000000. RED:
+  `0x00000000 == 0x80000000`.
+- The full suite is 54 ok; checkpatch is clean on the diff and on
+  `stix_det.c`/`.h` with `-f`.
+
+**nominal-smoke (D-2 changes):**
+- 0 `XrayDetFDIR.c:731` lines are expected in both modes; any other
+  count is a FAIL.
+- Zero timeouts alone would also pass if NOMINAL entry returned early,
+  before `OpModeMgmt.c:576` (the `gracefulFDIRtoSAFEModeRequest`
+  returns). So QEMU now runs with `-trace stixdet_idefx_cmd`, and the
+  gate also requires **positive evidence**: at least 32 delivered write
+  address blocks for **each** register 1..12. A write address block is
+  the word after a delivered SCINITSEQ (0xBFD30/0xBFD70/0xBFDB0) of the
+  same GrpAddr with R/W = 0. Tracking per GrpAddr keeps the count right
+  if FSW tasks interleave on different `grp`.
+- The count is exact and robust: `XrayDetFDIR_resetASICregistersToDefault`
+  is 32 ASICs × 12 registers. The only other writer in these runs is
+  the RCR state-0 R3 write (`RateCtrl.c:575`), so R3 reads 64. Per
+  register is stricter than a total of 384, which R3 alone could fill.
+- Why not a probed TM marker: no TM is provably sent after `:576` on
+  every path, and the trace counts the writes themselves.
+- The check needs gawk (`strtonum`, `and`, `rshift`); its absence is
+  exit 2.
+
+**Goldens:**
+- `uart.golden.log`: unchanged. boot-smoke PASS, and the normalized UART
+  of the capture run is identical to the golden (whole file).
+- `qemu-stdout.golden.log`: regenerated with `capture-golden.sh` (an
+  absolute QEMU path) into a scratch out-dir; only this file was copied
+  in. 30606 → 14815 lines:
+  - the 16000 `addr = 0x0` polls become 112 ideFxCmdSta accesses
+    (16 × (1 + 3 × 2)) reading 0x80000000 (0x800bffb0 after the
+    resetReg word);
+  - 48 new `stixdet_idefx_cmd` lines, all with
+    `delivered_grp_mask 0x0000`: nothing is powered at boot;
+  - one `stixdet_idefx_defaults … (device reset)` line;
+  - the idefxWriteMask/idefxModeData accesses of the 16 resetReg
+    frames.
+  - The capture is time-bounded (90 s), so the removal does not shift a
+    line window.
+
+**Gate record** (2026-11-11, worktree `stix-uprev-tc` at d2c6cae28a
+plus this change, normal ELF, every QEMU run under the 21000 flock):
+- boot-smoke (`/tmp/stix-uprev-run`): PASS (the normalized UART matches
+  the golden).
+- **nominal-smoke positive** (`/tmp/stix-d2-nominal`, fresh flash):
+  PASS.
+  - [L] confirmed: **0** `XrayDetFDIR.c:731` lines; NOMINAL entry
+    (`0021 04 05`) logs no IDeF-X error at all. The UART has 58 lines.
+  - Its set of UART message types (numbers masked) equals that of the
+    D-1 run still on disk (`/tmp/stix-d1-nominal`, the negative run),
+    minus that run's 731 lines and its expected "Transitioning to safe
+    mode" line. No new UART line and no new TM: the TM(5,x)
+    set is the same, with the one TM(5,2) 0x542C p1 = 1 (no LUTs), and
+    there is no 0x5DC while NOMINAL lasts.
+- **nominal-smoke `--negative`** (same dir, wiped by the script): PASS.
+  - 0 timeouts. NOMINAL lasted about 31 s (`0021 04 05` at 15:33:13,
+    `142E` and `0021 05 02` at 15:33:43-44).
+  - The exit flush is as in D-1: four TM(21,6) 0x5DC packets, SSID 33,
+    30, 31 and 34, and no SSID 32.
+- **[L] ASIC verification evidence** (an ad-hoc traced variant of the
+  positive run, kept outside the repo, `/tmp/stix-d2-verif`, fresh
+  flash):
+  - It adds TC(236,6) `02 02 00 1E` (verification period 30 s; acked,
+    TM(1,7)) at +62 s, `-trace 'stixdet_idefx*'`, and forbids 0x542E,
+    0x9438 and 0x142C from NOM onward. PASS: no forbid fired.
+  - The trace has **3 verification runs of exactly 384 read address
+    blocks** (`0x84000|reg<<7`, reg 1..12, each over 32 ASICs, 16
+    `grp`). All 1152 were delivered, and their 3936 read data blocks
+    are 3 × 1312, i.e. 41 bytes per ASIC.
+  - The writes are the 384 NOMINAL-entry writes plus a second R3 write
+    on all 32 ASICs, which is the RCR state-0 threshold write
+    (`RateCtrl.c:575`) [I]. It timed out silently before D-2.
+  - Its UART message types and TM set equal the positive run's.
+  - A successful verification is silent, as the plan says: the trace
+    is the only evidence.
+- **fault-smoke positive** (`/tmp/stix-d2-fault`, fresh flash): PASS.
+  The same 18 expectations as in D-1 matched, including DET_C
+  `9434 05 0258 0222`, and there was no 0x5DC TM. SAFE never powers a
+  quarter, so the IDeF-X model is idle.
+- The full qtest suite is 54 ok; checkpatch is clean.
+- The shared flash mtimes are unchanged: `/tmp/stix-uprev-run`
+  2026-11-10 13:05:54 and `/tmp/stix-baseline-run` 2026-11-09 15:30:10.
+- **After the review fixes** (RD = SC = 1 per addressed ASIC,
+  range-checked self-check, edge idles decoders, the realize error path
+  frees the watchdog timer and the ROTB ring, the new gating and reset
+  tests, and the nominal-smoke evidence check):
+  - the full suite is 54 ok; checkpatch is clean (diff and `-f`);
+  - boot-smoke PASS (the normalized UART matches the golden). The trace
+    golden is not regenerated: the boot's `resetReg(grp, 2)` is still
+    undelivered, so the trace is unchanged;
+  - nominal-smoke positive and `--negative` (`/tmp/stix-d2r-nominal`,
+    fresh flash): both PASS with 0 timeouts and `R1..R12 = 32` delivered
+    write address blocks each (R3 = 64);
+  - the shared flash mtimes are unchanged.

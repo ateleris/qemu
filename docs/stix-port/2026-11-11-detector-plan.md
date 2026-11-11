@@ -111,8 +111,8 @@ its index space in its name**, using the names below. A bare "det",
 | `grp` | IDeF-X group | 0-15 = `fpga_det`/2 | `StixIdpu.h` IDEFXCONFIG_ENABLE_V_QxGy; `dete_data` | GrpAddr, WriteMask, ReadMode, Enable bits, LTRG/ETRG index |
 | `quarter` | power quarter | 0-3 = `grp`/4 | `dete_data` quarterId | idefxConfig Q1..Q4ON, QuarterSeu |
 | `asic` | ASIC in a group | 0/1 (2 = both, "All") | `0xBFD30\|asic<<6` `Detectors.c:747, 806, 868` | slow-control addressing |
-| `subcol` | ASW sub-collimator = ICD "detector index" (number − 1); `subcol` 8 = CFL, 9 = BKG (ICD Table 32, ICD:3505-3678, ICD:3557-3561 [D=C]) | 0-31 (ICD detector number 1-32) | `utils_subcolIdFromFpgaId` / `utils_fpgaIdFromSubcolId` `utils.c:110-124`; `utils_subcolMask2fpgaMask` `utils.c:222-232` | every ASW parameter mask, QL TM detector index (`QLAccuDblBuffs.c:175`), archive control word (`RotAccuCompactor.c:300-315`) |
-| `fe_sc` | front-end ("old") sub-collimator | 1-32 | `Detectors_fpgaFromFrontendMinusOne` `Detectors.c:535-538` = `utils_oldSubcolIdToFpgaId` `utils.c:126-130`; inverse `Detectors_frontendFromFpga` `Detectors.c:521-527` | calibration report; the DSS app's "sc" |
+| `subcol` | ASW sub-collimator = ICD "detector index" (number − 1); `subcol` 8 = CFL, 9 = BKG (ICD Table 32, ICD:3505-3678, ICD:3557-3561 [D=C]) | 0-31 (ICD detector number 1-32) | `utils_subcolIdFromFpgaId` / `utils_fpgaIdFromSubcolId` `utils.c:113-127`; `utils_subcolMask2fpgaMask` `utils.c:222-232` | every ASW parameter mask, QL TM detector index (`QLAccuDblBuffs.c:175`), archive control word (`RotAccuCompactor.c:300-315`) |
+| `fe_sc` | front-end ("old") sub-collimator | 1-32 | `Detectors_fpgaFromFrontendMinusOne` `Detectors.c:536-540` = `utils_oldSubcolIdToFpgaId` `utils.c:129-133`; inverse `Detectors_frontendFromFpga` `Detectors.c:528-534` | calibration report; the DSS app's "sc" |
 | `dss_det` | DSS event detector field | 0-31 | DSS app table [D, notes-dss-app §3] | `.dssevs` bits 15:11 |
 | `ebin` | science energy bin | 0-31 | LACC dimension 2 (ELUT output); LC bands mask 0x10821082 = `ebin` 1-6, 7-11, 12-16, 17-22, 23-27 (`ParamMgmtDef.h:254`) | QL TM, SUMEMASK/VAREMASK bits |
 | `adc` | raw 12-bit ADC value | 0-4095 | ICD §7.2.11.2 (ICD:19596) | `.dssevs` events, IDeF-X ADC answers, ELUT input |
@@ -129,8 +129,8 @@ L0/L1 sample detector field and the EID detector parameters are `subcol`.
 - **`dss_det` = `fpga_det` (identity).** The DSS app's `fe_sc`→`dss_det`
   table (2,3,14,15,0,4,5,12,13,8,1,6,7,10,11,9, 24,26,27,22,23,16,25,28,
   29,20,21,17,30,31,18,19) is entry-for-entry equal to
-  `Detectors_fpgaFromFrontendMinusOne` (`Detectors.c:535-538`) and
-  `utils_oldSubcolIdToFpgaId` (`utils.c:126-130`) [C]. So a `.dssevs`
+  `Detectors_fpgaFromFrontendMinusOne` (`Detectors.c:536-540`) and
+  `utils_oldSubcolIdToFpgaId` (`utils.c:129-133`) [C]. So a `.dssevs`
   event's detector field is already the FPGA detector index, and the DSS
   "sc" is `fe_sc`. Replay uses `fpga_det = dss_det` with no lookup.
   (notes-dss-app §6 item 3 maps script ids through

@@ -977,9 +977,15 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
 
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 
-    stix_det_realize(&STIXCTRL->det, &STIXCTRL->reg, &STIXCTRL->sram,
-                     &STIXCTRL->lvar, &STIXCTRL->ltrg,
-                     &STIXCTRL->irq_detectors);
+    if (!stix_det_realize(&STIXCTRL->det, &STIXCTRL->reg, &STIXCTRL->sram,
+                          &STIXCTRL->lvar, &STIXCTRL->ltrg,
+                          &STIXCTRL->irq_detectors, errp)) {
+        timer_free(STIXCTRL->wdg_timer);
+        STIXCTRL->wdg_timer = NULL;
+        g_free(STIXCTRL->rotb_ring);
+        STIXCTRL->rotb_ring = NULL;
+        return;
+    }
 
     //STIXCTRL->reference_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     //STIXCTRL->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, grlib_stixctrl_timer_tick, STIXCTRL);
@@ -1104,6 +1110,11 @@ static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_BOOL("hk-prot", STIXCTRL, hk_prot, true),
     /* D-1 (D-Db): off keeps 0x00-0x4C plain storage, never reset */
     DEFINE_PROP_BOOL("det-model", STIXCTRL, det.model, true),
+    /*
+     * D-2 (D-Db): off keeps ideFxCmdSta, idefxModeData, idefxWriteMask
+     * and idefxConfig plain storage with CmdReady 0 (the 384 timeouts)
+     */
+    DEFINE_PROP_BOOL("det-idefx", STIXCTRL, det.idefx, true),
 };
 
 /* no injection from the moment the object exists (not only at realize) */

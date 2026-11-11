@@ -23,15 +23,23 @@
 # is seen — both TM(5,1) 0x142E and 0021 05 02 (NOMINAL -> SAFE; the
 # probe does not check their order).
 #
-# Expected NOMINAL-entry side effects, NOT failures: 384 IDeF-X write
-# timeouts on the UART (XrayDetFDIR.c:731), one TM(5,2) 0x542C (no LUTs
-# in flash; expected but NOT checked by this gate — seen in the
+# Expected NOMINAL-entry side effects, NOT failures: one TM(5,2) 0x542C
+# (no LUTs in flash; expected but NOT checked by this gate — seen in the
 # p3probe4 experiment, and the recon marks it inferred), LUTMgmt
 # messages, and SID2 showing LV/HV/SpW off (POWERSTAT = 0, D-P3a). The
 # UART is checked after the run: "init: SAFE mode" present, no
-# "storing new context[01] failed", and the IDeF-X timeout count
-# printed (384 expected in positive mode; another count is a WARN, not
-# a failure).
+# "storing new context[01] failed", and NO IDeF-X write timeout
+# (XrayDetFDIR.c:731) in either mode: since detector plan D-2 the model
+# answers the IDeF-X interface, so the 384 NOMINAL-entry register
+# writes complete; any count other than 0 is a FAIL (before D-2 there
+# were exactly 384, a WARN otherwise). Zero timeouts alone would also
+# pass if NOMINAL entry returned before the writes (OpModeMgmt.c:576),
+# so QEMU runs with -trace stixdet_idefx_cmd and the gate also requires
+# positive evidence in both modes: at least 32 delivered write address
+# blocks (the word after a delivered SCINITSEQ, tracked per GrpAddr,
+# with R/W = 0) for EACH register 1..12, i.e. the 32 ASICs x 12
+# registers of XrayDetFDIR_resetASICregistersToDefault. R3 also gets
+# the RCR state-0 write (RateCtrl.c:575), so it counts 64 here.
 #
 # Like tc-smoke.sh this script does NOT take the /tmp/stix-qtest-21000
 # flock itself; the caller must hold it (no script does this for you).
@@ -200,7 +208,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo "(cd $RUN_DIR && timeout $((DURATION + 30)) $QEMU_BIN \
 -M leon3_generic -m 64M -no-reboot -display none -monitor none \
 -serial file:$RUN_DIR/uart.nominal.raw -kernel $ASW_ELF \
-> qemu-stdout.nominal.log 2>&1)"
+-trace stixdet_idefx_cmd > qemu-stdout.nominal.log 2>&1)"
     printf 'python3 -u %s ' "$PROBE"
     printf '%q ' "${PROBE_ARGS[@]}"
     printf '\n'
@@ -211,6 +219,8 @@ fi
     echo "SKIP: ASW ELF absent ($ASW_ELF); set STIX_ASW_ELF to enable"
     exit 0
 }
+# the D-2 IDeF-X evidence check uses gawk (strtonum, and, rshift)
+command -v gawk > /dev/null || { echo "gawk is required"; exit 2; }
 
 if ss -ltn | grep -q ":${TMTC_PORT} "; then
     echo "TMTC port ${TMTC_PORT} busy — another QEMU instance running?"
@@ -251,7 +261,8 @@ timeout "$((DURATION + 30))" "$QEMU_BIN" \
     -M leon3_generic -m 64M -no-reboot \
     -display none -monitor none \
     -serial file:"$RUN_DIR/uart.nominal.raw" \
-    -kernel "$ASW_ELF" > qemu-stdout.nominal.log 2>&1 &
+    -kernel "$ASW_ELF" -trace stixdet_idefx_cmd \
+    > qemu-stdout.nominal.log 2>&1 &
 QEMU_PID=$!
 
 # --hold keeps the probe on the socket until --seconds; the verdict
@@ -320,17 +331,49 @@ if grep -Eq 'storing new context[01] failed' uart.nominal.txt; then
     echo "NOMINAL-SMOKE: FAIL (a flash context write failed)"
     exit 1
 fi
+# D-2: the IDeF-X interface is modelled, so the NOMINAL-entry register
+# writes must not time out (both modes enter NOMINAL)
 IDEFX_N="$(grep -c 'XrayDetFDIR.c:731' uart.nominal.txt || true)"
+if [ "$IDEFX_N" -ne 0 ]; then
+    grep -m1 'XrayDetFDIR.c:731' uart.nominal.txt
+    echo "NOMINAL-SMOKE: FAIL ($IDEFX_N IDeF-X write timeouts," \
+        "XrayDetFDIR.c:731; expected 0)"
+    exit 1
+fi
+echo "IDeF-X write timeouts (XrayDetFDIR.c:731): 0 (expected)"
+# D-2 positive evidence: the per-register delivered write address blocks
+# (stixdet_idefx_cmd "grp G word W delivered_grp_mask M ..."; SCINITSEQ
+# slow control is 0xbfd30/0xbfd70/0xbfdb0, a write address block
+# 0x80000 | reg << 7)
+IDEFX_W="$(gawk '
+    /stixdet_idefx_cmd/ {
+        g = $4; w = strtonum($6); m = strtonum($8)
+        if (m != 0 && prev[g] != "" && and(w, 0xFC07F) == 0x80000) {
+            r = and(rshift(w, 7), 0x7F)
+            if (r >= 1 && r <= 12) { n[r]++ }
+        }
+        sc = (m != 0 && (w == 0xbfd30 || w == 0xbfd70 || w == 0xbfdb0))
+        prev[g] = sc ? "init" : ""
+    }
+    END {
+        ok = 1; s = ""
+        for (r = 1; r <= 12; r++) {
+            s = s " R" r "=" (n[r] + 0)
+            if (n[r] < 32) { ok = 0 }
+        }
+        print (ok ? "OK" : "LOW") s
+    }' qemu-stdout.nominal.log)"
+case "$IDEFX_W" in
+    OK*)
+        echo "IDeF-X delivered write address blocks:${IDEFX_W#OK}" ;;
+    *)
+        echo "NOMINAL-SMOKE: FAIL (IDeF-X register writes not seen at" \
+            "NOMINAL entry, want >= 32 per register:${IDEFX_W#LOW})"
+        exit 1 ;;
+esac
 if [ "$NEGATIVE" -eq 1 ]; then
-    echo "IDeF-X write timeouts (XrayDetFDIR.c:731): $IDEFX_N"
     echo "NOMINAL-SMOKE (negative): PASS"
 else
-    if [ "$IDEFX_N" -eq 384 ]; then
-        echo "IDeF-X write timeouts (XrayDetFDIR.c:731): $IDEFX_N (expected)"
-    else
-        echo "WARN: IDeF-X write timeouts (XrayDetFDIR.c:731): $IDEFX_N" \
-            "(expected 384)"
-    fi
     echo "NOMINAL-SMOKE: PASS"
 fi
 exit 0

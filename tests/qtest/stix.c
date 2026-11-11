@@ -5177,10 +5177,10 @@ static void test_det_testpulse(void)
 
 /*
  * D-Dh: a device reset writes explicit reset values for 0x00-0x4C
- * (testPulseCmdSta Busy, all others 0; ideFxCmdSta stays 0 until D-2
- * lands CmdReady together with the IDeF-X store, §24) and stops the
- * tick. HK DET_C follows the cleared quarter power. RED on the pre-D-1
- * binary: the registers survive the reset.
+ * (ideFxCmdSta CmdReady = 0x80000000 since D-2, testPulseCmdSta Busy,
+ * all others 0) and stops the tick. HK DET_C follows the cleared
+ * quarter power. RED on the pre-D-1 binary: the registers survive the
+ * reset; on the D-1 binary: ideFxCmdSta read 0.
  */
 static void test_det_reg_reset(void)
 {
@@ -5198,7 +5198,8 @@ static void test_det_reg_reset(void)
     qtest_system_reset(qts);
 
     for (off = 0; off <= CTRL_DET_LAST; off += 4) {
-        uint32_t want = off == CTRL_TESTPULSECMDSTA ? TESTPULSE_BUSY : 0;
+        uint32_t want = off == CTRL_TESTPULSECMDSTA ? TESTPULSE_BUSY :
+                        off == CTRL_IDEFXCMDSTA ? 0x80000000u : 0;
 
         g_test_message("reg 0x%02x", off);
         g_assert_cmphex(ctrl_read(qts, off), ==, want);
@@ -5245,6 +5246,708 @@ static void test_det_model_off(void)
     g_assert_cmphex(ctrl_read(qts, CTRL_FSMSTA), ==, 0x5u);
     g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, 0x12345u);
     g_assert_cmphex(ctrl_read(qts, CTRL_FSMQLCONFIG), ==, 9u << 16);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* ---- IDeF-X interface and register store (detector plan D-2) ---- */
+
+#define CTRL_IDEFXMODEDATA   0x04u
+#define CTRL_IDEFXWRITEMASK  0x08u
+#define CTRL_IDEFXCONFIG     0x0cu
+#define IDEFX_CMDREADY       (1u << 31)
+
+/* IDeF-X register sizes in bits, 1..12 (commonFSW.h:251-262) */
+static const uint32_t idefx_reg_bits[13] = {
+    0, 2, 3, 192, 32, 4, 2, 5, 2, 2, 3, 3, 32,
+};
+
+/*
+ * the HW defaults as the FSW reads them back (ParamMgmtDef.h:525-536):
+ * one byte for the short registers (after readReg's >> (8 - len)), R4
+ * and R12 big-endian u32; R3 is 62 on every channel (checked apart)
+ */
+static const uint32_t idefx_reg_default[13] = {
+    0, 1, 0, 0, 0, 15, 1, 0, 3, 0, 3, 3, 0xFFFFFFFFu,
+};
+
+static uint32_t idefx_reg_bytes(uint32_t reg)
+{
+    return (idefx_reg_bits[reg] + 7) / 8;
+}
+
+/*
+ * One word through Detectors_transmission (Detectors.c:677-724):
+ * WAIT_FOR_READY, the word (CmdCounter 19:16, CmdData 15:0, GrpAddr
+ * 23:20), WAIT_FOR_READY, then the response in idefxModeData[15:0].
+ * The model executes at once, so one poll stands for the FSW's 1000.
+ * Returns false where the FSW would return E_RET_TIMEOUT.
+ */
+static bool idefx_word(QTestState *qts, uint32_t grp, uint32_t word,
+                       uint16_t *rx)
+{
+    if (!(ctrl_read(qts, CTRL_IDEFXCMDSTA) & IDEFX_CMDREADY)) {
+        return false;
+    }
+    ctrl_write(qts, CTRL_IDEFXCMDSTA,
+               (((word >> 16) & 0xFu) << 16) | (word & 0xFFFFu) | grp << 20);
+    if (!(ctrl_read(qts, CTRL_IDEFXCMDSTA) & IDEFX_CMDREADY)) {
+        return false;
+    }
+    if (rx) {
+        *rx = ctrl_read(qts, CTRL_IDEFXMODEDATA) & 0xFFFFu;
+    }
+    return true;
+}
+
+/* asserting variant: CmdReady is 1 before and after every command */
+static uint16_t idefx_word_ok(QTestState *qts, uint32_t grp, uint32_t word)
+{
+    uint16_t rx = 0xDEADu;
+
+    g_assert_true(idefx_word(qts, grp, word, &rx));
+    return rx;
+}
+
+/* Detectors_setQuarterPowerMask / setGroupEnableMask / setModeMask */
+static void idefx_power(QTestState *qts, uint32_t quarter_mask,
+                        uint32_t grp_enable_mask, uint32_t grp_mode_mask)
+{
+    uint32_t cfg = ctrl_read(qts, CTRL_IDEFXCONFIG);
+
+    cfg = (cfg & ~0xFu) | (quarter_mask & 0xFu);
+    ctrl_write(qts, CTRL_IDEFXCONFIG, cfg);
+    cfg = (cfg & ~(0xFFFFu << 4)) | ((grp_enable_mask & 0xFFFFu) << 4);
+    ctrl_write(qts, CTRL_IDEFXCONFIG, cfg);
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, (grp_mode_mask & 0xFFFFu) << 16);
+}
+
+/* NOMINAL entry (OpModeMgmt.c:470-501): all quarters, groups, modes */
+static void idefx_power_all(QTestState *qts)
+{
+    idefx_power(qts, 0xF, 0xFFFF, 0xFFFF);
+}
+
+/* WRITE_TO_GROUPS (Detectors.c:657) */
+static void idefx_write_to_groups(QTestState *qts, uint32_t grp_mask)
+{
+    ctrl_write(qts, CTRL_IDEFXWRITEMASK,
+               (ctrl_read(qts, CTRL_IDEFXWRITEMASK) & ~0xFFFF0000u) |
+               (grp_mask & 0xFFFFu) << 16);
+}
+
+/*
+ * The transaction frame of every Detectors_* operation: clear the
+ * group's ReadMode bit, WriteMask = 1 << grp; restore both at the end
+ */
+static uint32_t idefx_begin(QTestState *qts, uint32_t grp)
+{
+    uint32_t mode = ctrl_read(qts, CTRL_IDEFXMODEDATA) >> 16;
+
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, (mode & ~(1u << grp)) << 16);
+    idefx_write_to_groups(qts, 1u << grp);
+    return mode;
+}
+
+static void idefx_end(QTestState *qts, uint32_t mode)
+{
+    idefx_write_to_groups(qts, 0);
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, mode << 16);
+}
+
+/* Detectors_writeReg (Detectors.c:728-785), asic 0, 1 or 2 (All) */
+static void idefx_write_reg(QTestState *qts, uint32_t grp, uint32_t asic,
+                            uint32_t reg, const uint8_t *data,
+                            uint32_t nbytes)
+{
+    uint32_t mode = idefx_begin(qts, grp);
+    uint32_t n;
+
+    idefx_word_ok(qts, grp, 0);
+    idefx_word_ok(qts, grp, 0xBFD30u | asic << 6);
+    idefx_word_ok(qts, grp, 0x80000u | reg << 7);
+    for (n = 0; n < nbytes; n++) {
+        idefx_word_ok(qts, grp, 0x80000u | (uint32_t)data[n] << 7);
+    }
+    idefx_word_ok(qts, grp, 0x48000u);
+    idefx_word_ok(qts, grp, 0);
+    idefx_end(qts, mode);
+}
+
+/*
+ * Detectors_readReg (Detectors.c:787-851): raw[] gets the response
+ * bytes as the FSW reads them, out[] the bytes after the last-byte
+ * shift >> (8 - len % 8) (:840)
+ */
+static void idefx_read_reg_raw(QTestState *qts, uint32_t grp, uint32_t asic,
+                               uint32_t reg, uint8_t *raw, uint8_t *out)
+{
+    uint32_t len = idefx_reg_bits[reg];
+    uint32_t nbytes = idefx_reg_bytes(reg);
+    uint32_t mode = idefx_begin(qts, grp);
+    uint32_t n;
+
+    idefx_word_ok(qts, grp, 0);
+    idefx_word_ok(qts, grp, 0xBFD30u | asic << 6);
+    idefx_word_ok(qts, grp, 0x84000u | reg << 7);
+    for (n = 0; n < nbytes; n++) {
+        raw[n] = (uint8_t)idefx_word_ok(qts, grp, 0x80000u);
+        out[n] = raw[n];
+    }
+    if (len % 8) {
+        out[nbytes - 1] = (uint8_t)(out[nbytes - 1] >> (8 - len % 8));
+    }
+    idefx_word_ok(qts, grp, 0x48000u);
+    idefx_word_ok(qts, grp, 0);
+    idefx_end(qts, mode);
+}
+
+static void idefx_read_reg(QTestState *qts, uint32_t grp, uint32_t asic,
+                           uint32_t reg, uint8_t *out)
+{
+    uint8_t raw[24];
+
+    idefx_read_reg_raw(qts, grp, asic, reg, raw, out);
+}
+
+/* a short (<= 8 bit) register or a 32-bit one, as a number */
+static uint32_t idefx_read_val(QTestState *qts, uint32_t grp, uint32_t asic,
+                               uint32_t reg)
+{
+    uint8_t out[24];
+    uint32_t n, v = 0;
+
+    g_assert_cmpuint(idefx_reg_bytes(reg), <=, 4);
+    idefx_read_reg(qts, grp, asic, reg, out);
+    for (n = 0; n < idefx_reg_bytes(reg); n++) {
+        v = v << 8 | out[n];
+    }
+    return v;
+}
+
+static void idefx_write_val(QTestState *qts, uint32_t grp, uint32_t asic,
+                            uint32_t reg, uint32_t val)
+{
+    uint32_t nbytes = idefx_reg_bytes(reg);
+    uint8_t data[4];
+    uint32_t n;
+
+    g_assert_cmpuint(nbytes, <=, 4);
+    for (n = 0; n < nbytes; n++) {
+        data[n] = (uint8_t)(val >> (8 * (nbytes - 1 - n)));
+    }
+    idefx_write_reg(qts, grp, asic, reg, data, nbytes);
+}
+
+/* Detectors_resetReg (Detectors.c:853-881) */
+static void idefx_reset_reg(QTestState *qts, uint32_t grp, uint32_t asic)
+{
+    uint32_t mode = idefx_begin(qts, grp);
+
+    idefx_word_ok(qts, grp, 0);
+    idefx_word_ok(qts, grp, 0xBFF30u | asic << 6);
+    idefx_word_ok(qts, grp, 0);
+    idefx_end(qts, mode);
+}
+
+/* every register of (grp, asic) holds its HW default */
+static void idefx_expect_defaults(QTestState *qts, uint32_t grp,
+                                  uint32_t asic)
+{
+    static const uint8_t r3_pat[3] = { 0xFB, 0xEF, 0xBE };
+    uint8_t r3[24];
+    uint32_t reg, n;
+
+    for (reg = 1; reg <= 12; reg++) {
+        if (reg == 3) {
+            continue;
+        }
+        g_test_message("grp %u asic %u reg %u", grp, asic, reg);
+        g_assert_cmphex(idefx_read_val(qts, grp, asic, reg), ==,
+                        idefx_reg_default[reg]);
+    }
+    /* 62 = 0b111110 on all 32 channels: FB EF BE, eight times */
+    idefx_read_reg(qts, grp, asic, 3, r3);
+    for (n = 0; n < 24; n++) {
+        g_assert_cmphex(r3[n], ==, r3_pat[n % 3]);
+    }
+}
+
+/*
+ * D-De: ideFxCmdSta reads CmdReady = 1 from reset (D-Dh 0x80000000)
+ * and after every command of every FSW sequence; the command fields
+ * read back; idefxModeData 15:0 is read-only. RED on the D-1 binary:
+ * ideFxCmdSta reads 0 (plain storage, no CmdReady).
+ */
+static void test_det_idefx_ready(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t grp;
+    uint16_t a, b;
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, IDEFX_CMDREADY);
+
+    /* the boot's resetReg x 16 with nothing powered (OpModeMgmt.c:1061) */
+    for (grp = 0; grp < 16; grp++) {
+        idefx_reset_reg(qts, grp, 2);
+    }
+
+    idefx_power_all(qts);
+    idefx_write_val(qts, 4, 1, 5, 9);
+    g_assert_cmphex(idefx_read_val(qts, 4, 1, 5), ==, 9);
+    idefx_reset_reg(qts, 4, 2);
+
+    /* readTemp, and commands the model does not decode */
+    idefx_begin(qts, 4);
+    idefx_word_ok(qts, 4, 0);
+    idefx_word_ok(qts, 4, 0xBFD30u);
+    idefx_word_ok(qts, 4, 0x84680u);
+    idefx_word_ok(qts, 4, 0x60000u);
+    a = idefx_word_ok(qts, 4, 0x10000u);
+    idefx_word_ok(qts, 4, 0x80000u);
+    b = idefx_word_ok(qts, 4, 0x10000u);
+    g_assert_cmphex(a, >=, b);
+    idefx_word_ok(qts, 4, 0x70000u);
+    idefx_word_ok(qts, 4, 0x48000u);
+    idefx_word_ok(qts, 4, 0x5FFFFu);
+    idefx_word_ok(qts, 4, 0x9FFFFu);
+    idefx_word_ok(qts, 4, 0xCFFFFu);
+    idefx_word_ok(qts, 4, 0xFFFFFu);
+    idefx_word_ok(qts, 4, 0);
+
+    /* the command fields read back (reserved 30:24 read 0) */
+    ctrl_write(qts, CTRL_IDEFXCMDSTA, 0x7FF5ABCDu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, 0x80F5ABCDu);
+
+    /* idefxModeData: ReadMode 31:16 R/W, the response 15:0 read-only */
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, 0xA5A5FFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXMODEDATA), ==, 0xA5A50000u);
+    /* idefxWriteMask: the mask 31:16 R/W, reserved 15:0 read 0 */
+    ctrl_write(qts, CTRL_IDEFXWRITEMASK, 0x5A5AFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXWRITEMASK), ==, 0x5A5A0000u);
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, IDEFX_CMDREADY);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* a test pattern per (grp, asic, reg, byte), in range for short regs */
+static uint8_t idefx_pattern(uint32_t grp, uint32_t asic, uint32_t reg,
+                             uint32_t n)
+{
+    uint32_t v = (grp * 29 + asic * 101 + reg * 31 + n * 7 + 0x5A) & 0xFF;
+    uint32_t len = idefx_reg_bits[reg];
+
+    return len < 8 ? (uint8_t)(v & ((1u << len) - 1)) : (uint8_t)v;
+}
+
+/*
+ * D-De: every register 1..12 on both asic of two grp (different
+ * quarters) round-trips through the FSW's writeReg/readReg; short
+ * registers come back left-aligned (R1 0x01 -> 0x40, R7 0x15 -> 0xA8);
+ * the 24 bytes of R3 come back in order; R4 and R12 round-trip as
+ * 32-bit; a write longer than the register keeps the last N bits.
+ */
+static void test_det_idefx_roundtrip(void)
+{
+    static const uint32_t grps[2] = { 3, 12 };
+    QTestState *qts = stix_qtest_new();
+    uint8_t data[24], raw[24], out[24];
+    uint32_t g, asic, reg, n;
+
+    idefx_power_all(qts);
+
+    for (g = 0; g < 2; g++) {
+        for (asic = 0; asic < 2; asic++) {
+            for (reg = 1; reg <= 12; reg++) {
+                for (n = 0; n < idefx_reg_bytes(reg); n++) {
+                    data[n] = idefx_pattern(grps[g], asic, reg, n);
+                }
+                idefx_write_reg(qts, grps[g], asic, reg, data,
+                                idefx_reg_bytes(reg));
+            }
+        }
+    }
+    for (g = 0; g < 2; g++) {
+        for (asic = 0; asic < 2; asic++) {
+            for (reg = 1; reg <= 12; reg++) {
+                g_test_message("grp %u asic %u reg %u", grps[g], asic, reg);
+                idefx_read_reg(qts, grps[g], asic, reg, out);
+                for (n = 0; n < idefx_reg_bytes(reg); n++) {
+                    g_assert_cmphex(out[n], ==,
+                                    idefx_pattern(grps[g], asic, reg, n));
+                }
+            }
+        }
+    }
+    /* the other grp of the same quarters keep their defaults */
+    idefx_expect_defaults(qts, 2, 0);
+    idefx_expect_defaults(qts, 13, 1);
+
+    /* left alignment of the short registers, seen on the wire */
+    idefx_write_val(qts, 3, 0, 1, 0x01);
+    idefx_read_reg_raw(qts, 3, 0, 1, raw, out);
+    g_assert_cmphex(raw[0], ==, 0x40);
+    g_assert_cmphex(out[0], ==, 0x01);
+    idefx_write_val(qts, 3, 0, 7, 0x15);
+    idefx_read_reg_raw(qts, 3, 0, 7, raw, out);
+    g_assert_cmphex(raw[0], ==, 0xA8);
+    g_assert_cmphex(out[0], ==, 0x15);
+
+    /* R4 and R12 as 32-bit values */
+    idefx_write_val(qts, 12, 1, 4, 0x12345678u);
+    g_assert_cmphex(idefx_read_val(qts, 12, 1, 4), ==, 0x12345678u);
+    idefx_write_val(qts, 12, 1, 12, 0x89ABCDEFu);
+    g_assert_cmphex(idefx_read_val(qts, 12, 1, 12), ==, 0x89ABCDEFu);
+
+    /* more bytes than the length: the last N bits stay */
+    data[0] = 0x11;
+    data[1] = 0x22;
+    data[2] = 0x33;
+    data[3] = 0x44;
+    data[4] = 0x55;
+    idefx_write_reg(qts, 12, 1, 4, data, 5);
+    g_assert_cmphex(idefx_read_val(qts, 12, 1, 4), ==, 0x22334455u);
+    data[0] = 0x03;
+    data[1] = 0xFE;
+    idefx_write_reg(qts, 12, 1, 1, data, 2);
+    g_assert_cmphex(idefx_read_val(qts, 12, 1, 1), ==, 0x02);
+    data[0] = 0xFF;
+    data[1] = 0x6C;
+    idefx_write_reg(qts, 12, 1, 7, data, 2);
+    g_assert_cmphex(idefx_read_val(qts, 12, 1, 7), ==, 0x0C);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* D-De: asic = 2 (All, 0xBFDB0) writes both ASICs of the group */
+static void test_det_idefx_broadcast(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint8_t data[24], out[24];
+    uint32_t n;
+
+    idefx_power_all(qts);
+    idefx_write_val(qts, 5, 2, 5, 0x9);
+    g_assert_cmphex(idefx_read_val(qts, 5, 0, 5), ==, 0x9);
+    g_assert_cmphex(idefx_read_val(qts, 5, 1, 5), ==, 0x9);
+    g_assert_cmphex(idefx_read_val(qts, 4, 0, 5), ==, 15);
+    g_assert_cmphex(idefx_read_val(qts, 6, 1, 5), ==, 15);
+
+    for (n = 0; n < 24; n++) {
+        data[n] = (uint8_t)(0xC0 + n);
+    }
+    idefx_write_reg(qts, 5, 2, 3, data, 24);
+    idefx_read_reg(qts, 5, 0, 3, out);
+    g_assert_cmpmem(out, 24, data, 24);
+    idefx_read_reg(qts, 5, 1, 3, out);
+    g_assert_cmpmem(out, 24, data, 24);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* non-default values in every register of (grp, asic); R5 reads 0 */
+static void idefx_dirty(QTestState *qts, uint32_t grp, uint32_t asic)
+{
+    uint8_t data[24];
+    uint32_t reg, n;
+
+    for (reg = 1; reg <= 12; reg++) {
+        for (n = 0; n < idefx_reg_bytes(reg); n++) {
+            data[n] = (uint8_t)(idefx_reg_bits[reg] < 8 ?
+                                ~idefx_reg_default[reg] &
+                                ((1u << idefx_reg_bits[reg]) - 1) :
+                                0x12 + n);
+        }
+        idefx_write_reg(qts, grp, asic, reg, data, idefx_reg_bytes(reg));
+    }
+    g_assert_cmphex(idefx_read_val(qts, grp, asic, 5), ==, 0);
+}
+
+/*
+ * D-De defaults: the RD = SC = 1 command (resetReg, 0xBFF30 | asic << 6)
+ * resets the addressed ASIC only, both with asic 2 (All) [A: the FSW
+ * resets one ASIC per subcol, XRayADCsCtrl.c:833]; so does a
+ * quarter-power 0 -> 1 edge for its
+ * quarter's groups, and system_reset for all (which also idles a
+ * half-open transaction).
+ */
+static void test_det_idefx_reset(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t cfg;
+
+    idefx_power_all(qts);
+    idefx_dirty(qts, 2, 0);
+    idefx_dirty(qts, 2, 1);
+    idefx_dirty(qts, 9, 0);
+    idefx_dirty(qts, 0, 1);
+
+    /* resetReg(grp, 0): asic 0 only; the sibling keeps its values */
+    idefx_reset_reg(qts, 2, 0);
+    idefx_expect_defaults(qts, 2, 0);
+    g_assert_cmphex(idefx_read_val(qts, 2, 1, 5), ==, 0);
+    /* resetReg(grp, 1) (address 7): asic 1 only */
+    idefx_dirty(qts, 2, 0);
+    idefx_reset_reg(qts, 2, 1);
+    idefx_expect_defaults(qts, 2, 1);
+    g_assert_cmphex(idefx_read_val(qts, 2, 0, 5), ==, 0);
+    /* resetReg(grp, 2) (All, the boot's call): both */
+    idefx_dirty(qts, 2, 1);
+    idefx_reset_reg(qts, 2, 2);
+    idefx_expect_defaults(qts, 2, 0);
+    idefx_expect_defaults(qts, 2, 1);
+    g_assert_cmphex(idefx_read_val(qts, 9, 0, 5), ==, 0);
+    g_assert_cmphex(idefx_read_val(qts, 0, 1, 5), ==, 0);
+
+    /* quarter 2 (grp 8-11) power 1 -> 0 -> 1: grp 9 defaults, grp 0 kept */
+    cfg = ctrl_read(qts, CTRL_IDEFXCONFIG);
+    ctrl_write(qts, CTRL_IDEFXCONFIG, cfg & ~(1u << 2));
+    ctrl_write(qts, CTRL_IDEFXCONFIG, cfg);
+    idefx_expect_defaults(qts, 9, 0);
+    g_assert_cmphex(idefx_read_val(qts, 0, 1, 5), ==, 0);
+    /* a write of the powered mask (no edge) changes nothing */
+    idefx_dirty(qts, 9, 0);
+    ctrl_write(qts, CTRL_IDEFXCONFIG, cfg);
+    g_assert_cmphex(idefx_read_val(qts, 9, 0, 5), ==, 0);
+    /* the edge also idles the quarter's decoders: a half-open write */
+    idefx_begin(qts, 9);
+    idefx_word_ok(qts, 9, 0);
+    idefx_word_ok(qts, 9, 0xBFD30u);
+    idefx_word_ok(qts, 9, 0x80000u | 5u << 7);
+    ctrl_write(qts, CTRL_IDEFXCONFIG, cfg & ~(1u << 2));
+    ctrl_write(qts, CTRL_IDEFXCONFIG, cfg);
+    idefx_word_ok(qts, 9, 0x80000u | 0x03u << 7);
+    idefx_word_ok(qts, 9, 0x48000u);
+    idefx_word_ok(qts, 9, 0);
+    idefx_end(qts, 0xFFFF);
+    g_assert_cmphex(idefx_read_val(qts, 9, 0, 5), ==, 15);
+
+    /* a half-open write transaction, then system_reset */
+    idefx_begin(qts, 0);
+    idefx_word_ok(qts, 0, 0);
+    idefx_word_ok(qts, 0, 0xBFD70u);
+    idefx_word_ok(qts, 0, 0x80000u | 5u << 7);
+    qtest_system_reset(qts);
+    idefx_power_all(qts);
+    /* a data block alone is not a transaction after the reset */
+    idefx_write_to_groups(qts, 1u << 0);
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, 0);
+    idefx_word_ok(qts, 0, 0x80000u | 0x03u << 7);
+    idefx_word_ok(qts, 0, 0x48000u);
+    idefx_word_ok(qts, 0, 0);
+    idefx_end(qts, 0xFFFF);
+    idefx_expect_defaults(qts, 0, 1);
+    idefx_expect_defaults(qts, 9, 0);
+    idefx_expect_defaults(qts, 2, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * one raw write of R5 = val with WriteMask and ReadMode as given (the
+ * FSW's frame is bypassed); returns the OR of the responses
+ */
+static uint16_t idefx_raw_write_r5(QTestState *qts, uint32_t grp_addr,
+                                   uint32_t write_mask, uint32_t mode_mask,
+                                   uint32_t asic, uint32_t val)
+{
+    uint16_t rx = 0;
+
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, mode_mask << 16);
+    idefx_write_to_groups(qts, write_mask);
+    rx |= idefx_word_ok(qts, grp_addr, 0);
+    rx |= idefx_word_ok(qts, grp_addr, 0xBFD30u | asic << 6);
+    rx |= idefx_word_ok(qts, grp_addr, 0x80000u | 5u << 7);
+    rx |= idefx_word_ok(qts, grp_addr, 0x80000u | val << 7);
+    rx |= idefx_word_ok(qts, grp_addr, 0x48000u);
+    rx |= idefx_word_ok(qts, grp_addr, 0);
+    idefx_end(qts, 0xFFFF);
+    return rx;
+}
+
+/*
+ * one raw read of R5 (asic 0) with WriteMask and ReadMode as given;
+ * returns the data block's response
+ */
+static uint16_t idefx_raw_read_r5(QTestState *qts, uint32_t grp_addr,
+                                  uint32_t write_mask, uint32_t mode_mask)
+{
+    uint16_t rx;
+
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, mode_mask << 16);
+    idefx_write_to_groups(qts, write_mask);
+    idefx_word_ok(qts, grp_addr, 0);
+    idefx_word_ok(qts, grp_addr, 0xBFD30u);
+    idefx_word_ok(qts, grp_addr, 0x84000u | 5u << 7);
+    rx = idefx_word_ok(qts, grp_addr, 0x80000u);
+    idefx_word_ok(qts, grp_addr, 0x48000u);
+    idefx_word_ok(qts, grp_addr, 0);
+    idefx_end(qts, 0xFFFF);
+    return rx;
+}
+
+/*
+ * D-De delivery: a grp takes part only with its quarter powered, its
+ * Enable bit set and its ReadMode bit 0; otherwise the command is
+ * ignored, CmdReady stays 1 and the response is 0. A word goes to the
+ * WriteMask grp (GrpAddr's grp when WriteMask = 0); the response comes
+ * from GrpAddr's grp.
+ */
+static void test_det_idefx_gating(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint8_t out[24];
+    uint32_t n;
+
+    idefx_power_all(qts);
+    idefx_write_val(qts, 6, 0, 5, 7);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 7);
+
+    /* grp 6 disabled: the write is ignored and the read answers 0 */
+    idefx_power(qts, 0xF, 0xFFFF & ~(1u << 6), 0xFFFF);
+    idefx_write_val(qts, 6, 0, 5, 2);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 0);
+    idefx_read_reg(qts, 6, 0, 3, out);
+    for (n = 0; n < 24; n++) {
+        g_assert_cmphex(out[n], ==, 0);
+    }
+    idefx_power_all(qts);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 7);
+
+    /* ReadMode = 1 (readout mode): ignored, response 0 */
+    g_assert_cmphex(idefx_raw_write_r5(qts, 6, 1u << 6, 1u << 6, 0, 3),
+                    ==, 0);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 7);
+    /* the same with ReadMode = 0 is delivered */
+    idefx_raw_write_r5(qts, 6, 1u << 6, 0, 0, 3);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 3);
+    /* WriteMask = 0: delivered to GrpAddr's grp (lenient) */
+    idefx_raw_write_r5(qts, 6, 0, 0, 0, 4);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 4);
+    /* WriteMask names grp 7: grp 7 takes it, grp 6 does not */
+    idefx_raw_write_r5(qts, 6, 1u << 7, 0, 0, 5);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 4);
+    g_assert_cmphex(idefx_read_val(qts, 7, 0, 5), ==, 5);
+    /* the response comes from GrpAddr's grp: 0 if it is not in WriteMask */
+    idefx_begin(qts, 7);
+    idefx_word_ok(qts, 7, 0);
+    idefx_word_ok(qts, 7, 0xBFD30u);
+    idefx_word_ok(qts, 7, 0x84000u | 5u << 7);
+    g_assert_cmphex(idefx_word_ok(qts, 6, 0x80000u), ==, 0);
+    idefx_word_ok(qts, 7, 0x48000u);
+    idefx_word_ok(qts, 7, 0);
+    idefx_end(qts, 0xFFFF);
+
+    /*
+     * several grp in WriteMask, different contents (grp 6 R5 = 4, grp 7
+     * R5 = 5; 5 << 4 = 0x50 on the wire): the response is GrpAddr's
+     */
+    g_assert_cmphex(idefx_raw_read_r5(qts, 6, 3u << 6, 0), ==, 4u << 4);
+    g_assert_cmphex(idefx_raw_read_r5(qts, 7, 3u << 6, 0), ==, 5u << 4);
+    /* ReadMode gates reads too: grp 6 in readout mode answers 0 */
+    g_assert_cmphex(idefx_raw_read_r5(qts, 6, 1u << 6, 1u << 6), ==, 0);
+    g_assert_cmphex(idefx_raw_read_r5(qts, 6, 3u << 6, 1u << 6), ==, 0);
+    g_assert_cmphex(idefx_raw_read_r5(qts, 7, 3u << 6, 1u << 6), ==,
+                    5u << 4);
+
+    /* quarter 1 (grp 4-7) unpowered: ignored, the read answers 0 */
+    idefx_power(qts, 0xF & ~(1u << 1), 0xFFFF, 0xFFFF);
+    idefx_write_val(qts, 6, 0, 5, 1);
+    g_assert_cmphex(idefx_read_val(qts, 6, 0, 5), ==, 0);
+    g_assert_cmphex(idefx_read_val(qts, 8, 0, 5), ==, 15);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-De cmd 1 by context: Detectors_readTemp (Detectors.c:883-950)
+ * gets A = 0x900 then B = 0x700 (A >= B, XRayADCsCtrl.c:540-546);
+ * Detectors_adcRead (:976-1003) gets the baseline 1850; cmd 2/3 too.
+ */
+static void test_det_idefx_adc(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t mode;
+    uint16_t a, b, rx[4];
+
+    idefx_power_all(qts);
+    idefx_write_val(qts, 1, 0, 5, 0x6);
+
+    /* readTemp(1, 0) */
+    mode = idefx_begin(qts, 1);
+    idefx_word_ok(qts, 1, 0);
+    idefx_word_ok(qts, 1, 0xBFD30u);
+    idefx_word_ok(qts, 1, 0x84680u);
+    idefx_word_ok(qts, 1, 0x60000u);
+    a = idefx_word_ok(qts, 1, 0x10000u) & 0xFFF;
+    idefx_word_ok(qts, 1, 0x80000u);
+    b = idefx_word_ok(qts, 1, 0x10000u) & 0xFFF;
+    idefx_word_ok(qts, 1, 0x70000u);
+    idefx_word_ok(qts, 1, 0x48000u);
+    idefx_word_ok(qts, 1, 0);
+    idefx_end(qts, mode);
+    g_assert_cmphex(a, ==, 0x900);
+    g_assert_cmphex(b, ==, 0x700);
+    g_assert_cmphex(a, >=, b);
+    /* the temperature read touched no register */
+    g_assert_cmphex(idefx_read_val(qts, 1, 0, 5), ==, 0x6);
+
+    /* adcRead(1): 0x60000, 0x10000, 0x70000, 0; the ADC is rx[1] */
+    mode = idefx_begin(qts, 1);
+    rx[0] = idefx_word_ok(qts, 1, 0x60000u);
+    rx[1] = idefx_word_ok(qts, 1, 0x10000u);
+    rx[2] = idefx_word_ok(qts, 1, 0x70000u);
+    rx[3] = idefx_word_ok(qts, 1, 0);
+    idefx_end(qts, mode);
+    g_assert_cmpuint(rx[1] & 0xFFF, ==, 1850);
+    g_assert_cmpuint(rx[0], ==, 0);
+    g_assert_cmpuint(rx[2], ==, 0);
+    g_assert_cmpuint(rx[3], ==, 0);
+
+    /* cmd 2 (ADCBUFFREAD) and 3 (ADCMUXREAD) give the baseline too */
+    mode = idefx_begin(qts, 1);
+    g_assert_cmpuint(idefx_word_ok(qts, 1, 0x20000u), ==, 1850);
+    g_assert_cmpuint(idefx_word_ok(qts, 1, 0x30000u), ==, 1850);
+    idefx_word_ok(qts, 1, 0);
+    idefx_end(qts, mode);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-idefx=off keeps the legacy interface: ideFxCmdSta,
+ * idefxModeData and idefxWriteMask are plain storage with CmdReady 0,
+ * so every FSW transmission times out (the 384 NOMINAL-entry timeouts).
+ */
+static void test_det_idefx_off(void)
+{
+    QTestState *qts =
+        stix_qtest_new_extra("-global grlib-stixctrl.det-idefx=off");
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, 0);
+    idefx_power_all(qts);
+    g_assert_false(idefx_word(qts, 3, 0, NULL));
+    ctrl_write(qts, CTRL_IDEFXCMDSTA, 0x00B3FD30u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, 0x00B3FD30u);
+    ctrl_write(qts, CTRL_IDEFXMODEDATA, 0xFFFF1234u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXMODEDATA), ==, 0xFFFF1234u);
+    ctrl_write(qts, CTRL_IDEFXWRITEMASK, 0x0001FFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXWRITEMASK), ==, 0x0001FFFFu);
+
+    /* the rest of the detector model stays on: the D-Dh reset still runs */
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXCMDSTA), ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_IDEFXMODEDATA), ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_TESTPULSECMDSTA), ==, TESTPULSE_BUSY);
 
     qtest_quit(qts);
     stix_qtest_cleanup();
@@ -5315,6 +6018,15 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/det-reg-reset", test_det_reg_reset);
         qtest_add_func("/sparc/stix/det-model-off", test_det_model_off);
         qtest_add_func("/sparc/stix/det-token-spend", test_det_token_spend);
+        qtest_add_func("/sparc/stix/det-idefx-ready", test_det_idefx_ready);
+        qtest_add_func("/sparc/stix/det-idefx-roundtrip",
+                       test_det_idefx_roundtrip);
+        qtest_add_func("/sparc/stix/det-idefx-broadcast",
+                       test_det_idefx_broadcast);
+        qtest_add_func("/sparc/stix/det-idefx-reset", test_det_idefx_reset);
+        qtest_add_func("/sparc/stix/det-idefx-gating", test_det_idefx_gating);
+        qtest_add_func("/sparc/stix/det-idefx-adc", test_det_idefx_adc);
+        qtest_add_func("/sparc/stix/det-idefx-off", test_det_idefx_off);
     }
 
     return g_test_run();
