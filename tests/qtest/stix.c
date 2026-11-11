@@ -4346,6 +4346,260 @@ static void test_hk_prot(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P4-5: SpW link-down injection (spw-link-down, D-P4e) ---- */
+
+#define SPW_STATUS_DE   (1u << 3)
+#define SPW_STATUS_LS_SHIFT 21
+#define SPW_LS_READY    2u
+#define SPW_LS_RUN      5u
+#define SPW_CTRL_LI     (1u << 9)
+
+static uint32_t spw_ls(QTestState *qts)
+{
+    return (qtest_readl(qts, SPW_STATUS) >> SPW_STATUS_LS_SHIFT) & 7u;
+}
+
+static bool spw_irq_pending(QTestState *qts)
+{
+    return (qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT) != 0;
+}
+
+/*
+ * D-P4e: the runtime bool link-down (qom-set, like timecodes). While it
+ * is true status.LS reads READY (2) — the only value FDIR.c:711 counts
+ * — whatever the guest writes to status; DE is set on entry and re-set
+ * every 1 s after the ISR's write-1-to-clear, each time with IRQ 13 when
+ * control.LI and control.IE are set (the SPW_open value; LI with IE = 0
+ * latches per D-M); time codes stop; RX units are held in the no-spill
+ * queue and a TX (TE) waits, both completed on the clear (the TX bytes
+ * reach the UDP TM port only then; a clear with control.IE = 0 leaves
+ * the RX unit held for the IE edge). The clear
+ * brings LS back to RUN; time codes resume only if timecodes is true,
+ * and link-down never changes the timecodes value. A system reset
+ * clears link-down. RED on the pre-P4-5 binary: link-down is unknown.
+ */
+static void test_spw_link_down(void)
+{
+    static const uint8_t tc0[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x00,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0xd7, 0x7e
+    };
+    /* the DMA'd TX buffer: SpW header 49 02 00 00 + a version-0 SP */
+    static const uint8_t tm_full[12] = {
+        0x49, 0x02, 0x00, 0x00, 0x0d, 0x5e, 0x5e, 0xc0,
+        0x00, 0x03, 0x19, 0x42
+    };
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t got[sizeof(tc0)];
+    uint8_t dg[64];
+    QTestState *qts;
+    int tm_fd, tm_port;
+    bool ok, v;
+
+    tm_fd = stix_udp_bind_free(&tm_port);
+    extra = g_strdup_printf("-global grlib-stixspw.udp-tm-port=%d",
+                            tm_port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    stix_rx_setup(qts);
+    memset(got, RX_GUARD, sizeof(got));
+    qtest_memwrite(qts, RXBUF_BASE, got, sizeof(got));
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+
+    /* a. the default: up, LS = RUN, no DE */
+    v = stix_qom_get_bool(qts, path, "link-down", &ok);
+    g_assert_true(ok);
+    g_assert_false(v);
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_RUN);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE, ==, 0);
+
+    /* b. down: LS = READY, DE, IRQ 13 at once */
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert_true(stix_qom_get_bool(qts, path, "link-down", &ok));
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_READY);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE,
+                     ==, SPW_STATUS_DE);
+    g_assert_true(spw_irq_pending(qts));
+    /* setting it again is no new entry: no IRQ */
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert_false(spw_irq_pending(qts));
+
+    /*
+     * c. the ISR's DE clear works (W1C), SPW_open's status clear write
+     * (LS field 0, SPW.c:549-558) leaves LS at READY, and 1 s later DE
+     * and IRQ 13 are back
+     */
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_DE);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE, ==, 0);
+    qtest_writel(qts, SPW_STATUS, 0x3ffu);
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_READY);
+    qtest_writel(qts, SPW_STATUS, 0xffffffffu);
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_READY);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_clock_step(qts, NSEC_PER_SEC / 2);
+    g_assert_false(spw_irq_pending(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE, ==, 0);
+    qtest_clock_step(qts, NSEC_PER_SEC / 2 + 1000);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE,
+                     ==, SPW_STATUS_DE);
+    g_assert_true(spw_irq_pending(qts));
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_READY);
+
+    /* d. no time codes while down; the timecodes value is untouched */
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO | SPW_STATUS_DE);
+    tc_step_rollover(qts);
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO, ==, 0);
+    g_assert_true(stix_qom_get_bool(qts, path, "timecodes", &ok));
+
+    /* e. RX is held: buffer untouched, desc0 armed, no PR; RD retries too */
+    g_assert(stix_rx_inject(qts, path, tc0, sizeof(tc0)));
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN); /* RD: retry */
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(got));
+    g_assert_cmpuint(got[0], ==, RX_GUARD);
+    g_assert_cmpuint(qtest_readl(qts, RXDSC_ADDR) & SPW_RXDSC_EN,
+                     ==, SPW_RXDSC_EN);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR, ==, 0);
+    g_assert_cmpint(stix_qom_rx_dropped(qts, path), ==, 0);
+
+    /*
+     * f. a TX waits: TE stays, the descriptor stays armed, no PS, no
+     * datagram. The descriptor has no IE, so the IRQ at the clear (i)
+     * can only come from the RX delivery.
+     */
+    qtest_memwrite(qts, TXDATA_ADDR, tm_full, sizeof(tm_full));
+    qtest_writel(qts, TXDSC_ADDR + 0, TXDSC_EN | TXDSC_WR);
+    qtest_writel(qts, TXDSC_ADDR + 4, 0);
+    qtest_writel(qts, TXDSC_ADDR + 8, sizeof(tm_full));
+    qtest_writel(qts, TXDSC_ADDR + 12, TXDATA_ADDR);
+    qtest_writel(qts, SPW_DMATxDesc, TXDSC_ADDR);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) &
+                     (SPW_DMA_TE | SPW_DMA_PS), ==, SPW_DMA_TE);
+    g_assert_cmpuint(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, TXDSC_EN);
+    g_usleep(100 * 1000);
+    errno = 0;
+    g_assert_cmpint(recv(tm_fd, dg, sizeof(dg), MSG_DONTWAIT), ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+
+    /* g. LI = 0: DE re-sets, no IRQ */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_LI);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_DE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_clock_step(qts, NSEC_PER_SEC + 1000);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE,
+                     ==, SPW_STATUS_DE);
+    g_assert_false(spw_irq_pending(qts));
+
+    /*
+     * h. LI with IE = 0: no IRQ, latched; the IE 0->1 write pulses it
+     * and does not release the held RX unit
+     */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_IE);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_DE);
+    qtest_clock_step(qts, NSEC_PER_SEC + 1000);
+    g_assert_false(spw_irq_pending(qts));
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    g_assert_true(spw_irq_pending(qts));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(got));
+    g_assert_cmpuint(got[0], ==, RX_GUARD);
+
+    /*
+     * i. clear: LS = RUN; the held unit is delivered (PR, IRQ — the TX
+     * descriptor has no IE) and the waiting TX completes (PS, EN
+     * cleared, its bytes on the UDP TM port); no more DE afterwards
+     */
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_DE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", false));
+    g_assert_false(stix_qom_get_bool(qts, path, "link-down", &ok));
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_RUN);
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(got));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR,
+                     ==, SPW_DMA_PR);
+    g_assert_true(spw_irq_pending(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) &
+                     (SPW_DMA_TE | SPW_DMA_PS), ==, SPW_DMA_PS);
+    g_assert_cmpuint(qtest_readl(qts, TXDSC_ADDR) & TXDSC_EN, ==, 0);
+    g_assert_cmpint(stix_udp_recv(tm_fd, dg, sizeof(dg), NULL),
+                    ==, (ssize_t)sizeof(tm_full) - 4);
+    g_assert_cmpint(memcmp(dg, tm_full + 4, sizeof(tm_full) - 4), ==, 0);
+    qtest_clock_step(qts, 2 * NSEC_PER_SEC);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE, ==, 0);
+
+    /* j. time codes resume at the next rollover */
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+
+    /*
+     * k. timecodes=false, then a link outage: the clear does not
+     * re-enable the codes; timecodes=true while down waits for the clear
+     */
+    g_assert_true(stix_qom_set_bool(qts, path, "timecodes", false));
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", false));
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO, ==, 0);
+    g_assert_false(stix_qom_get_bool(qts, path, "timecodes", &ok));
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert_true(stix_qom_set_bool(qts, path, "timecodes", true));
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO, ==, 0);
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", false));
+    tc_step_rollover(qts);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO,
+                     ==, SPW_STATUS_TO);
+
+    /*
+     * m. a clear while control.IE = 0 (the SPW_send window) keeps the
+     * held unit back (M1 of the P2-5 review); the IE edge delivers it
+     * with the IRQ
+     */
+    stix_rx_setup(qts);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_PR);
+    memset(got, RX_GUARD, sizeof(got));
+    qtest_memwrite(qts, RXBUF_BASE, got, sizeof(got));
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert(stix_rx_inject(qts, path, tc0, sizeof(tc0)));
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_IE);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", false));
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(got));
+    g_assert_cmpuint(got[0], ==, RX_GUARD);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR, ==, 0);
+    g_assert_false(spw_irq_pending(qts));
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    qtest_memread(qts, RXBUF_BASE, got, sizeof(got));
+    g_assert_cmpint(memcmp(got, tc0, sizeof(tc0)), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR,
+                     ==, SPW_DMA_PR);
+    g_assert_true(spw_irq_pending(qts));
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_DE);
+
+    /* l. a system reset clears link-down: LS = RUN, no DE later */
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", true));
+    qtest_system_reset(qts);
+    g_assert_false(stix_qom_get_bool(qts, path, "link-down", &ok));
+    g_assert_true(ok);
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_RUN);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    qtest_clock_step(qts, 2 * NSEC_PER_SEC);
+    g_assert_cmpuint(qtest_readl(qts, SPW_STATUS) & SPW_STATUS_DE, ==, 0);
+
+    qtest_quit(qts);
+    close(tm_fd);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -4400,6 +4654,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/powerstat", test_powerstat);
         qtest_add_func("/sparc/stix/adc-inject", test_adc_inject);
         qtest_add_func("/sparc/stix/hk-prot", test_hk_prot);
+        qtest_add_func("/sparc/stix/spw-link-down", test_spw_link_down);
     }
 
     return g_test_run();

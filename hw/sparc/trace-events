@@ -71,6 +71,9 @@ stixspw_rx_truncated(uint32_t len, uint32_t n) "RX unit truncated: %u -> %u byte
 stixspw_rx_retry(uint32_t pending) "RX queue retry: pending=%u"
 stixspw_timecode_emit(uint32_t coarse, uint32_t timecnt) "time code emitted: coarse=0x%08x timecnt=%u"
 stixspw_timecode_skip(uint32_t coarse, uint32_t fine) "time code skipped: coarse=0x%08x fine=%u >= 0x1000"
+stixspw_link_down(bool down, uint32_t rx_queued) "link-down=%d (RX units queued %u)"
+stixspw_link_error(uint32_t status, bool li, bool ie) "link error: status=0x%08x LI=%d IE=%d"
+stixspw_tx_link_wait(void) "TE while the link is down: the exchange waits for the link"
 stixspw_timecode_arm(uint32_t coarse, uint32_t fine, int64_t ns) "time-code timer armed: coarse=0x%08x fine=%u next rollover in %"PRId64" ns"
 
 # tmtc_io_server.c (STIX)

@@ -47,7 +47,8 @@
  * Register write rules (StixIdpu.h bit positions; FSW contract in
  * recon-phase2-fsw-rx §1.2):
  * - status: TO/CE/ER/DE/PE/WE/IA/EE are write-1-to-clear; LS (23:21)
- *   stays at RUN and nothing in the model sets the error bits.
+ *   is not writable: it reads RUN, or READY while link-down is set
+ *   (P4-5, D-P4e), which is also the only source of DE.
  * - dmaControl: PR/PS/TA/RA are write-1-to-clear; TE/RE/TI/RI/AI/RD/
  *   NS/LE latch as written; RX (bit 10) is the read-only reception
  *   status and AT (bit 9) a self-clearing strobe — the model never
@@ -56,6 +57,12 @@
  *   0xFFFE01E0 reads back 0 (SPW.c:531-542).
  */
 #define SPW_STATUS_RUN 0xA00000u
+/* D-P4e: LS = READY (2), the only value FDIR.c:711 counts as a link error */
+#define SPW_STATUS_READY 0x400000u
+#define SPW_STATUS_LS_FIELD \
+    (STIXSPW_STATUS_LS_MASK << STIXSPW_STATUS_LS)
+/* D-P4e: DE and the error IRQ repeat once a second while the link is down */
+#define SPW_LINK_ERR_PERIOD_NS 1000000000LL
 #define SPW_STATUS_W1C_MASK                                    \
     ((1u << STIXSPW_STATUS_TO) | (1u << STIXSPW_STATUS_CE) |   \
      (1u << STIXSPW_STATUS_ER) | (1u << STIXSPW_STATUS_DE) |   \
@@ -141,6 +148,17 @@ struct STIXSPW
     QEMUTimer *tc_timer;
 
     /*
+     * D-P4e (P4-5): link-down is runtime-settable (qom-set) and cleared
+     * at reset. While set, LS reads READY, DE and the link-error IRQ
+     * repeat on link_timer, time codes stop, RX units stay queued and
+     * a TE waits (practically never reached by the FSW: SPW_send
+     * checks LS first, SPW.c:692-696; only a qom-set landing between
+     * SPW.c:693 and :725 gets here).
+     */
+    bool link_down;
+    QEMUTimer *link_timer;
+
+    /*
      * TMTC transport state (D-N); the fds are -1 while the server is
      * off
      */
@@ -150,6 +168,7 @@ struct STIXSPW
 static uint8_t buffer[8192];
 
 static void stixspw_rx_deliver(STIXSPW *s, const uint8_t *buf, int len);
+static void grlib_stixspw_tx(STIXSPW *stixspw);
 
 /*
  * A whole TC unit arrived from the transport (TCP D-K framing, or one
@@ -290,7 +309,8 @@ static void stixspw_rx_deliver(STIXSPW *s, const uint8_t *buf, int len)
     if (len <= 0) {
         return;
     }
-    if (s->rx_count == 0) {
+    /* D-P4e: no unit crosses a down link; it waits in the queue */
+    if (s->rx_count == 0 && !s->link_down) {
         StixSpwRxResult r = stixspw_rx_deliver_one(s, buf, len);
 
         if (r == STIXSPW_RX_DELIVERED) {
@@ -327,7 +347,7 @@ static void stixspw_rx_deliver(STIXSPW *s, const uint8_t *buf, int len)
  */
 static void stixspw_rx_retry(STIXSPW *s)
 {
-    if (s->rx_count == 0) {
+    if (s->rx_count == 0 || s->link_down) {
         return;
     }
     trace_stixspw_rx_retry(s->rx_count);
@@ -359,8 +379,12 @@ static void stixspw_tc_arm(STIXSPW *s)
     uint16_t fine;
     int64_t now, ns_into;
 
-    /* m3: pre-realize (or timecodes=off) there is nothing to arm */
-    if (!s->timecodes || s->scet_ctrl == NULL || s->tc_timer == NULL) {
+    /*
+     * m3: pre-realize (or timecodes=off) there is nothing to arm; D-P4e:
+     * no time codes cross a down link, the clear re-arms
+     */
+    if (!s->timecodes || s->link_down || s->scet_ctrl == NULL ||
+        s->tc_timer == NULL) {
         return;
     }
     stixctrl_scet_now(s->scet_ctrl, &coarse, &fine);
@@ -391,7 +415,7 @@ static void stixspw_tc_timer(void *opaque)
     uint32_t coarse;
     uint16_t fine;
 
-    if (!s->timecodes) {
+    if (!s->timecodes || s->link_down) {
         return; /* silenced at run time; the property re-arms */
     }
 
@@ -424,6 +448,76 @@ static void stixspw_tc_timer(void *opaque)
         }
     }
     stixspw_tc_arm(s);
+}
+
+/*
+ * D-P4e: one link error while the link is down. DE (re-)sets — the ISR
+ * clears it with a write-1 (SPW.c:227-233) and the next period brings
+ * it back — and IRQ 13 is raised when control.LI is set, gated by
+ * control.IE with the D-M latch like every other source.
+ */
+static void stixspw_link_error(STIXSPW *s)
+{
+    bool li = s->reg.control & (1u << STIXSPW_CONTROL_LI);
+    bool ie = s->reg.control & (1u << STIXSPW_CONTROL_IE);
+
+    s->reg.status |= (1u << STIXSPW_STATUS_DE);
+    trace_stixspw_link_error(s->reg.status, li, ie);
+    if (li) {
+        if (ie) {
+            qemu_irq_pulse(s->irq);
+        } else {
+            s->irq_latched = true;
+            trace_stixspw_irq_latched();
+        }
+    }
+}
+
+static void stixspw_link_timer(void *opaque)
+{
+    STIXSPW *s = opaque;
+
+    if (!s->link_down) {
+        return;
+    }
+    stixspw_link_error(s);
+    timer_mod_ns(s->link_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                SPW_LINK_ERR_PERIOD_NS);
+}
+
+/*
+ * D-P4e: take the link down or bring it back (the link-down property).
+ * The clear runs the TX and the RX DMA outside an MMIO dispatch (from
+ * QMP); a guest daddr at this device's MMIO nests one write at most,
+ * the same bound as the TCP/UDP RX path.
+ * Down: LS = READY, a link error at once and then every second, time
+ * codes stopped. Up: LS = RUN (DE stays until the guest clears it, as
+ * W1C), the time codes re-arm if timecodes is true, a TE that waited
+ * runs, and the queued RX units are delivered.
+ */
+static void stixspw_set_link(STIXSPW *s, bool down)
+{
+    if (s->link_down == down) {
+        return;
+    }
+    s->link_down = down;
+    trace_stixspw_link_down(down, s->rx_count);
+    s->reg.status &= ~SPW_STATUS_LS_FIELD;
+    if (down) {
+        s->reg.status |= SPW_STATUS_READY;
+        if (s->tc_timer != NULL) {
+            timer_del(s->tc_timer);
+        }
+        stixspw_link_timer(s);
+        return;
+    }
+    s->reg.status |= SPW_STATUS_RUN;
+    timer_del(s->link_timer);
+    stixspw_tc_arm(s);
+    if (s->reg.dmaControl & (1u << STIXSPW_DMACONTROL_TE)) {
+        grlib_stixspw_tx(s);
+    }
+    stixspw_rx_retry(s);
 }
 
 #define STIXSPW_REG_WORDS (sizeof(stixSpwRegs_s) / sizeof(uint32_t))
@@ -597,7 +691,7 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value,
             }
         }
         break;
-    case 1: /* status: W1C, LS stays RUN */
+    case 1: /* status: W1C, LS is read-only (RUN, or READY while down) */
         stixspw->reg.status &= ~(SPW_STATUS_W1C_MASK & val);
         break;
     case 8: /* dmaControl: W1C + latch, reserved bits read 0 */
@@ -609,8 +703,14 @@ static void grlib_stixspw_write(void *opaque, hwaddr addr, uint64_t value,
         updated &= ~SPW_DMACONTROL_RESERVED_MASK;
         stixspw->reg.dmaControl = updated;
 
-        /* the exchange runs only on a dmaControl write with TE set */
-        if (val & (1u << STIXSPW_DMACONTROL_TE)) {
+        /*
+         * the exchange runs only on a dmaControl write with TE set;
+         * D-P4e: while the link is down TE stays set and the exchange
+         * runs when the link comes back (the GRSPW waits for Run)
+         */
+        if ((val & (1u << STIXSPW_DMACONTROL_TE)) && stixspw->link_down) {
+            trace_stixspw_tx_link_wait();
+        } else if (val & (1u << STIXSPW_DMACONTROL_TE)) {
             trace_stixspw_data_exchange();
             grlib_stixspw_tx(stixspw);
         }
@@ -720,6 +820,8 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
 
     STIXSPW->tc_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixspw_tc_timer,
                                      STIXSPW);
+    STIXSPW->link_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixspw_link_timer,
+                                       STIXSPW);
     if (STIXSPW->timecodes) {
         stixspw_tc_arm(STIXSPW);
     }
@@ -744,6 +846,11 @@ static void grlib_stixspw_unrealize(DeviceState *dev)
         timer_del(STIXSPW->tc_timer);
         timer_free(STIXSPW->tc_timer);
         STIXSPW->tc_timer = NULL;
+    }
+    if (STIXSPW->link_timer != NULL) {
+        timer_del(STIXSPW->link_timer);
+        timer_free(STIXSPW->link_timer);
+        STIXSPW->link_timer = NULL;
     }
     stix_tmtc_cleanup(&STIXSPW->tmtc);
     stixspw_rx_queue_clear(STIXSPW);
@@ -833,6 +940,23 @@ static void grlib_stixspw_set_timecodes(Object *obj, bool value, Error **errp)
     }
 }
 
+static bool grlib_stixspw_get_link_down(Object *obj, Error **errp)
+{
+    return GRLIB_STIXSPW(obj)->link_down;
+}
+
+static void grlib_stixspw_set_link_down(Object *obj, bool value, Error **errp)
+{
+    STIXSPW *s = GRLIB_STIXSPW(obj);
+
+    /* runtime-only: a reset (including the one at machine start) clears it */
+    if (!DEVICE(obj)->realized) {
+        error_setg(errp, "link-down can only be set at run time (qom-set)");
+        return;
+    }
+    stixspw_set_link(s, value);
+}
+
 static void grlib_stixspw_instance_init(Object *obj)
 {
     STIXSPW *STIXSPW = GRLIB_STIXSPW(obj);
@@ -864,6 +988,10 @@ static void grlib_stixspw_instance_init(Object *obj)
     object_property_add_bool(obj, "timecodes",
                              grlib_stixspw_get_timecodes,
                              grlib_stixspw_set_timecodes);
+    /* D-P4e: SpW link fault injection, runtime-only like timecodes */
+    object_property_add_bool(obj, "link-down",
+                             grlib_stixspw_get_link_down,
+                             grlib_stixspw_set_link_down);
 }
 
 static void grlib_stixspw_reset(DeviceState *d)
@@ -880,6 +1008,14 @@ static void grlib_stixspw_reset(DeviceState *d)
     STIXSPW->irq_latched = false;
     stixspw_rx_queue_clear(STIXSPW);
     STIXSPW->rx_index = 0;
+    /* D-P4e: a reset brings the link back up (no TX or RX is left) */
+    if (STIXSPW->link_down) {
+        trace_stixspw_link_down(false, 0);
+    }
+    STIXSPW->link_down = false;
+    if (STIXSPW->link_timer != NULL) {
+        timer_del(STIXSPW->link_timer);
+    }
 
     /*
      * D-J (correction 16): the time-code timer survives a reset — the

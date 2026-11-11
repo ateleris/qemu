@@ -1854,3 +1854,171 @@ normal ELF, fresh flash per run, under the 21000 flock):
   change). The shared flash mtimes are unchanged
   (`/tmp/stix-uprev-run` 2026-11-10 13:05:54, `/tmp/stix-baseline-run`
   2026-11-09 15:30:10).
+
+## 29. SpW link-down injection (baseline: the link is always up)
+
+**Baseline:** status.LS always read RUN (5) and nothing set DE or any
+other link-error bit. The FSW's SpW link FDIR (`SPW_callbackLink`,
+`FDIR_SpWLinkFailure`, TMBuffer's 10 s report) was dead code in the
+model.
+
+SPW.c below is the ASW tree's `ASW/BSW_ASW/src/BSW/SPW/SPW.c`.
+
+**Model (P4-5, D-P4e):** stixspw has a runtime bool `link-down`
+(`qom-set /machine/stixspw link-down true|false`, like `timecodes`).
+- Runtime-only: a set before realize is refused, and a device reset
+  (a system reset, including the watchdog's) clears it.
+- **While it is true:**
+  - status.LS reads READY (2). The guest cannot change it: status
+    writes are W1C only, so SPW_open's clear write (LS field 0,
+    SPW.c:549-558) leaves READY.
+  - DE (status bit 3) is set on entry and again every 1 s
+    (`QEMU_CLOCK_VIRTUAL`). It stays W1C: the ISR's clear
+    (SPW.c:227-233) works, and the next period sets it again.
+  - With each DE, IRQ 13 is raised when control.LI (bit 9) is set,
+    gated by control.IE (bit 3) with the D-M latch (LI with IE = 0
+    latches, and the IE 0 -> 1 write pulses it). SPW_open sets IE|LI
+    (SPW.c:567-570). This is the primary detection path.
+  - Time codes stop: the timer is cancelled and re-arming is blocked.
+    The `timecodes` value itself is not changed.
+  - RX units from the wire (TCP, UDP or `rx-inject`) wait in the
+    existing 64-unit no-spill queue. The RD write and the IE edge do
+    not release them. Overflow drops and counts as before
+    (`rx-dropped`).
+  - **TX (choice):** a dmaControl write with TE leaves TE set and sends
+    nothing. The descriptor stays armed and PS is not set. The exchange
+    runs when the link comes back, as a GRSPW waits for Run when the
+    abort-on-link-error bit (dmaControl.LE) is clear, and the FSW never
+    sets it. The FSW practically never reaches this path: SPW_send
+    returns `E_SPW_RES_ERROR_LINK` before arming the descriptor when
+    LS != RUN (SPW.c:692-696), so TMBuffer keeps the TM queued and
+    retries every 1 s (TMBuffer.c:924-933). Only a qom-set that lands
+    between SPW.c:693 and :725 reaches it, and the model handles that
+    case: TE waits.
+- **On false:**
+  - LS reads RUN. DE stays until the guest clears it.
+  - The link-error timer stops.
+  - Time codes re-arm, but only if `timecodes` is true.
+  - A waiting TE exchange runs, then the queued RX units are delivered.
+- Setting the current value again is a no-op (no new entry IRQ).
+- **Re-entrancy:** the clear runs the TX and the RX DMA from QMP,
+  outside an MMIO dispatch. A guest daddr at the device's own MMIO
+  nests at most one write. This is the same bound as the existing
+  TCP/UDP RX path.
+- Traces: `stixspw_link_down` (also on a reset that brings the link
+  up), `stixspw_link_error` and `stixspw_tx_link_wait`.
+
+**Deviations:**
+- A real GRSPW with autostart cycles through ErrorReset, ErrorWait,
+  Ready, Started and Connecting while the far end is gone. Only Run is
+  stable. The model pins READY, because that is the only value the
+  FSW's FDIR counts (below). The other error bits (CE, ER, PE, EE) are
+  never set.
+- The 1 s DE/IRQ period is a model choice. The real reconnect attempts
+  come at the link's timing (about 12.8 µs per ErrorWait), so the ISR
+  would run far more often. The FSW cannot tell the difference: it
+  needs only one error past its 10 s transient window.
+- RX units that arrive during the outage are delivered after it. On
+  real HW the ground could not send them at all.
+- dmaControl.LE (abort on link error) is ignored: a TE always waits. The
+  FSW never sets LE. A real GRSPW with LE = 1 would abort the TX
+  instead of waiting.
+
+**FSW behaviour (observed, not modelled around): FDIR.c:711 counts only
+LS == READY.** `FDIR_SpWLinkFailure` ignores every status except
+`E_SPW_RES_ERROR_LINK`. That constant belongs to the `SPW_result_e`
+enum, but it is compared with an `SPW_linkStatus_e` value. Its value
+equals READY (2), so an outage seen as ErrorReset (0), ErrorWait (1),
+Started (3) or Connecting (4) is not counted. The gate ELF has the same
+comparison (the phase-4 plan's validation). The FDIR TN means any link
+error to count (REQ-029: no communication; REQ-038: no duplicate
+reports). The code does not do that. The model follows the code, so
+the injection reads READY. Whether this is a bug or a late spec change
+is open (the released docs may differ from the product).
+
+**Seen live (the FSW reaction):**
+- The ISR calls `SPW_callbackLink(2)` once per IRQ, which calls
+  `FDIR_SpWLinkFailure(line 0, 2, external = TRUE)`.
+- The first call starts the transient window. The first call after
+  10 s sends TM(5,2) 0x5435 with param 0x48
+  (`external << 6 | READY << 2 | line 0`, FDIR.c:772).
+- About 1 s later a second 0x5435 comes. This is TMBuffer's report
+  (TMBuffer.c:940-946), 10 s after the last successful TX. Its param
+  is also **0x48**, not the 0x08 the plan expected: the ISR's next
+  call ORs `possiblyExternal` back to TRUE before TMBuffer reports
+  (FDIR.c:659, reset at :775). The gate checks neither the count nor
+  the order of the 0x5435s.
+- All TM is queued during the outage. Heartbeats are not even queued
+  (HKReport.c:145-147). Both 0x5435 and then TM(5,1) 0x142D 00 (line
+  0, FDIR.c:690-697) come out within a second of the clear. 0x142D is
+  sent at the first successful TX, which calls `FDIR_SpWLinkFailure`
+  with RUN (SpwControl.c:401).
+- The TMBuffer flash backups (TMBuffer.c:947) start after 10 s. This
+  is why fault-smoke must use its own fresh flash (§27).
+
+**Tests:** `/sparc/stix/spw-link-down` covers:
+- the default: false, LS = RUN, no DE;
+- down: LS = READY, DE and IRQ 13 at once, and a repeated set raises
+  nothing new;
+- the W1C clear of DE, then DE and the IRQ back after 1 s (not after
+  0.5 s);
+- the SPW_open status write keeps READY;
+- no time code over two rollovers, with `timecodes` still true;
+- an injected RX unit is held, even through an RD write and the IE
+  edge;
+- the status write 0xFFFFFFFF keeps READY, and DE is still clear
+  0.5 s after the W1C;
+- a TE waits: TE stays set, EN stays armed, no PS, and no datagram on
+  the UDP TM port. The descriptor has no IE, so the IRQ at the clear
+  comes from the RX delivery alone;
+- LI = 0 gives DE and no IRQ;
+- LI with IE = 0 latches, and the IE edge pulses;
+- the clear: LS = RUN, the unit is delivered (PR, IRQ), the TX
+  completes (PS, EN cleared, TE clear), its 8 bytes arrive as one UDP
+  datagram (SpW header stripped), and no DE follows. The order of TX
+  and RX at the clear (TX first) is not asserted;
+- time codes resume;
+- `timecodes` = false survives an outage, and `timecodes` = true set
+  while down waits for the clear;
+- a clear with control.IE = 0 keeps the unit held (buffer untouched,
+  PR = 0, no IRQ), and the IE edge delivers it with the IRQ;
+- a system reset clears `link-down` (LS = RUN, no DE later).
+
+RED on the pre-P4-5 binary: `link-down` is unknown
+(`stix.c:4400: 'ok' should be TRUE`). The full suite is 38 ok.
+
+**Gate:** fault-smoke (§27) gains two rows. `STIX_FAULT_SECONDS`
+(default 250) must be at least 250 (negative mode excepted, as
+before).
+
+| at | action | expected |
+|---|---|---|
+| 210 | stixspw `link-down` = true | TM(5,2) `5435 48` within 35 s (it comes after the clear) |
+| 230 | `link-down` = false | TM(5,1) `142D 00` within 10 s |
+| 250 | end (`--hold`) | — |
+
+The forbids already in force stay: 0x9434 from +95, 0x9449 from +100,
+and TM(1,2)/(1,8) for the whole run. Nothing during the outage trips
+them. `--negative` is unchanged: it fails at +40 s and stops long
+before these rows.
+
+**Gate record** (2026-11-11, worktree at 27091e745f plus this change,
+normal ELF, fresh flash per run, under the 21000 flock):
+- **Positive** (`/tmp/stix-p45-pos`): PASS, 3 min 59 s. Every earlier
+  expectation matched as before: 0x9434 at +85, `542B`, and `1429` at
+  +195.
+  - The UART shows 20 `SPW_callbackLink status = 2` (about 1/s, from
+    00:03:16.6 to 00:03:34.3), and `FDIR_SpWReportComFailure ... Link
+    Status = 2, IsPossiblyExternal = 1` at 00:03:26.9 and at
+    00:03:27.9.
+  - All three TMs arrived in one burst after the clear (11:27:48):
+    - `5435 48`, CUC coarse 0xDD, about 10 s after the down;
+    - `5435 48`, 0xDF;
+    - `142D 00`, 0xE6, at the clear.
+  - No other TM in the outage, and nothing forbidden.
+- **Negative** (`/tmp/stix-p45-neg`): PASS, with exactly
+  `not matched: 0x5A7:5:3:9449070708079f@10 0x5A7:5:4:d42000080000@10`.
+- boot-smoke PASS (the normalized UART matches the golden, so the
+  golden is unchanged).
+- The shared flash mtimes are unchanged: `/tmp/stix-uprev-run`
+  2026-11-10 13:05:54 and `/tmp/stix-baseline-run` 2026-11-09 15:30:10.

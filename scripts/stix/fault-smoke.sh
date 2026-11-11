@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FAULT smoke: the SAFE-mode fault gate (P4-3, P4-4). Boots the STIX model on
+# FAULT smoke: the SAFE-mode fault gate (P4-3, P4-4, P4-5). Boots the STIX model on
 # a FRESH flash (an empty run dir: TMBuffer flash backups during a link
 # outage write flash, and the shared flashes must stay untouched), with
 # a QMP socket in the run dir, and proves the FSW's fault detection
@@ -41,7 +41,21 @@
 #        from here any TM(5,3) 0x9449 fails the run (the limits stay
 #        tightened, the nominal 2048 / 2300 are inside them)
 #   @195 timecodes=true: TM(5,1) 0x1429 within 10 s
-#   hold to +215 s.
+#   @210 stixspw link-down=true (P4-5, D-P4e): LS reads READY, DE and
+#        IRQ 13 every 1 s, so the ISR calls SPW_callbackLink(READY)
+#        (SPW.c:227-233) -> FDIR_SpWLinkFailure(.., TRUE): the first
+#        call starts the 10 s transient window (FDIR.c:723-729), a
+#        later one past it sends TM(5,2) 0x5435 48 (external bit 1 << 6
+#        | READY 2 << 2 | line 0, FDIR.c:772). SPW_send refuses while
+#        LS != RUN (SPW.c:692-696), so TM stops (heartbeats too,
+#        HKReport.c:145-147) and the 0x5435 is queued: it comes after
+#        the clear, so its window (35 s) covers the outage. A second
+#        0x5435 (TMBuffer's 10 s report, TMBuffer.c:940-946; seen as 48
+#        too, the ISR re-sets the external flag) may come; neither the
+#        count nor the order is checked
+#   @230 link-down=false: TM(5,1) 0x142D 00 (link restored, line 0,
+#        FDIR.c:690-697, sent at the first successful TX) within 10 s
+#   hold to +250 s.
 # Why the count TCs: the SW-limit TM goes out when the consecutive
 # out-of-limit count EQUALS hkLineLimits[line].count (HKMonitor.c:467;
 # checks every 1 s). ParamMgmtDef.h gives 3 (value, range 1..255), but
@@ -77,7 +91,7 @@
 #                          (or /) is refused, as in nominal-smoke.sh.
 #                          The QMP socket is <run dir>/qmp.sock and its
 #                          path must stay under 108 bytes.
-#   STIX_FAULT_SECONDS     the probe's --seconds (default 215)
+#   STIX_FAULT_SECONDS     the probe's --seconds (default 250)
 #   --dry-run prints the QEMU and probe command lines, boots nothing.
 #   --check-guard only runs the run-dir guard and exits 0/2.
 #
@@ -110,7 +124,7 @@ done
 ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_FAULT_RUN_DIR:-/tmp/stix-fault-run}"
-DURATION="${STIX_FAULT_SECONDS:-215}"
+DURATION="${STIX_FAULT_SECONDS:-250}"
 PROBE="$REPO_ROOT/scripts/stix/tmtc-probe.py"
 TMTC_PORT=$((20000 + $(id -u)))
 
@@ -163,9 +177,9 @@ case "$DURATION" in
         exit 2
         ;;
 esac
-if [ "$DURATION" -lt 215 ] && [ "$NEGATIVE" -eq 0 ]; then
-    echo "STIX_FAULT_SECONDS must be >= 215 (the 0x1429 window ends" \
-        "at +205 s; got: $DURATION)"
+if [ "$DURATION" -lt 250 ] && [ "$NEGATIVE" -eq 0 ]; then
+    echo "STIX_FAULT_SECONDS must be >= 250 (the 0x5435 window ends" \
+        "at +245 s; got: $DURATION)"
     exit 2
 fi
 
@@ -205,7 +219,8 @@ fi
 # data (EID first) as a prefix. Payloads: TM_5.c sizes 0x122 for 0x9449
 # (id u8, value u16, limit u16; utils.c:576, high nibble first), the
 # same for 0x9434 (TM_5.c:342-344), 0xD420 one u32 mask (TM_5.c:422),
-# 0x542B / 0x1429 none. The 0x9434 ids (HKData.h:155-170): 01 1V5_C
+# 0x542B / 0x1429 none, 0x5435 / 0x142D one u8 (FDIR.c:696, :772). The
+# 0x9434 ids (HKData.h:155-170): 01 1V5_C
 # (and 2V5_C, FDIR.c:869), 03 3V3_C, 04 SPW_C, 05 DET_C, 06 ATT_C,
 # 0c ATT_V, 0d HV_01, 0e HV_17.
 PROBE_ARGS=(
@@ -250,6 +265,10 @@ PROBE_ARGS=(
     --forbid "0x5A7:5:3:9449"
     --send-at 195 --qmp-cmd "$(qom_set /machine/stixspw timecodes true)"
     --expect "0x5A7:5:1:1429@10"
+    --send-at 210 --qmp-cmd "$(qom_set /machine/stixspw link-down true)"
+    --expect "0x5A7:5:2:543548@35"
+    --send-at 230 --qmp-cmd "$(qom_set /machine/stixspw link-down false)"
+    --expect "0x5A7:5:1:142d00@10"
     --hold
 )
 
