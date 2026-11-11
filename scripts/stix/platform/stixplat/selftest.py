@@ -1997,8 +1997,13 @@ def t_relay(env):
         got = [gs.recvfrom(4096)[0] for _ in units]
         check(got == [u[4:] for u in units], "relay not byte-identical")
         wait_for(lambda: ctl.plat.relay.tm_count == 5, what="5 TMs")
-        with open(os.path.join(ctl.run_dir, "tm.jsonl")) as f:
-            lines = [json.loads(x) for x in f]
+
+        def tm_lines():
+            with open(os.path.join(ctl.run_dir, "tm.jsonl")) as f:
+                return [json.loads(x) for x in f if x.endswith("\n")]
+        # the count goes up before the line is written: wait for it
+        wait_for(lambda: len(tm_lines()) >= 5, what="5 tm.jsonl lines")
+        lines = tm_lines()
         check([x["hex"] for x in lines] == [u[4:].hex() for u in units],
               "tm.jsonl")
         check(sum(r.kind == "tm" for r in ctl.log.since(0)) == 5,
