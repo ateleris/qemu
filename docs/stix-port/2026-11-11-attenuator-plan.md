@@ -1125,3 +1125,12 @@ Q1-Q6 remain open for the user (see "Open questions for the user").
 - The PL-2a split landed as `stixctrl_hk_truth()` (true value) and `stixctrl_hk_value()` (presented value); this plan now uses those names.
 - The platform `hw-state` getter calls both functions for every HK table channel on every controller poll (2-20 Hz). The attenuator truth/presented functions (`stix_att_hk_att_c()` and the 0x5C state) must therefore be **strictly pure**: no lazy state advance that changes later results, no trace event, no IRQ. Compute the lazy state as a function of `QEMU_CLOCK_VIRTUAL`, so an extra read changes nothing. Add a qtest that reads hw-state many times during a move and checks the move timing and the trace are unchanged.
 - **User answer, Q3 (2026-11-11):** a move takes "usually 1 second-ish". `att-travel-ms` defaults to 1000 and stays a knob. The FSW's 1.6 s drive window and 3.2 s give-up leave margin. The motor currents are still unknown; the [A] values stand.
+
+## Blocking change from the flash-latency plan (2026-11-11)
+
+The PFM ELFs boot in QEMU only once the flash latency model (flash-latency plan F-3, branch stix-uprev-flash) has landed. With it, PFM reaches FS-ready (TM(5,1) 0x0032) at ≈26 s or later; that figure is a lower bound. The PFM sequence of att-smoke must therefore:
+- anchor on events, not fixed times: wait for 0x0032, then 0x142E;
+- send CONF only after 0x142E;
+- fail clearly (not time out silently) if 0x142E has not arrived within the flash plan's limit.
+
+The old "0x14A3 within 30 s, CONF @35" sequence is void. The PFM ELFs live in /home/laszlo/dev/stix-elf/ (see PROVENANCE.md there). The attenuator's PFM work starts after flash F-3.
