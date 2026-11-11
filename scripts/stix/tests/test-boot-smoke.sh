@@ -9,6 +9,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SMOKE="$REPO_ROOT/scripts/stix/boot-smoke.sh"
 FAKE="$REPO_ROOT/scripts/stix/tests/fake-qemu.sh"
 FAKE_ABS="$(cd "$(dirname "$FAKE")" && pwd)/$(basename "$FAKE")"
+# Review S5: the gates' "port busy" check uses ss; a stub reports no
+# listener, so these fake-QEMU cases pass while another track's real QEMU
+# holds 20000+uid (nothing here binds a port).
+export PATH="$REPO_ROOT/scripts/stix/tests/stub-bin:$PATH"
 PASS=0
 FAIL=0
 

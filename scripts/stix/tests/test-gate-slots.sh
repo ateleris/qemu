@@ -15,14 +15,18 @@
 #
 # Slot mode uses STIX_PORT_BASE=1 with a temporary lock dir and a fake
 # master flash; the real locks and the shared flash.bin files are never
-# touched. The legacy cases check port 20000+uid with ss like the real
-# gates, so run this under /tmp/stix-qtest-21000.lock.
+# touched. The legacy cases run the real gates' ss port check against a
+# stub (stub-bin/ss), so no 21000 lock is needed.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 S="$REPO_ROOT/scripts/stix"
 FAKE="$S/tests/fake-qemu.sh"
 FPROBE="$S/tests/fake-probe.py"
+# Review S5: the gates' "port busy" check uses ss; a stub reports no
+# listener, so these fake-QEMU cases pass while another track's real QEMU
+# holds 20000+uid (nothing here binds a port).
+export PATH="$REPO_ROOT/scripts/stix/tests/stub-bin:$PATH"
 REF="${STIX_LEGACY_REF:-2721343939}"
 UIDB=$((20000 + $(id -u)))
 B1=$((UIDB + 100))

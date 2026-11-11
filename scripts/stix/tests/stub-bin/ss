@@ -1,0 +1,5 @@
+#!/bin/sh
+# ss stand-in for the fake-QEMU tests (review S5): an empty listening
+# table, so the gates' "TMTC port busy" check passes even while another
+# track's real QEMU holds 20000+uid. Nothing in these tests binds a port.
+echo "State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process"
