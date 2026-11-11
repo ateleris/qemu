@@ -1,10 +1,26 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # The v1 fault catalogue (platform plan D-PLq). JSON; whole-line "#"
 # comments are allowed, as in QEMU's QAPI files.
+#
+# "changes": truth for a physical failure (the platform stops sending,
+# a link carries nothing), presented for a wrong reading (the HK ADC
+# forcings): the attenuator plan's amendment to D-PLo.
+#
+# Reserved for the attenuator track (its plan's fault catalogue; they
+# arrive as "qom" actions on /machine/stixctrl*):
+#   attenuator.sensor_ab.stuck_open, attenuator.sensor_ab.stuck_closed,
+#   attenuator.sensor_bc.stuck_open, attenuator.sensor_bc.stuck_closed,
+#   attenuator.motor1.dead, attenuator.motor2.dead,
+#   attenuator.mechanism.jammed, attenuator.current.zero,
+#   attenuator.current.offset;
+#   later: attenuator.move.slow, attenuator.mechanism.partial,
+#   attenuator.motor1.flag_lost, attenuator.motor2.flag_lost,
+#   attenuator.controller.fail_flag, attenuator.current.scale.
 {
   "api": 1,
   "faults": [
     {"id": "spw.link.disconnect", "class": "link",
+     "changes": "truth",
      "target": "platform.spw.link", "mode": "disconnect", "params": {},
      "persistence": "until_cleared", "reversible": true,
      "action": {"kind": "link_down"},
@@ -13,12 +29,14 @@
        {"tm": "0x5A7:5:2:542b", "within_s": 70,
         "note": "no time code for 60 s: time unsynchronised"}]},
     {"id": "timecode.missing", "class": "timing",
+     "changes": "truth",
      "target": "platform.timecode.enabled", "mode": "drop", "params": {},
      "persistence": "until_cleared", "reversible": true,
      "action": {"kind": "timecodes_off"},
      "preconditions": [],
      "expected_detection": [{"tm": "0x5A7:5:2:542b", "within_s": 70}]},
     {"id": "timecode.wrong_value", "class": "timing",
+     "changes": "truth",
      "target": "platform.timecode", "mode": "wrong_value",
      "params": {"timecnt": {"type": "integer", "min": 0, "max": 63,
                             "default": 0, "unit": "TIMECNT",
@@ -26,7 +44,8 @@
      "persistence": "transient", "reversible": false,
      "action": {"kind": "timecode_inject"},
      "preconditions": [], "expected_detection": []},
-    {"id": "obt.jump", "class": "timing", "target": "platform.obt",
+    {"id": "obt.jump", "class": "timing",
+     "changes": "truth", "target": "platform.obt",
      "mode": "offset",
      "params": {"delta_s": {"type": "integer", "min": -86400,
                             "max": 86400, "default": 32, "unit": "s"}},
@@ -34,12 +53,14 @@
      "action": {"kind": "obt_jump"},
      "preconditions": [], "expected_detection": []},
     {"id": "keepalive.missing", "class": "signal",
+     "changes": "truth",
      "target": "platform.keepalive", "mode": "drop", "params": {},
      "persistence": "until_cleared", "reversible": true,
      "action": {"kind": "keepalive_off"},
      "preconditions": [],
      "expected_detection": [{"tm": "0x5A7:5:1:142e", "within_s": 40}]},
     {"id": "power.dpu_1v5.undervoltage", "class": "component",
+     "changes": "presented",
      "target": "instrument.hk_adc.24", "mode": "stuck_at",
      "params": {"value": {"type": "integer", "min": 0, "max": 4095,
                           "default": 1800, "unit": "adc",
@@ -50,6 +71,7 @@
        "the DPU_1V5_V SW limit is tightened by TC(236,10) (fault-smoke)"],
      "expected_detection": [{"tm": "0x5A7:5:3:9449", "within_s": 20}]},
     {"id": "thermal.psu.overtemp", "class": "component",
+     "changes": "presented",
      "target": "instrument.hk_adc.40", "mode": "stuck_at",
      "params": {"value": {"type": "integer", "min": 0, "max": 4095,
                           "default": 3900, "unit": "adc",
@@ -60,6 +82,7 @@
        "the PSU_T SW limit is tightened by TC(236,10) (fault-smoke)"],
      "expected_detection": [{"tm": "0x5A7:5:3:9449", "within_s": 20}]},
     {"id": "hk_prot.det_c.overcurrent", "class": "component",
+     "changes": "presented",
      "target": "instrument.hk_adc.4", "mode": "stuck_at",
      "params": {"value": {"type": "integer", "min": 0, "max": 4095,
                           "default": 600, "unit": "adc",

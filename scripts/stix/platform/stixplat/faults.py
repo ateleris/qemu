@@ -4,7 +4,16 @@
 A named failure records the *intent*: an id from the JSON catalogue,
 its resolved params and seed, and its expected detection, as one
 `fault` record per inject and per clear. The action itself reuses the
-platform switches and the forcing hooks.
+platform switches and the forcing hooks, or (`qom`) sets a property of
+a STIX device, for device-level faults such as the attenuator's.
+
+What a fault changes (the attenuator plan's amendment to D-PLo, PL-4
+review SF8): a fault that models a physical failure may change *truth*
+(a dead motor stops the mechanism; a disconnected link carries
+nothing), a signal fault changes *presented* only (a sensor reads
+wrong). Each entry declares it as `changes: truth|presented`; either
+way the item shows as `fault` through `fault_ids` (D-PLp), never as a
+UI-made truth change.
 
 Lifecycle (PL-4 review SF4):
 - everything is validated before anything is marked;
@@ -33,10 +42,16 @@ CLASSES = ("component", "signal", "link", "memory", "timing")
 PERSISTENCE = ("transient", "until_cleared", "permanent", "until_write")
 LASTING = ("until_cleared", "until_write")
 ACTIONS = ("link_down", "timecodes_off", "timecode_inject", "obt_jump",
-           "keepalive_off", "adc")
+           "keepalive_off", "adc", "qom")
+CHANGES = ("truth", "presented")
+# the qom action reaches the STIX devices only (stixctrl and its
+# sub-models such as the attenuator, and stixspw)
+QOM_PATH = re.compile(r"^/machine/(stixctrl[A-Za-z0-9_-]*"
+                      r"(/[A-Za-z0-9_-]+)*|stixspw)$")
 TRIGGERS = ("now", "at_sim")
-REQUIRED = ("id", "class", "target", "mode", "params", "persistence",
-            "reversible", "action", "preconditions", "expected_detection")
+REQUIRED = ("id", "class", "changes", "target", "mode", "params",
+            "persistence", "reversible", "action", "preconditions",
+            "expected_detection")
 ADC_TARGET = re.compile(r"^instrument\.hk_adc\.(\d+)$")
 HK_CHANNELS = 128
 
@@ -68,6 +83,8 @@ def validate(cat):
         _need(fid not in seen, "duplicate fault id %r" % fid)
         seen.add(fid)
         _need(f["class"] in CLASSES, "%s: class %r" % (fid, f["class"]))
+        _need(f["changes"] in CHANGES, "%s: changes %r is not truth or "
+              "presented" % (fid, f["changes"]))
         _need(f["persistence"] in PERSISTENCE, "%s: persistence %r"
               % (fid, f["persistence"]))
         _need(isinstance(f["reversible"], bool), "%s: reversible is not "
@@ -90,6 +107,18 @@ def validate(cat):
         for d in f["expected_detection"]:
             _need(isinstance(d, dict) and "tm" in d and "within_s" in d,
                   "%s: expected_detection needs tm and within_s" % fid)
+        if act["kind"] == "qom":
+            _need(qom_path_ok(act.get("path")), "%s: qom path %r is not "
+                  "a STIX device (/machine/stixctrl*, /machine/stixspw)"
+                  % (fid, act.get("path")))
+            _need(isinstance(act.get("property"), str) and
+                  act["property"], "%s: qom property is not a string" % fid)
+            _need(act.get("param") in f["params"] or
+                  (isinstance(act.get("value"), int) and
+                   "param" not in act),
+                  "%s: qom needs a param of the entry or a value" % fid)
+            _need(isinstance(act.get("clear", 0), int), "%s: qom clear "
+                  "is not an integer" % fid)
         if act["kind"] == "adc":
             ch = act.get("ch")
             _need(isinstance(ch, int) and 0 <= ch < HK_CHANNELS,
@@ -100,6 +129,10 @@ def validate(cat):
                   "instrument.hk_adc.%d (the action's ch)"
                   % (fid, f["target"], ch))
     return cat
+
+
+def qom_path_ok(path):
+    return isinstance(path, str) and QOM_PATH.match(path) is not None
 
 
 def load(path=None):

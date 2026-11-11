@@ -349,6 +349,24 @@ class Platform:
             else:
                 self.forcing.set(adc_path(entry), prior, why=why)
 
+        def qom(entry, p):
+            a = entry["action"]
+            if not faults_mod.qom_path_ok(a["path"]):
+                raise VerbError(403, "qom path %r is not a STIX device"
+                                % a["path"])
+            q = self._q()
+            prior = None
+            if "clear" not in a:
+                prior = q.qom_get(a["path"], a["property"])
+            q.qom_set(a["path"], a["property"],
+                      p[a["param"]] if "param" in a else a["value"])
+            return prior
+
+        def qom_undo(entry, p, prior):
+            a = entry["action"]
+            self._q().qom_set(a["path"], a["property"],
+                              a["clear"] if "clear" in a else prior)
+
         def nothing(entry, p, prior=None):
             pass
 
@@ -357,7 +375,8 @@ class Platform:
                 "timecode_inject": (tc_inject, nothing),
                 "obt_jump": (obt_jump, nothing),
                 "keepalive_off": (ka_off, ka_undo),
-                "adc": (adc, adc_undo)}
+                "adc": (adc, adc_undo),
+                "qom": (qom, qom_undo)}
 
     # -- read side ------------------------------------------------------------
     def status(self):

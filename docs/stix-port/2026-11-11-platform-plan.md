@@ -837,6 +837,13 @@ TCP TMTC server: off (-global grlib-stixspw.tmtc-server=off)
     equals truth unless a forcing or a fault is active.
   - `reported`: what STIX says in TM (D-PLp).
   - **"Break a component" changes `presented`, never `truth`.**
+    **Amended (the attenuator plan's D-Ag note, adopted in the PL-4
+    review SF8):** a fault that models a physical failure may change
+    `truth` (a dead motor stops the mechanism, a disconnected link
+    carries nothing); a signal fault changes `presented` only. Each
+    catalogue entry declares `changes: truth|presented`. Either way the
+    item shows as `fault` through `fault_ids` (D-PLp), never as a truth
+    change made by the UI.
 - **Readable today, through `qom-get`, with no QEMU change:**
 
   | Item | Property |
@@ -973,8 +980,14 @@ TCP TMTC server: off (-global grlib-stixspw.tmtc-server=off)
 - **The catalogue check** reports every problem, a wrong type too, as a
   catalogue error naming the entry, and cross-checks an `adc` action's
   `ch` against its `instrument.hk_adc.<ch>` target.
-- A fault changes `presented` only (D-PLo). The comparison view then
-  shows it as `fault` straight away.
+- A fault changes `truth` or `presented`, as its `changes` field says
+  (D-PLo as amended). The comparison view shows it as `fault` straight
+  away.
+- **The `qom` action** (SF8) sets a property of a STIX device
+  (`/machine/stixctrl*` or `/machine/stixspw`, checked at load and at
+  apply) from a param or a constant, and clear sets its `clear` value
+  or the value read before the inject. The attenuator's faults arrive
+  this way; their IDs are reserved in a catalogue comment.
 
 ### D-PLr: time: QEMU's virtual clock is the single master (survey §3.5)
 - **The times in every record:**
@@ -1787,7 +1800,8 @@ changes the core.
   - `attenuator.motor2.dead`;
   - `attenuator.move.slow` (factor), which gives TIMEOUT;
   - `attenuator.current.zero` (motion with no current).
-  - Each one changes `presented` only, and its expected detection is
+  - Sensor faults change `presented`, motor and mechanism faults
+    `truth` (D-PLo as amended), and the expected detection is
     the correlation-check outcome [I: which TM carries 0x1620 and
     0x1630 is to be read in AttCtrl.c / TM_5].
 - **Prerequisites:** the register semantics from the HW/SW ICD (notes

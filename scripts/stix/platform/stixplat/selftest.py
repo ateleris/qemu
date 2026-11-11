@@ -1534,6 +1534,66 @@ def t_fault_lifecycle(env):
     check(calls.count(("apply", "obt.jump")) == n, "disarmed obt.jump ran")
 
 
+QOM_FAULT = {
+    "id": "test.qom.adc7", "class": "signal", "changes": "presented",
+    "target": "instrument.hk_adc.7", "mode": "stuck_at",
+    "params": {"value": {"type": "integer", "min": 0, "max": 4095,
+                         "default": 100}},
+    "persistence": "until_cleared", "reversible": True,
+    "action": {"kind": "qom", "path": "/machine/stixctrl",
+               "property": "adc-inject[7]", "param": "value",
+               "clear": 0xFFFFFFFF},
+    "preconditions": [], "expected_detection": []}
+
+
+def t_fault_model(env):
+    """SF8: every entry says whether it changes truth or presented (the
+    attenuator amendment), and the generic qom action reaches only the
+    STIX devices."""
+    cat = faults_mod.load()
+    check(all(f["changes"] in ("truth", "presented")
+              for f in cat["faults"]), "changes on every entry")
+    byid = {f["id"]: f for f in cat["faults"]}
+    check(byid["spw.link.disconnect"]["changes"] == "truth" and
+          byid["thermal.psu.overtemp"]["changes"] == "presented",
+          "a link fault is truth, a sensor reading presented")
+    base = {k: v for k, v in cat["faults"][0].items() if k != "changes"}
+    for broken in (base, dict(base, changes="both")):
+        raises(faults_mod.CatalogueError, faults_mod.validate,
+               {"api": 1, "faults": [broken]})
+    faults_mod.validate({"api": 1, "faults": [QOM_FAULT]})
+    for act in ({"kind": "qom", "path": "/machine/stixflash",
+                 "property": "x", "param": "value"},
+                {"kind": "qom", "path": "/machine/peripheral/stixctrl",
+                 "property": "x", "param": "value"},
+                {"kind": "qom", "path": "/machine/stixctrl/../unattached",
+                 "property": "x", "param": "value"},
+                {"kind": "qom", "path": "/machine/stixctrl",
+                 "property": 3, "param": "value"},
+                {"kind": "qom", "path": "/machine/stixctrl",
+                 "property": "x", "param": "nosuch"}):
+        raises(faults_mod.CatalogueError, faults_mod.validate,
+               {"api": 1, "faults": [dict(QOM_FAULT, action=act)]})
+    faults_mod.validate({"api": 1, "faults": [dict(QOM_FAULT, action=dict(
+        QOM_FAULT["action"], path="/machine/stixctrl-att"))]})
+    path = os.path.join(env.tmp, "cat-qom.json")
+    with open(path, "w") as f:
+        json.dump({"api": 1, "faults": [QOM_FAULT]}, f)
+    ctl = env.controller(faults={"catalogue": path})
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        ctl.command("fault.inject", {"id": "test.qom.adc7",
+                                     "params": {"value": 321}})
+        ctl.command("fault.clear", {"id": "test.qom.adc7"})
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-2:] == [["/machine/stixctrl", "adc-inject[7]", 321],
+                            ["/machine/stixctrl", "adc-inject[7]",
+                             0xFFFFFFFF]], "qom fault sets %r" % sets[-2:])
+    finally:
+        ctl.shutdown()
+
+
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
@@ -1928,6 +1988,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("platform TCs (9/20, R2)", t_platform_tcs),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
+         ("fault model: truth|presented, qom", t_fault_model),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]
