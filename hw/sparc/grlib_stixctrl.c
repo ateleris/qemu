@@ -87,6 +87,12 @@ struct STIXCTRL
      * and rollback.
      */
     bool hk_adc;
+    /*
+     * P4-1 (D-P4c): when true, hkCmdSta POWERSTAT (bits 9:5) is composed
+     * on read from the commanded enables and guest writes to it are
+     * dropped; when false it is plain storage (legacy, A/B comparison).
+     */
+    bool powerstat;
 };
 
 /*static void grlib_stixctrl_timer_tick(void *opaque)
@@ -344,10 +350,10 @@ static const MemoryRegionOps grlib_stixctrl_rotb_ops = {
  * PFM) and a flash context with flight limits do not matter. Unused
  * channels read 0. The state-dependent entries (3, 4, 12, 16, 20, 48,
  * 52) are never read — stixctrl_hk_value() overrides them; they are
- * kept as the off/base value for documentation. POWERSTAT (hkCmdSta
- * bits 9:5) is deliberately not modelled and reads 0, so the FSW's SpW
- * voltage checks (HKMonitor_spwCheck) and the ATT_V/HV checks
- * (HKMonitor_regularCheck) stay skipped.
+ * kept as the off/base value for documentation. The FSW checks the
+ * SPW0/1_V, ATT_V and HV lines only while POWERSTAT reports the supply
+ * on (HKMonitor.c:357-370); since P4-1 it does (stixctrl_hkcmdsta), and
+ * the "on" values here pass those checks.
  */
 static const uint16_t stixctrl_hk_adc_table[128] = {
     [0] = 700,   /* DPU_1V5_C, 162..2185 */
@@ -401,8 +407,8 @@ static const uint16_t stixctrl_hk_adc_table[128] = {
  * The ADC value for one channel: the static nominal table plus the
  * overrides that follow the CURRENT commanded register state (hkCmdSta
  * and idefxConfig, as they stand when the hkAdc write happens).
- * POWERSTAT (hkCmdSta bits 9:5) is neither consulted nor synthesised
- * (D-P3a).
+ * POWERSTAT (hkCmdSta bits 9:5) is not consulted: the values follow
+ * the commanded enables, which POWERSTAT mirrors (stixctrl_hkcmdsta).
  */
 static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
 {
@@ -443,6 +449,39 @@ static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
     }
 }
 
+/*
+ * P4-1 (D-P4c): hkCmdSta as the FSW reads it. POWERSTAT (bits 9:5) is
+ * the PSU power-good of the supplies (PSU.h:36-43): bit 5 LV, 6 HV01,
+ * 7 HV17, 8 SPW0, 9 SPW1, i.e. the commanded enables in bits 4:0
+ * (StixIdpu.h POWERSTAT_V_*). The model has no power-up delay (the FSW
+ * waits 10 ms before it looks). The real FPGA also cuts a supply on a
+ * protection trip (latched until the enable is cleared); the model
+ * does not (D-P4d), so the blockade mask is always 0 for now. A supply
+ * is therefore good exactly while it is commanded on. The write handler
+ * keeps bits 9:5 of the stored value clear.
+ */
+static uint32_t stixctrl_hkcmdsta(STIXCTRL *s)
+{
+    uint32_t cmdsta = s->reg.hkCmdSta;
+    uint32_t blockade = 0; /* supplies cut by a protection trip: none */
+    uint32_t enables;
+
+    if (!s->powerstat) {
+        return cmdsta;
+    }
+
+    /* bits 4:0 = LVEN, HV0116EN, HV1732EN, SPWEN[1:0], in POWERSTAT order */
+    enables = (cmdsta >> STIXCTRL_HKCMDSTA_LVEN) & STIXCTRL_HKCMDSTA_LVEN_MASK;
+    enables |= ((cmdsta >> STIXCTRL_HKCMDSTA_HV0116EN) &
+                STIXCTRL_HKCMDSTA_HV0116EN_MASK) << 1;
+    enables |= ((cmdsta >> STIXCTRL_HKCMDSTA_HV1732EN) &
+                STIXCTRL_HKCMDSTA_HV1732EN_MASK) << 2;
+    enables |= ((cmdsta >> STIXCTRL_HKCMDSTA_SPWEN) &
+                STIXCTRL_HKCMDSTA_SPWEN_MASK) << 3;
+
+    return cmdsta | ((enables & ~blockade) << STIXCTRL_HKCMDSTA_POWERSTAT);
+}
+
 static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 {
     STIXCTRL *stixctrl = opaque;
@@ -457,10 +496,20 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
         (stixctrl->wdg_reload << STIXCTRL_WATCHDOG_RELOADVAL) |
         (stixctrl_wdg_count(stixctrl) << STIXCTRL_WATCHDOG_COUNT);
 
-    /* 0x54 is composed live (stixctrl_rotb_cmdsta); the rest is stored */
+    /*
+     * 0x54 and 0x88 are composed live (stixctrl_rotb_cmdsta,
+     * stixctrl_hkcmdsta); the rest is stored
+     */
     if (addr == 0x54 /* rotbCmdSta */)
     {
         uint32_t regval = stixctrl_rotb_cmdsta(stixctrl);
+
+        trace_stixctrl_io_read((uint32_t)addr, regval);
+
+        return regval;
+    }
+    if (addr == 0x88 /* hkCmdSta */) {
+        uint32_t regval = stixctrl_hkcmdsta(stixctrl);
 
         trace_stixctrl_io_read((uint32_t)addr, regval);
 
@@ -544,6 +593,17 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
         }
     }
 
+    /*
+     * hkCmdSta (0x88), P4-1: POWERSTAT (9:5) is status, composed on read
+     * (stixctrl_hkcmdsta). The PSU driver writes the register
+     * read-modify-write (PSU.c:20-90), so a stored status bit would keep
+     * a supply "good" after its enable is cleared; drop them.
+     */
+    if (addr == 0x88 /* hkCmdSta */ && stixctrl->powerstat) {
+        value &= ~((uint64_t)STIXCTRL_HKCMDSTA_POWERSTAT_MASK <<
+                   STIXCTRL_HKCMDSTA_POWERSTAT);
+    }
+
     /* rotbCmdSta (0x54): writable fields are COMMAND (1:0) and the
      * EDACRESET strobe (bit 2); BLOCKCOUNT, SECCOUNT, READY, FULL and
      * DEDETECTED are read-only status, composed in the read handler
@@ -566,6 +626,7 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
         stixctrl_rotb_command(stixctrl, (uint32_t)value & STIXCTRL_ROTBCMDSTA_COMMAND_MASK);
     }
 
+    /* the stored value: 0x54 and 0x88 are composed on read */
     trace_stixctrl_io_write((uint32_t)addr,
                             ((volatile uint32_t *)&stixctrl->reg) /* re-read */
                             [(uint32_t)addr / sizeof(uint32_t)]);
@@ -685,6 +746,7 @@ static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_UINT32("rotb-blocks", STIXCTRL, rotb_blocks,
                        STIXCTRL_ROTB_MAX_BLOCKS),
     DEFINE_PROP_BOOL("hk-adc", STIXCTRL, hk_adc, true),
+    DEFINE_PROP_BOOL("powerstat", STIXCTRL, powerstat, true),
 };
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)

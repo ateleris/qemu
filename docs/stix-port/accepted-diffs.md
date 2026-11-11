@@ -1284,7 +1284,8 @@ when the write happens):
 | SPW0_V (48) | 3240 when hkCmdSta bit 3 (SPWEN bit 0) is set, else 20 |
 | SPW1_V (52) | 3240 when hkCmdSta bit 4 (SPWEN bit 1) is set, else 20 |
 
-**POWERSTAT stays 0 (D-P3a, deliberate):** `hkCmdSta` bits 9:5 remain
+**POWERSTAT stays 0 (D-P3a, deliberate; superseded by §25, P4-1, which
+composes it from the enables):** `hkCmdSta` bits 9:5 remain
 plain storage — what is written comes back, nothing is synthesised.
 With POWERSTAT = 0 the SpW voltage checks (`HKMonitor_spwCheck` gates
 SPW0_V/SPW1_V on the status bits) and the ATT_V/HV checks
@@ -1336,7 +1337,8 @@ bit above the field (0x10) does not count; (e) LVEN → ATT_V 1670/10,
 HV0116EN → 1000/15, HV1732EN → 1000/16; (f) unused channels 5/100/127
 → VAL 0, READY set; (g) `hk-adc=off` → ch 24 reads VAL 0 with READY set;
 (h) POWERSTAT bits 9:5 read back as written (0x3E0, and bit 5 alone),
-nothing synthesised. Red on the pre-P3-1 binary: `(VAL == 2048)` failed
+nothing synthesised (since §25 case h instead pins that written status
+bits do not stick). Red on the pre-P3-1 binary: `(VAL == 2048)` failed
 with 0 (and the `hk-adc` property is unknown). Green: `hk-adc`, `ctrl`
 (the READY pin), and the full suite (34 tests). checkpatch on the diff:
 0 errors, 0 warnings.
@@ -1389,7 +1391,8 @@ TM(5,2) 0x542C p1 = 1 (no LUTs in flash) — expected but **not** checked
 by the gate: it was seen in the p3probe4 experiment, and the recon
 marks it inferred; LUTMgmt "could not find LUT" messages; and SID2
 reporting LV/HV/SpW **off** in NOMINAL, because POWERSTAT (hkCmdSta
-bits 9:5) stays unmodelled at 0 (D-P3a). The gate counts the 384
+bits 9:5) stays unmodelled at 0 (D-P3a; since §25 it follows the
+enables). The gate counts the 384
 timeouts and prints the number; another count is a `WARN:` line, not a
 failure. The UART must contain "init: SAFE mode" and must not match
 `storing new context[01] failed`.
@@ -1431,7 +1434,7 @@ not mistaken for a bug (plan P3-3; decisions D-P3a..c):
   QL IRQ fires, and ROTB blocks come only from the detector hardware
   that is not modelled — so no QL TM is produced and BLOCKCOUNT stays
   0 (recon-phase3-nominal §2, §3).
-- **No POWERSTAT.** hkCmdSta bits 9:5 stay plain storage at 0 (D-P3a):
+- **No POWERSTAT** (resolved by §25, P4-1). hkCmdSta bits 9:5 stay plain storage at 0 (D-P3a):
   SID2 shows LV/HV/SpW off even in NOMINAL, and the FSW's SpW, ATT_V
   and HV voltage checks stay skipped. Synthesising it later requires
   the SpW voltages to track SPWEN atomically or a PFM/context run falls
@@ -1454,3 +1457,70 @@ not mistaken for a bug (plan P3-3; decisions D-P3a..c):
   `capture-golden.sh` (§22): it was last captured before the watchdog
   model and the D-I flash, and Phase 3 does not change it.
 
+
+## 25. POWERSTAT follows the commanded supplies (baseline: plain storage, 0)
+
+**Baseline:** `hkCmdSta` (CTRL 0x88) was plain storage. POWERSTAT
+(bits 9:5) read back whatever was written; the FSW never writes ones
+there, so it read 0. The FSW therefore saw every supply as unpowered.
+- It skipped the SPW0/1_V, ATT_V and HV checks (HKMonitor.c:357-370),
+  and `HKMonitor_spwCheck` during SpW init (SpwControl.c:472-491).
+- SID2 reported LV/HV/SpW off in every mode (§22, §24).
+
+**Model (P4-1, D-P4c):**
+- POWERSTAT is the PSU power-good (PSU.h:36-43), composed on read
+  (`stixctrl_hkcmdsta`): bit 5 LV, 6 HV01, 7 HV17, 8 SPW0 and 9 SPW1
+  follow LVEN, HV0116EN, HV1732EN and SPWEN[1:0] (bits 0..4).
+- The write handler drops bits 9:5. The PSU driver writes the register
+  read-modify-write (PSU.c:20-90), so a stored status bit would keep a
+  supply "good" after its enable is cleared.
+- The other fields (HV0116VAL, HV1732VAL) stay plain storage.
+- There is no power-up delay; the FSW waits 10 ms before it looks
+  (commonFSW.h:319).
+- There is no protection cut-off. The real FPGA latches a supply off on a
+  protection trip (TN REQ-043, DD §5.6); the model keeps a `blockade`
+  mask, always 0, as the hook for that (D-P4d).
+- `powerstat=off` (property, default on) restores the plain storage for
+  A/B runs.
+
+**FSW effect (reviewed against the source; all values pass):**
+- SpW init now reads SPW0_V/SPW1_V for the powered lines and gets 3240
+  (AX 0..4095, PFM 3011..3468).
+- The ATT_V/HV checks run only while LV/HV are commanded on (1670 and
+  1000; PFM 585..3370 and 0..2543).
+- No FSW code waits for POWERSTAT to drop.
+- Under the gate ELF's limits (all 0..0xFFF, `spw_c_limits` too) nothing
+  can trip.
+
+**Golden changes:**
+- `uart.golden.log`: unchanged apart from the timestamps (boot-smoke
+  passes on the normalized log).
+- `qemu-stdout.golden.log`: the hkCmdSta reads show the status bits
+  (0x18 becomes 0x318 with both SpW lines on), and SpW init adds
+  SPW0_V/SPW1_V conversions (for example `0xca8000b0` = ch 48, VAL
+  3240). The rest shifts by those lines.
+- SID2 (live capture, `powerstat` on and off, otherwise identical boots):
+  exactly one byte of the 109-byte packet differs, by two adjacent bits
+  (0x18 vs 0x00). This matches status4 SPW0/SPW1 (bits 28/29,
+  HKAcquire.c:329-336), the only supplies on in SAFE.
+
+**Tests:**
+- `/sparc/stix/powerstat`:
+  - the reset value is 0;
+  - each enable maps to its own bit, and all on gives 0x3FF;
+  - written status bits do not stick;
+  - the FSW's read-clear-LVEN-write pattern drops LV to off;
+  - the HV value fields are kept;
+  - `powerstat=off` keeps plain storage.
+- `/sparc/stix/hk-adc` case h now pins that written status bits do not
+  stick.
+- Both were red on the pre-P4-1 binary. The full suite is 35 ok.
+
+**Gates:** boot-smoke (new golden), soak 300 s, tc-smoke, the probe
+self-test, and nominal-smoke in both modes (384 IDeF-X timeouts, as
+before) all pass. The shared `/tmp/stix-uprev-run/flash.bin` is
+untouched.
+
+**Known gap:** reset does not clear `hkCmdSta` (pre-existing). After a
+watchdog reset POWERSTAT therefore reports the old supplies on until the
+BSW rewrites the register.

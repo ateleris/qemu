@@ -127,7 +127,10 @@ Revised after the validation and the document review (sections at the end).
 - **D-P4d: HW protection.** Model all nine comparators.
   - Threshold reset values come from ICD Table 4-75: 1V5 2282, 2V5 3416,
     3V3 3826, SPW 3826, DET 546, ATT_C 751, ATT_V 4095, HV17 2323,
-    HV01 2323.
+    HV01 2323. They are document values only: the FSW never writes the
+    eight non-SPW thresholds, so the code cannot confirm them. The
+    released documents may miss late spec changes; if the live behaviour
+    looks off, revisit these first.
   - The comparator is strict ">" on the line's channel (0, 1, 2, 3, 4, 8, 12,
     16, 20). It trips on the second consecutive high sample, evaluated at each
     conversion of that channel and when an injection is set (two evaluations).
@@ -151,7 +154,7 @@ Revised after the validation and the document review (sections at the end).
 ### P4-1: POWERSTAT
 - Compose bits 9:5 on read (D-P4c) and add the `powerstat` property.
 - qtest: each enable maps to its bit; a written 1 in 9:5 does not stick;
-  `powerstat=off` reads 0 there.
+  `powerstat=off` keeps plain storage.
 - Regenerate the goldens and add accepted-diffs §25 (SID2 status4 bits).
 - Gates: the full set, with nominal-smoke in both modes. HKMonitor_spwCheck
   now runs for real during SpW init.
@@ -217,7 +220,9 @@ Revised after the validation and the document review (sections at the end).
 - fault-smoke step: link-down for 20 s. After it is cleared, expect
   `5435 48`, allow a second 0x5435 (count and order not pinned), and expect
   `142D 00`.
-- Record the FDIR.c:711 bug (confirmed against TN REQ-029/038).
+- Record FDIR.c:711 as observed behaviour. The TN (REQ-029/038) intends any
+  link error to count; the code and the gate ELF count only READY. The model
+  follows the code. Whether this is a bug or a late spec change is open.
 
 ### P4-6: docs
 - ground-station.md "Fault injection": the QMP socket, the qom-set commands,

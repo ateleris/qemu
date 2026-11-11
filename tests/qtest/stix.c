@@ -3735,7 +3735,7 @@ static void hk_check(QTestState *qts, uint32_t ch, uint32_t val)
  * SPWEN (hkCmdSta bits 4:3) drives SPW_C by line count and SPW0_V /
  * SPW1_V by their own bit, idefxConfig[3:0] gives the DET_C quarter
  * count, LVEN / HV0116EN / HV1732EN the ATT_V and HV lines. Unused
- * channels read 0. POWERSTAT (bits 9:5) stays plain storage. With
+ * channels read 0. The overrides never consult POWERSTAT. With
  * hk-adc=off the legacy behaviour (VAL 0, READY forced) is kept.
  * RED on the pre-P3-1 binary: VAL is 0 everywhere and the property is
  * unknown.
@@ -3817,19 +3817,17 @@ static void test_hk_adc(void)
     hk_check(qts, 127, 0);
 
     /*
-     * h. POWERSTAT (bits 9:5) is plain storage: what is written comes
-     * back, nothing is synthesised (from the enable bits or otherwise),
-     * and the overrides ignore it — every state-dependent line reads
-     * its off value with the status bits set
+     * h. the overrides follow the enable bits only: a guest write of
+     * ones to POWERSTAT (bits 9:5) does not stick (P4-1, see
+     * /sparc/stix/powerstat) and every state-dependent line reads its
+     * off value
      */
     ctrl_write(qts, CTRL_HKCMDSTA, 0x3E0u);
-    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0x3E0u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0);
     hk_check(qts, 48, 20);
     hk_check(qts, 52, 20);
     hk_check(qts, 12, 10);
     hk_check(qts, 3, 50);
-    ctrl_write(qts, CTRL_HKCMDSTA, 1u << 5);
-    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 1u << 5);
     ctrl_write(qts, CTRL_HKCMDSTA, 0);
 
     qtest_quit(qts);
@@ -3838,6 +3836,84 @@ static void test_hk_adc(void)
     /* g. hk-adc=off: the legacy behaviour, VAL 0 with READY set */
     qts = stix_qtest_new_extra("-global grlib-stixctrl.hk-adc=off");
     hk_check(qts, 24, 0);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* ---- P4-1: POWERSTAT (hkCmdSta bits 9:5) ---- */
+
+#define HKCMDSTA_POWERSTAT_SHIFT 5
+#define HKCMDSTA_ENABLES_MASK    0x1Fu  /* LVEN, HV0116EN, HV1732EN, SPWEN */
+
+/*
+ * P4-1 (D-P4c): POWERSTAT is the PSU power-good (PSU.h:36-43), composed
+ * on read from the commanded enables: bit 5 LV, 6 HV01, 7 HV17, 8 SPW0,
+ * 9 SPW1 follow hkCmdSta bits 0..4. Guest writes to bits 9:5 are
+ * ignored, and the other fields (e.g. HV0116VAL 23:16) stay plain
+ * storage. powerstat=off keeps the legacy plain storage for A/B runs.
+ * RED on the pre-P4-1 binary: bits 9:5 read back whatever was written
+ * and the property is unknown.
+ */
+static void test_powerstat(void)
+{
+    QTestState *qts;
+    uint32_t bit;
+
+    qts = stix_qtest_new();
+
+    /* reset: nothing commanded, nothing powered */
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0);
+
+    /* each enable drives exactly its own status bit */
+    for (bit = 0; bit < 5; bit++) {
+        ctrl_write(qts, CTRL_HKCMDSTA, 1u << bit);
+        g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==,
+                        (1u << bit) |
+                        (1u << (bit + HKCMDSTA_POWERSTAT_SHIFT)));
+    }
+
+    /* all on */
+    ctrl_write(qts, CTRL_HKCMDSTA, HKCMDSTA_ENABLES_MASK);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==,
+                    HKCMDSTA_ENABLES_MASK |
+                    (HKCMDSTA_ENABLES_MASK << HKCMDSTA_POWERSTAT_SHIFT));
+
+    /*
+     * written status bits do not stick: the PSU driver writes hkCmdSta
+     * read-modify-write (PSU.c:20-90), so a stale status read must not
+     * turn a supply "on"
+     */
+    ctrl_write(qts, CTRL_HKCMDSTA, 0x3E0u | 0x5u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==,
+                    0x5u | (0x5u << HKCMDSTA_POWERSTAT_SHIFT));
+
+    /*
+     * the FSW's own pattern, PSU_setLVState(false): read (status bits
+     * set), clear LVEN, write the rest back. LV must drop to "off".
+     */
+    ctrl_write(qts, CTRL_HKCMDSTA, HKCMDSTA_ENABLES_MASK);
+    ctrl_write(qts, CTRL_HKCMDSTA, ctrl_read(qts, CTRL_HKCMDSTA) & ~1u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==,
+                    0x1Eu | (0x1Eu << HKCMDSTA_POWERSTAT_SHIFT));
+
+    /* the other fields are plain storage (HV0116VAL 23:16, HV1732VAL 31:24) */
+    ctrl_write(qts, CTRL_HKCMDSTA, 0xA5C30000u | 0x2u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==,
+                    0xA5C30000u | 0x2u | (0x2u << HKCMDSTA_POWERSTAT_SHIFT));
+
+    /* switching off clears the status again */
+    ctrl_write(qts, CTRL_HKCMDSTA, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* powerstat=off: the legacy plain storage, nothing synthesised */
+    qts = stix_qtest_new_extra("-global grlib-stixctrl.powerstat=off");
+    ctrl_write(qts, CTRL_HKCMDSTA, HKCMDSTA_ENABLES_MASK);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, HKCMDSTA_ENABLES_MASK);
+    ctrl_write(qts, CTRL_HKCMDSTA, 0x3E0u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_HKCMDSTA), ==, 0x3E0u);
     qtest_quit(qts);
     stix_qtest_cleanup();
 }
@@ -3893,6 +3969,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/spw-udp-host-error",
                        test_spw_udp_host_error);
         qtest_add_func("/sparc/stix/hk-adc", test_hk_adc);
+        qtest_add_func("/sparc/stix/powerstat", test_powerstat);
     }
 
     return g_test_run();
