@@ -37,7 +37,16 @@ def main():
                     help="run mode: only these variants; repeatable")
     ap.add_argument("--self-test", nargs="?", const="", metavar="CASE",
                     help="run the offline self-test (optionally one case)")
+    ap.add_argument("--check-ui", metavar="URL",
+                    help="check the UI a running controller serves at URL "
+                    "(http://127.0.0.1:PORT) against its verbs; exit 1 on "
+                    "a mismatch")
     args = ap.parse_args()
+    if args.check_ui:
+        from stixplat import uicheck
+        ok, why = uicheck.check(args.check_ui.rstrip("/"))
+        print(("ok   " if ok else "FAIL ") + "ui: " + why)
+        return 0 if ok else 1
     if args.self_test is not None:
         from stixplat import selftest
         return selftest.main(args.self_test or None)

@@ -2071,6 +2071,16 @@ defaults that the user can override.
   `stixplat/verbs.py`), S5 (a variant without a check is an error), S6
   (above), N1-N7. Not done: a live QEMU-killed run (S1 is tested with
   the scripted world and the self-test's run-mode cases).
+- **PL-6** is on `stix-uprev-platform`. As built: besides the plan's
+  panels, an "any verb" form generated from `GET /verbs`, and a new read
+  endpoint `GET /api/v1/scenarios` (the scenario panel needs the list).
+  The page is served with a hash-based CSP (its own inline script and
+  style only, connections to its origin only). The live gate is
+  `stixplat.py --check-ui URL` (`stixplat/uicheck.py`), run by
+  core-smoke and link-smoke on their server. A browser pass
+  (Playwright, against a fake-QEMU controller) found two runtime bugs
+  the static checks cannot see; both were fixed before the commit; the
+  manual checklist is in platform.md.
 - **Gate ports (done after the rebase onto gate-ports, §41):**
   core-smoke, link-smoke and run-smoke source `tests/plat-slot.sh` on
   top of `scripts/stix/lib/slot.sh`. Unset `STIX_PORT_BASE` keeps the

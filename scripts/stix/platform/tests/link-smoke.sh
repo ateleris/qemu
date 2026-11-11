@@ -21,6 +21,7 @@
 #   fault.inject spw.link.disconnect: the same silence, logged as fault
 #   link-down set while frozen survives cont: no TM until link up
 #   relay: the fake GS got byte-identical bare SPs, one per tm.jsonl line
+#   the UI page this server serves matches its verbs and CSP (--check-ui)
 #
 # Usage: link-smoke.sh <qemu-binary>   (STIX_ASW_ELF as in boot-smoke.sh)
 # Legacy: run it under flock /tmp/stix-qtest-21000.lock; STIX_PORT_BASE=
@@ -429,6 +430,12 @@ def run():
                            stdout=out, stderr=subprocess.STDOUT)
     try:
         main(gs, ctl)
+        ui = subprocess.run([sys.executable,
+                             os.path.join(PKG, "..", "stixplat.py"),
+                             "--check-ui", API[:-len("/api/v1")]],
+                            capture_output=True, text=True, timeout=60)
+        check(ui.returncode == 0, ui.stdout.strip() or ui.stderr.strip())
+        ok(ui.stdout.strip()[5:])
         finish(gs, ctl)
     except Fail as e:
         print("LINK-SMOKE: FAIL: %s%s" % (e, TAG))

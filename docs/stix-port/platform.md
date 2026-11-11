@@ -28,6 +28,9 @@ The path prefix is `/api/v1`. Read endpoints:
 | `GET /stream?topics=a,b` | SSE: `id` = seq, `event` = topic, `data` = the record line; resume with `Last-Event-ID` |
 | `GET /faults` | the fault catalogue and the active faults |
 | `GET /verbs` | the command vocabulary with argument schemas |
+| `GET /scenarios` | the scenario dir's files: name, variants, description, or the load error |
+
+`GET /` serves the web UI (below).
 
 Every state change is `POST /api/v1/cmd/<verb>` with a JSON object of
 arguments, `Content-Type: application/json` and `X-Stix-Platform: 1`.
@@ -199,3 +202,56 @@ fault_with_recovery), `gate-keepalive` (the NOMINAL-entry re-arm, R1),
 `gate-timesync` (aligned, mismatch), the optional `gate-timecode-loss`,
 and `gate-negative`, which must fail with exactly one unmatched await
 (`tests/run-smoke.sh` checks both).
+
+## The web UI (PL-6)
+
+`http://127.0.0.1:8080/` by default (`[ports] api`, interactive mode).
+One file,
+`scripts/stix/platform/ui/index.html`: plain HTML, CSS and JS, no build,
+no CDN. It is only an API client:
+
+- every control is an element with a `data-verb` that posts
+  `/api/v1/cmd/<verb>`, with its `data-args` or the inputs of its row
+  (`data-only` limits which); the faults panel is generated from
+  `GET /faults`, the forcings from the state tree's `instrument.hk_adc.*`
+  leaves, the scenario list from `GET /scenarios`, and an "any verb"
+  form and the buttons' tooltips from `GET /verbs` (a verb the server
+  does not enable is greyed out);
+- everything shown comes from `/status` (polled each second),
+  `/state` (every 2 s), and the event log and UART tail: first
+  `GET /log` (the last 2000 records), then the SSE stream from that seq.
+  So a reload loses nothing, and nothing lives only in the page.
+
+The server sends it behind the same Host filter, with
+`Content-Security-Policy: default-src 'none'; script-src <hash>;
+style-src <hash>; connect-src 'self'; …; frame-ancestors 'none'`: only
+the page's own inline script and style run, and only this origin is
+reachable. The page never uses `innerHTML`: TM and UART text is set as
+text.
+
+Gates without a browser: the self-test parses the page (every
+`data-verb` is served and its posted inputs are args of it, the panels
+cover the plan's verbs, no browser storage, no external URL, no inline
+handler or style attribute, the script parses with `node --check` when
+node exists); core-smoke and link-smoke run `stixplat.py --check-ui
+http://127.0.0.1:<port>` against their live server.
+
+### Manual browser checklist (optional)
+
+Against a controller with the real ASW (or the self-test's fake QEMU):
+
+1. Load `/`: the devtools console shows no error and no CSP violation;
+   the header chips fill in within a second.
+2. on, boot: power `frozen`, then `running`; the UART pane shows the
+   banner; TM lines stream into the events pane.
+3. SpW down, then up: the SpW chip follows; TM stops and resumes.
+4. Time codes off, once, on; TC(9,129) send: the time sync chip goes
+   `pending`, then `ok`.
+5. A fault (for example `spw.link.disconnect`): inject, the row shows
+   `active`, a `fault` line appears; clear: `idle`.
+6. A forcing on an `instrument.hk_adc.<ch>` leaf: the state table shows
+   presented ≠ truth (highlighted); clear.
+7. Reload the page mid-run: the events and UART panes come back with the
+   same records (same seqs) and keep streaming.
+8. Stop the controller: the page shows "stream: reconnecting…" and
+   recovers when it is back.

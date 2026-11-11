@@ -2907,6 +2907,43 @@ def t_ui_page(env):
            "state"} <= paths, "API paths %r" % paths)
 
 
+def t_ui_check(env):
+    """PL-6: uicheck (used by core-smoke and link-smoke against the live
+    server): ok on the served page; a page naming an unknown verb, a CSP
+    that does not cover the page's script, and a server without the page
+    each fail with the reason."""
+    from . import uicheck
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    base = "http://127.0.0.1:%d" % srv.server_address[1]
+    real_page, real_csp = api_mod.UI_PAGE, api_mod.page_csp
+    try:
+        ok, why = uicheck.check(base)
+        check(ok and "data-verb" in why, "the served page: %s" % why)
+        with open(real_page, encoding="utf-8") as f:
+            page = f.read()
+        bad = os.path.join(env.tmp, "bad-%d.html" % env.n)
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write(page.replace('data-verb="sim.pause"',
+                                 'data-verb="sim.nosuch"'))
+        api_mod.UI_PAGE = bad
+        ok, why = uicheck.check(base)
+        check(not ok and "sim.nosuch" in why, "unknown verb: %s" % why)
+        api_mod.UI_PAGE = real_page
+        api_mod.page_csp = lambda p: "default-src 'none'"
+        ok, why = uicheck.check(base)
+        check(not ok and "CSP" in why, "CSP: %s" % why)
+        api_mod.page_csp = real_csp
+        api_mod.UI_PAGE = os.path.join(env.tmp, "missing.html")
+        ok, why = uicheck.check(base)
+        check(not ok and "500" in why, "no page: %s" % why)
+    finally:
+        api_mod.UI_PAGE, api_mod.page_csp = real_page, real_csp
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
 def t_probe_lib(env):
     p = probe_lib.load()
     units = list(p.frame_units(bytes.fromhex("fe0201") + b"\x00" * 6))
@@ -2957,7 +2994,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),
          ("gate ports from the slot band", t_gate_slots),
          ("UI: served at /, CSP, scenarios", t_ui_server),
-         ("UI: the page (no browser)", t_ui_page)]
+         ("UI: the page (no browser)", t_ui_page),
+         ("UI: the live check (smokes)", t_ui_check)]
 
 
 def main(only=None):

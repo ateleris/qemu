@@ -7,6 +7,8 @@
 # band and /tmp/stix-plat/core-smoke-s<k>. A fresh sparse flash made by
 # QEMU. Checks, in order:
 #   power on: frozen, flash.bin sparse; an SSE client collects records
+#   the UI page this server serves: its data-verbs are all served, its
+#     CSP covers its script and style (stixplat.py --check-ui)
 #   timecodes=false set while frozen (raw QMP via debug.qmp) survives cont
 #   boot: the UART banner within 20 s, as uart records
 #   pause 10 s, resume: sim_time advanced < 0.5 s across the pause
@@ -126,6 +128,10 @@ okpost platform.power.on > /dev/null
 [ "$(blocks)" -lt $((1 << 30)) ] || fail "flash.bin not sparse"
 INO="$(stat -c %i "$RUN/flash.bin")"
 ok "power on: frozen, flash.bin sparse ($(blocks) bytes)"
+
+# -- the UI (PL-6): the page this server serves, against its verbs -------
+UI="$(python3 "$CTL" --check-ui "http://127.0.0.1:$PORT")" || fail "$UI"
+echo "$UI"
 
 # -- timecodes=false while frozen survives cont --------------------------
 SPW='"path":"/machine/stixspw","property":"timecodes"'
