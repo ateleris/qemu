@@ -30,7 +30,7 @@ connect group arms at connect) and stays armed; a match before its
 group's send is ignored. Forbids take no @window suffix.
 
 QMP groups (--qmp PATH, --qmp-cmd JSON; P4-3): PATH is a unix socket or,
-since PL-2b, tcp:HOST:PORT. A send group can be a
+since PL-2b, tcp:HOST:PORT (IPv6 bracketed). A send group can be a
 QMP command instead of a TC unit, e.g. a qom-set that injects a fault.
 It takes the preceding --send-at, collects the expectations and
 forbids that follow, and drains the TM already buffered before it
@@ -281,16 +281,26 @@ class QmpError(Exception):
 
 
 def qmp_address(path):
-    """The socket family and address of a --qmp value (PL-2b): a unix
-    socket path, or tcp:HOST:PORT (platform plan D-PLj; HOST is used
-    as given, the callers keep it to 127.0.0.1/localhost)."""
+    """The kind and address of a --qmp value (PL-2b): ("unix", path), or
+    ("tcp", (host, port)) for tcp:HOST:PORT, where an IPv6 HOST is
+    bracketed (tcp:[::1]:PORT) and PORT is 1..65535 (platform plan
+    D-PLj; the callers keep HOST to the loopback)."""
     if not path.startswith("tcp:"):
-        return socket.AF_UNIX, path
-    host, sep, port = path[4:].rpartition(":")
-    if not sep or not host or not port.isdigit() or \
-            not 0 < int(port) < 65536:
-        raise QmpError("bad QMP address %r: want tcp:HOST:PORT" % path)
-    return socket.AF_INET, (host, int(port))
+        return "unix", path
+    rest = path[4:]
+    if rest.startswith("["):
+        host, sep, tail = rest[1:].partition("]")
+        if not sep or not tail.startswith(":"):
+            host = ""
+        port = tail[1:]
+    else:
+        host, sep, port = rest.rpartition(":")
+        if ":" in host:  # an unbracketed IPv6 address is ambiguous
+            host = ""
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise QmpError("bad QMP address %r: want tcp:HOST:PORT or "
+                       "tcp:[IPV6]:PORT" % path)
+    return "tcp", (host, int(port))
 
 
 class QmpClient:
@@ -317,15 +327,25 @@ class QmpClient:
     def _connect(self):
         deadline = time.monotonic() + self.timeout
         if self.sock is None:
-            family, addr = qmp_address(self.path)
+            kind, addr = qmp_address(self.path)
             while True:
-                s = socket.socket(family, socket.SOCK_STREAM)
                 try:
-                    s.connect(addr)
+                    if kind == "tcp":
+                        # every address family the host resolves to
+                        s = socket.create_connection(
+                            addr, timeout=max(0.1, deadline -
+                                              time.monotonic()))
+                    else:
+                        s = socket.socket(socket.AF_UNIX,
+                                          socket.SOCK_STREAM)
+                        try:
+                            s.connect(addr)
+                        except OSError:
+                            s.close()
+                            raise
                     self.sock = s
                     break
                 except OSError as e:
-                    s.close()
                     if time.monotonic() >= deadline:
                         raise QmpError("cannot connect to %s: %s"
                                        % (self.path, e))
@@ -465,7 +485,7 @@ def make_parser():
                          "that group's send; a match before the send is "
                          "ignored. No @window suffix (repeatable)")
     ap.add_argument("--qmp", metavar="PATH",
-                    help="QEMU QMP unix socket, or tcp:HOST:PORT, for the "
+                    help="QEMU QMP unix socket, or tcp:HOST:PORT (tcp:[::1]:PORT for IPv6), for the "
                          "--qmp-cmd groups (connected at the first due "
                          "--qmp-cmd)")
     ap.add_argument("--qmp-cmd", action=OpAction, metavar="JSON",
@@ -1247,39 +1267,65 @@ def self_test():
     assert abs(float(m1[3:-1]) - time.monotonic()) < 1.0, m1
 
     # q8. PL-2b: QMP over TCP. --qmp tcp:HOST:PORT connects with
-    #     AF_INET (a real listener on an ephemeral 127.0.0.1 port); the
-    #     same greeting/capabilities/command exchange as the unix form
-    lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    lst.bind(("127.0.0.1", 0))
-    lst.listen(1)
-    tport = lst.getsockname()[1]
-    tbox = {}
+    #     socket.create_connection (any address family) to a real
+    #     listener on an ephemeral port; the same greeting/capabilities/
+    #     command exchange as the unix form
+    def tcp_case(family, bind_host, client_fmt):
+        lst = socket.socket(family, socket.SOCK_STREAM)
+        lst.bind((bind_host, 0))
+        lst.listen(1)
+        lst.settimeout(3)  # a client that never connects fails, not hangs
+        tport = lst.getsockname()[1]
+        tbox = {}
 
-    def tcp_accept():
-        peer, _ = lst.accept()
-        th_, b_ = fake_qmp(peer, [ok_ret, b'{"return": {"tcp": 1}}\r\n'])
-        th_.join(timeout=3)
-        tbox.update(b_)
-        peer.close()
-    tth = threading.Thread(target=tcp_accept)
-    tth.start()
-    c = QmpClient("tcp:127.0.0.1:%d" % tport, timeout=1.0)
-    ret = c.execute(json.loads(qset))
-    c.close()
-    tth.join(timeout=3)
-    lst.close()
-    assert not tth.is_alive() and ret == {"tcp": 1}, ret
-    assert [m["execute"] for m in tbox["cmds"]] == \
-        ["qmp_capabilities", "qom-set"]
-    # q9. the address forms: a unix path stays a path; tcp needs a
-    #     host and a numeric port
-    assert qmp_address("/x/qmp.sock") == (socket.AF_UNIX, "/x/qmp.sock")
-    assert qmp_address("tcp:127.0.0.1:4444") == \
-        (socket.AF_INET, ("127.0.0.1", 4444))
-    assert qmp_address("tcp:localhost:4444") == \
-        (socket.AF_INET, ("localhost", 4444))
+        def tcp_accept():
+            try:
+                peer, _ = lst.accept()
+            except socket.timeout:
+                return
+            th_, b_ = fake_qmp(peer, [ok_ret, b'{"return": {"tcp": 1}}\r\n'])
+            th_.join(timeout=3)
+            tbox.update(b_)
+            peer.close()
+        tth = threading.Thread(target=tcp_accept)
+        tth.start()
+        c = QmpClient(client_fmt % tport, timeout=1.0)
+        try:
+            ret = c.execute(json.loads(qset))
+        finally:
+            c.close()
+            tth.join(timeout=4)
+            lst.close()
+        assert not tth.is_alive() and ret == {"tcp": 1}, ret
+        assert [m["execute"] for m in tbox["cmds"]] == \
+            ["qmp_capabilities", "qom-set"]
+
+    tcp_case(socket.AF_INET, "127.0.0.1", "tcp:127.0.0.1:%d")
+    # q8b. "localhost" may resolve to ::1 first; create_connection tries
+    #      every address, so an IPv4-only listener is still reached
+    tcp_case(socket.AF_INET, "127.0.0.1", "tcp:localhost:%d")
+    # q8c. a bracketed IPv6 loopback (skipped when the host has no ::1)
+    if socket.has_ipv6:
+        try:
+            probe6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            probe6.bind(("::1", 0))
+            probe6.close()
+            have6 = True
+        except OSError:
+            have6 = False
+        if have6:
+            tcp_case(socket.AF_INET6, "::1", "tcp:[::1]:%d")
+        else:
+            print("self-test: no IPv6 loopback, q8c skipped")
+    # q9. the address forms: a unix path stays a path; tcp needs a host
+    #     (an IPv6 one in brackets) and a port 1..65535
+    assert qmp_address("/x/qmp.sock") == ("unix", "/x/qmp.sock")
+    assert qmp_address("tcp:127.0.0.1:4444") == ("tcp", ("127.0.0.1", 4444))
+    assert qmp_address("tcp:localhost:4444") == ("tcp", ("localhost", 4444))
+    assert qmp_address("tcp:[::1]:4444") == ("tcp", ("::1", 4444))
     for bad in ("tcp:127.0.0.1", "tcp::4444", "tcp:127.0.0.1:x",
-                "tcp:127.0.0.1:70000"):
+                "tcp:127.0.0.1:70000", "tcp:127.0.0.1:0", "tcp:::1:4444",
+                "tcp:[::1:4444", "tcp:[]:4444", "tcp:[::1]x:4444"):
         try:
             qmp_address(bad)
             raise AssertionError("bad QMP address accepted: %s" % bad)
