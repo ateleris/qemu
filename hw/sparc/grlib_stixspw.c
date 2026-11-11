@@ -157,6 +157,8 @@ struct STIXSPW
      */
     bool link_down;
     QEMUTimer *link_timer;
+    /* a stixspw_rx_retry is running: a nested call returns at once */
+    bool rx_retrying;
 
     /*
      * TMTC transport state (D-N); the fds are -1 while the server is
@@ -171,6 +173,29 @@ static void stixspw_rx_deliver(STIXSPW *s, const uint8_t *buf, int len);
 static void grlib_stixspw_tx(STIXSPW *stixspw);
 
 /*
+ * The DMA paths that run outside an MMIO dispatch (the TCP/UDP fd
+ * handler, rx-inject and the link-down clear, all from the main loop)
+ * engage the device's re-entrancy guard, as qemu_bh_new_guarded does
+ * (util/async.c, aio_bh_call). A guest descriptor address inside this
+ * device's MMIO is then refused by memory.c ("Blocked re-entrant IO",
+ * MEMTX_ACCESS_ERROR, the write is dropped), exactly as it is on the
+ * in-MMIO paths (a dmaControl write that runs the TX or the RX retry).
+ */
+static bool stixspw_guard_enter(STIXSPW *s)
+{
+    MemReentrancyGuard *g = &DEVICE(s)->mem_reentrancy_guard;
+    bool was = g->engaged_in_io;
+
+    g->engaged_in_io = true;
+    return was;
+}
+
+static void stixspw_guard_exit(STIXSPW *s, bool was)
+{
+    DEVICE(s)->mem_reentrancy_guard.engaged_in_io = was;
+}
+
+/*
  * A whole TC unit arrived from the transport (TCP D-K framing, or one
  * UDP datagram, D-B; BQL held): hand it to the RX DMA path (P2-5),
  * which applies truncation and the no-spill queue.
@@ -178,9 +203,12 @@ static void grlib_stixspw_tx(STIXSPW *stixspw);
 static void recv_packet_callback(uint8_t *data, int length, void *opaque)
 {
     STIXSPW *stixspw = opaque;
+    bool was;
 
     trace_stixspw_recv_packet_callback(length);
+    was = stixspw_guard_enter(stixspw);
     stixspw_rx_deliver(stixspw, data, length);
+    stixspw_guard_exit(stixspw, was);
 }
 
 /* The RX descriptors are big-endian words (correction 16) */
@@ -347,9 +375,15 @@ static void stixspw_rx_deliver(STIXSPW *s, const uint8_t *buf, int len)
  */
 static void stixspw_rx_retry(STIXSPW *s)
 {
-    if (s->rx_count == 0 || s->link_down) {
+    /*
+     * The head stays queued while it is delivered, so a nested retry
+     * (should the guard ever let a DMA write reach dmaControl) would
+     * deliver and free it a second time: refuse to nest.
+     */
+    if (s->rx_count == 0 || s->link_down || s->rx_retrying) {
         return;
     }
+    s->rx_retrying = true;
     trace_stixspw_rx_retry(s->rx_count);
     while (s->rx_count > 0) {
         uint8_t *buf = s->rx_queue[s->rx_head];
@@ -363,6 +397,7 @@ static void stixspw_rx_retry(STIXSPW *s)
         s->rx_head = (s->rx_head + 1) % SPW_RX_QUEUE_LEN;
         s->rx_count--;
     }
+    s->rx_retrying = false;
 }
 
 /* D-J: the SCET fine field counts 1/65536 s ticks */
@@ -488,8 +523,8 @@ static void stixspw_link_timer(void *opaque)
 /*
  * D-P4e: take the link down or bring it back (the link-down property).
  * The clear runs the TX and the RX DMA outside an MMIO dispatch (from
- * QMP); a guest daddr at this device's MMIO nests one write at most,
- * the same bound as the TCP/UDP RX path.
+ * QMP), so it engages the re-entrancy guard: a guest daddr at this
+ * device's MMIO is refused, as on the in-MMIO paths.
  * Down: LS = READY, a link error at once and then every second, time
  * codes stopped. Up: LS = RUN (DE stays until the guest clears it, as
  * W1C), the time codes re-arm if timecodes is true, a TE that waited
@@ -497,6 +532,8 @@ static void stixspw_link_timer(void *opaque)
  */
 static void stixspw_set_link(STIXSPW *s, bool down)
 {
+    bool was;
+
     if (s->link_down == down) {
         return;
     }
@@ -514,10 +551,12 @@ static void stixspw_set_link(STIXSPW *s, bool down)
     s->reg.status |= SPW_STATUS_RUN;
     timer_del(s->link_timer);
     stixspw_tc_arm(s);
+    was = stixspw_guard_enter(s);
     if (s->reg.dmaControl & (1u << STIXSPW_DMACONTROL_TE)) {
         grlib_stixspw_tx(s);
     }
     stixspw_rx_retry(s);
+    stixspw_guard_exit(s, was);
 }
 
 #define STIXSPW_REG_WORDS (sizeof(stixSpwRegs_s) / sizeof(uint32_t))
@@ -876,6 +915,7 @@ static void grlib_stixspw_set_rx_inject(Object *obj, const char *value,
     const char *p;
     size_t len = 0;
     bool high = false;
+    bool was;
     uint8_t cur = 0;
 
     if (!qtest_enabled()) {
@@ -917,7 +957,9 @@ static void grlib_stixspw_set_rx_inject(Object *obj, const char *value,
     }
 
     trace_stixspw_rx_inject((uint32_t)len);
+    was = stixspw_guard_enter(s);
     stixspw_rx_deliver(s, buf, (int)len);
+    stixspw_guard_exit(s, was);
 }
 
 static bool grlib_stixspw_get_timecodes(Object *obj, Error **errp)

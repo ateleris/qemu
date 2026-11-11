@@ -1901,10 +1901,25 @@ SPW.c below is the ASW tree's `ASW/BSW_ASW/src/BSW/SPW/SPW.c`.
   - Time codes re-arm, but only if `timecodes` is true.
   - A waiting TE exchange runs, then the queued RX units are delivered.
 - Setting the current value again is a no-op (no new entry IRQ).
-- **Re-entrancy:** the clear runs the TX and the RX DMA from QMP,
-  outside an MMIO dispatch. A guest daddr at the device's own MMIO
-  nests at most one write. This is the same bound as the existing
-  TCP/UDP RX path.
+- **Re-entrancy guard (fix after review).** Three paths run DMA from
+  the main loop, outside an MMIO dispatch, where QEMU's per-device
+  re-entrancy guard is not engaged: the link-up clear, the TCP/UDP
+  receive handler and `rx-inject`.
+  - The bug on ca01170003: a held RX unit's descriptor daddr was the
+    device's own dmaControl. Delivering it during the clear wrote RD
+    there, and the nested `stixspw_rx_retry` delivered and freed the
+    queue head the outer retry still held. That is a guest-triggerable
+    double free (glibc abort).
+  - The fix: these paths now engage `mem_reentrancy_guard` around the
+    DMA, as `qemu_bh_new_guarded` does. A guest descriptor address
+    inside the device's MMIO is refused, the same as on the in-MMIO
+    paths (memory.c "Blocked re-entrant IO", MEMTX_ACCESS_ERROR, the
+    write is dropped).
+  - `stixspw_rx_retry` also refuses to nest (the `rx_retrying` flag);
+    the queue order is unchanged.
+  - Test: `/sparc/stix/spw-link-down-reentry` holds two units, with
+    desc0 at dmaControl. It is RED on ca01170003 (`free(): double free
+    detected in tcache 2`, SIGABRT). The full suite is 39 ok.
 - Traces: `stixspw_link_down` (also on a reset that brings the link
   up), `stixspw_link_error` and `stixspw_tx_link_wait`.
 

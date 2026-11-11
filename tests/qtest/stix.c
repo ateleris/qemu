@@ -4600,6 +4600,71 @@ static void test_spw_link_down(void)
     stix_qtest_cleanup();
 }
 
+/*
+ * The link-up path runs the RX DMA from QMP, outside any MMIO dispatch.
+ * A held unit whose descriptor daddr is this device's dmaControl would
+ * write RD there; that nested MMIO write retried the queue while the
+ * outer retry still held the head, so the head was delivered and freed
+ * twice (a double free, and rx_count wrapped). The device's re-entrancy
+ * guard must refuse the nested write, as on the in-MMIO paths, and the
+ * queue must drain once, in order. RED on ca01170003: the clear aborts
+ * QEMU (glibc's double-free check).
+ */
+static void test_spw_link_down_reentry(void)
+{
+    /* dmaControl = RD|NS|AI|RE|TI|RI, big-endian on the bus */
+    static const uint8_t rd_word[4] = { 0x00, 0x00, 0x18, 0x1e };
+    static const uint8_t tc1[16] = {
+        0x40, 0x02, 0x00, 0x00, 0x1d, 0xac, 0xc0, 0x01,
+        0x00, 0x05, 0x19, 0x11, 0x01, 0x00, 0x6f, 0x1f
+    };
+    g_autofree gchar *path = NULL;
+    uint8_t got[sizeof(tc1)];
+    QTestState *qts;
+
+    qts = stix_qtest_new();
+    path = stix_spw_path(qts);
+
+    stix_rx_setup(qts);
+    /* desc0 points at the device's own dmaControl */
+    qtest_writel(qts, RXDSC_ADDR + 4u, SPW_DMAControl);
+    memset(got, RX_GUARD, sizeof(got));
+    qtest_memwrite(qts, RXBUF_BASE + RX_BUF_STEP, got, sizeof(got));
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert(stix_rx_inject(qts, path, rd_word, sizeof(rd_word)));
+    g_assert(stix_rx_inject(qts, path, tc1, sizeof(tc1)));
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_PR);
+
+    g_assert_true(stix_qom_set_bool(qts, path, "link-down", false));
+
+    /*
+     * the device is alive; each unit was delivered once: desc0 took
+     * the 4-byte unit (its write to dmaControl refused), desc1 the TC
+     */
+    g_assert_cmpuint(spw_ls(qts), ==, SPW_LS_RUN);
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR),
+                    ==, SPW_RXDSC_IE | sizeof(rd_word));
+    g_assert_cmphex(qtest_readl(qts, RXDSC_ADDR + 8u),
+                    ==, SPW_RXDSC_IE | SPW_RXDSC_WR | sizeof(tc1));
+    qtest_memread(qts, RXBUF_BASE + RX_BUF_STEP, got, sizeof(got));
+    g_assert_cmpint(memcmp(got, tc1, sizeof(tc1)), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SPW_DMAControl),
+                    ==, SPW_DMA_FSW_OPEN | SPW_DMA_PR);
+    g_assert_cmpint(stix_qom_rx_dropped(qts, path), ==, 0);
+
+    /* the queue is empty: a re-armed desc0 gets nothing on a retry */
+    stix_rx_arm(qts, 0, false, true);
+    qtest_writel(qts, SPW_DMAControl, SPW_DMA_FSW_OPEN | SPW_DMA_PR);
+    g_assert_cmpuint(qtest_readl(qts, RXDSC_ADDR) & SPW_RXDSC_EN,
+                     ==, SPW_RXDSC_EN);
+    g_assert_cmpuint(qtest_readl(qts, SPW_DMAControl) & SPW_DMA_PR, ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -4655,6 +4720,8 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/adc-inject", test_adc_inject);
         qtest_add_func("/sparc/stix/hk-prot", test_hk_prot);
         qtest_add_func("/sparc/stix/spw-link-down", test_spw_link_down);
+        qtest_add_func("/sparc/stix/spw-link-down-reentry",
+                       test_spw_link_down_reentry);
     }
 
     return g_test_run();
