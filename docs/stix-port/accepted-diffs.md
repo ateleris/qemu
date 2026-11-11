@@ -3286,5 +3286,12 @@ att) can run their gates at the same time without the global 21000 lock.
   `/tmp/stix-qt-baseline` with a sparse copy of the master: the wrapper
   strips `flash-file`, and the 5.2 model writes a full 16.5 GB flash.bin
   into a CWD that has none.
+- **Fresh-flash gates pre-create flash.bin.** nominal-, fault- and
+  detector-smoke delete flash.bin per run and then
+  `truncate -s 17716740096 flash.bin`, in legacy and slot mode, so no
+  QEMU ever creates the file itself (an older build fills a missing
+  flash.bin densely: 16.5 GB on C:). An empty sparse file of full size
+  is what the current device creates anyway (inverted storage: a hole
+  reads as erased 0xFF).
 - Leaked `/tmp/stix-flash-*` qtest files multiply with parallel suites
   (small, out of scope).

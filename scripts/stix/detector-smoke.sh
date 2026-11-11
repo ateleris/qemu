@@ -326,11 +326,14 @@ fi
 mkdir -p "$RUN_DIR"
 cd "$RUN_DIR"
 # Fresh flash every run: clear only this run dir's own files, by
-# explicit path (the shared run dirs are refused above). The dump is
+# explicit path (the shared run dirs are refused above), then pre-create
+# an empty sparse flash.bin of the full size, so QEMU never creates one
+# itself (an older build fills a missing one densely, 16.5 GB). The dump is
 # appended to, so it must start empty.
 rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
       ql.contrast.log qmp.sock
+truncate -s 17716740096 flash.bin
 
 PROBE_PID=""
 QEMU_PID=""

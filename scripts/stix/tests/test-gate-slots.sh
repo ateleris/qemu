@@ -347,6 +347,16 @@ rc=$?
 check "B2: slot mode refuses a -s1 dir symlinked to the uprev dir" $? \
     "rc=$rc: $out"
 
+# S1: a gate that deletes flash.bin pre-creates it sparse right after, so
+# no QEMU build ever creates (or fills) one itself
+for sc in nominal-smoke.sh fault-smoke.sh detector-smoke.sh; do
+    awk '/^rm -f flash.bin/ { r = 1 }
+         r && !/\\$/ { getline nx; print nx; exit }' "$S/$sc" |
+        grep -qx 'truncate -s 17716740096 flash.bin'
+    check "S1: $sc pre-creates a sparse flash.bin after its rm" $? \
+        "$(grep -n -A3 '^rm -f flash.bin' "$S/$sc")"
+done
+
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]
