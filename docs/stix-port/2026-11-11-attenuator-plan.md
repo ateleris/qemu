@@ -379,7 +379,7 @@ These change what the track can deliver. Read them first.
   - **Motors:** M1 and M2 drive one shaft. Any live, powered, commanded
     motor moves it at the nominal speed; with two, the faster one sets
     the speed [A].
-  - **The travel** end to end takes `att-travel-ms` (default **500** [A],
+  - **The travel** end to end takes `att-travel-ms` (default **1000**, user 2026-11-11: "usually 1 second-ish",
     Q3). A motor is powered iff hkCmdSta LVEN was set at the command
     (LV is sampled at the command [A]; the FSW refuses moves with LV off
     and never cuts LV mid-move).
@@ -622,7 +622,7 @@ a closed contact) is not known [A] (Q5). The names follow the brief.
 ## FSW-visible outcome per fault
 
 Setup: CONFIGURATION, LV on, FDIR on (after 0x14A3), PFM ELF, defaults
-(travel 500, ramp 1600, debounce 10, timeout-finishes on), start at OUT.
+(travel 1000, ramp 1600, debounce 10, timeout-finishes on), start at OUT.
 **C** = TC(236,5) `04 01` (close with M1 → IN); **O** = TC(236,4) `04 01`.
 - Every TC move gets TM(1,1), an **immediate** TM(1,7) from the service,
   and a second TM(1,7) at FINISH (correction 3).
@@ -1124,3 +1124,4 @@ Q1-Q6 remain open for the user (see "Open questions for the user").
 
 - The PL-2a split landed as `stixctrl_hk_truth()` (true value) and `stixctrl_hk_value()` (presented value); this plan now uses those names.
 - The platform `hw-state` getter calls both functions for every HK table channel on every controller poll (2-20 Hz). The attenuator truth/presented functions (`stix_att_hk_att_c()` and the 0x5C state) must therefore be **strictly pure**: no lazy state advance that changes later results, no trace event, no IRQ. Compute the lazy state as a function of `QEMU_CLOCK_VIRTUAL`, so an extra read changes nothing. Add a qtest that reads hw-state many times during a move and checks the move timing and the trace are unchanged.
+- **User answer, Q3 (2026-11-11):** a move takes "usually 1 second-ish". `att-travel-ms` defaults to 1000 and stays a knob. The FSW's 1.6 s drive window and 3.2 s give-up leave margin. The motor currents are still unknown; the [A] values stand.
