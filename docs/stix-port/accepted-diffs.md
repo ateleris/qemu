@@ -3668,3 +3668,59 @@ att) can run their gates at the same time without the global 21000 lock.
   reads as erased 0xFF).
 - Leaked `/tmp/stix-flash-*` qtest files multiply with parallel suites
   (small, out of scope).
+
+## P-1. Platform time and read-only hardware state (baseline: none)
+
+Platform plan PL-1 and PL-2 (`docs/stix-port/2026-11-11-platform-plan.md`,
+D-PLb, D-PLc, D-PLo, D-PLr). The heading is non-numeric on purpose: it
+becomes §39+ when this branch merges with the detector branch (§31-§38).
+
+**Baseline:** the time codes followed only the IDPU's own SCET (§20), so
+the "spacecraft clock" was the instrument clock and no time-sync test
+meant anything. There was no one-shot or wrong-value code.
+
+**The default keeps §20.** `timecode-source` defaults to `scet`: the
+codes, their TIMECNT, the commit hook and every golden are as in §20.
+Everything below is opt-in or a runtime property that nothing sets
+unless a test or the platform controller does.
+
+**Model (PL-1, stixspw):**
+- **`timecode-source`** (qdev string, `scet` | `obt`; any other value is
+  a realize error) and **`obt-epoch`** (qdev uint64, CUC 32.16, default
+  `0x10000000 << 16`, so coarse & 63 = 0; wider than 48 bits is a realize
+  error).
+- **In `obt` mode** the OBT = obt_base + (vclock − vclock_base) · 65536
+  / 1e9 (whole seconds and the remainder converted separately, so long
+  runs do not overflow). The timer fires at the OBT rollover (the
+  remainder rounded up, so the OBT at the deadline is the new coarse,
+  fine 0); TIMECNT = OBT coarse & 63. The guest SCET commit hook does not
+  move the codes. The skip rule (fine ≥ 0x1000) is unchanged.
+- **`obt`** (runtime uint64, CUC 32.16 in bits 47:0): the getter reads
+  the OBT, or in `scet` mode the SCET (coarse without UNSYNCED, as
+  `stixctrl_scet_now`), with no side effect. The setter is an OBT jump,
+  in `obt` mode only: it rebases at the current vclock and re-arms. A
+  value past 48 bits or a set in `scet` mode is refused. The OBT survives
+  a device reset (like `timecodes`).
+- **`timecode-once`** (runtime bool): true arms one correct code at the
+  next rollover while `timecodes` is false; a no-op while it is true;
+  refused while `link-down` is true or control.TR is 0 (traced with
+  `emitted=0`). The getter is the pending state. A pending once is
+  dropped (traced, `stixspw_timecode_once_drop`) by `link-down = true`,
+  by any `timecodes` write and by a `false` write. It survives a reset;
+  with TR = 0 after the reset it is consumed with nothing emitted.
+- **`timecode-inject`** (runtime write-only uint32, 0..63): one code now
+  with that TIMECNT through the same TR/TQ/IE path and D-M latch as the
+  timer (`stixspw_tc_emit`, factored out of the timer). 64 and above,
+  `link-down` and TR = 0 are refused.
+- **Re-entrancy:** the once/inject paths only latch registers and pulse
+  IRQ 13; no DMA runs, so they need no re-entrancy guard (the TX/RX paths
+  reachable from QMP keep theirs, §29).
+- **Traces:** `stixspw_timecode_manual(kind, timecnt, emitted)`,
+  `stixspw_timecode_once_drop(why)`, `stixspw_obt_set(old, new)`;
+  `stixspw_rx_deliver` gains `vclock_ns` (the D-PLd ordering check).
+  Traces are in no golden.
+
+**Evidence (PL-1):** qtests `/sparc/stix/spw-obt`, `spw-timecode-once`,
+`spw-timecode-inject`. RED before PL-1: QEMU refuses
+`-global grlib-stixspw.timecode-source=obt` ("Property not found"), and
+`qom-set timecode-once` / `timecode-inject` fail.

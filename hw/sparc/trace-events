@@ -78,7 +78,7 @@ stixspw_tx_skip_en(uint32_t ctrl) "TX skipped: TXDSC_EN clear (ctrl=0x%x)"
 stixspw_irq_latched(void) "IRQ event latched: control.IE=0"
 stixspw_irq_deferred(void) "latched IRQ pulsed on control.IE 0->1"
 stixspw_rx_inject(uint32_t len) "rx-inject: %u byte unit"
-stixspw_rx_deliver(uint32_t len, uint32_t ctrl, uint32_t sel) "RX unit delivered: len=%u ctrl=0x%x sel=%u"
+stixspw_rx_deliver(uint32_t len, uint32_t ctrl, uint32_t sel, int64_t vclock_ns) "RX unit delivered: len=%u ctrl=0x%x sel=%u vclock_ns=%"PRId64
 stixspw_rx_queued(uint32_t len, uint32_t pending) "RX unit queued: len=%u pending=%u"
 stixspw_rx_dropped(uint32_t len) "RX unit dropped: no-spill queue full (len=%u)"
 stixspw_rx_truncated(uint32_t len, uint32_t n) "RX unit truncated: %u -> %u bytes"
@@ -89,6 +89,9 @@ stixspw_link_down(bool down, uint32_t rx_queued) "link-down=%d (RX units queued 
 stixspw_link_error(uint32_t status, bool li, bool ie) "link error: status=0x%08x LI=%d IE=%d"
 stixspw_tx_link_wait(void) "TE while the link is down: the exchange waits for the link"
 stixspw_timecode_arm(uint32_t coarse, uint32_t fine, int64_t ns) "time-code timer armed: coarse=0x%08x fine=%u next rollover in %"PRId64" ns"
+stixspw_timecode_manual(const char *kind, uint32_t timecnt, bool emitted) "manual time code: kind=%s timecnt=%u emitted=%d"
+stixspw_timecode_once_drop(const char *why) "pending timecode-once dropped: %s"
+stixspw_obt_set(uint64_t old, uint64_t obt) "obt set: 0x%012"PRIx64" -> 0x%012"PRIx64
 
 # tmtc_io_server.c (STIX)
 stixtmtc_accept_failed(void) "accept failed"

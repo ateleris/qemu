@@ -7380,6 +7380,353 @@ static void test_det_chunk_guard(void)
     stix_qtest_cleanup();
 }
 
+
+/* ---- Platform controller (PL-1): OBT source, one-shot, inject ---- */
+
+/*
+ * The platform-test controller plan (2026-11-11-platform-plan.md) keeps
+ * its qtests in this one appended block behind stix_platform_register(),
+ * so a merge with the detector branch touches main() in one line.
+ */
+
+#define OBT_CUC(coarse, fine) (((uint64_t)(coarse) << 16) | (fine))
+#define OBT_DEFAULT_EPOCH     OBT_CUC(0x10000000u, 0)
+#define OBT_MASK              0xFFFFFFFFFFFFull
+#define MS_NS                 (1000 * 1000LL)
+
+/* A uint64 property, or *ok = false when qom-get fails. */
+static uint64_t stix_qom_get_u64(QTestState *qts, const char *path,
+                                 const char *prop, bool *ok)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s, 'property': %s}}",
+                            path, prop);
+    QNum *n = qobject_to(QNum, qdict_get(resp, "return"));
+    uint64_t val = 0;
+
+    *ok = n != NULL && qnum_get_try_uint(n, &val);
+    qobject_unref(resp);
+    return val;
+}
+
+/* qom-set of an integer property; true when QEMU accepted it. */
+static bool stix_qom_set_u64(QTestState *qts, const char *path,
+                             const char *prop, uint64_t value)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %" PRIu64 "}}",
+                            path, prop, value);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+static uint64_t plat_obt(QTestState *qts)
+{
+    bool ok;
+    uint64_t v = stix_qom_get_u64(qts, "/machine/stixspw", "obt", &ok);
+
+    g_assert(ok);
+    return v;
+}
+
+static bool spw_to(QTestState *qts)
+{
+    return (qtest_readl(qts, SPW_STATUS) & SPW_STATUS_TO) != 0;
+}
+
+static void spw_to_clear(QTestState *qts)
+{
+    qtest_writel(qts, SPW_STATUS, SPW_STATUS_TO);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+}
+
+/* Step to 10 ms past the next OBT rollover (fine < 0x1000 at fire). */
+static void obt_step_rollover(QTestState *qts)
+{
+    uint64_t fine = plat_obt(qts) & 0xFFFFu;
+    int64_t ns_into = (int64_t)fine * NSEC_PER_SEC / SUBSEC_PER_SEC;
+
+    qtest_clock_step(qts, NSEC_PER_SEC - ns_into + 10 * MS_NS);
+}
+
+/*
+ * D-PLb: timecode-source=obt makes a platform OBT the time-code source:
+ * OBT = obt-epoch + vclock · 65536 / 1e9 (CUC 32.16), the codes come at
+ * the OBT rollovers with TIMECNT = OBT coarse & 63, a guest SCET commit
+ * does not move them, a runtime `obt` set (an OBT jump) re-arms, and the
+ * OBT survives a system reset. In the default scet mode `obt` reads the
+ * IDPU SCET (coarse without UNSYNCED) and a set is refused. RED before
+ * PL-1: timecode-source, obt-epoch and obt are unknown.
+ */
+static void test_spw_obt(void)
+{
+    const uint64_t epoch = OBT_CUC(0x10000005u, 0);
+    g_autofree gchar *extra = NULL;
+    const char *path = "/machine/stixspw";
+    QTestState *qts;
+    uint64_t obt, before;
+    bool ok;
+
+    extra = g_strdup_printf("-global grlib-stixspw.timecode-source=obt "
+                            "-global grlib-stixspw.obt-epoch=%" PRIu64,
+                            epoch);
+    qts = stix_qtest_new_extra(extra);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    spw_to_clear(qts);
+
+    /* the OBT starts at the epoch and advances exactly with the vclock */
+    g_assert_cmphex(plat_obt(qts), ==, epoch);
+    qtest_clock_step(qts, 250 * MS_NS);
+    g_assert_cmphex(plat_obt(qts), ==, epoch + 0x4000u);
+    g_assert(!spw_to(qts));
+
+    /*
+     * a. the OBT rollover emits with TIMECNT = OBT coarse & 63 (6), not
+     * the SCET's (1)
+     */
+    obt_step_rollover(qts);
+    g_assert_cmpuint(ctrl_sec(qts) & 63u, ==, 1);
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME) & 63u, ==,
+                     0x10000006u & 63u);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==,
+                     SPW_IRQ_BIT);
+    spw_to_clear(qts);
+
+    /*
+     * b. a guest SCET commit mid-second does not move the codes: in
+     * scet mode a commit with fine 0x8000 emits 0.5 s later (spw-timecode
+     * e); in obt mode nothing comes until the OBT rollover
+     */
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x12345678u);
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0x8000u);
+    qtest_clock_step(qts, 510 * MS_NS);
+    g_assert_cmpuint(ctrl_sec(qts), ==, 0x12345679u);
+    g_assert(!spw_to(qts));
+    obt_step_rollover(qts);
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME) & 63u, ==,
+                     0x10000007u & 63u);
+    spw_to_clear(qts);
+
+    /*
+     * c. an obt set (a jump to 0.75 s into 0x20000010) re-arms: the next
+     * code comes 0.25 s later with TIMECNT 0x11; the old schedule
+     * (0.99 s away) never fires
+     */
+    ok = stix_qom_set_u64(qts, path, "obt", OBT_CUC(0x20000010u, 0xC000u));
+    g_assert(ok);
+    g_assert_cmphex(plat_obt(qts), ==, OBT_CUC(0x20000010u, 0xC000u));
+    qtest_clock_step(qts, 240 * MS_NS);
+    g_assert(!spw_to(qts));
+    qtest_clock_step(qts, 20 * MS_NS);
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME) & 63u, ==,
+                     0x20000011u & 63u);
+    spw_to_clear(qts);
+    /* a value past 48 bits is refused and changes nothing */
+    before = plat_obt(qts);
+    g_assert(!stix_qom_set_u64(qts, path, "obt", OBT_MASK + 1));
+    g_assert_cmphex(plat_obt(qts), ==, before);
+
+    /*
+     * d. the OBT survives a system reset, and the codes follow it again
+     * once the FSW re-writes control (TR)
+     */
+    before = plat_obt(qts);
+    qtest_system_reset(qts);
+    g_assert_cmphex(plat_obt(qts), ==, before);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    spw_to_clear(qts);
+    obt_step_rollover(qts);
+    obt = plat_obt(qts);
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME) & 63u, ==,
+                     (uint32_t)(obt >> 16) & 63u);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* e. scet mode (the default): obt reads the SCET; a set is refused */
+    qts = stix_qtest_new();
+    qtest_clock_step(qts, 300 * MS_NS);
+    obt = plat_obt(qts);
+    g_assert_cmphex(obt >> 16, ==, ctrl_sec(qts));
+    g_assert_cmphex(obt & 0xFFFFu, ==, ctrl_sub(qts));
+    ctrl_write(qts, CTRL_LONGTIMERSEC, 0x80000123u); /* UNSYNCED set */
+    ctrl_write(qts, CTRL_LONGTIMERSUBSEC, 0x4000u);
+    g_assert_cmphex(plat_obt(qts), ==, OBT_CUC(0x123u, 0x4000u));
+    g_assert(!stix_qom_set_u64(qts, path, "obt", OBT_DEFAULT_EPOCH));
+    g_assert_cmphex(plat_obt(qts), ==, OBT_CUC(0x123u, 0x4000u));
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* f. the default epoch is 0x10000000 (coarse & 63 = 0, D-PLb) */
+    qts = stix_qtest_new_extra("-global grlib-stixspw.timecode-source=obt");
+    g_assert_cmphex(plat_obt(qts), ==, OBT_DEFAULT_EPOCH);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-PLc: timecode-once arms exactly one correct code at the next
+ * rollover while timecodes is false; it is a no-op while timecodes is
+ * true, refused while link-down is true or control.TR is 0, and a
+ * pending once is dropped by link-down and by a timecodes write. RED
+ * before PL-1: timecode-once is unknown.
+ */
+static void test_spw_timecode_once(void)
+{
+    const char *path = "/machine/stixspw";
+    QTestState *qts;
+    uint32_t coarse;
+    bool ok, v;
+
+    qts = stix_qtest_new();
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    g_assert(stix_qom_set_bool(qts, path, "timecodes", false));
+    spw_to_clear(qts);
+
+    /* a. exactly one code, with the correct TIMECNT, then silence */
+    g_assert(stix_qom_set_bool(qts, path, "timecode-once", true));
+    v = stix_qom_get_bool(qts, path, "timecode-once", &ok);
+    g_assert(ok && v);
+    tc_step_rollover(qts);
+    coarse = ctrl_sec(qts);
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME) & 63u, ==, coarse & 63u);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==,
+                     SPW_IRQ_BIT);
+    v = stix_qom_get_bool(qts, path, "timecode-once", &ok);
+    g_assert(ok && !v);
+    spw_to_clear(qts);
+    tc_step_rollover(qts);
+    tc_step_rollover(qts);
+    g_assert(!spw_to(qts));
+
+    /* b. a no-op while timecodes is true: nothing pending, codes as usual */
+    g_assert(stix_qom_set_bool(qts, path, "timecodes", true));
+    g_assert(stix_qom_set_bool(qts, path, "timecode-once", true));
+    v = stix_qom_get_bool(qts, path, "timecode-once", &ok);
+    g_assert(ok && !v);
+    tc_step_rollover(qts);
+    g_assert(spw_to(qts));
+    spw_to_clear(qts);
+    g_assert(stix_qom_set_bool(qts, path, "timecodes", false));
+
+    /* c. refused while the link is down */
+    g_assert(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert(!stix_qom_set_bool(qts, path, "timecode-once", true));
+    g_assert(stix_qom_set_bool(qts, path, "link-down", false));
+    tc_step_rollover(qts);
+    g_assert(!spw_to(qts));
+
+    /* d. an error with control.TR = 0 (the model would emit nothing) */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_TR);
+    g_assert(!stix_qom_set_bool(qts, path, "timecode-once", true));
+    v = stix_qom_get_bool(qts, path, "timecode-once", &ok);
+    g_assert(ok && !v);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+
+    /* e. a pending once is dropped by link-down = true */
+    g_assert(stix_qom_set_bool(qts, path, "timecode-once", true));
+    g_assert(stix_qom_set_bool(qts, path, "link-down", true));
+    v = stix_qom_get_bool(qts, path, "timecode-once", &ok);
+    g_assert(ok && !v);
+    g_assert(stix_qom_set_bool(qts, path, "link-down", false));
+    tc_step_rollover(qts);
+    g_assert(!spw_to(qts));
+
+    /* f. ... and by a timecodes write */
+    g_assert(stix_qom_set_bool(qts, path, "timecode-once", true));
+    g_assert(stix_qom_set_bool(qts, path, "timecodes", false));
+    v = stix_qom_get_bool(qts, path, "timecode-once", &ok);
+    g_assert(ok && !v);
+    tc_step_rollover(qts);
+    g_assert(!spw_to(qts));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * D-PLc: timecode-inject (write-only uint32 0..63) emits one code now
+ * with that TIMECNT through the TR/TQ/IE path and the D-M latch; 64 is
+ * rejected, and it is refused while link-down is true or control.TR is
+ * 0. RED before PL-1: timecode-inject is unknown.
+ */
+static void test_spw_timecode_inject(void)
+{
+    const char *path = "/machine/stixspw";
+    QTestState *qts;
+
+    qts = stix_qtest_new();
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    g_assert(stix_qom_set_bool(qts, path, "timecodes", false));
+    qtest_clock_step(qts, 300 * MS_NS); /* mid-second: a wrong-time code */
+    spw_to_clear(qts);
+
+    /* a. the given TIMECNT now, TO and IRQ 13 */
+    g_assert(stix_qom_set_u64(qts, path, "timecode-inject", 42));
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME), ==, 42);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==,
+                     SPW_IRQ_BIT);
+    spw_to_clear(qts);
+
+    /* b. control.IE = 0 latches the IRQ; the IE 0->1 write pulses it */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_IE);
+    g_assert(stix_qom_set_u64(qts, path, "timecode-inject", 5));
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME), ==, 5);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==,
+                     SPW_IRQ_BIT);
+    spw_to_clear(qts);
+
+    /* c. control.TQ = 0: TO and TIMECNT, no IRQ */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_TQ);
+    g_assert(stix_qom_set_u64(qts, path, "timecode-inject", 63));
+    g_assert(spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME), ==, 63);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & SPW_IRQ_BIT, ==, 0);
+    spw_to_clear(qts);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW);
+
+    /* d. 64 is rejected: no code, TIMECNT unchanged */
+    g_assert(!stix_qom_set_u64(qts, path, "timecode-inject", 64));
+    g_assert(!spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME), ==, 63);
+
+    /* e. refused while the link is down */
+    g_assert(stix_qom_set_bool(qts, path, "link-down", true));
+    g_assert(!stix_qom_set_u64(qts, path, "timecode-inject", 7));
+    g_assert(!spw_to(qts));
+    g_assert(stix_qom_set_bool(qts, path, "link-down", false));
+
+    /* f. an error with control.TR = 0, and nothing emitted */
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_FSW & ~SPW_CTRL_TR);
+    g_assert(!stix_qom_set_u64(qts, path, "timecode-inject", 9));
+    g_assert(!spw_to(qts));
+    g_assert_cmpuint(qtest_readl(qts, SPW_TIME), ==, 63);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+static void stix_platform_register(void)
+{
+    qtest_add_func("/sparc/stix/spw-obt", test_spw_obt);
+    qtest_add_func("/sparc/stix/spw-timecode-once", test_spw_timecode_once);
+    qtest_add_func("/sparc/stix/spw-timecode-inject",
+                   test_spw_timecode_inject);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -7471,6 +7818,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/det-chunk-sumdmask",
                        test_det_chunk_sumdmask);
         qtest_add_func("/sparc/stix/det-chunk-guard", test_det_chunk_guard);
+        stix_platform_register();
     }
 
     return g_test_run();

@@ -8,6 +8,8 @@
 #include "chardev/char-fe.h"
 #include "qapi/error.h"
 #include "qapi/qapi-types-common.h"
+#include "qapi/qapi-builtin-type-infos.h"
+#include "qapi/visitor.h"
 #include "system/physmem.h"
 #include "system/qtest.h"
 #include "StixIdpu.h"
@@ -146,6 +148,24 @@ struct STIXSPW
     STIXCTRL *scet_ctrl;
     bool timecodes;
     QEMUTimer *tc_timer;
+
+    /*
+     * D-PLb (PL-1): timecode-source=obt makes a platform on-board time
+     * the source instead of the IDPU SCET. OBT = obt_base + (vclock -
+     * obt_vclock_base) * 65536 / 1e9 in CUC 32.16 units, rebased by an
+     * obt set; it survives a device reset like timecodes. The qdev
+     * string is parsed at realize into obt_mode.
+     */
+    char *timecode_source;
+    bool obt_mode;
+    uint64_t obt_epoch;
+    uint64_t obt_base;
+    int64_t obt_vclock_base;
+    /*
+     * D-PLc: one correct code armed at the next rollover while
+     * timecodes is false (timecode-once)
+     */
+    bool once_pending;
 
     /*
      * D-P4e (P4-5): link-down is runtime-settable (qom-set) and cleared
@@ -305,7 +325,8 @@ static StixSpwRxResult stixspw_rx_deliver_one(STIXSPW *s,
         newctrl |= 1u << RXDSC_TR;
     }
     stixspw_st_be32(desc_addr, newctrl);
-    trace_stixspw_rx_deliver(len, newctrl, s->rx_index);
+    trace_stixspw_rx_deliver(len, newctrl, s->rx_index,
+                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     /*
      * the selector wraps at WR, like the FSW's re-arm loop, and at
@@ -403,84 +424,176 @@ static void stixspw_rx_retry(STIXSPW *s)
 /* D-J: the SCET fine field counts 1/65536 s ticks */
 #define STIXSPW_SUBSEC_PER_SEC 65536LL
 #define STIXSPW_NSEC_PER_SEC 1000000000LL
+/* D-PLb: the OBT is a 48-bit CUC (32-bit coarse, 16-bit fine) */
+#define STIXSPW_OBT_MASK 0xFFFFFFFFFFFFull
 
 /*
- * D-J: arm the time-code timer at the next SCET coarse rollover; the
- * CTRL's fine field gives the offset into the running second.
+ * D-PLb: the OBT ticks elapsed since the base, from the virtual clock.
+ * Whole seconds and the remainder are converted separately, so a long
+ * run cannot overflow the 64-bit product.
+ */
+static uint64_t stixspw_obt_at(STIXSPW *s, int64_t now)
+{
+    uint64_t e = now > s->obt_vclock_base ? now - s->obt_vclock_base : 0;
+    uint64_t secs = e / STIXSPW_NSEC_PER_SEC;
+    uint64_t rem = e % STIXSPW_NSEC_PER_SEC;
+
+    return s->obt_base + (secs << 16) +
+           rem * STIXSPW_SUBSEC_PER_SEC / STIXSPW_NSEC_PER_SEC;
+}
+
+/*
+ * D-PLb: the virtual time at which the OBT reaches the next coarse
+ * rollover. The remainder is rounded up, so the OBT read at the
+ * deadline is the new coarse with fine 0 (never one tick short).
+ */
+static int64_t stixspw_obt_next_rollover(STIXSPW *s, int64_t now)
+{
+    uint64_t next = ((stixspw_obt_at(s, now) >> 16) + 1) << 16;
+    uint64_t d = next - s->obt_base;
+    uint64_t rem = d & 0xFFFFu;
+
+    return s->obt_vclock_base + (int64_t)((d >> 16) * STIXSPW_NSEC_PER_SEC) +
+           (int64_t)DIV_ROUND_UP(rem * STIXSPW_NSEC_PER_SEC,
+                                 STIXSPW_SUBSEC_PER_SEC);
+}
+
+/*
+ * The time the codes follow: the OBT in obt mode, else the IDPU SCET
+ * (stixctrl_scet_now, the coarse without the UNSYNCED bit).
+ */
+static void stixspw_tc_now(STIXSPW *s, uint32_t *coarse, uint16_t *fine)
+{
+    if (s->obt_mode) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        uint64_t obt = stixspw_obt_at(s, now) & STIXSPW_OBT_MASK;
+
+        *coarse = (uint32_t)(obt >> 16);
+        *fine = (uint16_t)obt;
+        return;
+    }
+    stixctrl_scet_now(s->scet_ctrl, coarse, fine);
+}
+
+/*
+ * D-J: arm the time-code timer at the next coarse rollover of the
+ * source (the SCET, or the OBT in obt mode, D-PLb). It also runs while
+ * only a timecode-once is pending (D-PLc).
  */
 static void stixspw_tc_arm(STIXSPW *s)
 {
     uint32_t coarse;
     uint16_t fine;
-    int64_t now, ns_into;
+    int64_t now, due;
 
     /*
-     * m3: pre-realize (or timecodes=off) there is nothing to arm; D-P4e:
-     * no time codes cross a down link, the clear re-arms
+     * m3: pre-realize (or timecodes=off with no once pending) there is
+     * nothing to arm; D-P4e: no time codes cross a down link, the clear
+     * re-arms
      */
-    if (!s->timecodes || s->link_down || s->scet_ctrl == NULL ||
-        s->tc_timer == NULL) {
+    if (!(s->timecodes || s->once_pending) || s->link_down ||
+        s->scet_ctrl == NULL || s->tc_timer == NULL) {
         return;
     }
-    stixctrl_scet_now(s->scet_ctrl, &coarse, &fine);
     now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    ns_into = fine * STIXSPW_NSEC_PER_SEC / STIXSPW_SUBSEC_PER_SEC;
-    timer_mod_ns(s->tc_timer, now + STIXSPW_NSEC_PER_SEC - ns_into);
-    trace_stixspw_timecode_arm(coarse, fine,
-                               STIXSPW_NSEC_PER_SEC - ns_into);
+    stixspw_tc_now(s, &coarse, &fine);
+    if (s->obt_mode) {
+        due = stixspw_obt_next_rollover(s, now);
+    } else {
+        due = now + STIXSPW_NSEC_PER_SEC -
+              fine * STIXSPW_NSEC_PER_SEC / STIXSPW_SUBSEC_PER_SEC;
+    }
+    timer_mod_ns(s->tc_timer, due);
+    trace_stixspw_timecode_arm(coarse, fine, due - now);
 }
 
-/* correction 6: the guest committed a new on-board time (0xCC) */
+/*
+ * correction 6: the guest committed a new on-board time (0xCC). In obt
+ * mode the codes follow the platform OBT, so the guest SCET does not
+ * move them (D-PLb).
+ */
 static void stixspw_scet_committed(void *opaque)
 {
-    stixspw_tc_arm(opaque);
+    STIXSPW *s = opaque;
+
+    if (!s->obt_mode) {
+        stixspw_tc_arm(s);
+    }
+}
+
+/*
+ * One time code with this TIMECNT, when control.TR is set: it latches
+ * time = TIMECNT (bits 5:0, TCTRL 7:6 = 0), sets status.TO and raises
+ * IRQ 13 when control.TQ is set, gated by control.IE per D-M. Returns
+ * false when TR = 0 (nothing emitted). Register and IRQ work only: no
+ * DMA, so a caller outside an MMIO dispatch needs no re-entrancy guard.
+ */
+static bool stixspw_tc_emit(STIXSPW *s, uint32_t coarse, uint32_t timecnt)
+{
+    if (!(s->reg.control & (1u << STIXSPW_CONTROL_TR))) {
+        return false;
+    }
+    s->reg.time = timecnt & 63u;
+    s->reg.status |= (1u << STIXSPW_STATUS_TO);
+    trace_stixspw_timecode_emit(coarse, s->reg.time);
+    if (s->reg.control & (1u << STIXSPW_CONTROL_TQ)) {
+        if (s->reg.control & (1u << STIXSPW_CONTROL_IE)) {
+            qemu_irq_pulse(s->irq);
+        } else {
+            s->irq_latched = true;
+            trace_stixspw_irq_latched();
+        }
+    }
+    return true;
+}
+
+/* D-PLc: a pending timecode-once is dropped (traced) */
+static void stixspw_once_drop(STIXSPW *s, const char *why)
+{
+    if (s->once_pending) {
+        s->once_pending = false;
+        trace_stixspw_timecode_once_drop(why);
+    }
 }
 
 /*
  * D-J: the time-code timer fired at a coarse rollover. A code is
  * emitted only in the first 1/16 s of the new second (fine < 0x1000 —
  * a mid-second code would drag the synchronised FSW clock,
- * Timing.c:199-328) and only when control.TR is set; it latches
- * time = TIMECNT (bits 5:0, TCTRL 7:6 = 0), sets status.TO and raises
- * IRQ 13 when control.TQ is set, gated by control.IE per D-M.
+ * Timing.c:199-328) and only when control.TR is set (stixspw_tc_emit).
+ * A pending timecode-once is consumed by this rollover (D-PLc).
  */
 static void stixspw_tc_timer(void *opaque)
 {
     STIXSPW *s = opaque;
     uint32_t coarse;
     uint16_t fine;
+    bool emitted;
 
-    if (!s->timecodes || s->link_down) {
+    if (!(s->timecodes || s->once_pending) || s->link_down) {
         return; /* silenced at run time; the property re-arms */
     }
 
-    stixctrl_scet_now(s->scet_ctrl, &coarse, &fine);
+    stixspw_tc_now(s, &coarse, &fine);
     if (fine >= 0x1000) {
         /*
          * m5: the callback ran more than 62.5 ms late — possible
          * without -icount when the main loop is starved. A code
          * emitted now would drag the synchronised FSW clock
          * (Timing.c:199-328): one second is lost and the re-arm emits
-         * at the next rollover. A guest SCET set cannot reach this
-         * path — every 0xCC commit re-arms through the hook.
+         * at the next rollover (a pending once waits for it). A guest
+         * SCET set cannot reach this path — every 0xCC commit re-arms
+         * through the hook, and in obt mode the OBT is not guest-set.
          */
         trace_stixspw_timecode_skip(coarse, fine);
         stixspw_tc_arm(s);
         return;
     }
 
-    if (s->reg.control & (1u << STIXSPW_CONTROL_TR)) {
-        s->reg.time = coarse & 63u;
-        s->reg.status |= (1u << STIXSPW_STATUS_TO);
-        trace_stixspw_timecode_emit(coarse, s->reg.time);
-        if (s->reg.control & (1u << STIXSPW_CONTROL_TQ)) {
-            if (s->reg.control & (1u << STIXSPW_CONTROL_IE)) {
-                qemu_irq_pulse(s->irq);
-            } else {
-                s->irq_latched = true;
-                trace_stixspw_irq_latched();
-            }
-        }
+    emitted = stixspw_tc_emit(s, coarse, coarse & 63u);
+    if (s->once_pending) {
+        s->once_pending = false;
+        trace_stixspw_timecode_manual("once", coarse & 63u, emitted);
     }
     stixspw_tc_arm(s);
 }
@@ -541,6 +654,7 @@ static void stixspw_set_link(STIXSPW *s, bool down)
     trace_stixspw_link_down(down, s->rx_count);
     s->reg.status &= ~SPW_STATUS_LS_FIELD;
     if (down) {
+        stixspw_once_drop(s, "link-down");
         s->reg.status |= SPW_STATUS_READY;
         if (s->tc_timer != NULL) {
             timer_del(s->tc_timer);
@@ -808,6 +922,24 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
                    "grlib-stixspw: timecodes=on needs the scet-source link");
         return;
     }
+    /* D-PLb: the time-code source, scet (the default) or obt */
+    if (STIXSPW->timecode_source == NULL ||
+        !strcmp(STIXSPW->timecode_source, "scet")) {
+        STIXSPW->obt_mode = false;
+    } else if (!strcmp(STIXSPW->timecode_source, "obt")) {
+        STIXSPW->obt_mode = true;
+    } else {
+        error_setg(errp, "grlib-stixspw: timecode-source '%s' is not "
+                   "'scet' or 'obt'", STIXSPW->timecode_source);
+        return;
+    }
+    if (STIXSPW->obt_epoch > STIXSPW_OBT_MASK) {
+        error_setg(errp, "grlib-stixspw: obt-epoch 0x%" PRIx64
+                   " is wider than the 48-bit CUC", STIXSPW->obt_epoch);
+        return;
+    }
+    STIXSPW->obt_base = STIXSPW->obt_epoch;
+    STIXSPW->obt_vclock_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     sysbus_init_irq(sbd, &STIXSPW->irq);
 
@@ -971,6 +1103,8 @@ static void grlib_stixspw_set_timecodes(Object *obj, bool value, Error **errp)
 {
     STIXSPW *s = GRLIB_STIXSPW(obj);
 
+    /* D-PLc: any timecodes write drops a pending once */
+    stixspw_once_drop(s, "timecodes");
     s->timecodes = value;
     if (!value) {
         if (s->tc_timer != NULL) {
@@ -997,6 +1131,144 @@ static void grlib_stixspw_set_link_down(Object *obj, bool value, Error **errp)
         return;
     }
     stixspw_set_link(s, value);
+}
+
+/*
+ * D-PLb: the runtime obt (uint64, CUC 32.16 in bits 47:0). The getter
+ * reads the OBT in obt mode, or the IDPU SCET (coarse without UNSYNCED)
+ * in scet mode; it has no side effect. The setter is an OBT jump, in
+ * obt mode only: it rebases the OBT at the current virtual time and
+ * re-arms the time-code timer.
+ */
+static void grlib_stixspw_get_obt(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    STIXSPW *s = GRLIB_STIXSPW(obj);
+    uint32_t coarse;
+    uint16_t fine;
+    uint64_t value;
+
+    if (!DEVICE(obj)->realized || (!s->obt_mode && s->scet_ctrl == NULL)) {
+        error_setg(errp, "obt is only readable at run time");
+        return;
+    }
+    stixspw_tc_now(s, &coarse, &fine);
+    value = ((uint64_t)coarse << 16) | fine;
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void grlib_stixspw_set_obt(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    STIXSPW *s = GRLIB_STIXSPW(obj);
+    uint32_t coarse;
+    uint16_t fine;
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+    if (!DEVICE(obj)->realized) {
+        error_setg(errp, "obt can only be set at run time (qom-set)");
+        return;
+    }
+    if (!s->obt_mode) {
+        error_setg(errp, "obt can only be set with timecode-source=obt");
+        return;
+    }
+    if (value > STIXSPW_OBT_MASK) {
+        error_setg(errp, "obt 0x%" PRIx64 " is wider than the 48-bit CUC",
+                   value);
+        return;
+    }
+    stixspw_tc_now(s, &coarse, &fine);
+    trace_stixspw_obt_set(((uint64_t)coarse << 16) | fine, value);
+    s->obt_base = value;
+    s->obt_vclock_base = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    stixspw_tc_arm(s);
+}
+
+static bool grlib_stixspw_get_timecode_once(Object *obj, Error **errp)
+{
+    return GRLIB_STIXSPW(obj)->once_pending;
+}
+
+/*
+ * D-PLc: true arms exactly one correct code at the next rollover while
+ * timecodes is false (a no-op while it is true); refused while the link
+ * is down or control.TR is 0, when the model would emit nothing. False
+ * cancels a pending once.
+ */
+static void grlib_stixspw_set_timecode_once(Object *obj, bool value,
+                                            Error **errp)
+{
+    STIXSPW *s = GRLIB_STIXSPW(obj);
+    uint32_t coarse;
+    uint16_t fine;
+
+    if (!DEVICE(obj)->realized) {
+        error_setg(errp, "timecode-once can only be set at run time");
+        return;
+    }
+    if (!value) {
+        stixspw_once_drop(s, "cancel");
+        return;
+    }
+    if (s->link_down) {
+        error_setg(errp, "timecode-once: the link is down");
+        return;
+    }
+    if (!(s->reg.control & (1u << STIXSPW_CONTROL_TR))) {
+        stixspw_tc_now(s, &coarse, &fine);
+        trace_stixspw_timecode_manual("once", (coarse + 1) & 63u, false);
+        error_setg(errp, "timecode-once: control.TR is 0, no code would "
+                   "be emitted");
+        return;
+    }
+    if (s->timecodes) {
+        return; /* the next rollover emits anyway */
+    }
+    s->once_pending = true;
+    stixspw_tc_arm(s);
+}
+
+/*
+ * D-PLc: timecode-inject (write-only, 0..63) emits one code now with
+ * that TIMECNT through the TR/TQ/IE path and the D-M latch: the fault
+ * tool for a wrong value or a mid-second code. Refused while the link
+ * is down or control.TR is 0. No DMA runs (stixspw_tc_emit).
+ */
+static void grlib_stixspw_set_timecode_inject(Object *obj, Visitor *v,
+                                              const char *name, void *opaque,
+                                              Error **errp)
+{
+    STIXSPW *s = GRLIB_STIXSPW(obj);
+    uint32_t value, coarse;
+    uint16_t fine;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (!DEVICE(obj)->realized) {
+        error_setg(errp, "timecode-inject can only be set at run time");
+        return;
+    }
+    if (value > 63) {
+        error_setg(errp, "timecode-inject: TIMECNT %u is not 0..63", value);
+        return;
+    }
+    if (s->link_down) {
+        error_setg(errp, "timecode-inject: the link is down");
+        return;
+    }
+    stixspw_tc_now(s, &coarse, &fine);
+    if (!stixspw_tc_emit(s, coarse, value)) {
+        trace_stixspw_timecode_manual("inject", value, false);
+        error_setg(errp, "timecode-inject: control.TR is 0, no code "
+                   "emitted");
+        return;
+    }
+    trace_stixspw_timecode_manual("inject", value, true);
 }
 
 static void grlib_stixspw_instance_init(Object *obj)
@@ -1034,6 +1306,15 @@ static void grlib_stixspw_instance_init(Object *obj)
     object_property_add_bool(obj, "link-down",
                              grlib_stixspw_get_link_down,
                              grlib_stixspw_set_link_down);
+    /* D-PLb/D-PLc (PL-1): the platform time, runtime like timecodes */
+    object_property_add(obj, "obt", "uint64", &uint64_type_info,
+                        grlib_stixspw_get_obt, grlib_stixspw_set_obt,
+                        NULL, NULL);
+    object_property_add_bool(obj, "timecode-once",
+                             grlib_stixspw_get_timecode_once,
+                             grlib_stixspw_set_timecode_once);
+    object_property_add(obj, "timecode-inject", "uint32", &uint32_type_info,
+                        NULL, grlib_stixspw_set_timecode_inject, NULL, NULL);
 }
 
 static void grlib_stixspw_reset(DeviceState *d)
@@ -1062,7 +1343,9 @@ static void grlib_stixspw_reset(DeviceState *d)
     /*
      * D-J (correction 16): the time-code timer survives a reset — the
      * SCET keeps running (the CTRL keeps its correction), so re-arm at
-     * the next rollover; the FSW re-writes control at SPW_open.
+     * the next rollover; the FSW re-writes control at SPW_open. D-PLb:
+     * the OBT and a pending once survive too (with TR = 0 after the
+     * reset the once is consumed with nothing emitted, traced).
      */
     stixspw_tc_arm(STIXSPW);
 }
@@ -1080,6 +1363,11 @@ static const Property grlib_stixspw_properties[] = {
     DEFINE_PROP_BOOL("udp-spw-header", STIXSPW, udp_spw_header, false),
     DEFINE_PROP_LINK("scet-source", STIXSPW, scet_ctrl,
                      TYPE_GRLIB_STIXCTRL, STIXCTRL *),
+    /* D-PLb (PL-1): scet (default, §20 unchanged) or obt */
+    DEFINE_PROP_STRING("timecode-source", STIXSPW, timecode_source),
+    /* D-PLb: the OBT start value, CUC 32.16; coarse & 63 = 0 */
+    DEFINE_PROP_UINT64("obt-epoch", STIXSPW, obt_epoch,
+                       0x10000000ull << 16),
 };
 
 static void grlib_stixspw_class_init(ObjectClass *klass, const void *data)
