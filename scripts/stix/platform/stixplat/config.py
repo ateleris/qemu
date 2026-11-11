@@ -33,7 +33,8 @@ DEFAULTS = {
     "api": {"bind": "127.0.0.1"},
     "power": {"off_time_s": 2.0, "cycle_boots": True,
               "quit_timeout_s": 5.0},
-    "clock": {"sample_hz": 20.0, "state_hz": 2.0},
+    "clock": {"sample_hz": 20.0, "state_hz": 2.0,
+              "snapshot_s": 10.0},  # a full state record (0 = off)
     "log": {"max_log_mb": 50, "max_log_files": 5, "ring": 20000},
     "retention": {"run_root": "/tmp/stix-plat/runs-root", "keep_runs": 10,
                   "keep_failed_days": 7, "max_total_mb": 2048,
@@ -86,6 +87,8 @@ def _check(cfg):
             raise ConfigError("ports.%s = %r is out of range" % (k, p))
     if not 0 <= cfg["qemu"]["obt_epoch"] < (1 << 48):
         raise ConfigError("qemu.obt_epoch is wider than the 48-bit CUC")
+    if cfg["clock"]["snapshot_s"] < 0:
+        raise ConfigError("clock.snapshot_s < 0")
     if cfg["power"]["off_time_s"] < 0:
         raise ConfigError("power.off_time_s < 0")
     for k in ("sample_hz", "state_hz"):

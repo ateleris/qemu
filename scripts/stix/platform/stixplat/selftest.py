@@ -442,6 +442,12 @@ def t_power(env):
                  what="state poll")
         check(ctl.state.get("instrument.hk_adc.5")["truth"] == 100,
               "state leaf")
+        snaps = [x.obj["data"]["leaves"] for x in ctl.log.since(0)
+                 if x.kind == "state" and x.obj["path"] == "snapshot"]
+        check(snaps and "idpu.scet.coarse" in snaps[0] and
+              "platform.obt" in snaps[0], "state snapshot record")
+        dq = [x for x in ctl.log.since(0) if x.obj["path"] == "debug.qmp"]
+        check(not dq, "debug.qmp records before any call")
         sim_before = ctl.clock.now()[0]
         r = cmd("platform.power.cycle", {"off_time_s": 0.2})
         check(r["boot_id"] == 2 and ctl.power.state == "running", "cycle")
@@ -489,6 +495,10 @@ def t_power(env):
         r = ctl.command("debug.qmp", {"command": "qom-get", "arguments": {
             "path": "/machine/stixspw", "property": "obt"}})
         check(r["return"] == 5 << 16, "debug.qmp round trip")
+        dq = [x.obj for x in ctl.log.since(0) if x.obj["path"] == "debug.qmp"]
+        check([x["kind"] for x in dq] == ["cmd", "result"] * 2 and
+              dq[0]["data"]["args"]["command"] == "qom-set",
+              "every debug.qmp call is logged: %r" % dq)
         e = raises(VerbError, ctl.command, "debug.qmp", {"command": "quit"})
         check(e.status == 400, "debug.qmp allowlist")
     finally:

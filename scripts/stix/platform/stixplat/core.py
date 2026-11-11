@@ -46,6 +46,7 @@ class Controller:
         self.stopping = threading.Event()
         self.poller = None
         self.last_state_poll = 0.0
+        self.last_snapshot = None   # bench time of the last snapshot
         self.server = None
         self._register()
         self.log.emit("ctl", "log", "controller.start",
@@ -141,6 +142,21 @@ class Controller:
             self.power.last_obt = (spw["obt"], sim)
         self._emit_changes(self.state.update_hw(ctrl, spw, sim))
         self.last_state_poll = time.monotonic()
+        self._maybe_snapshot(sim)
+
+    def _maybe_snapshot(self, sim):
+        """A full `state` record (path "snapshot") every snapshot_s of
+        bench time, so the log alone can rebuild the volatile leaves
+        that change records skip."""
+        every = int(self.cfg["clock"]["snapshot_s"] * 1e9)
+        if every <= 0 or (self.last_snapshot is not None and
+                          sim - self.last_snapshot < every):
+            return
+        self.last_snapshot = sim
+        with self.state.lock:
+            leaves = {p: {"truth": lf["truth"], "presented": lf["presented"]}
+                      for p, lf in sorted(self.state.leaves.items())}
+        self.log.emit("ctl", "state", "snapshot", {"leaves": leaves})
 
     def _poll_loop(self):
         period = 1.0 / self.cfg["clock"]["sample_hz"]

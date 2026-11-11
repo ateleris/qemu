@@ -65,6 +65,13 @@ lists exactly these verbs and arguments.
 - `boot_id` counts every power-on and every guest reset.
 - `"sim_est": true` marks a time the controller estimated between two
   `vclock-ns` samples.
+- A `state` record is logged when a leaf changes. Volatile leaves (the
+  SCET, the watchdog count, the OBT and the last time code) are left out
+  of these change records. Instead, every `[clock] snapshot_s` of bench
+  time (default 10 s, 0 = off) a `state` record with path `snapshot`
+  carries every leaf, so the log alone can rebuild them.
+- Every `debug.qmp` call is logged as `cmd` and `result` records, like
+  any other verb.
 - Topics: `cmd` and `result` map to `cmd`; `state` and `power` map to
   `state`; `fault` and `force` map to `fault`; `debug` maps to `log`.
   Every other kind is its own topic.
