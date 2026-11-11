@@ -112,7 +112,8 @@ without reconfiguring QEMU or restarting the container.
 - The OBC increments it at 8 Hz, and instruments receive the packet "at
   an agreed frequency up to 8 Hz" (ICD:1311, :10946).
 - **Neither the FSW nor the ICD gives the STIX period** (open question
-  Q1).
+  Q1). **Resolved by the user:** "a message every 125 ms, configurable",
+  the ICD's 8 Hz upper bound, so the count steps by one per TC.
 
 The SuSW ignores TC(20,128) altogether (ICD:10783).
 
@@ -414,7 +415,9 @@ bench**.
   it unnecessary.
 
 ### D-PLe: the TC(20,128) keep-alive (controller)
-- **The period:** default 1 s (Q1). Paced on **virtual time** (D-PLr), so
+- **The period:** default **125 ms** (8 Hz, the user's Q1 decision: "a
+  message every 125 ms, configurable"; `[keepalive] period_s`, 0.125 to
+  3600 s). Paced on **virtual time** (D-PLr), so
   a QMP `stop` or a slow host cannot fake a lapse.
 - **The sequence count** follows the OBC's 8 Hz counter:
   floor(t_sim · 8) mod 2^14 (ICD:1311).

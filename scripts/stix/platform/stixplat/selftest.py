@@ -124,6 +124,9 @@ def t_config(env):
     c = config_mod.load()
     check(c["qemu"]["on_guest_reset"] == "warm", "default policy")
     check(c["qemu"]["obt_epoch"] & 63 << 16 == 0, "epoch 6-LSB aligned")
+    check(c["keepalive"]["period_s"] == 0.125,
+          "the keep-alive default is 125 ms (user decision): %r"
+          % c["keepalive"]["period_s"])
     c = config_mod.load(text='mode = "interactive"\n[ports]\napi = 21520\n'
                         '[qemu]\non_guest_reset = "halt"  # comment\n')
     check(c["ports"]["api"] == 21520 and
@@ -947,29 +950,30 @@ def t_keepalive(env):
 
     def run_to(ns):
         while clk.exact_sim() < ns:
-            clk.sample(clk.vclock + 100_000_000)
+            clk.sample(clk.vclock + 5_000_000)
             clk.run_due()
     run_to(3_000_000_000)
     check(not sent, "nothing before the first TM")
     ka.on_tm(None, None)
-    run_to(6_000_000_000)
-    check(len(sent) == 3, "one per second: %d" % len(sent))
+    run_to(6_000_000_000 + 1_000_000)
+    check(len(sent) == 24, "one per 125 ms (the default): %d" % len(sent))
     seqs = [tcbuild.parse_tc(u[4:])[1] for u in sent]
-    check(seqs == [s * 8 for s in (4, 5, 6)], "8 Hz count %r" % seqs)
+    check(seqs == list(range(25, 49)), "8 Hz count, one step per TC20 %r"
+          % seqs)
     clk.stopped()
     for _ in range(50):
         clk.sample(clk.vclock)
         clk.run_due()
-    check(len(sent) == 3, "no keep-alive while paused")
+    check(len(sent) == 24, "no keep-alive while paused")
     clk.resumed()
     why["v"] = "the SpW link is down"
-    run_to(9_000_000_000)
-    check(len(sent) == 3 and ka.suppressed == 3, "suppressed %d"
+    run_to(9_000_000_000 + 1_000_000)
+    check(len(sent) == 24 and ka.suppressed == 24, "suppressed %d"
           % ka.suppressed)
     why["v"] = None
     ka.set(enabled=False)
     run_to(12_000_000_000)
-    check(len(sent) == 3, "disabled")
+    check(len(sent) == 24, "disabled")
 
 
 def t_relay(env):

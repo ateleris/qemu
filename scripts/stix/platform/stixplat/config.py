@@ -36,7 +36,8 @@ DEFAULTS = {
            "tc_during_link_down": "drop",   # "drop" | "hold"
            "emulation": "auto",    # tc.gs.send: "auto" (run mode) | on | off
            "emulation_source": 121},
-    "keepalive": {"enabled": True, "period_s": 1.0,
+    # D-PLe: a TC(20,128) every 125 ms (user decision), configurable
+    "keepalive": {"enabled": True, "period_s": 0.125,
                   "autostart": "first_tm"},   # "first_tm" | "boot" | "off"
     "faults": {"catalogue": ""},              # "" = the v1 catalogue
     # bind: loopback only, unless container = true (PL-7: inside a
