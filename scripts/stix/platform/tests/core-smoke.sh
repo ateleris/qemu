@@ -11,6 +11,7 @@
 #   off (same flash inode), on, boot, cycle: boot_id increments and
 #     sim_time is continuous (it grows by at least the off-time)
 #   after the cycle the time codes run again (the positive control)
+#   the UART banner is logged for every boot, also after the cycle
 #   SIGTERM: the controller powers QEMU off with quit, rc 0
 #   the SSE records equal the log.jsonl lines (same seqs, same bytes)
 #
@@ -77,8 +78,12 @@ okpost() {
     echo "$r"
 }
 blocks() { echo $(( $(stat -c %b "$RUN/flash.bin") * 512 )); }
-uart_count() {
-    get "log?since=0&kinds=uart" | grep -c 'STIX ASW.*ver\.' || true
+banners_in_boot() {
+    get "log?since=0&kinds=uart" | python3 -c "
+import json,re,sys
+print(sum(1 for l in sys.stdin
+          if re.search(r'STIX ASW.*ver\.', json.loads(l)['data']['line'])
+          and json.loads(l)['boot_id'] == $1))"
 }
 emits_in_boot() {
     get "log?since=0&kinds=log" | python3 -c "
@@ -115,10 +120,10 @@ okpost debug.qmp "{\"command\":\"qom-set\",\"arguments\":{$SPW,\"value\":false}}
 # -- boot: the banner within 20 s ----------------------------------------
 okpost platform.power.boot > /dev/null
 for _ in $(seq 200); do
-    [ "$(uart_count)" -ge 1 ] && break
+    [ "$(banners_in_boot 1)" -ge 1 ] && break
     sleep 0.1
 done
-[ "$(uart_count)" -ge 1 ] || fail "no UART banner within 20 s"
+[ "$(banners_in_boot 1)" -ge 1 ] || fail "no UART banner within 20 s"
 ok "boot: UART banner as a uart record"
 
 # -- pause / resume --------------------------------------------------------
@@ -163,6 +168,10 @@ for _ in $(seq 300); do
 done
 [ "$(emits_in_boot "$B2")" -ge 2 ] || fail "no time codes after the cycle"
 ok "time codes run again after the cycle (positive control)"
+for b in "$B1" "$B2"; do
+    [ "$(banners_in_boot "$b")" -ge 1 ] || fail "no UART banner in boot $b"
+done
+ok "UART banner logged in boots $B1 and $B2 too (append=on)"
 
 QPID="$(get status | jq_ 'd["pid"]')"
 

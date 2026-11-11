@@ -119,7 +119,8 @@ def t_config(env):
 ARGV_GOLDEN = [
     "/q/qemu-system-sparc", "-M", "leon3_generic", "-m", "64M", "-S",
     "-display", "none", "-monitor", "none",
-    "-serial", "file:/r/uart.raw",
+    "-chardev", "file,id=stixuart,path=/r/uart.raw,append=on",
+    "-serial", "chardev:stixuart",
     "-qmp", "unix:/r/qmp.sock,server=on,wait=off",
     "-global", "grlib-stixflash.flash-file=/r/flash.bin",
     "-global", "grlib-stixflash.inverted-storage=on",
@@ -505,6 +506,31 @@ def t_power(env):
         ctl.shutdown()
 
 
+def t_uart_cycle(env):
+    """B1: the banner of every boot reaches the log (QEMU's file chardev
+    truncates without append=on)."""
+    ctl = env.controller()
+    try:
+        def banners():
+            return sorted({r.obj["boot_id"] for r in ctl.log.since(0)
+                           if r.kind == "uart" and "STIX ASW" in r.line})
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        wait_for(lambda: banners() == [1], what="banner of boot 1")
+        ctl.command("platform.power.cycle", {"off_time_s": 0.1})
+        wait_for(lambda: banners() == [1, 2], what="banner of boot 2")
+        # a reader that meets a truncated file starts over at 0
+        uart = os.path.join(ctl.run_dir, "uart.raw")
+        open(uart, "wb").close()
+        with open(uart, "ab") as f:
+            f.write(b"STIX ASW after truncation ver. 9\r\n")
+        wait_for(lambda: any("after truncation" in r.line
+                             for r in ctl.log.since(0)
+                             if r.kind == "uart"), what="truncated reread")
+    finally:
+        ctl.shutdown()
+
+
 def _power_recs(ctl, event):
     return [r.obj["data"] for r in ctl.log.since(0)
             if r.kind == "power" and r.obj["data"].get("event") == event]
@@ -696,6 +722,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("binary guard", t_binary_guard), ("retention", t_retention),
          ("record log + rotation", t_log), ("QmpConnection", t_qmp),
          ("SimClock", t_simclock), ("power state machine", t_power),
+         ("uart across a power cycle", t_uart_cycle),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]

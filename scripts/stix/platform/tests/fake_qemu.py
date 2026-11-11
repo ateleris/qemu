@@ -71,12 +71,18 @@ class Fake:
         self.no_reboot = "-no-reboot" in args
         self.halt = "reboot=shutdown,shutdown=pause" in args
         self.qmp_path = None
+        self.uart_append = False
         for i, a in enumerate(args):
             nxt = args[i + 1] if i + 1 < len(args) else ""
             if a == "-qmp" and nxt.startswith("unix:"):
                 self.qmp_path = nxt[5:].split(",")[0]
             if a == "-serial" and nxt.startswith("file:"):
                 self.uart = nxt[5:]
+                self.uart_append = False
+            if a == "-chardev" and nxt.startswith("file,"):
+                opts = dict(o.split("=", 1) for o in nxt.split(",")[1:])
+                self.uart = opts["path"]
+                self.uart_append = opts.get("append") == "on"
             if a == "-global" and nxt.startswith(
                     "grlib-stixflash.flash-file="):
                 flash = nxt.split("=", 1)[1]
@@ -85,6 +91,11 @@ class Fake:
                         f.truncate(1 << 30)
             if a == "-global" and nxt.startswith("grlib-stixspw.obt-epoch="):
                 self.epoch = int(nxt.split("=", 1)[1])
+
+    def open_uart(self):
+        """Like QEMU's file chardev: O_TRUNC unless append=on."""
+        if self.uart:
+            open(self.uart, "ab" if self.uart_append else "wb").close()
 
     def vclock(self):
         if self.running:
@@ -252,7 +263,9 @@ def main():
         variant, args = args[1], args[2:]
     if "-M" in args and args[args.index("-M") + 1] == "none":
         return guard_mode(variant)
-    Fake(args, variant).serve()
+    f = Fake(args, variant)
+    f.open_uart()
+    f.serve()
     return 0
 
 

@@ -38,7 +38,11 @@ def build_argv(cfg, run_dir, binary=None):
     argv = [binary or q["binary"],
             "-M", "leon3_generic", "-m", q["memory"], "-S",
             "-display", "none", "-monitor", "none",
-            "-serial", "file:%s" % os.path.join(run_dir, "uart.raw"),
+            # append=on: QEMU's file chardev truncates otherwise
+            # (char-file.c), and every boot's UART must survive
+            "-chardev", "file,id=stixuart,path=%s,append=on"
+            % os.path.join(run_dir, "uart.raw"),
+            "-serial", "chardev:stixuart",
             "-qmp", "unix:%s,server=on,wait=off"
             % os.path.join(run_dir, "qmp.sock"),
             "-global", "grlib-stixflash.flash-file=%s"
@@ -168,6 +172,9 @@ class QemuProcess:
             alive = self.proc.poll() is None
             try:
                 with open(path, "rb") as f:
+                    if os.fstat(f.fileno()).st_size < pos:
+                        pos = 0       # truncated under us: start over
+                        buf = b""
                     f.seek(pos)
                     chunk = f.read()
             except OSError:
