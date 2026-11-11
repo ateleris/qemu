@@ -28,6 +28,8 @@ class Controller:
                  sleep=time.sleep):
         self.cfg = cfg
         self.run_dir = rundir.guard(run_dir or cfg["run_dir"]["path"])
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.lock_fd = rundir.lock(self.run_dir)
         self.removed = rundir.prepare(self.run_dir,
                                       cfg["run_dir"]["fresh"])
         self.clock = SimClock(mono_fn) if mono_fn else SimClock()
@@ -40,6 +42,7 @@ class Controller:
         self.power = power_mod.Power(cfg, self.run_dir, self.log,
                                      self.clock, launcher=launcher,
                                      sleep=sleep)
+        self.power.lock_fd = self.lock_fd
         self.power.on_line = self._qemu_line
         self.power.on_change = self._power_changed
         self.dispatcher = Dispatcher(self.log)
@@ -230,6 +233,9 @@ class Controller:
         if self.poller is not None:
             self.poller.join(timeout=2)
         self.log.close()
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
 
 
 def _public(cfg):

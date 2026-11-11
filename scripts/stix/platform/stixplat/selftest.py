@@ -183,7 +183,17 @@ def t_rundir(env):
     link = os.path.join(env.tmp, "sneaky")
     os.symlink("/tmp/stix-uprev-run", link)
     raises(rundir.RunDirError, rundir.guard, link)
-    rundir.guard("/tmp/stix-plat/core-smoke")
+    for bad in ("/tmp/stix-uprev-run-s1", "/tmp/stix-uprev-run-s12/x",
+                "/tmp/stix-uprev-run/sub/dir", "/tmp/stix-baseline-run/a",
+                "/", "/tmp/stix-d4-run-s3"):
+        raises(rundir.RunDirError, rundir.guard, bad)
+    deep = os.path.join(env.tmp, "deeplink")
+    os.symlink("/tmp/stix-uprev-run-s2/inner", deep)
+    raises(rundir.RunDirError, rundir.guard, deep)
+    # "*" must not cross "/": these are not gate run dirs
+    for good in ("/tmp/stix-plat/core-smoke", "/tmp/stix-plat/x-run",
+                 "/tmp/stix-plat/a/b-run-s1", "/tmp/stix-uprev-runner"):
+        rundir.guard(good)
     d = env.run_dir()
     rundir.preflight(d)                       # the real FS: sparse
     check(not os.path.exists(os.path.join(d, rundir.PROBE_NAME)),
@@ -531,6 +541,58 @@ def t_uart_cycle(env):
         ctl.shutdown()
 
 
+def t_run_lock(env):
+    """S2: one controller per run dir; QEMU inherits the lock and dies
+    with its parent (PDEATHSIG), also when spawned from a short-lived
+    (HTTP request) thread."""
+    d = env.run_dir()
+    cfg = env.cfg()
+    ctl = core_mod.Controller(cfg, run_dir=d)
+    try:
+        e = raises(rundir.RunDirError, core_mod.Controller, cfg, run_dir=d)
+        check("in use" in str(e), "second controller: %s" % e)
+        res = {}
+        t = threading.Thread(target=lambda: res.update(
+            ctl.command("platform.power.on", {})))
+        t.start()
+        t.join()
+        time.sleep(0.5)          # the spawning thread is gone by now
+        check(ctl.power.proc.alive(), "QEMU died with its spawning thread")
+        lock = os.path.join(d, rundir.LOCK_NAME)
+        ino = os.stat(lock).st_ino
+        with open("/proc/locks") as f:
+            locks = f.read()
+        check(sum(":%d " % ino in ln for ln in locks.splitlines()) >= 1,
+              "run-dir lock not held")
+        fds = os.listdir("/proc/%d/fd" % res["pid"])
+        check(any(os.path.realpath("/proc/%d/fd/%s" % (res["pid"], fd))
+                  == os.path.realpath(lock) for fd in fds),
+              "QEMU does not hold the run-dir lock")
+    finally:
+        ctl.shutdown()
+    ctl = core_mod.Controller(cfg, run_dir=d)    # free again
+    ctl.shutdown()
+    # the parent dies hard: its QEMU follows (PDEATHSIG)
+    d2 = env.run_dir()
+    code = ("import sys,json; sys.path.insert(0,%r)\n"
+            "from stixplat import core, config\n"
+            "c = core.Controller(config.load(overrides=json.loads(%r)),"
+            " run_dir=%r)\n"
+            "print(c.command('platform.power.on', {})['pid'], flush=True)\n"
+            "import os; os._exit(0)\n"
+            % (os.path.dirname(HERE), json.dumps(
+                {"qemu": {"binary": env.bins["new"], "elf": "/dev/null"}}),
+               d2))
+    import subprocess
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         timeout=30).stdout.decode().split()
+    check(out, "the child controller printed no pid")
+    pid = int(out[-1])
+    wait_for(lambda: not os.path.exists("/proc/%d" % pid) or
+             open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()[0]
+             == "Z", what="QEMU to die with its parent (PDEATHSIG)")
+
+
 def _fake_children():
     """Our live child fake QEMUs (pids)."""
     out = []
@@ -763,6 +825,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("SimClock", t_simclock), ("power state machine", t_power),
          ("uart across a power cycle", t_uart_cycle),
          ("no orphaned QEMU", t_no_orphan),
+         ("run-dir lock + PDEATHSIG", t_run_lock),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib)]

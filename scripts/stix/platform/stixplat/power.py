@@ -57,6 +57,7 @@ class Power:
                                        name="power-events", daemon=True)
         self.worker.start()
         self.gen = 0               # the process generation
+        self.lock_fd = None        # the run-dir lock, inherited by QEMU
 
     # -- helpers ------------------------------------------------------------
     def _record(self, event, **data):
@@ -105,7 +106,9 @@ class Power:
             argv = qemu_mod.build_argv(self.cfg, self.run_dir)
             self.gen += 1
             gen = self.gen
-            self.proc = self.launcher(argv, self.run_dir, self._line)
+            self.proc = self.launcher(argv, self.run_dir, self._line,
+                                      keep_fds=() if self.lock_fd is None
+                                      else (self.lock_fd,))
             self.pid = self.proc.spawn()
             try:
                 return self._on_spawned(gen, sock, argv)

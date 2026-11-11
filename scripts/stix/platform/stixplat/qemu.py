@@ -3,9 +3,12 @@
 stderr (trace) and UART readers (platform plan D-PLf, D-PLg, D-PLl).
 """
 
+import ctypes
 import json
 import os
+import queue
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -120,6 +123,47 @@ def check_binary(binary, run_dir):
 
 
 # -- the process ----------------------------------------------------------
+PR_SET_PDEATHSIG = 1
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+def _pdeathsig():
+    """In the child before exec: SIGTERM when the parent dies."""
+    _libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+
+
+class _Spawner:
+    """PDEATHSIG fires when the *thread* that forked exits, and verbs
+    run on short-lived HTTP request threads. So every QEMU is forked
+    from this one long-lived thread."""
+
+    def __init__(self):
+        self.q = queue.Queue()
+        t = threading.Thread(target=self._loop, name="qemu-spawner",
+                             daemon=True)
+        t.start()
+
+    def _loop(self):
+        while True:
+            fn, box, done = self.q.get()
+            try:
+                box.append((True, fn()))
+            except BaseException as e:
+                box.append((False, e))
+            done.set()
+
+    def call(self, fn):
+        box, done = [], threading.Event()
+        self.q.put((fn, box, done))
+        done.wait()
+        ok, val = box[0]
+        if not ok:
+            raise val
+        return val
+
+
+_spawner = _Spawner()
+
 TRACE_RE = re.compile(r"^(?:\d+@\d+\.\d+:)?(stix\w+) (.*)$")
 
 
@@ -127,7 +171,7 @@ class QemuProcess:
     """One QEMU process: spawned frozen; stderr (traces) and UART are
     read by threads and handed to @on_line(kind, text)."""
 
-    def __init__(self, argv, run_dir, on_line):
+    def __init__(self, argv, run_dir, on_line, keep_fds=()):
         self.argv = argv
         self.run_dir = run_dir
         self.on_line = on_line
@@ -135,16 +179,17 @@ class QemuProcess:
         self.threads = []
         self.stop_evt = threading.Event()
         self.qemu_log = None
+        self.keep_fds = tuple(keep_fds)
 
     def spawn(self):
         self.qemu_log = open(os.path.join(self.run_dir, "qemu.log"), "ab")
         uart = os.path.join(self.run_dir, "uart.raw")
         self.uart_start = os.path.getsize(uart) if os.path.exists(uart) \
             else 0
-        self.proc = subprocess.Popen(self.argv, cwd=self.run_dir,
-                                     stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT)
+        self.proc = _spawner.call(lambda: subprocess.Popen(
+            self.argv, cwd=self.run_dir, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            pass_fds=self.keep_fds, preexec_fn=_pdeathsig))
         for fn, name in ((self._stderr_loop, "qemu-stderr"),
                          (self._uart_loop, "qemu-uart")):
             t = threading.Thread(target=fn, name=name, daemon=True)

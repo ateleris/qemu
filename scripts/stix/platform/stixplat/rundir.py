@@ -7,12 +7,17 @@ The controller never writes flash.bin itself; QEMU makes it.
 
 import ctypes
 import ctypes.util
-import fnmatch
+import fcntl
 import os
+import re
 
 GIB = 1 << 30
-# the gates' own run dirs and the reference flashes
-FORBIDDEN = ("/tmp/stix-*-run", "/tmp/stix-baseline-run")
+# the gates' own run dirs (and their slot copies <dir>-s<k>, and
+# anything inside them), matched on the realpath like slot.sh's
+# stix_run_dir_guard; "*" never crosses a "/"
+FORBIDDEN_RE = re.compile(r"^/tmp/stix-[^/]*-run(-s\d+)?(/.*)?$")
+SHARED = ("/tmp/stix-uprev-run", "/tmp/stix-baseline-run")
+LOCK_NAME = ".stixplat.lock"
 PROBE_NAME = ".stixplat-sparse-probe"
 # the files `fresh = true` removes (its own named files only)
 FRESH_FILES = ("flash.bin", "uart.raw", "qemu.log", "log.jsonl", "tm.jsonl")
@@ -25,14 +30,36 @@ class RunDirError(Exception):
 
 
 def guard(path):
-    """Refuse the gates' run dirs (after resolving symlinks)."""
+    """Refuse the gates' run dirs, their slot copies and anything inside
+    them, on the path as given and after resolving symlinks; also /."""
     real = os.path.realpath(path)
-    for pat in FORBIDDEN:
-        if fnmatch.fnmatchcase(real.rstrip("/"), pat) or \
-                fnmatch.fnmatchcase(path.rstrip("/"), pat):
-            raise RunDirError("run dir %s is reserved (%s); the controller "
-                              "never uses a gate's run dir" % (path, pat))
+    shared = [os.path.realpath(d) for d in SHARED]
+    for p in (os.path.normpath(os.path.abspath(path)), real):
+        if p == "/":
+            raise RunDirError("refusing run dir / (%s)" % path)
+        hit = FORBIDDEN_RE.match(p) or any(
+            re.match(re.escape(d) + r"(-s\d+)?(/.*)?$", p) for d in shared)
+        if hit:
+            raise RunDirError("run dir %s (resolves to %s) is a gate's run "
+                              "dir or inside one; the controller never "
+                              "uses it" % (path, real))
     return real
+
+
+def lock(run_dir):
+    """S2 (the slot.sh pattern): an exclusive flock on the run dir,
+    held by the controller and inherited by its QEMU, so a second
+    controller (or a QEMU that outlived one) is refused. Returns the fd."""
+    fd = os.open(os.path.join(run_dir, LOCK_NAME),
+                 os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RunDirError("run dir %s is in use (its %s is locked by "
+                          "another controller or its QEMU)"
+                          % (run_dir, LOCK_NAME))
+    return fd
 
 
 class RealFs:
