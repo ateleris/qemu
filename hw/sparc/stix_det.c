@@ -164,6 +164,9 @@ static void stix_det_bank_zero(StixDetState *d, uint32_t ql_bank)
 {
     stix_det_ram_zero(d->sram, stix_det_lacc_off[ql_bank],
                       STIXCTRL_LACC0_SIZE);
+    /* the FPGA rewrite cures any armed upset (D-Uc host-write rule) */
+    stixctrl_edac_sram_write(d->owner, stix_det_lacc_off[ql_bank],
+                             STIXCTRL_LACC0_SIZE);
     stix_det_ram_zero(d->ltrg, stix_det_ltrg_off[ql_bank],
                       STIXCTRL_LTRG0_SIZE);
     stix_det_ram_zero(d->lvar, stix_det_lvar_off[ql_bank],
@@ -1682,6 +1685,9 @@ static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
                                     grp_events);
     memory_region_set_dirty(d->sram, stix_det_lacc_off[ql_bank],
                             STIXCTRL_LACC0_SIZE);
+    /* the rewrite cures any armed upset in the bank (D-Uc) */
+    stixctrl_edac_sram_write(d->owner, stix_det_lacc_off[ql_bank],
+                             STIXCTRL_LACC0_SIZE);
 
     for (grp = 0; grp < STIX_DET_N_GRP; grp++) {
         stix_det_ram_stl(d->ltrg, stix_det_ltrg_off[ql_bank] +
@@ -1735,6 +1741,9 @@ static void stix_det_nom_bank_zero(StixDetState *d, uint32_t nom_bank)
 {
     stix_det_ram_zero(d->sram, stix_det_eacc_off[nom_bank],
                       STIXCTRL_EACC0_SIZE);
+    /* the FPGA rewrite cures any armed upset (D-Uc host-write rule) */
+    stixctrl_edac_sram_write(d->owner, stix_det_eacc_off[nom_bank],
+                             STIXCTRL_EACC0_SIZE);
     stix_det_ram_zero(d->etrg, stix_det_etrg_off[nom_bank],
                       STIXCTRL_ETRG0_SIZE);
 }
@@ -1787,6 +1796,9 @@ static uint64_t stix_det_nom_materialize(StixDetState *d, uint32_t nom_bank)
                                     grp_events);
     memory_region_set_dirty(d->sram, stix_det_eacc_off[nom_bank],
                             STIXCTRL_EACC0_SIZE);
+    /* the rewrite cures any armed upset in the bank (D-Uc) */
+    stixctrl_edac_sram_write(d->owner, stix_det_eacc_off[nom_bank],
+                             STIXCTRL_EACC0_SIZE);
     for (grp = 0; grp < STIX_DET_N_GRP; grp++) {
         uint64_t ev = grp_events[grp] +
                       stix_det_poisson(d, d->nom_trg_extra_grp[grp]);

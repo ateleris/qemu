@@ -18,8 +18,10 @@
 #ifndef HW_SPARC_STIX_EDAC_H
 #define HW_SPARC_STIX_EDAC_H
 
+#include "hw/core/irq.h"
 #include "hw/core/qdev.h"
 #include "qom/object.h"
+#include "system/memory.h"
 
 #define TYPE_STIX_EDAC "stix-edac"
 
@@ -35,6 +37,49 @@ typedef enum StixEdacModule {
     STIX_EDAC_ROTBUF,
     STIX_EDAC_N_MODULE,
 } StixEdacModule;
+
+/* the EDAC word (32 bit) and the overlay granularity (D-Uc) */
+#define STIX_EDAC_WORD_SIZE 4u
+/* = TARGET_PAGE_SIZE on sparc: an overlay never splits a TCG page */
+#define STIX_EDAC_PAGE_SIZE 0x1000u
+/* the poison-table capacity; full is refused in upset-inject */
+#define STIX_EDAC_N_POISON 256u
+
+typedef struct StixEdacOverlay StixEdacOverlay;
+
+/*
+ * One EDAC memory's upset state (D-Ua): the backing RAM the overlays sit
+ * on, the owner's stored register word that gates the reactions (EDACON,
+ * and for CACHE OPMODE), the DE IRQ line, and the upsets-active
+ * counters. Only CACHE is linked in M-2; SDRAM follows in M-3.
+ */
+typedef struct StixEdacMem {
+    MemoryRegion *backing;      /* the guest-mapped RAM (stixctrl->sram) */
+    hwaddr base;                /* the guest address of backing offset 0 */
+    volatile uint32_t *edacon_reg; /* the owner's word with EDACON */
+    qemu_irq *irq;              /* the module's DE line (sysbus slot) */
+    StixEdacOverlay *overlays;  /* live 4 KB page overlays */
+    StixEdacOverlay *spares;    /* removed overlays, parked for reuse */
+    /* upsets-active counters (D-Ug): injects and their effects */
+    uint32_t injected;
+    uint32_t corrected;
+    uint32_t detected;
+} StixEdacMem;
+
+/*
+ * One armed upset (D-Uc): the 32-bit EDAC word at @addr reads with @mask
+ * XORed. The mode derives from the mask (1 bit = SEU, >= 2 = DEU/MBU)
+ * unless the upset-inject string overrides it; persist=1 keeps the
+ * poison after its first effect (D-Uh).
+ */
+typedef struct StixEdacPoison {
+    StixEdacModule mem;
+    uint32_t addr;              /* guest byte address, word-aligned */
+    uint32_t mask;              /* XOR mask, nonzero */
+    bool de;                    /* true = DEU/MBU, false = SEU */
+    bool persist;               /* survive the first effect */
+    bool armed;                 /* false = a free slot */
+} StixEdacPoison;
 
 struct StixEdac {
     DeviceState parent_obj;
@@ -55,6 +100,16 @@ struct StixEdac {
      */
     uint8_t sec[STIX_EDAC_N_MODULE];
     bool ded[STIX_EDAC_N_MODULE];
+
+    /*
+     * M-2 (D-Uc/D-Ug): the poison table and the sparse page overlays.
+     * The poisons and the overlays survive a system reset (D-Uh: a
+     * reboot does not heal a cell); the counters are host-side
+     * statistics and survive too.
+     */
+    StixEdacMem mems[STIX_EDAC_N_MODULE];
+    StixEdacPoison poison[STIX_EDAC_N_POISON];
+    uint32_t n_armed;
 };
 
 /*
@@ -89,5 +144,24 @@ uint32_t stix_edac_cache_write(StixEdac *e, uint32_t stored, uint32_t value);
  * as the strobe and calls stix_edac_clear().
  */
 uint32_t stix_edac_rotb_status(StixEdac *e);
+
+/*
+ * M-2 (D-Uc): wire the CACHE memory to the unit, at the register
+ * owner's realize. @cache_cmdsta is the stored word whose EDACON (bit
+ * 16) and OPMODE (bit 0) gate the overlay reactions, @sram the backing
+ * RAM the overlays sit on (STIXCTRL_SRAM_SIZE at STIXCTRL_SRAM_START),
+ * @edac_irq the sysbus IRQ slot that pulses IRQMP line 6 (D-Ue).
+ */
+void stix_edac_cache_link(StixEdac *e, volatile uint32_t *cache_cmdsta,
+                          MemoryRegion *sram, qemu_irq *edac_irq);
+
+/*
+ * M-2 (D-Uc, the host-side writer rule): a host write into a linked
+ * memory (stix_det's LACC/EACC materialization) retires every poison it
+ * overwrites, like a guest write — a rewrite cures the cell. @off and
+ * @len are byte offsets in the backing RAM.
+ */
+void stix_edac_host_write(StixEdac *e, StixEdacModule m, hwaddr off,
+                          hwaddr len);
 
 #endif /* HW_SPARC_STIX_EDAC_H */

@@ -392,6 +392,17 @@ StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
     return STIX_DET_ROTB_APPENDED;
 }
 
+/*
+ * D-Uc (M-2): stix_det's host-side writes into the CACHE SRAM (the
+ * LACC/EACC materialization) retire every poison they overwrite, like a
+ * guest write — the FPGA rewrite cures the cell. @off is a
+ * STIXCTRL_SRAM offset, @len its length in bytes.
+ */
+void stixctrl_edac_sram_write(STIXCTRL *s, hwaddr off, hwaddr len)
+{
+    stix_edac_host_write(&s->edac, STIX_EDAC_CACHE, off, len);
+}
+
 /* ROTB FIFO commands, from the FSW driver (RotBuf.c
  * RotBuf_advancePointer/RotBuf_clear, OpModeMgmt.c mode switches):
  * GETBLOCK advances the read pointer, PUTBLOCK the write pointer
@@ -1171,6 +1182,15 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &STIXCTRL->lvar);
     sysbus_init_mmio(sbd, &STIXCTRL->ltrg);
     sysbus_init_mmio(sbd, &STIXCTRL->etrg);
+
+    /*
+     * D-Ua, M-2 (D-Uc): wire the CACHE memory to the EDAC unit — the
+     * stored cacheCmdSta word gates the overlay reactions (EDACON
+     * bit 16, OPMODE bit 0), the SRAM window is the backing RAM the
+     * overlays sit on, and the sysbus slot pulses IRQMP line 6 (D-Ue).
+     */
+    stix_edac_cache_link(&STIXCTRL->edac, &STIXCTRL->reg.cacheCmdSta,
+                         &STIXCTRL->sram, &STIXCTRL->irq_edac);
 
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 

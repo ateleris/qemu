@@ -127,3 +127,9 @@ stixtmtc_udp_tc_error(int err) "UDP TC receive error: %d"
 stixtmtc_udp_tm_send(int len) "UDP TM datagram sent: %d bytes"
 stixtmtc_udp_tm_dropped(int len, int err) "UDP TM datagram dropped: sendto failed (len=%d errno=%d)"
 stixtmtc_udp_tm_short(int len) "UDP TM packet dropped: shorter than the SpW header (%d bytes)"
+
+# stix_edac.c (STIX, memory-upset plan D-Ug: only from the QOM verbs and
+# actual intercepted accesses, never from a getter)
+stix_edac_inject(const char *mem, uint32_t addr, uint32_t mask, const char *mode) "upset inject memory=%s addr=0x%08x mask=0x%08x mode=%s"
+stix_edac_effect(const char *mem, uint32_t addr, const char *kind) "upset effect memory=%s addr=0x%08x kind=%s"
+stix_edac_clear(const char *mem, uint32_t addr) "upset clear memory=%s addr=0x%08x"

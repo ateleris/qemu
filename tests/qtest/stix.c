@@ -13020,6 +13020,417 @@ static void test_edac_rotb_strobe_quirk(void)
     stix_qtest_cleanup();
 }
 
+/* ---- CACHE (FPGA SRAM) upsets (memory-upset plan M-2) ---- */
+
+#define EDAC_ELUT       0xE0001000u  /* inside the ELUT window */
+#define EDAC_IRQ_BIT    (1u << 6)    /* IRQ_STIXCTRL_EDAC = 6 */
+
+/* A string property, or NULL when qom-get fails. */
+static char *stix_qom_get_str(QTestState *qts, const char *path,
+                              const char *prop)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s, 'property': %s}}",
+                            path, prop);
+    const char *s = qdict_get_try_str(resp, "return");
+    char *val = s ? g_strdup(s) : NULL;
+
+    qobject_unref(resp);
+    return val;
+}
+
+/* the number of armed poisons in upsets-active (spacing-agnostic) */
+static unsigned edac_poison_count(QTestState *qts)
+{
+    g_autofree char *json = stix_qom_get_str(qts, EDAC_EDAC_PATH,
+                                             "upsets-active");
+    const char *p = json;
+    unsigned n = 0;
+
+    while ((p = strstr(p, "\"memory\"")) != NULL) {
+        n++;
+        p++;
+    }
+    return n;
+}
+
+/*
+ * /sparc/stix/edac-cache-seu (M-2): a 1-bit upset in a LACC word is
+ * corrected on read, counts one SEC and self-retires (D-Uh), so a
+ * further read counts no more. RED on M-1: no upset-inject verb — the
+ * qom-set is refused, nothing arms and the overlay never exists.
+ */
+static void test_edac_cache_seu(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = QL_LACC(0) + 0x40u;
+    g_autofree char *json;
+
+    qtest_writel(qts, addr, 0x12345678u);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x12345678u);
+
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180040,0x1"));
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    /* qobject_to_json (unpretty) separates keys with ": " and ", " */
+    g_assert_nonnull(strstr(json, "\"memory\": \"cache\""));
+    g_assert_nonnull(strstr(json, "\"mode\": \"seu\""));
+
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x12345678u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, CACHE_SEC(1));
+
+    /* the poison retired: nothing armed, a second read counts no more */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_null(strstr(json, "\"memory\""));
+    g_assert_nonnull(strstr(json, "\"corrected\": 1"));
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x12345678u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, CACHE_SEC(1));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-cache-seu-raw (M-2, D-Uf): with EDACON = 0 the flip
+ * is returned raw, SECCOUNT stays 0 and the poison stays armed (nothing
+ * corrected the cell). RED on M-1: no upset-inject verb and no overlay.
+ */
+static void test_edac_cache_seu_raw(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = QL_LACC(0) + 0x44u;
+
+    qtest_writel(qts, addr, 0xCAFEBABEu);
+    qtest_writel(qts, EDAC_CACHECMDSTA, 0);     /* EDACON = 0 */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180044,0x1"));
+
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xCAFEBABEu ^ 0x1u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, 0);
+    /* still armed: the second raw read flips again, no correction */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xCAFEBABEu ^ 0x1u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-cache-ded (M-2, D-Ue): a 2-bit flip returns the
+ * corrupted word, latches DEDETECTED and pulses IRQ 6; the FSW's
+ * EDACRESET set-then-clear pair (EDAC.c:299-302) clears the latch. The
+ * poison is one-shot: the next read returns the clean word. RED on M-1:
+ * no injection path — the read returns clean and IRQ 6 never pulses
+ * (only the test-latch property could force DEDETECTED).
+ */
+static void test_edac_cache_ded(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = QL_LACC(0) + 0x80u;
+
+    qtest_writel(qts, IRQMP_CLEAR, EDAC_IRQ_BIT);
+    qtest_writel(qts, addr, 0xA5A5A5A5u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180080,0x5"));
+
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xA5A5A5A5u ^ 0x5u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA),
+                    ==, CACHE_EDACON | CACHE_DEDETECTED);
+    g_assert_cmphex(qtest_readl(qts, IRQMP_PENDING) & EDAC_IRQ_BIT,
+                    ==, EDAC_IRQ_BIT);
+
+    /* one-shot: the detected read retired the poison */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xA5A5A5A5u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+
+    /* the FSW's EDACRESET strobe pair clears the latch, keeps EDACON */
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON | CACHE_EDACRESET);
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, CACHE_EDACON);
+
+    qtest_writel(qts, IRQMP_CLEAR, EDAC_IRQ_BIT);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-cache-opmode (M-2, D-Ue): with OPMODE = 1 (not cache
+ * mode) a DE read still returns the flip — the register comment gates
+ * the IRQ and the status, not the data — but no DEDETECTED and no IRQ 6.
+ * RED on M-1: no injection path, no overlay.
+ */
+static void test_edac_cache_opmode(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = QL_LACC(0) + 0xC0u;
+
+    qtest_writel(qts, IRQMP_CLEAR, EDAC_IRQ_BIT);
+    qtest_writel(qts, addr, 0x5A5A5A5Au);
+    /* EDACON = 1, OPMODE = 1 */
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON | 1u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE01800C0,0x5"));
+
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x5A5A5A5Au ^ 0x5u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA),
+                    ==, CACHE_EDACON | 1u);
+    g_assert_cmphex(qtest_readl(qts, IRQMP_PENDING) & EDAC_IRQ_BIT, ==, 0);
+    /* still armed: the read was not a detected one */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x5A5A5A5Au ^ 0x5u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-cache-tlut (M-2): the same SEU in the ELUT window,
+ * with no EDAC-on precondition beyond EDACON: EDACON = 0 returns the
+ * flip raw, EDACON = 1 corrects and counts on the next read (the gate
+ * is live per read). RED on M-1: no upset-inject verb, no overlay.
+ */
+static void test_edac_cache_tlut(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = EDAC_ELUT;
+
+    qtest_writel(qts, addr, 0x0BADF00Du);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0001000,0x1"));
+
+    qtest_writel(qts, EDAC_CACHECMDSTA, 0);     /* EDACON = 0 */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x0BADF00Du ^ 0x1u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, 0);
+
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x0BADF00Du);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, CACHE_SEC(1));
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x0BADF00Du);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, CACHE_SEC(1));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-cache-persist (M-2, D-Uh): persist=1 keeps the
+ * poison after its first effect, so every read corrects and counts
+ * again, saturating at the 8-bit SECCOUNT (D-Ue). RED on M-1: no
+ * upset-inject verb (persist mode).
+ */
+static void test_edac_cache_persist(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = QL_LACC(1) + 0x10u;
+    int i;
+
+    qtest_writel(qts, addr, 0xDEADBEEFu);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0188010,0x1,seu,1"));
+
+    for (i = 1; i <= 3; i++) {
+        g_assert_cmphex(qtest_readl(qts, addr), ==, 0xDEADBEEFu);
+        g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                        ==, CACHE_SEC(i));
+    }
+    for (i = 0; i < 260; i++) {
+        qtest_readl(qts, addr);
+    }
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, CACHE_SEC(0xFF));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-inject-reject (M-2, D-Ug): unknown memory, unaligned
+ * address, zero mask, a mask outside the 32-bit word and an address
+ * outside the SRAM are all refused and change nothing, like the
+ * adc-inject setter; upset-clear with a bad index is refused too.
+ * RED on M-1: the verbs do not exist — every set (including the good
+ * one at the end) is refused for a different reason.
+ */
+static void test_edac_inject_reject(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = QL_LACC(0) + 0x40u;
+    g_autofree char *json;
+
+    /* the verbs exist (RED on M-1 fails here, naming upsets-active) */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_nonnull(json);
+    g_assert_null(strstr(json, "\"memory\""));
+
+    qtest_writel(qts, addr, 0x11223344u);
+
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "sram,0xE0180040,0x1"));
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "cache,0xE0180041,0x1"));
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "cache,0xE0180040,0x0"));
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "cache,0xE0180040,0x1FFFFFFFF"));
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "cache,0xE0200000,0x1"));
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-clear",
+                                    "7"));
+
+    /* nothing armed, no counter moved, the word reads clean */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_null(strstr(json, "\"memory\""));
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x11223344u);
+
+    /* and a good injection still works afterwards */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180040,0x1"));
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x11223344u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, CACHE_SEC(1));
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_nonnull(strstr(json, "\"injected\": 1"));
+
+    /*
+     * a re-inject of an armed word replaces its record: one poison,
+     * two injected, and a clear-all leaves nothing armed
+     */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180040,0x3"));
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180040,0x5"));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_nonnull(strstr(json, "\"injected\": 3"));
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-clear",
+                                   "all"));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-clear",
+                                   "0") == false);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-cache-subword (M-2, D-Uc): reads of a poisoned word
+ * see the flip at every width (u32, u16 LACC-style, u8 ELUT-style), and
+ * a write touching any byte of the word clears the whole poison (the
+ * EDAC word is the unit). RED on M-1: no overlay — sub-word reads
+ * cannot see a flip.
+ */
+static void test_edac_cache_subword(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t wa = QL_LACC(0) + 0x20u;
+    const uint32_t wb = QL_LACC(0) + 0x24u;
+
+    /* EDACON = 0: pure overlay mechanics, no status consumed */
+    qtest_writel(qts, EDAC_CACHECMDSTA, 0);
+    qtest_writel(qts, wa, 0x11223344u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180020,0x300"));
+
+    /* the flip, at every width (mask sits in byte 2) */
+    g_assert_cmphex(qtest_readl(qts, wa), ==, 0x11223044u);
+    g_assert_cmphex(qtest_readw(qts, wa + 2), ==, 0x3044u);
+    g_assert_cmphex(qtest_readb(qts, wa + 2), ==, 0x30u);
+    g_assert_cmphex(qtest_readw(qts, wa), ==, 0x1122u);
+    g_assert_cmphex(qtest_readb(qts, wa + 3), ==, 0x44u);
+
+    /* a u8 write touching one byte clears the whole poison */
+    qtest_writeb(qts, wa + 3, 0xEEu);
+    g_assert_cmphex(qtest_readl(qts, wa), ==, 0x112230EEu);
+    g_assert_cmphex(qtest_readw(qts, wa + 2), ==, 0x30EEu);
+    g_assert_cmphex(qtest_readb(qts, wa + 2), ==, 0x30u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+
+    /* ... and so does a u16 write (LACC style) */
+    qtest_writel(qts, wb, 0xAABBCCDDu);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180024,0x10000"));
+    g_assert_cmphex(qtest_readb(qts, wb + 1), ==, 0xBAu);
+    qtest_writew(qts, wb + 2, 0x1234u);
+    /* the RMW keeps the untouched flip (EDACON = 0): BB ^ 01 = BA */
+    g_assert_cmphex(qtest_readl(qts, wb), ==, 0xAABA1234u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+
+    /* nothing counted: EDACON was off all along */
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, 0);
+
+    /*
+     * EDACON = 1: an SEU is corrected by the RMW's read half, so a
+     * sub-word store leaves the untouched bytes clean
+     */
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON);
+    qtest_writel(qts, wa, 0x11223344u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180020,0x100"));
+    qtest_writeb(qts, wa + 3, 0x55u);
+    g_assert_cmphex(qtest_readl(qts, wa), ==, 0x11223355u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+
+    /*
+     * the page's overlay is parked and reused: two more inject/clear
+     * cycles on the same page still see the flip (the MR is not
+     * initialized twice)
+     */
+    for (int c = 0; c < 2; c++) {
+        g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                       "cache,0xE0180020,0x300"));
+        qtest_writel(qts, EDAC_CACHECMDSTA, 0);
+        g_assert_cmphex(qtest_readl(qts, wa), ==, 0x11223055u);
+        qtest_writel(qts, wa, 0x11223355u);
+        g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, wa), ==, 0x11223355u);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-cache-swap-poison (M-2, D-Uc): the QL swap's
+ * host-side LACC materialization retires an armed poison — the FPGA
+ * rewrite cures the cell, so the rewritten word reads clean and no SEC
+ * is ever counted. Pins the stix_edac_host_write hook. RED on M-1: no
+ * upset-inject verb, so nothing can arm before the swap.
+ */
+static void test_edac_cache_swap_poison(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = QL_LACC(0) + 8u;
+
+    /* det-source=zero: the swap materializes zeros (known data) */
+    g_assert_true(sky_set_str(qts, "det-source", "zero"));
+    det_start(qts, 0);          /* QlIntTime 0: the swap is the next tick */
+
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180008,0x1"));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    det_step_ticks(qts, 1);     /* the 100 ms tick: the QL swap */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_SEC(0xFF),
+                    ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_edac_register(void)
 {
     qtest_add_func("/sparc/stix/edac-reg-reset", test_edac_reg_reset);
@@ -13028,6 +13439,21 @@ static void stix_edac_register(void)
     qtest_add_func("/sparc/stix/edac-strobe", test_edac_strobe);
     qtest_add_func("/sparc/stix/edac-rotb-strobe-quirk",
                    test_edac_rotb_strobe_quirk);
+    qtest_add_func("/sparc/stix/edac-cache-seu", test_edac_cache_seu);
+    qtest_add_func("/sparc/stix/edac-cache-seu-raw",
+                   test_edac_cache_seu_raw);
+    qtest_add_func("/sparc/stix/edac-cache-ded", test_edac_cache_ded);
+    qtest_add_func("/sparc/stix/edac-cache-opmode",
+                   test_edac_cache_opmode);
+    qtest_add_func("/sparc/stix/edac-cache-tlut", test_edac_cache_tlut);
+    qtest_add_func("/sparc/stix/edac-cache-persist",
+                   test_edac_cache_persist);
+    qtest_add_func("/sparc/stix/edac-inject-reject",
+                   test_edac_inject_reject);
+    qtest_add_func("/sparc/stix/edac-cache-subword",
+                   test_edac_cache_subword);
+    qtest_add_func("/sparc/stix/edac-cache-swap-poison",
+                   test_edac_cache_swap_poison);
 }
 
 int main(int argc, char **argv)

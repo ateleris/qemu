@@ -741,6 +741,89 @@ the merge.
     SEC — pins the stix_det host-write hook (D-Uc).
 - **Gate impact:** none uninjected. `fsw-accesses`-style counters are
   not needed: the FSW reads these memories on AX.
+- **As built (M-2):**
+  - The poison table and the overlays live in the EDAC unit and are
+    generic per module (the `StixEdacMem`/`StixEdacPoison` records are
+    keyed by the module enum); M-2 links only CACHE, through
+    `stix_edac_cache_link()` at the stixctrl realize (the stored
+    cacheCmdSta word as the EDACON/OPMODE gate source, the `sram` MR as
+    the backing RAM, the sysbus IRQ slot that pulses line 6). M-3 adds
+    an `stix_edac_sdram_link()` on the same structures.
+  - **The flip lives in the poison table, not the backing bytes**: an
+    overlay read fetches the clean word from the backing RAM and XORs
+    the mask. D-Uh's "write the corrected word back" is therefore
+    implicit in retiring the SEU poison — there is nothing to write
+    back. A D-Uc host-write rule consequence: stix_det's materialization
+    calls `stixctrl_edac_sram_write` (a thin wrapper around
+    `stix_edac_host_write`; the wrapper exists because the STIXCTRL
+    struct is private to grlib_stixctrl.c), which retires every poison
+    the write's byte range covers. It covers the **LACC and EACC**
+    banks (both sit in the sram region and are FPGA-rewritten at their
+    swaps: bank zeroing at fresh enable and the materialization at the
+    QL/nominal swap); LTRG/LVAR writes are in other windows and are not
+    touched (lvar is M-5 BRAM anyway).
+  - **Retirement rules:** a one-shot DE retires on the first *detected*
+    read (EDACON=1 and OPMODE=0); with EDACON=0 or OPMODE=1 the flip is
+    returned raw and the poison **stays armed** (nothing corrected the
+    cell — "the detected read" is what retires, not any read). An SEU
+    poison retires on the first read with EDACON=1 (corrected + SEC)
+    and stays armed under EDACON=0. `persist` keeps it armed through
+    everything. The overlay is added on the first poison in a 4 KB page
+    and removed when the page empties; a removed overlay struct is
+    parked on a freelist and reused, not freed — an SEU retire happens
+    inside its own read dispatch, so freeing there would be a
+    use-after-free.
+  - **The OPMODE gate is the DE status/IRQ gate, not the data gate**
+    (per `edac-cache-opmode` and the `StixIdpu.h:1547` comment): with
+    OPMODE=1 the DE flip is still returned. The SEU path gates on
+    EDACON only ([I] — the plan's qtests never read an SEU with
+    OPMODE=1; one constant to change if Q3 says otherwise).
+  - `upset-clear` index semantics: each record in `upsets-active` ids
+    itself (`"id"` = the 0-based position in the armed list, the same
+    order the JSON lists); `upset-clear` accepts that number or "all".
+  - `upset-inject` in M-2 parses `sdram`/`rotbuf`/`bram` as known
+    memories but refuses them as "not supported yet" (a caller is never
+    left with a silently unarmed upset). A re-inject of an already
+    poisoned word replaces its record (mask/mode/persist) and counts a
+    fresh `injected`. Other grammar decisions: `mode` ∈ {seu, de}
+    (overrides the popcount derivation), `persist` ∈ {0, 1}, numbers in
+    the C `strtoull` base-0 syntax (0x hex or decimal); every rejection
+    names the offending field and changes nothing.
+  - `upsets-active` shape: `{"poisons": [{"id", "memory", "address",
+    "mask", "mode", "persist"}...], "counters": {<memory>:
+    {"injected", "corrected", "detected"}}}` — the writer's unpretty
+    form (`": "`/`", "` separators), integers for address/mask. The
+    counters are host-side statistics that
+    survive reset (the poisons do too, D-Uh; the M-1 reset hook keeps
+    clearing only the SEC/DE latches).
+  - Trace kinds in `stix_edac_effect`: "sec", "ded", "raw" (flip
+    returned without EDAC), "write-clear" (a guest write cures the
+    cell), "host-clear" (the stix_det hook) — D-Ug's three-event set,
+    with the effect kind naming the interceptor. The host-write hook
+    traces although it is neither a QOM verb nor a guest access: the
+    swap cures are exactly what the trace golden for a campaign needs;
+    nothing traces from a getter.
+  - The nine M-2 qtests are registered in `stix_edac_register()`; every
+    one is red-by-construction on M-1 (no verbs, no overlay) and says
+    so in its one-line comment. No FSW-visible behaviour changed
+    uninjected (the overlays exist only under an armed poison; the
+    stix_det hook early-returns on an empty table), so no
+    accepted-diffs entry is owed from this commit.
+  - Orchestrator changes after the implementation and its review:
+    (a) a sub-word store to a poisoned word is a read-modify-write of
+    the EDAC word: the untouched bytes keep the flip (EDACON = 0, or a
+    DE: re-encoded with fresh check bits, the corruption becomes the
+    cell's content), except an SEU with EDACON = 1, which the RMW's
+    read half corrects (no SEC counted; the FSW never observes an RMW);
+    (b) a parked overlay keeps its initialized MR and is reused (the MR
+    is initialized once per struct); (c) a re-inject of an armed word
+    replaces its record without counting a new armed poison, and is
+    allowed with a full table; (d) the DE gate is per module
+    (`stix_edac_de_gate`: CACHE adds the OPMODE half), ready for M-3.
+    Known bounded window (review, for M-6 live campaigns): after an
+    inject over QMP a running vCPU may still hit a stale RAM TLB entry
+    for a few TBs (the flush is async), so the first read can be clean
+    and the poison stays armed until the next read through the overlay.
 
 ### M-3: SDRAM upsets and the reboot path
 - The overlay on machine RAM (`sdram-ram` link), the device-initiated

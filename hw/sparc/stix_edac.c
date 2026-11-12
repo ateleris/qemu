@@ -1,10 +1,15 @@
 /*
- * STIX IDPU EDAC unit (memory-upset plan D-Ua, M-1): the SEC counters
- * and DeDetected latches of the three EDAC memories and the edac-at-boot
- * property (D-Uk). No upsets yet: nothing here counts up — the strobes
- * clear, the test-latch properties force. No traces: the unit must not
- * appear in the trace golden (D-Ug: never at realize, reset or in a
- * getter).
+ * STIX IDPU EDAC unit (memory-upset plan D-Ua): the SEC counters and
+ * DeDetected latches of the three EDAC memories and the edac-at-boot
+ * property (D-Uk, M-1), and since M-2 the CACHE upset machinery (D-Uc):
+ * a sparse poison table, 4 KB page overlays over the SRAM window, the
+ * SEU correct-on-read / DE flip + DEDETECTED + IRQ 6 paths (D-Ue) and
+ * the upset-inject/upset-clear/upsets-active verbs (D-Ug). The SDRAM
+ * overlay and the rotbuf/bram upsets follow in M-3/M-4/M-5 on the same
+ * table and overlay code.
+ *
+ * Traces only fire from the QOM verbs and actual intercepted accesses,
+ * never at realize, reset or in a getter (D-Ug, D-Ai).
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -13,12 +18,18 @@
 #include "hw/core/qdev.h"
 #include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
+#include "qemu/bswap.h"
 #include "qemu/cutils.h"
+#include "qemu/host-utils.h"
 #include "qemu/module.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
+#include "qobject/qlist.h"
 #include "system/qtest.h"
 #include "system/reset.h"
 #include "StixIdpu.h"
 #include "stix_edac.h"
+#include "trace.h"
 
 /* D-Uk, ICD reset values (STIX-ICD-0026 txt:2119, txt:2202, txt:3249) */
 #define STIX_EDAC_BOOT_HW_RESET (1u << STIX_EDAC_CACHE)
@@ -125,6 +136,582 @@ uint32_t stix_edac_rotb_status(StixEdac *e)
     return (e->sec[STIX_EDAC_ROTBUF] << STIXCTRL_ROTBCMDSTA_SECCOUNT) |
            ((e->ded[STIX_EDAC_ROTBUF] ? 1u : 0u)
             << STIXCTRL_ROTBCMDSTA_DEDETECTED);
+}
+
+/*
+ * ---- M-2: the upset machinery (D-Uc, D-Ue, D-Ug) ----
+ *
+ * The flip lives in the poison table, never in the backing bytes: an
+ * overlay read fetches the clean word from the backing RAM and XORs the
+ * mask. The EDAC word is the 32-bit unit at the poison's address; the
+ * overlay forwards 1/2/4-byte accesses and any write touching a byte of
+ * a poisoned word clears the whole poison (D-Uc). Zero cost uninjected:
+ * no overlay exists until the first poison lands in a 4 KB page, and it
+ * is removed when the page empties.
+ */
+
+static const char *const stix_edac_mem_name[STIX_EDAC_N_MODULE] = {
+    "sdram", "cache", "rotbuf",
+};
+
+/* the live EDACON bit of the module's stored register word (D-Uf) */
+static bool stix_edac_gate(StixEdac *e, StixEdacModule m)
+{
+    if (e->mems[m].edacon_reg == NULL) {
+        return false;
+    }
+    if (m == STIX_EDAC_CACHE) {
+        return (*e->mems[m].edacon_reg >>
+                STIXCTRL_CACHECMDSTA_EDACON) & 1u;
+    }
+    return false;               /* SDRAM/ROTBUF links come in M-3/M-4 */
+}
+
+/*
+ * CACHE only: the DE status and IRQ additionally need OPMODE = 0 (cache
+ * mode, StixIdpu.h:1547; the gate is the IRQ's, not the data's — with
+ * OPMODE = 1 the flip is still returned, D-Ue).
+ */
+static bool stix_edac_cache_de_gate(StixEdac *e)
+{
+    return stix_edac_gate(e, STIX_EDAC_CACHE) &&
+           !(*e->mems[STIX_EDAC_CACHE].edacon_reg &
+             (STIXCTRL_CACHECMDSTA_OPMODE_MASK <<
+              STIXCTRL_CACHECMDSTA_OPMODE));
+}
+
+/* the DE status/IRQ gate of a module: CACHE adds the OPMODE half */
+static bool stix_edac_de_gate(StixEdac *e, StixEdacModule m)
+{
+    return m == STIX_EDAC_CACHE ? stix_edac_cache_de_gate(e)
+                                : stix_edac_gate(e, m);
+}
+
+struct StixEdacOverlay {
+    MemoryRegion mr;
+    StixEdac *e;
+    StixEdacModule m;
+    hwaddr page;                /* guest base of the covered 4 KB page */
+    StixEdacOverlay *next;
+};
+
+/* the clean word from the backing RAM (big-endian, as the banks are) */
+static uint32_t stix_edac_backing_word(StixEdacMem *mem, hwaddr wa)
+{
+    const uint8_t *p = memory_region_get_ram_ptr(mem->backing) +
+                       (wa - mem->base);
+
+    return ldl_be_p(p);
+}
+
+/* read the clean word and write it back (the EDAC write-back, D-Uh) */
+static void stix_edac_backing_fix(StixEdacMem *mem, hwaddr wa, uint32_t w)
+{
+    stl_be_p((uint8_t *)memory_region_get_ram_ptr(mem->backing) +
+             (wa - mem->base), w);
+    memory_region_set_dirty(mem->backing, wa - mem->base,
+                            STIX_EDAC_WORD_SIZE);
+}
+
+static StixEdacOverlay *stix_edac_overlay_find(StixEdacMem *mem, hwaddr page)
+{
+    StixEdacOverlay *ov;
+
+    for (ov = mem->overlays; ov != NULL; ov = ov->next) {
+        if (ov->page == page) {
+            return ov;
+        }
+    }
+    return NULL;
+}
+
+/* remove the overlay once its page holds no armed poison (D-Uc) */
+static void stix_edac_overlay_trim(StixEdac *e, StixEdacModule m, hwaddr page)
+{
+    StixEdacMem *mem = &e->mems[m];
+    StixEdacOverlay *ov = stix_edac_overlay_find(mem, page);
+    StixEdacOverlay **link;
+    StixEdacPoison *p;
+    uint32_t i;
+
+    if (ov == NULL) {
+        return;
+    }
+    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+        p = &e->poison[i];
+        if (p->armed && p->mem == m &&
+            (p->addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1)) == page) {
+            return;
+        }
+    }
+    for (link = &mem->overlays; *link != NULL; link = &(*link)->next) {
+        if (*link == ov) {
+            *link = ov->next;
+            memory_region_del_subregion(mem->backing, &ov->mr);
+            /*
+             * parked, not freed: the dispatch running this very handler
+             * may still touch the MR (an SEU retire happens on its own
+             * read); the next add reuses the struct
+             */
+            ov->next = mem->spares;
+            mem->spares = ov;
+            return;
+        }
+    }
+}
+
+static StixEdacPoison *stix_edac_poison_get(StixEdac *e, StixEdacModule m,
+                                            hwaddr wa)
+{
+    StixEdacPoison *p;
+    uint32_t i;
+
+    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+        p = &e->poison[i];
+        if (p->armed && p->mem == m && p->addr == wa) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* retire one poison; the overlay goes when its page empties */
+static void stix_edac_poison_retire(StixEdac *e, StixEdacPoison *p)
+{
+    hwaddr page = p->addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1);
+
+    p->armed = false;
+    e->n_armed--;
+    stix_edac_overlay_trim(e, p->mem, page);
+}
+
+/*
+ * retire every poison whose word intersects [off, off + len): a write
+ * touching any byte of the word cures the whole cell (D-Uc)
+ */
+static void stix_edac_poison_drop(StixEdac *e, StixEdacModule m, hwaddr off,
+                                  hwaddr len, const char *kind)
+{
+    StixEdacPoison *p;
+    uint32_t i;
+
+    if (e == NULL || e->n_armed == 0) {
+        return;
+    }
+    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+        p = &e->poison[i];
+        if (p->armed && p->mem == m &&
+            p->addr < off + len && off < p->addr + STIX_EDAC_WORD_SIZE) {
+            trace_stix_edac_effect(stix_edac_mem_name[m], p->addr, kind);
+            stix_edac_poison_retire(e, p);
+        }
+    }
+}
+
+static uint64_t stix_edac_overlay_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    StixEdacOverlay *ov = opaque;
+    StixEdac *e = ov->e;
+    StixEdacModule m = ov->m;
+    StixEdacMem *mem = &e->mems[m];
+    hwaddr ga = ov->page + addr;
+    hwaddr wa = ga & ~(hwaddr)(STIX_EDAC_WORD_SIZE - 1);
+    StixEdacPoison *p = stix_edac_poison_get(e, m, wa);
+    uint32_t word, out = 0;
+    unsigned k;
+
+    if (p == NULL) {
+        return ldn_be_p(memory_region_get_ram_ptr(mem->backing) +
+                        (ga - mem->base), size);
+    }
+
+    word = stix_edac_backing_word(mem, wa);
+    if (p->de) {
+        if (stix_edac_de_gate(e, ov->m)) {
+            word ^= p->mask;
+            e->ded[m] = true;
+            e->mems[m].detected++;
+            trace_stix_edac_effect(stix_edac_mem_name[m], wa, "ded");
+            if (mem->irq != NULL) {
+                qemu_irq_pulse(*mem->irq);
+            }
+            if (!p->persist) {
+                stix_edac_poison_retire(e, p);
+            }
+        } else {
+            /* EDACON = 0 or OPMODE = 1: the flip, raw, stays armed */
+            word ^= p->mask;
+            trace_stix_edac_effect(stix_edac_mem_name[m], wa, "raw");
+        }
+    } else {
+        if (stix_edac_gate(e, m)) {
+            if (e->sec[m] < 0xFF) {
+                e->sec[m]++;            /* 8-bit fields saturate (D-Ue) */
+            }
+            e->mems[m].corrected++;
+            trace_stix_edac_effect(stix_edac_mem_name[m], wa, "sec");
+            stix_edac_backing_fix(mem, wa, word);
+            if (!p->persist) {
+                stix_edac_poison_retire(e, p);
+            }
+        } else {
+            word ^= p->mask;            /* EDACON = 0: raw, stays armed */
+            trace_stix_edac_effect(stix_edac_mem_name[m], wa, "raw");
+        }
+    }
+
+    /* slice the presented word big-endian, as the dispatch expects */
+    k = ga - wa;
+    while (size-- > 0) {
+        out = (out << 8) | ((word >> (24 - 8 * k)) & 0xffu);
+        k = (k + 1) & 3u;
+    }
+    return out;
+}
+
+static void stix_edac_overlay_write(void *opaque, hwaddr addr,
+                                    uint64_t value, unsigned size)
+{
+    StixEdacOverlay *ov = opaque;
+    StixEdacMem *mem = &ov->e->mems[ov->m];
+    hwaddr ga = ov->page + addr;
+    hwaddr wa = ga & ~(hwaddr)(STIX_EDAC_WORD_SIZE - 1);
+    StixEdacPoison *p = stix_edac_poison_get(ov->e, ov->m, wa);
+
+    /*
+     * A sub-word store is a read-modify-write of the EDAC word: the
+     * bytes it does not touch are written back as the read half saw
+     * them. An SEU with EDACON = 1 is corrected by that read (the word
+     * stays clean, no SEC counted: the FSW never observes an RMW); with
+     * EDACON = 0, or for a DE, the flipped bits are re-encoded with
+     * fresh check bits and become the cell's content. A full-word store
+     * overwrites everything, so the fold is moot there.
+     */
+    if (p != NULL && size < STIX_EDAC_WORD_SIZE &&
+        (p->de || !stix_edac_gate(ov->e, ov->m))) {
+        stix_edac_backing_fix(mem, wa,
+                              stix_edac_backing_word(mem, wa) ^ p->mask);
+    }
+    stn_be_p((uint8_t *)memory_region_get_ram_ptr(mem->backing) +
+             (ga - mem->base), size, value);
+    memory_region_set_dirty(mem->backing, ga - mem->base, size);
+    stix_edac_poison_drop(ov->e, ov->m, ga, size, "write-clear");
+}
+
+static const MemoryRegionOps stix_edac_overlay_ops = {
+    .read = stix_edac_overlay_read,
+    .write = stix_edac_overlay_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+};
+
+/* the priority-1 page overlay over the backing RAM (D-Uc) */
+static void stix_edac_overlay_add(StixEdac *e, StixEdacModule m, hwaddr page)
+{
+    StixEdacMem *mem = &e->mems[m];
+    StixEdacOverlay *ov = mem->spares;
+
+    /*
+     * a parked spare keeps its initialized MR (ops and opaque are the
+     * struct itself): only the page changes, so the MR is initialized
+     * exactly once per struct
+     */
+    if (ov == NULL) {
+        ov = g_new0(StixEdacOverlay, 1);
+        memory_region_init_io(&ov->mr, OBJECT(e), &stix_edac_overlay_ops,
+                              ov, "stix-edac-overlay", STIX_EDAC_PAGE_SIZE);
+    } else {
+        mem->spares = ov->next;
+    }
+    ov->e = e;
+    ov->m = m;
+    ov->page = page;
+    ov->next = mem->overlays;
+    /*
+     * the parent is a RAM leaf, not a container: render_memory_region
+     * (system/memory.c) renders a region's subregions before its own
+     * RAM, so the priority-1 overlay wins for its page
+     */
+    memory_region_add_subregion_overlap(mem->backing, page - mem->base,
+                                        &ov->mr, 1);
+    mem->overlays = ov;
+}
+
+/* volatile: stixctrl's register block is declared volatile (StixIdpu.h) */
+void stix_edac_cache_link(StixEdac *e, volatile uint32_t *cache_cmdsta,
+                          MemoryRegion *sram, qemu_irq *edac_irq)
+{
+    StixEdacMem *mem = &e->mems[STIX_EDAC_CACHE];
+
+    mem->backing = sram;
+    mem->base = STIXCTRL_SRAM_START;
+    mem->edacon_reg = cache_cmdsta;
+    mem->irq = edac_irq;
+}
+
+void stix_edac_host_write(StixEdac *e, StixEdacModule m, hwaddr off,
+                          hwaddr len)
+{
+    if (e == NULL || e->mems[m].backing == NULL) {
+        return;
+    }
+    /* the caller speaks backing offsets; the poisons carry addresses */
+    stix_edac_poison_drop(e, m, e->mems[m].base + off, len, "host-clear");
+}
+
+/*
+ * upsets-active (D-Ug): the armed poisons as records plus the per-memory
+ * injected/corrected/detected counters. Pure: no state is touched, so
+ * two reads with no accesses in between are equal.
+ */
+static char *stix_edac_upsets_json(StixEdac *e)
+{
+    g_autoptr(QDict) root = qdict_new();
+    QDict *counters = qdict_new();
+    QList *poisons = qlist_new();
+    StixEdacPoison *p;
+    uint32_t i, id = 0;
+    GString *json;
+    StixEdacModule m;
+
+    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+        p = &e->poison[i];
+        if (!p->armed) {
+            continue;
+        }
+        QDict *rec = qdict_new();
+
+        qdict_put_int(rec, "id", id++);
+        qdict_put_str(rec, "memory", stix_edac_mem_name[p->mem]);
+        qdict_put_int(rec, "address", p->addr);
+        qdict_put_int(rec, "mask", p->mask);
+        qdict_put_str(rec, "mode", p->de ? "de" : "seu");
+        qdict_put_bool(rec, "persist", p->persist);
+        qlist_append(poisons, rec);
+    }
+    qdict_put(root, "poisons", poisons);
+
+    for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
+        QDict *c = qdict_new();
+
+        qdict_put_int(c, "injected", e->mems[m].injected);
+        qdict_put_int(c, "corrected", e->mems[m].corrected);
+        qdict_put_int(c, "detected", e->mems[m].detected);
+        qdict_put(counters, stix_edac_mem_name[m], c);
+    }
+    qdict_put(root, "counters", counters);
+
+    json = qobject_to_json(QOBJECT(root));
+    return g_string_free(json, false);
+}
+
+/*
+ * upset-inject (D-Ug): "memory,address,bitmask[,mode][,persist]" with
+ * memory in {sdram,cache,rotbuf,bram}. M-2 wires CACHE only — the other
+ * memories are rejected as unsupported so a caller is never left with a
+ * silently unarmed upset. A rejected set changes nothing.
+ */
+static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    StixEdac *e = STIX_EDAC(obj);
+    StixEdacModule m = STIX_EDAC_N_MODULE;
+    char *str, **fields;
+    uint64_t addr, mask;
+    bool de, persist = false, replace = false;
+    uint32_t i, slot = STIX_EDAC_N_POISON;
+
+    if (!visit_type_str(v, name, &str, errp)) {
+        return;
+    }
+    fields = g_strsplit(str, ",", 6);
+    for (i = 0; fields[i] != NULL; i++) {
+    }
+    if (i < 3 || i > 5) {
+        error_setg(errp, "%s: expected \"memory,address,bitmask"
+                   "[,mode][,persist]\", not \"%s\"", name, str);
+        goto out;
+    }
+    if (strcmp(fields[0], "cache") == 0) {
+        m = STIX_EDAC_CACHE;
+    } else if (strcmp(fields[0], "sdram") == 0 ||
+               strcmp(fields[0], "rotbuf") == 0 ||
+               strcmp(fields[0], "bram") == 0) {
+        error_setg(errp, "%s: memory %s is not supported yet "
+                   "(M-2 wires cache only)", name, fields[0]);
+        goto out;
+    } else {
+        error_setg(errp, "%s: unknown memory %s (expected sdram, cache, "
+                   "rotbuf or bram)", name, fields[0]);
+        goto out;
+    }
+    if (e->mems[m].backing == NULL) {
+        error_setg(errp, "%s: memory %s is not wired in this machine",
+                   name, fields[0]);
+        goto out;
+    }
+    if (qemu_strtou64(fields[1], NULL, 0, &addr) < 0) {
+        error_setg(errp, "%s: bad address %s", name, fields[1]);
+        goto out;
+    }
+    if (addr & (STIX_EDAC_WORD_SIZE - 1)) {
+        error_setg(errp, "%s: address 0x%" PRIx64 " is not %u-aligned",
+                   name, addr, STIX_EDAC_WORD_SIZE);
+        goto out;
+    }
+    if (addr < e->mems[m].base ||
+        addr >= e->mems[m].base + memory_region_size(e->mems[m].backing)) {
+        error_setg(errp, "%s: address 0x%" PRIx64 " is outside %s "
+                   "(0x%" HWADDR_PRIx "..0x%" HWADDR_PRIx ")", name, addr,
+                   stix_edac_mem_name[m], e->mems[m].base,
+                   e->mems[m].base + memory_region_size(e->mems[m].backing));
+        goto out;
+    }
+    if (qemu_strtou64(fields[2], NULL, 0, &mask) < 0 || mask == 0 ||
+        mask > 0xFFFFFFFFull) {
+        error_setg(errp, "%s: bitmask %s must be nonzero and fit the "
+                   "32-bit word", name, fields[2]);
+        goto out;
+    }
+    de = ctpop32(mask) != 1;
+    if (i >= 4) {
+        if (strcmp(fields[3], "seu") == 0) {
+            de = false;
+        } else if (strcmp(fields[3], "de") == 0) {
+            de = true;
+        } else {
+            error_setg(errp, "%s: bad mode %s (expected seu or de)",
+                       name, fields[3]);
+            goto out;
+        }
+    }
+    if (i == 5) {
+        if (strcmp(fields[4], "0") == 0) {
+            persist = false;
+        } else if (strcmp(fields[4], "1") == 0) {
+            persist = true;
+        } else {
+            error_setg(errp, "%s: bad persist %s (expected 0 or 1)",
+                       name, fields[4]);
+            goto out;
+        }
+    }
+    /*
+     * a fresh event on an already poisoned word replaces its record
+     * (allowed even with a full table, and not counted as a new armed
+     * poison); otherwise the first free slot
+     */
+    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+        StixEdacPoison *p = &e->poison[i];
+
+        if (p->armed && p->mem == m && p->addr == addr) {
+            slot = i;
+            replace = true;
+            break;
+        }
+        if (slot == STIX_EDAC_N_POISON && !p->armed) {
+            slot = i;
+        }
+    }
+    if (slot == STIX_EDAC_N_POISON) {
+        error_setg(errp, "%s: poison table full (%u upsets)", name,
+                   STIX_EDAC_N_POISON);
+        goto out;
+    }
+    e->poison[slot] = (StixEdacPoison) {
+        .mem = m,
+        .addr = addr,
+        .mask = mask,
+        .de = de,
+        .persist = persist,
+        .armed = true,
+    };
+    if (!stix_edac_overlay_find(&e->mems[m],
+                                addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1))) {
+        stix_edac_overlay_add(e, m,
+                              addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1));
+    }
+    if (!replace) {
+        e->n_armed++;
+    }
+    e->mems[m].injected++;
+    trace_stix_edac_inject(stix_edac_mem_name[m], addr, mask,
+                           de ? "de" : "seu");
+
+out:
+    g_strfreev(fields);
+    g_free(str);
+}
+
+/*
+ * upset-clear (D-Ug): "all", or the index of a record in upsets-active.
+ * A bad index is refused and changes nothing.
+ */
+static void stix_edac_clear_set(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    StixEdac *e = STIX_EDAC(obj);
+    char *str;
+
+    if (!visit_type_str(v, name, &str, errp)) {
+        return;
+    }
+    if (strcmp(str, "all") == 0) {
+        uint32_t i;
+
+        for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+            StixEdacPoison *p = &e->poison[i];
+
+            if (p->armed) {
+                trace_stix_edac_clear(stix_edac_mem_name[p->mem], p->addr);
+                stix_edac_poison_retire(e, p);
+            }
+        }
+    } else {
+        uint64_t id;
+        uint32_t i, seen = 0;
+
+        if (qemu_strtou64(str, NULL, 0, &id) < 0) {
+            error_setg(errp, "%s: expected \"all\" or an index into "
+                       "upsets-active, not \"%s\"", name, str);
+            goto out;
+        }
+        for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+            StixEdacPoison *p = &e->poison[i];
+
+            if (!p->armed) {
+                continue;
+            }
+            if (seen == id) {
+                trace_stix_edac_clear(stix_edac_mem_name[p->mem], p->addr);
+                stix_edac_poison_retire(e, p);
+                goto out;
+            }
+            seen++;
+        }
+        error_setg(errp, "%s: no upset %" PRIu64 " armed (upsets-active holds "
+                   "%u)", name, id, e->n_armed);
+    }
+out:
+    g_free(str);
+}
+
+static void stix_edac_upsets_get(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    StixEdac *e = STIX_EDAC(obj);
+    char *str = stix_edac_upsets_json(e);
+
+    visit_type_str(v, name, &str, errp);
+    g_free(str);
 }
 
 /*
@@ -261,6 +848,27 @@ static void stix_edac_instance_init(Object *obj)
             "test-only, under qtest only: force the latch, "
             "bit 31 = DeDetected, 7:0 = SecCount");
     }
+
+    /*
+     * M-2 (D-Ug): the fault verbs on /machine/stixctrl/edac. They are
+     * write-only (a get of a verb is meaningless); upsets-active is the
+     * read-only face. Platform fault verbs, not qtest-only.
+     */
+    object_property_add(obj, "upset-inject", "string", &str_type_info,
+                        NULL, stix_edac_inject_set, NULL, NULL);
+    object_property_set_description(obj, "upset-inject",
+        "inject an upset: \"memory,address,bitmask[,mode][,persist]\" "
+        "(memory: cache in M-2; bitmask bit count 1 = seu, >=2 = de, "
+        "mode overrides; persist=1 keeps the poison after its effect)");
+    object_property_add(obj, "upset-clear", "string", &str_type_info,
+                        NULL, stix_edac_clear_set, NULL, NULL);
+    object_property_set_description(obj, "upset-clear",
+        "clear armed upsets: \"all\", or an index into upsets-active");
+    object_property_add(obj, "upsets-active", "string", &str_type_info,
+                        stix_edac_upsets_get, NULL, NULL, NULL);
+    object_property_set_description(obj, "upsets-active",
+        "read-only JSON: the armed poisons and the per-memory "
+        "injected/corrected/detected counters");
 }
 
 static void stix_edac_class_init(ObjectClass *klass, const void *data)

@@ -305,5 +305,13 @@ void stixctrl_scet_reg(STIXCTRL *s, uint32_t *coarse_reg, uint16_t *fine);
 StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
                                        uint32_t n_blocks,
                                        uint32_t *rotb_count);
+/*
+ * Provided by grlib_stixctrl.c (memory-upset plan D-Uc, M-2): stix_det's
+ * host-side writes into the CACHE SRAM (the LACC/EACC materialization)
+ * retire every armed upset they overwrite, like a guest write — the FPGA
+ * rewrite cures the cell. @off is a STIXCTRL_SRAM offset, @len its
+ * length in bytes.
+ */
+void stixctrl_edac_sram_write(STIXCTRL *s, hwaddr off, hwaddr len);
 
 #endif
