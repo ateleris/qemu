@@ -15,6 +15,11 @@
  * SECCOUNT 7:0 and DEDETECTED 31 from the EDAC unit (the stixctrl
  * device's child, linked by leon3.c) and takes its ICD reset value at
  * every device reset with the D-Uk edac-at-boot EDACON state.
+ *
+ * M-3 (D-Uc/D-Ud): the device also holds the machine RAM link and hands
+ * both to the EDAC unit at realize — the stored edac word gates the
+ * SDRAM overlay reactions and the machine RAM is the backing the
+ * overlays sit on.
  */
 #include "qemu/osdep.h"
 #include "hw/core/irq.h"
@@ -41,6 +46,12 @@ struct STIXSDRAM
      * register plain storage)
      */
     StixEdac *edac;
+
+    /*
+     * M-3 (D-Uc): the machine RAM (leon3.c), the backing the EDAC
+     * overlays sit on and the poison address space
+     */
+    MemoryRegion *sdram_ram;
 
     MemoryRegion iomem;
 };
@@ -95,6 +106,17 @@ static void grlib_stixsdram_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->iomem, OBJECT(s), &grlib_stixsdram_ops, s,
                           "stixsdram", STIXSDRAM_REG_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
+
+    /*
+     * M-3 (D-Uc/D-Ud): wire the SDRAM memory to the EDAC unit — the
+     * stored Sdram:Edac word gates the overlay reactions (EDACON bit
+     * 12) and the machine RAM is the backing the overlays sit on. Both
+     * links come from leon3.c; with either missing the register keeps
+     * the composed semantics with zero counters, like M-1.
+     */
+    if (s->edac != NULL && s->sdram_ram != NULL) {
+        stix_edac_sdram_link(s->edac, &s->reg.edac, s->sdram_ram);
+    }
 }
 
 /*
@@ -121,6 +143,12 @@ static void grlib_stixsdram_instance_init(Object *obj)
      */
     object_property_add_link(obj, "edac", TYPE_STIX_EDAC,
                              (Object **)&s->edac,
+                             object_property_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
+
+    /* M-3 (D-Uc): the machine RAM backs the SDRAM overlays */
+    object_property_add_link(obj, "sdram-ram", TYPE_MEMORY_REGION,
+                             (Object **)&s->sdram_ram,
                              object_property_allow_set_link,
                              OBJ_PROP_LINK_STRONG);
 }

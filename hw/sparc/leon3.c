@@ -48,6 +48,7 @@
 #include "hw/intc/grlib_irqmp.h"
 #include "hw/misc/grlib_ahb_apb_pnp.h"
 #include "hw/sparc/grlib_stix.h"
+#include "stix_edac.h"
 #include "StixIdpu.h"
 
 /* Default system clock.  */
@@ -493,8 +494,23 @@ static void leon3_generic_hw_init(MachineState *machine)
     dev = qdev_new(TYPE_GRLIB_STIXSDRAM);
     /* M-1 (D-Ua): the SDRAM edac register composes from the EDAC unit */
     object_property_set_link(OBJECT(dev), "edac", edac, &error_abort);
+    /*
+     * M-3 (D-Uc): the machine RAM (mapped above at LEON3_RAM_OFFSET)
+     * backs the EDAC overlays and is the upsets' address space
+     */
+    object_property_set_link(OBJECT(dev), "sdram-ram", OBJECT(machine->ram),
+                             &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SDRAM_APB_BASE);
+
+    /*
+     * M-3 (D-Ud): the AHBSTAT window — the one failing-address word the
+     * FSW's trap handler reads at 0x80000F00 (WDT.c:117-123, GRLIB
+     * AN-0004; the full layout stays [I]). The EDAC unit owns it and
+     * latches the address of the last AHB error response (SDRAM DE).
+     */
+    memory_region_add_subregion(address_space_mem, SDRAM_AHBSTAT_BASE,
+                                stix_edac_ahbstat_mr(STIX_EDAC(edac)));
 
     /* Allocate flash */
     dev = qdev_new(TYPE_GRLIB_STIXFLASH);

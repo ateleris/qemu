@@ -1964,6 +1964,21 @@ void sparc_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
     bool is_write = access_type == MMU_DATA_STORE;
     bool is_exec = access_type == MMU_INST_FETCH;
     bool is_asi = false;
+    CPUSPARCState *env = cpu_env(cs);
+
+    /*
+     * LEON3 (the CPU_FEATURE_CACHE_CTRL bit is set only on the LEON3
+     * model, cpu.c; the same gate the LEON cache-register ASIs use
+     * above): an AHB error response (MEMTX_ERROR) on a data access is
+     * the data-access-exception trap TT_DFAULT (0x09), regardless of
+     * the MMU enable. MEMTX_DECODE_ERROR (unassigned memory) keeps the
+     * MMU-gated behaviour below, so nothing traps on a plain access to
+     * an unmapped address.
+     */
+    if (response == MEMTX_ERROR && !is_exec &&
+        (env->def.features & CPU_FEATURE_CACHE_CTRL)) {
+        cpu_raise_exception_ra(env, TT_DFAULT, retaddr);
+    }
 
     sparc_raise_mmu_fault(cs, physaddr, is_write, is_exec,
                           is_asi, size, retaddr);

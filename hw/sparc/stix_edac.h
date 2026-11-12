@@ -110,6 +110,16 @@ struct StixEdac {
     StixEdacMem mems[STIX_EDAC_N_MODULE];
     StixEdacPoison poison[STIX_EDAC_N_POISON];
     uint32_t n_armed;
+
+    /*
+     * M-3 (D-Ud): the AHBSTAT failing-address word (0x80000F00) — the
+     * address of the last SDRAM MEMTX_ERROR read. Zeroed at power-on,
+     * latched across a system reset [I]: the trap handler reads it
+     * before the watchdog reset, and the post-reboot record is the BRAM
+     * copy (WDT.c:86-126), not this register.
+     */
+    uint32_t ahbstat;
+    MemoryRegion ahbstat_mr;
 };
 
 /*
@@ -154,6 +164,24 @@ uint32_t stix_edac_rotb_status(StixEdac *e);
  */
 void stix_edac_cache_link(StixEdac *e, volatile uint32_t *cache_cmdsta,
                           MemoryRegion *sram, qemu_irq *edac_irq);
+
+/*
+ * M-3 (D-Uc): wire the SDRAM memory to the unit, at the register
+ * owner's realize. @sdram_edac is the stored Sdram:Edac word whose
+ * EDACON (bit 12) gates the overlay reactions, @ram the machine RAM the
+ * overlays sit on (mapped at LEON3_RAM_OFFSET = 0x40000000, leon3.c),
+ * which is also the poison address base. No IRQ: the SDRAM DE reports
+ * as an AHB error (trap 0x09, D-Ud), not on the shared line
+ * (EDAC.c:69-76).
+ */
+void stix_edac_sdram_link(StixEdac *e, volatile uint32_t *sdram_edac,
+                          MemoryRegion *ram);
+
+/*
+ * M-3 (D-Ud): the AHBSTAT window's MemoryRegion (4 bytes at
+ * 0x80000F00); leon3.c maps it into the system memory.
+ */
+MemoryRegion *stix_edac_ahbstat_mr(StixEdac *e);
 
 /*
  * M-2 (D-Uc, the host-side writer rule): a host write into a linked

@@ -12729,6 +12729,7 @@ static void stix_flashdmg_register(void)
 /* ---- EDAC register semantics and reset state (memory-upset plan M-1) ---- */
 
 #define EDAC_SDRAM_EDAC  0x80000C04u  /* Sdram:Edac (FTSDCTRL16) */
+#define EDAC_AHBSTAT     0x80000F00u  /* the failing-address word (WDT.c) */
 #define EDAC_CACHECMDSTA 0x80000550u  /* StixCtrl:CacheCmdSta */
 #define EDAC_ROTBCMDSTA  0x80000554u
 #define EDAC_ROTBCONFIG  0x80000558u
@@ -13024,6 +13025,13 @@ static void test_edac_rotb_strobe_quirk(void)
 
 #define EDAC_ELUT       0xE0001000u  /* inside the ELUT window */
 #define EDAC_IRQ_BIT    (1u << 6)    /* IRQ_STIXCTRL_EDAC = 6 */
+
+/* ---- SDRAM upsets and the reboot path (memory-upset plan M-3) ---- */
+
+/* a machine-RAM word and the guest scratch the trap test uses */
+#define EDAC_SDRAM_DATA      0x40001000u
+#define EDAC_SDRAM_RESULT    0x40002000u
+#define EDAC_SDRAM_TRAPMAGIC 0x40002004u
 
 /* A string property, or NULL when qom-get fails. */
 static char *stix_qom_get_str(QTestState *qts, const char *path,
@@ -13431,6 +13439,371 @@ static void test_edac_cache_swap_poison(void)
     stix_qtest_cleanup();
 }
 
+/* ---- SDRAM upsets and the reboot path (memory-upset plan M-3) ---- */
+
+/*
+ * /sparc/stix/edac-sdram-seu (M-3): a 1-bit upset in a machine-RAM word
+ * is corrected on read with EDACON = 1, counts one SEC and self-retires
+ * (D-Uh); the FSW's EDACRST pair (EDAC.c:294-297) clears the counter.
+ * RED on M-2: the sdram inject is refused, so SECCOUNT stays 0.
+ */
+static void test_edac_sdram_seu(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = EDAC_SDRAM_DATA;
+
+    qtest_writel(qts, EDAC_SDRAM_EDAC, SDRAM_EDAC_EDACON);
+    qtest_writel(qts, addr, 0x12345678u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "sdram,0x40001000,0x1"));
+
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x12345678u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_SEC(0xFF),
+                    ==, SDRAM_EDAC_SEC(1));
+
+    /* the poison retired: nothing armed, a second read counts no more */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x12345678u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_SEC(0xFF),
+                    ==, SDRAM_EDAC_SEC(1));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+
+    /* the EDACRST set-then-clear pair leaves EDACON intact */
+    qtest_writel(qts, EDAC_SDRAM_EDAC,
+                 SDRAM_EDAC_EDACON | SDRAM_EDAC_EDACRST);
+    qtest_writel(qts, EDAC_SDRAM_EDAC, SDRAM_EDAC_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC), ==, SDRAM_EDAC_EDACON);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-sdram-seu-raw (M-3, D-Uf): with EDACON = 0 (the ICD
+ * reset, txt:3249) the flip is returned raw, SECCOUNT stays 0 and the
+ * poison stays armed. RED on M-2: the sdram inject is refused, the read
+ * returns the clean word.
+ */
+static void test_edac_sdram_seu_raw(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = EDAC_SDRAM_DATA + 0x40u;
+
+    qtest_writel(qts, addr, 0xCAFEBABEu);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "sdram,0x40001040,0x1"));
+
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xCAFEBABEu ^ 0x1u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_SEC(0xFF),
+                    ==, 0);
+    /* still armed: the second raw read flips again, no correction */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xCAFEBABEu ^ 0x1u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-sdram-ded-ahbstat (M-3, D-Ud): with EDACON = 1 the
+ * DE read is an AHB error response — DEDETECTED latches and the AHBSTAT
+ * window 0x80000F00 holds the failing address; with EDACON = 0 it is
+ * the raw row and nothing latches. qtest drives no CPU, so the trap
+ * itself is pinned by edac-sdram-ded-trap-runtime; the AHBSTAT latch
+ * (which only the MEMTX_ERROR branch writes) pins the error path here.
+ * The latch survives a system reset (the post-reboot record is the BRAM
+ * copy, WDT.c:86-126). RED on M-2: the sdram inject is refused and no
+ * AHBSTAT window exists (reads 0 — same as the reset value).
+ */
+static void test_edac_sdram_ded_ahbstat(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t ra = EDAC_SDRAM_DATA + 0x40u;
+    const uint32_t rb = EDAC_SDRAM_DATA + 0x80u;
+
+    /* the raw row first: EDACON = 0, no AHB error, nothing latched */
+    qtest_writel(qts, ra, 0xA5A5A5A5u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "sdram,0x40001040,0x9"));
+    g_assert_cmphex(qtest_readl(qts, ra), ==, 0xA5A5A5A5u ^ 0x9u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_AHBSTAT), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC)
+                    & SDRAM_EDAC_DEDETECTED, ==, 0);
+
+    /* EDACON = 1: the read faults — DEDETECTED and AHBSTAT latch */
+    qtest_writel(qts, EDAC_SDRAM_EDAC, SDRAM_EDAC_EDACON);
+    qtest_writel(qts, rb, 0x5A5A5A5Au);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "sdram,0x40001080,0x9"));
+    g_assert_cmphex(qtest_readl(qts, rb), ==, 0x5A5A5A5Au ^ 0x9u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_AHBSTAT), ==, 0x40001080u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC),
+                    ==, SDRAM_EDAC_EDACON | SDRAM_EDAC_DEDETECTED);
+
+    /* one-shot: the detected read retired its poison (ra stays armed) */
+    g_assert_cmphex(qtest_readl(qts, rb), ==, 0x5A5A5A5Au);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, EDAC_AHBSTAT), ==, 0x40001080u);
+
+    /* the watchdog reboot: the register resets, the latch does not */
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_AHBSTAT), ==, 0x40001080u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-sdram-persist (M-3, D-Uh): persist=1 models the
+ * stuck cell — every read re-detects, AHBSTAT keeps the address and the
+ * poison stays armed (the boot-loop mode; the live reboot loop itself
+ * is M-6 edac-smoke). RED on M-2: the sdram inject is refused.
+ */
+static void test_edac_sdram_persist(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = EDAC_SDRAM_DATA + 0xC0u;
+    g_autofree char *json;
+
+    qtest_writel(qts, EDAC_SDRAM_EDAC, SDRAM_EDAC_EDACON);
+    qtest_writel(qts, addr, 0xDEADBEEFu);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "sdram,0x400010C0,0x5,de,1"));
+
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xDEADBEEFu ^ 0x5u);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0xDEADBEEFu ^ 0x5u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_AHBSTAT), ==, 0x400010C0u);
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_nonnull(strstr(json, "\"detected\": 2"));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * The -kernel guest for edac-sdram-ded-trap-runtime (the
+ * write_spin_elf pattern, the gptimer test). It sets its own trap
+ * table (TBR = 0x40003000), enables traps (PSR = S|PS|ET) and loops
+ * reading the poisoned word 0x40001100 into RESULT 0x40002000. The
+ * tt 0x09 handler sits at TBR + 0x90 — this emulator routes trap tt to
+ * base + tt*16 (int32_helper.c:163-165) — records 0x55 at TRAPMAGIC
+ * 0x40002004 and spins.
+ */
+static gchar *write_trap_elf(void)
+{
+    /* ELF32, big-endian, EXEC, EM_SPARC, entry 0x40000000, phoff 52 */
+    static const uint8_t hdr[52] = {
+        0x7f, 'E', 'L', 'F', 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 2, 0, 2, 0, 0, 0, 1, 0x40, 0, 0, 0, 0, 0, 0, 52,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 32, 0, 2, 0, 0,
+        0, 0, 0, 0,
+    };
+    static const uint8_t phdr[2][32] = {
+        {   /* the code: offset 116, vaddr = paddr = 0x40000000, 68 B */
+            0, 0, 0, 1, 0, 0, 0, 116, 0x40, 0, 0, 0, 0x40, 0, 0, 0,
+            0, 0, 0, 68, 0, 0, 0, 68, 0, 0, 0, 5, 0, 0, 0, 4,
+        },
+        {   /* the trap table: offset 184, vaddr = paddr = 0x40003000 */
+            0, 0, 0, 1, 0, 0, 0, 184, 0x40, 0, 0x30, 0, 0x40, 0, 0x30, 0,
+            0, 0, 0, 164, 0, 0, 0, 164, 0, 0, 0, 6, 0, 0, 0, 4,
+        },
+    };
+    /* encodings computed and decoded field by field (M-3 review) */
+    static const uint8_t code[68] = {
+        0x05, 0x10, 0x00, 0x0C,     /* sethi %hi(0x40003000), %g2 */
+        0x81, 0x98, 0x80, 0x00,     /* wr   %g2, %g0, %tbr        */
+        0x84, 0x10, 0x20, 0xE0,     /* or   %g0, 0xE0, %g2        */
+        0x81, 0x88, 0x80, 0x00,     /* wr   %g2, %g0, %psr        */
+        0x01, 0x00, 0x00, 0x00,     /* nop                        */
+        0x01, 0x00, 0x00, 0x00,     /* nop                        */
+        0x03, 0x10, 0x00, 0x04,     /* sethi %hi(0x40001100), %g1 */
+        0xC6, 0x00, 0x61, 0x00,     /* ld   [%g1 + 0x100], %g3    */
+        0x09, 0x10, 0x00, 0x08,     /* sethi %hi(0x40002000), %g4 */
+        0xC6, 0x21, 0x00, 0x00,     /* st   %g3, [%g4]            */
+        0x10, 0xBF, 0xFF, 0xFC,     /* ba   loop (0x40000018)     */
+        0x01, 0x00, 0x00, 0x00,     /* nop                        */
+        0x0B, 0x10, 0x00, 0x08,     /* sethi %hi(0x40002004), %g5 */
+        0x8C, 0x10, 0x20, 0x55,     /* or   %g0, 0x55, %g6        */
+        0xCC, 0x21, 0x60, 0x04,     /* st   %g6, [%g5 + 4]        */
+        0x10, 0x80, 0x00, 0x00,     /* ba   .                     */
+        0x01, 0x00, 0x00, 0x00,     /* nop                        */
+    };
+    /*
+     * 164 zero bytes, except the tt 0x09 slot at +0x90: ba 0x40000030
+     * and its delay-slot nop (a zero word is unimp)
+     */
+    static const uint8_t table[164] = {
+        [0x90] = 0x10, [0x91] = 0xBF, [0x92] = 0xF3, [0x93] = 0xE8,
+        [0x94] = 0x01,              /* the delay slot: nop */
+    };
+    gchar *path = NULL;
+    int fd = g_file_open_tmp("stix-trap-XXXXXX.elf", &path, NULL);
+
+    g_assert(fd >= 0);
+    g_assert(write(fd, hdr, sizeof(hdr)) == sizeof(hdr));
+    g_assert(write(fd, phdr, sizeof(phdr)) == sizeof(phdr));
+    g_assert(write(fd, code, sizeof(code)) == sizeof(code));
+    g_assert(write(fd, table, sizeof(table)) == sizeof(table));
+    close(fd);
+    return path;
+}
+
+/*
+ * The -kernel guest for edac-sdram-dword (M-3 review finding 1): an
+ * aligned ldd/std is one 8-byte io access on SPARC. The guest loops
+ * ldd [0x40001200] -> %g2/%g3, std to RESULT + 0x10 and std back into
+ * the (overlaid) page at 0x40001208. One phdr: offset 84, vaddr =
+ * paddr = 0x40000000, 28 bytes. Encodings computed and decoded field
+ * by field.
+ */
+static gchar *write_dword_elf(void)
+{
+    static const uint8_t hdr[52] = {
+        0x7f, 'E', 'L', 'F', 1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 2, 0, 2, 0, 0, 0, 1, 0x40, 0, 0, 0, 0, 0, 0, 52,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 32, 0, 1, 0, 0,
+        0, 0, 0, 0,
+    };
+    static const uint8_t phdr[32] = {
+        0, 0, 0, 1, 0, 0, 0, 84, 0x40, 0, 0, 0, 0x40, 0, 0, 0,
+        0, 0, 0, 28, 0, 0, 0, 28, 0, 0, 0, 7, 0, 0, 0, 4,
+    };
+    static const uint8_t code[28] = {
+        0x03, 0x10, 0x00, 0x04,     /* sethi %hi(0x40001000), %g1 */
+        0xC4, 0x18, 0x62, 0x00,     /* ldd  [%g1 + 0x200], %g2    */
+        0x09, 0x10, 0x00, 0x08,     /* sethi %hi(0x40002000), %g4 */
+        0xC4, 0x39, 0x20, 0x10,     /* std  %g2, [%g4 + 0x10]     */
+        0xC4, 0x38, 0x62, 0x08,     /* std  %g2, [%g1 + 0x208]    */
+        0x10, 0xBF, 0xFF, 0xFB,     /* ba   0x40000000            */
+        0x01, 0x00, 0x00, 0x00,     /* nop                        */
+    };
+    gchar *path = NULL;
+    int fd = g_file_open_tmp("stix-dword-XXXXXX.elf", &path, NULL);
+
+    g_assert(fd >= 0);
+    g_assert(write(fd, hdr, sizeof(hdr)) == sizeof(hdr));
+    g_assert(write(fd, phdr, sizeof(phdr)) == sizeof(phdr));
+    g_assert(write(fd, code, sizeof(code)) == sizeof(code));
+    close(fd);
+    return path;
+}
+
+/*
+ * /sparc/stix/edac-sdram-dword (M-3 review finding 1): with a poison
+ * armed elsewhere in the page (the overlay is in place), the guest's
+ * 8-byte ldd/std still read and write both words. RED before the fix
+ * (overlay valid.max_access_size 4): the 8-byte access is a decode
+ * error, the ldd returns 0 and the std is dropped, silently.
+ */
+static void test_edac_sdram_dword(void)
+{
+    QTestState *qts;
+    g_autofree gchar *elf = NULL;
+    g_autofree gchar *extra = NULL;
+    gint64 deadline;
+
+    if (!qtest_has_accel("tcg")) {
+        g_test_skip("needs TCG to run the guest");
+        return;
+    }
+    elf = write_dword_elf();
+    extra = g_strdup_printf("-accel tcg -kernel %s", elf);
+    qts = stix_qtest_new_extra(extra);
+
+    /* EDACON = 0 (hw-reset): a raw poison only arms the page overlay */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "sdram,0x40001000,0x1"));
+    qtest_writel(qts, EDAC_SDRAM_DATA + 0x200u, 0x11223344u);
+    qtest_writel(qts, EDAC_SDRAM_DATA + 0x204u, 0x55667788u);
+    deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (qtest_readl(qts, EDAC_SDRAM_RESULT + 0x10u) != 0x11223344u ||
+           qtest_readl(qts, EDAC_SDRAM_RESULT + 0x14u) != 0x55667788u ||
+           qtest_readl(qts, EDAC_SDRAM_DATA + 0x208u) != 0x11223344u ||
+           qtest_readl(qts, EDAC_SDRAM_DATA + 0x20Cu) != 0x55667788u) {
+        g_assert(g_get_monotonic_time() < deadline);
+        g_usleep(1000);
+    }
+    /* the overlay was in place all along */
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(elf);
+}
+
+
+/*
+ * /sparc/stix/edac-sdram-ded-trap-runtime (M-3, D-Ud, the 2026-11-12
+ * user decision): boot with hw-reset — the guest reads the DE word raw,
+ * no trap; the runtime edac-enable qom-set (a platform verb) arms the
+ * trap path, and the next DE load raises trap 0x09: the guest's own
+ * handler runs, the poison is retired (one-shot) and the loop is parked
+ * in the handler, so RESULT keeps the flipped word. qtest drives no
+ * CPU, so the trap is only observable through guest code. RED on M-2:
+ * the sdram inject is refused — RESULT never flips, the trap never
+ * fires.
+ */
+static void test_edac_sdram_ded_trap_runtime(void)
+{
+    QTestState *qts;
+    g_autofree gchar *elf = NULL;
+    g_autofree gchar *extra = NULL;
+    gint64 deadline;
+
+    if (!qtest_has_accel("tcg")) {
+        g_test_skip("needs TCG to run the guest");
+        return;
+    }
+    elf = write_trap_elf();
+    extra = g_strdup_printf("-accel tcg -kernel %s", elf);
+    qts = stix_qtest_new_extra(extra);
+
+    /* the poisoned word holds a known pattern while the guest spins */
+    qtest_writel(qts, EDAC_SDRAM_DATA + 0x100u, 0xCAFEBABEu);
+    deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (qtest_readl(qts, EDAC_SDRAM_RESULT) != 0xCAFEBABEu) {
+        g_assert(g_get_monotonic_time() < deadline);
+        g_usleep(1000);
+    }
+
+    /* the raw row: the flip is returned, no trap */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "sdram,0x40001100,0x9"));
+    deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (qtest_readl(qts, EDAC_SDRAM_RESULT) != (0xCAFEBABEu ^ 0x9u)) {
+        g_assert(g_get_monotonic_time() < deadline);
+        g_usleep(1000);
+    }
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_TRAPMAGIC), ==, 0);
+
+    /* the runtime enable: EDACON = 1, as a software write would set */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-enable", "1"));
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_EDACON,
+                    ==, SDRAM_EDAC_EDACON);
+
+    /* the next DE load is the AHB error: trap 0x09, the handler ran */
+    deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+    while (qtest_readl(qts, EDAC_SDRAM_TRAPMAGIC) != 0x55u) {
+        g_assert(g_get_monotonic_time() < deadline);
+        g_usleep(1000);
+    }
+    /*
+     * the loop is parked in the handler: the raw result is still the
+     * flip, the one-shot poison is retired, the registers latched
+     */
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_RESULT),
+                    ==, 0xCAFEBABEu ^ 0x9u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_AHBSTAT), ==, 0x40001100u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC),
+                    ==, SDRAM_EDAC_EDACON | SDRAM_EDAC_DEDETECTED);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(elf);
+}
+
 static void stix_edac_register(void)
 {
     qtest_add_func("/sparc/stix/edac-reg-reset", test_edac_reg_reset);
@@ -13454,6 +13827,17 @@ static void stix_edac_register(void)
                    test_edac_cache_subword);
     qtest_add_func("/sparc/stix/edac-cache-swap-poison",
                    test_edac_cache_swap_poison);
+    qtest_add_func("/sparc/stix/edac-sdram-seu", test_edac_sdram_seu);
+    qtest_add_func("/sparc/stix/edac-sdram-seu-raw",
+                   test_edac_sdram_seu_raw);
+    qtest_add_func("/sparc/stix/edac-sdram-ded-ahbstat",
+                   test_edac_sdram_ded_ahbstat);
+    qtest_add_func("/sparc/stix/edac-sdram-dword",
+                   test_edac_sdram_dword);
+    qtest_add_func("/sparc/stix/edac-sdram-ded-trap-runtime",
+                   test_edac_sdram_ded_trap_runtime);
+    qtest_add_func("/sparc/stix/edac-sdram-persist",
+                   test_edac_sdram_persist);
 }
 
 int main(int argc, char **argv)

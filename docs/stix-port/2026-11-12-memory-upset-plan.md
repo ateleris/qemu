@@ -397,31 +397,46 @@ These change what the track can deliver. Read them first.
     `edac-cache-swap-poison` pins it.
   - **All guest access sizes are forwarded.** The FSW reads u16 LACC
     words, u8 ELUT bytes and 32-bit words elsewhere, so the overlay
-    handlers accept 1/2/4-byte accesses. Sub-word write semantics on a
+    handlers accept 1/2/4-byte accesses, and 8-byte ones (an aligned
+    SPARC ldd/std is a single 8-byte io access; memory.c splits it into
+    two 4-byte handler calls — M-3 review finding 1). Sub-word write semantics on a
     poisoned word: any write that touches any byte of the word clears
     the whole poison — the EDAC word is the unit and the hardware
     read-modify-write rewrites all 32 bits.
 - **D-Ud: SDRAM DEU/MBU raises the trap the FSW already handles —
-  from the overlay itself.** Nothing traps today (correction 3): the
-  generic unassigned-access path raises only with the MMU enabled
-  (`ldst_helper.c:469`) and is not touched. The overlay's read handler
-  raises the SPARC data-access exception **TT_DFAULT = 0x09** itself
-  (`cpu_raise_exception_ra(env, TT_DFAULT, retaddr)` /
-  `cpu_loop_exit_restore` from the overlay handler, the
-  `sparc_raise_mmu_fault` pattern) — a device-initiated trap from a
-  mapped address. A minimal **AHBSTAT window** at 0x80000F00 is added
-  in the same commit: the FSW reads exactly one 32-bit word there, the
-  failing address (`WDT.c:117-123`; the full GRLIB-AN-0004 layout
-  stays [I]), so `storeBadTrapInfo` records the real failing address
-  and the next boot's BRAM record is meaningful. The FSW then forces
-  the watchdog itself; the model's existing watchdog-FORCE →
+  via the AHB error response, not a device-side raise.** Nothing traps
+  today (correction 3): the generic unassigned-access path raises only
+  with the MMU enabled (`ldst_helper.c:469`) and is not touched. The
+  draft's `cpu_raise_exception_ra` from the overlay read handler is not
+  possible — an MMIO dispatch runs without a host retaddr, and the raise
+  needs one. As built (2026-11-12): the overlay read handler returns
+  **MEMTX_ERROR** (an AHB error response) for a detected SDRAM DE read
+  (EDACON=1); the TCG load path forwards it to
+  `sparc_cpu_do_transaction_failed` (`ldst_helper.c:1958`, through
+  `io_failed`, `accel/tcg/cputlb.c`), which — for a LEON3 CPU
+  (`CPU_FEATURE_CACHE_CTRL`, set only on the LEON3 model, `cpu.c:544`;
+  the same gate the LEON cache ASIs use, `ldst_helper.c:602,821`), a
+  data access (not an instruction fetch) and `response == MEMTX_ERROR`
+  — raises **TT_DFAULT = 0x09** with the proper retaddr, regardless of
+  the MMU enable. `MEMTX_DECODE_ERROR` (unassigned memory) keeps today's
+  MMU-gated behaviour, so nothing else changes: a grep over every device
+  mapped in leon3.c (stixctrl, stixsdram, stixflash, stixspw, irqmp,
+  gptimer, apbuart, ahb/apb pnp) shows none returns MEMTX_ERROR today
+  (all plain `.read`/`.write` handlers, which always dispatch as
+  MEMTX_OK), and no machine sets `ignore_memory_transaction_failures`.
+  A minimal **AHBSTAT window** at 0x80000F00 is added in the same
+  commit: the FSW reads exactly one 32-bit word there, the failing
+  address (`WDT.c:117-123`; the full GRLIB-AN-0004 layout stays [I]), so
+  `storeBadTrapInfo` records the real failing address and the next
+  boot's BRAM record is meaningful. The FSW then forces the watchdog
+  itself; the model's existing watchdog-FORCE →
   `qemu_system_reset_request` path (`grlib_stixctrl.c:281-287`)
   completes the reboot. The model does not reboot on its own. The
   DEDETECTED/SECCOUNT bits of the SDRAM edac register still latch/count
   (register-visible, even though the ASW reads them nowhere — Doc vs
-  code 1). If the raise hits a wall the review did not foresee, the
-  fallback stays status-only SDRAM DE (DEDETECTED + SECCOUNT, no
-  reboot) with the trap as A-later.
+  code 1). The review's status-only fallback is not needed: the raise
+  is implemented and pinned by a qtest that runs guest code
+  (`edac-sdram-ded-trap-runtime`, M-3 — the suite run decides).
   **User decision (2026-11-12): a DEU may lead to a trap on purpose.**
   One-shot stays the default, and the trap must be reachable from a
   test without rebuilding the image. It is reached through EDACON=1
@@ -551,7 +566,7 @@ reversible. `changes: truth` in every row: these are physical failures.
 | `memory.cache.seu` | physical | address, bitmask=1 bit (persist off) | corrected on read; cacheCmdSta SECCOUNT++ | TM(5,2) 0x542F after the report period (Q4); science TM corrupted if in ELUT/TLUT/LACC [L] |
 | `memory.cache.ded` | physical | address, bitmask ≥2 bits (persist off) | flipped data returned; DEDETECTED; IRQ 6 | SID2 status1 bits 2:0 next HK cycle; 0x542F never (DEs are not SECs) |
 | `memory.sdram.seu` | physical | address, 1 bit | corrected on read; edac SECCOUNT++ — needs EDACON=1 (SuSW hand-over or `edac-at-boot`, D-Uk) | TM(5,2) 0x542F after the period (Q4) |
-| `memory.sdram.ded` | physical | address, ≥2 bits | trap 0x09 → watchdog reboot (one-shot default) — needs EDACON=1 (D-Uk); with EDACON=0 (the reset default) the flip is returned raw | UART "Unexpected trap (0x09)" then reboot; boot report 0x0022; BRAM trap record |
+| `memory.sdram.ded` | physical | address, ≥2 bits | trap 0x09 → watchdog reboot (one-shot default) — needs EDACON=1 (D-Uk: `edac-at-boot` or the runtime `edac-enable`); with EDACON=0 (the reset default) the flip is returned raw | UART "Unexpected trap (0x09)" then reboot; boot report 0x0022; BRAM trap record |
 | `memory.rotbuf.seu` | physical | `<block>:<offset>`, 1 bit | corrected on read; rotbCmdSta SECCOUNT++ — needs EDACON=1 (D-Uk) | TM(5,2) 0x542F after the period (Q4) |
 | `memory.rotbuf.ded` | physical | `<block>:<offset>`, ≥2 bits | flipped block data; DEDETECTED; IRQ 6; FSW skips the block — needs EDACON=1 (D-Uk) | SID2 status1 bits 5:3; one block of science lost [L] |
 | `memory.bram.flip` | physical | address (0xE0200000+), bitmask | silent; raw flipped bytes from the next boot | **none** for the MemBram record (0xE02003C0): SuSW-only record, no ASW reader (`MemBram.h:10-11`) |
@@ -826,12 +841,14 @@ the merge.
     and the poison stays armed until the next read through the overlay.
 
 ### M-3: SDRAM upsets and the reboot path
-- The overlay on machine RAM (`sdram-ram` link), the device-initiated
-  trap raise (D-Ud: `cpu_raise_exception_ra(env, TT_DFAULT, retaddr)`
-  from the overlay handler; the generic unassigned-access path in
-  `ldst_helper.c` is not touched), the AHBSTAT window at 0x80000F00
-  (the one failing-address word), SDRAM EDACON/EDACRST gating. The
-  live-FSW variants need SDRAM EDACON=1: run with
+- The overlay on machine RAM (`sdram-ram` link), the AHB error
+  response path (D-Ud as corrected 2026-11-12: the overlay returns
+  MEMTX_ERROR for a detected SDRAM DE read; the LEON3 CPU raises
+  TT_DFAULT from `sparc_cpu_do_transaction_failed`, which has the host
+  retaddr the overlay handler lacks; the generic unassigned-access path
+  in `ldst_helper.c` is not touched beyond that), the AHBSTAT window at
+  0x80000F00 (the one failing-address word), SDRAM EDACON/EDACRST
+  gating. The live-FSW variants need SDRAM EDACON=1: run with
   `edac-at-boot=all-on` (D-Uk); SuSW does not (Q1, user). M-3 adds
   the run-time `edac-enable` write (D-Ud user decision), so a campaign
   can arm the DE → trap path mid-run. Unlike `test-latch-*` it is not
@@ -848,22 +865,121 @@ the merge.
   - `edac-sdram-seu`: write/read a pattern at 0x40001000 with
     EDACON=1 → corrected + SECCOUNT=1; EDACRST clears.
   - `edac-sdram-seu-raw`: EDACON=0 → flipped word returned.
-  - `edac-sdram-ded-ahbstat`: DE flip; a guest read faults; read
-    AHBSTAT 0x80000F00 (from the *next* context — via the qtest
-    `qtest_inl` after the reset, or a unit-level accessor [L]) shows
-    the failing address. The qtest pins that the fault is a trap 0x09,
-    not a silent return.
-  - `edac-sdram-reboot`: **live-FSW variant** [L]: with the gate ELF,
-    inject a one-shot DE into a data address the FSW touches, expect
-    the UART trap line, a watchdog reset, and a fresh 0x0022 boot
-    report; then confirm the model's stixStatus reset bits (the recon
-    stays [L]). If the suite cannot run the FSW in-qtest, this moves into
-    the M-6 `edac-smoke.sh` and the qtest keeps the unit-level part.
-  - `edac-sdram-persist`: `persist=1` DE → the reboot loop reproducible
-    (bounded: two boots then stop), demonstrating the stuck-cell mode.
+  - `edac-sdram-ded-ahbstat`: DE flip; with EDACON=1 the read faults —
+    qtest drives no CPU, so the qtest pins the MEMTX_ERROR branch's
+    observable side (DEDETECTED, the AHBSTAT latch at 0x80000F00, the
+    one-shot retire) and that the raw row latches nothing; the latch
+    survives a system reset (the post-reboot context reads it, as the
+    plan wanted).
+  - `edac-sdram-ded-trap-runtime`: the trap itself, through guest code
+    (the `write_spin_elf` pattern): the -kernel guest sets its own
+    trap table and loops loading a poisoned word; raw first, then
+    `edac-enable`, then the PC lands in the tt 0x09 slot (TBR+0x90 —
+    this emulator routes trap tt to base + tt*16,
+    `int32_helper.c:163`), AHBSTAT holds the failing address.
+  - `edac-sdram-persist`: `persist=1` DE → every read re-detects
+    (AHBSTAT keeps the address, the poison stays armed) — the
+    stuck-cell mode at qtest level.
+  - `edac-sdram-reboot`: **moves to M-6** (the live-FSW variant needs
+    the FSW UART/boot evidence, and the qtest-level pieces are covered
+    above; the M-6 `edac-smoke.sh` runs the FSW with
+    `edac-at-boot=all-on` and expects the trap line, the watchdog
+    reset and 0x0022).
 - **Gate impact:** the AHBSTAT window is a new region — the goldens
   never touch it (the FSW reads it only inside a trap handler; the gate
   runs have no traps). Soak/boot gates unchanged.
+- **As built (M-3):**
+  - `target/sparc/ldst_helper.c` `sparc_cpu_do_transaction_failed`:
+    for `response == MEMTX_ERROR`, a data access (loads and stores —
+    TT_DFAULT covers both; no device errors a store today) and the
+    LEON3 gate `CPU_FEATURE_CACHE_CTRL`, it raises TT_DFAULT with the
+    retaddr `io_failed` passed. Everything else in
+    `sparc_raise_mmu_fault` is untouched; `MEMTX_DECODE_ERROR`
+    (unassigned) keeps the MMU-gated behaviour. No new feature bit:
+    `CPU_FEATURE_CACHE_CTRL` already exists (`cpu-feature.h.inc`) and
+    is set only on the LEON3 model (`cpu.c:544-546`), and it is how
+    `ldst_helper.c` itself picks the LEON cache ASIs (`:602,:821`) —
+    cited as the tree's LEON discriminator. On sparc64 no model sets
+    it, so the path is LEON3-only by construction. Scope: the raise
+    only fires on accesses that route through the TCG io path —
+    `helper_ld/st_asi`'s own `address_space_*` cases (MXCC, the Mbus
+    MMU passthrough 0x21..0x2f) call `sparc_raise_mmu_fault` directly
+    and keep today's behaviour; the inline ASIs (plain user/kernel
+    data and ASI_LEON_BYPASS, `ldst_helper.c:776-784`) take the io
+    path, so both plain and bypass SDRAM reads trap.
+  - The overlay ops became `read_with_attrs`/`write_with_attrs`
+    (a plain `.read` would have won the dispatch —
+    `memory_dispatch_read1` checks `ops->read` first — so both moved).
+    The SDRAM DE branch (EDACON=1) latches DEDETECTED/SECCOUNT as
+    before, latches the failing word address into the AHBSTAT word and
+    returns MEMTX_ERROR; the *data* under the error response is the
+    flipped word (undefined on real hardware; the trap path never sees
+    it, `qtest_readl` does — pinned in `edac-sdram-ded-ahbstat`).
+    EDACON=0 keeps the raw row (flip + MEMTX_OK), CACHE keeps the IRQ
+    6 pulse and never errors the bus.
+  - The AHBSTAT window (4 bytes, 0x80000F00, StixIdpu.h
+    `SDRAM_AHBSTAT_BASE`): owned by the EDAC unit (realize inits the
+    MR), mapped by leon3.c via `stix_edac_ahbstat_mr()` after the
+    stixsdram block (nothing was mapped at 0x80000F00 before).
+    Reset value 0 [I]; the latch survives a system reset [I] — the
+    trap handler reads it before the watchdog reset, and the post-
+    reboot record is the BRAM copy (WDT.c:86-126), so reset-clearing
+    would destroy nothing but the plan's "read it from the next
+    context" qtest; writes drop.
+  - The SDRAM link: the stixsdram device gains a `sdram-ram` link
+    (machine RAM, set by leon3.c next to its M-1 `edac` link) and its
+    realize calls `stix_edac_sdram_link(e, &s->reg.edac, ram)` — the
+    M-2 shape, where the register owner's realize wires the module.
+    The backing RAM's base is 0x40000000 (`SDRAM_AHB_BASE`,
+    leon3.c `LEON3_RAM_OFFSET`); `stix_edac_gate` reads the stored
+    Sdram:Edac EDACON (bit 12) live, so `edac-at-boot=all-on`,
+    `edac-enable` and a guest write all drive the gate the same way.
+    `upset-inject` accepts `sdram` (rotbuf/bram still refused); the
+    no-IRQ wiring is deliberate (EDAC.c:69-76: SDRAM reports via the
+    trap, not IRQ 6).
+  - `edac-enable` on `/machine/stixctrl/edac`: "all-on" or a 3-bit
+    mask like `edac-at-boot` (1 sdram, 2 cache, 4 rotb); it ORs the
+    EdacOn bits of exactly the given modules into the owners' stored
+    words and never clears a bit — a module left out keeps its current
+    EDACON state (the off path is the FSW's TC(236) or a reset). A
+    module whose register owner is not wired is refused and *nothing*
+    changes (all-or-nothing, so "all-on" errors until M-4 wires rotb —
+    a caller is never left with a silently missed module). Write-only
+    like the upset verbs (a get is meaningless — the registers are the
+    state); traces `stix_edac_enable`; not qtest-gated (platform verb).
+  - qtests (all in `stix_edac_register()`, one-line RED story each):
+    `edac-sdram-seu` (RED on M-2: the sdram inject is refused, so
+    SECCOUNT stays 0), `edac-sdram-seu-raw` (RED: the read returns the
+    clean word), `edac-sdram-ded-ahbstat` (RED: the AHBSTAT window
+    does not exist), `edac-sdram-ded-trap-runtime` (RED: RESULT never
+    flips, the trap never fires), `edac-sdram-persist` (RED: the
+    detected counter stays 0). The guest ELF for the trap test carries
+    two PT_LOADs: the code at 0x40000000 (TBR/PSR bring-up, the load
+    loop, the tt 0x09 handler) and the 164-byte trap table at
+    0x40003000 with `ba handler` at +0x90. The handler records 0x55 at
+    0x40002004 and spins (never RETTs, so the one-shot retire plus the
+    parked loop is observable); RESULT (0x40002000) is the loop's
+    store target.
+  - `edac-sdram-reboot` (live FSW) moves to M-6 unchanged in substance.
+  - Known bounded window, as in M-2: after an inject over QMP a
+    running vCPU may still hit a stale RAM TLB entry for a few TBs;
+    the trap test polls for the flip instead of assuming it.
+  - Review fixes (orchestrator, after the M-3 review):
+    - The overlay's `valid.max_access_size` is 8 (was 4): with 4, every
+      guest ldd/std/lddf/stdf in a page holding any armed poison was a
+      decode error — the load returned 0 and the store was dropped,
+      poisoned word or not, silently (MMU off). qtest
+      `edac-sdram-dword` runs a guest ldd/std loop on an overlaid page;
+      RED with 4, green with 8. The trap-test guest words were
+      re-encoded and decoded field by field (8 of 17 were wrong) and
+      the tt 0x09 slot got its delay-slot nop.
+    - `edac-enable` refuses an empty mask ("0").
+    - Known limit: an instruction fetch from a DE word with EDACON = 1
+      does not trap (the raise excludes `is_exec`): the flipped word is
+      executed, the poison retires and AHBSTAT/DEDETECTED latch a code
+      address. Hardware would take an instruction-access error. M-6's
+      SDRAM reboot gate must inject into a data word, never code; the
+      `memory.sdram.ded` catalogue row must say so.
 
 ### M-4: ROTBUF upsets
 - `stix_edac_rotb_check()` in the rotb window read handler and in
@@ -992,18 +1108,18 @@ the merge.
 
 ## Risks and checks
 
-- **Raising trap 0x09 from a device read [L] — the headline risk.**
-  There is **no positive control**: with the MMU off an unassigned
-  access silently completes (`ldst_helper.c:469` raises only with
-  MMU_E; LEON3 resets MMU-off, `cpu.c:77`), so the FSW's trap selftest
-  does not trap today (`HWSelftest.c:277-282`) and cannot serve as the
-  control. M-3 must prove the device-initiated raise from scratch
-  (`cpu_raise_exception_ra(env, TT_DFAULT, retaddr)` from the overlay
-  handler, the `sparc_raise_mmu_fault` pattern) — timebox it and fall
-  back to status-only SDRAM DE (DEDETECTED + SECCOUNT, no reboot) with
-  the trap as A-later. The generic unassigned-access behaviour stays
-  untouched; making the HWSelftest selftest trap is a separate optional
-  item (M-3).
+- **Raising trap 0x09 from a device read — resolved by the M-3
+  redesign.** The draft's device-side raise had no positive control and
+  no retaddr to raise with; as built the overlay returns MEMTX_ERROR
+  and the raise happens in `sparc_cpu_do_transaction_failed`, which has
+  the retaddr `io_failed` passed (D-Ud, corrected 2026-11-12). The
+  positive control is the qtest that runs guest code
+  (`edac-sdram-ded-trap-runtime`): the trap is expected to land in the
+  guest's own tt 0x09 slot (the suite run decides). The generic
+  unassigned-access behaviour stays untouched (MEMTX_DECODE_ERROR is
+  not MEMTX_ERROR, and nothing in the leon3 machine returned
+  MEMTX_ERROR before); making the HWSelftest selftest trap is a
+  separate optional item (M-3).
 - **The composed registers change values only when latched.** The FSW
   never writes SECCOUNT/DEDETECTED (`EDAC.c` writes strobes, EDACON and
   SCRUBRATE only), so dropping those writes cannot break readback

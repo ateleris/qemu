@@ -225,6 +225,7 @@ for StixIdpu.
 #define EEPROM_APB_BASE                                        0x80000900
 #define SPW_APB_BASE                                           0x80000A00
 #define SDRAM_APB_BASE                                         0x80000C00
+#define SDRAM_AHBSTAT_BASE                                     0x80000F00
 #define DSU_AHB_BASE                                           0x90000000
 #define STIXCTRL_AHB_BASE                                      0xE0000000
 

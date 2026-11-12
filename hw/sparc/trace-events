@@ -133,3 +133,4 @@ stixtmtc_udp_tm_short(int len) "UDP TM packet dropped: shorter than the SpW head
 stix_edac_inject(const char *mem, uint32_t addr, uint32_t mask, const char *mode) "upset inject memory=%s addr=0x%08x mask=0x%08x mode=%s"
 stix_edac_effect(const char *mem, uint32_t addr, const char *kind) "upset effect memory=%s addr=0x%08x kind=%s"
 stix_edac_clear(const char *mem, uint32_t addr) "upset clear memory=%s addr=0x%08x"
+stix_edac_enable(uint32_t mask) "edac-enable mask=0x%x (bit0 sdram, 1 cache, 2 rotb)"

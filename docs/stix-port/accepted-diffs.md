@@ -4879,3 +4879,23 @@ upset commits extend it in place.
   and `edac-rotb-strobe-quirk` are red-by-construction (the property
   and the strobe semantics are new). The strobes are exercised with
   forced latches via the unit's test-only `test-latch-*` properties.
+- **Behaviour change in `target/sparc` (M-3): a MEMTX_ERROR on a LEON3
+  data access now raises trap 0x09.** `sparc_cpu_do_transaction_failed`
+  (`target/sparc/ldst_helper.c`) raises `TT_DFAULT` (0x09) when the
+  transaction failed with an AHB error response (`MEMTX_ERROR`), the
+  access is a data access (not an instruction fetch) and the CPU is a
+  LEON3 — discriminated by `CPU_FEATURE_CACHE_CTRL`, which only the
+  LEON3 model sets (`cpu.c:544-546`) and which `ldst_helper.c` already
+  uses as the LEON gate for the cache ASIs (`:602,:821`). The raise is
+  independent of the MMU enable (ASW runs MMU-off; unassigned memory,
+  `MEMTX_DECODE_ERROR`, keeps the MMU-gated behaviour, so the HWSelftest
+  store to 0xF0000000 still does not trap). This is a behaviour change
+  only for `MEMTX_ERROR`, which nothing returned before: every device
+  mapped in leon3.c (stixctrl, stixsdram, stixflash, stixspw, irqmp,
+  gptimer, apbuart, ahb/apb pnp) uses plain `.read`/`.write` handlers,
+  which always dispatch as MEMTX_OK, and no machine sets
+  `ignore_memory_transaction_failures`. The first (and only) producer
+  is the EDAC unit's SDRAM DE overlay read. `edac-sdram-ded-trap-runtime`
+  is the assertion for the trap, with guest code (the trap is expected
+  to land in the guest's tt 0x09 slot at TBR+0x90 — this emulator
+  routes trap tt to base + tt*16, `int32_helper.c:163`).

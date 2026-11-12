@@ -1,12 +1,13 @@
 /*
  * STIX IDPU EDAC unit (memory-upset plan D-Ua): the SEC counters and
  * DeDetected latches of the three EDAC memories and the edac-at-boot
- * property (D-Uk, M-1), and since M-2 the CACHE upset machinery (D-Uc):
- * a sparse poison table, 4 KB page overlays over the SRAM window, the
- * SEU correct-on-read / DE flip + DEDETECTED + IRQ 6 paths (D-Ue) and
- * the upset-inject/upset-clear/upsets-active verbs (D-Ug). The SDRAM
- * overlay and the rotbuf/bram upsets follow in M-3/M-4/M-5 on the same
- * table and overlay code.
+ * property (D-Uk, M-1), since M-2 the CACHE upset machinery (D-Uc) and
+ * since M-3 the SDRAM one: the sparse poison table, 4 KB page overlays
+ * over the backing RAMs, the SEU correct-on-read / DE flip + DEDETECTED
+ * paths (D-Ue), the SDRAM DE as an AHB error response (MEMTX_ERROR +
+ * the AHBSTAT word, D-Ud) and the upset-inject/upset-clear/
+ * upsets-active/edac-enable verbs (D-Ug). The rotbuf/bram upsets follow
+ * in M-4/M-5 on the same table and overlay code.
  *
  * Traces only fire from the QOM verbs and actual intercepted accesses,
  * never at realize, reset or in a getter (D-Ug, D-Ai).
@@ -164,7 +165,10 @@ static bool stix_edac_gate(StixEdac *e, StixEdacModule m)
         return (*e->mems[m].edacon_reg >>
                 STIXCTRL_CACHECMDSTA_EDACON) & 1u;
     }
-    return false;               /* SDRAM/ROTBUF links come in M-3/M-4 */
+    if (m == STIX_EDAC_SDRAM) {
+        return (*e->mems[m].edacon_reg >> FTSDCTRL16_EDAC_EDACON) & 1u;
+    }
+    return false;               /* ROTBUF link comes in M-4 */
 }
 
 /*
@@ -308,8 +312,21 @@ static void stix_edac_poison_drop(StixEdac *e, StixEdacModule m, hwaddr off,
     }
 }
 
-static uint64_t stix_edac_overlay_read(void *opaque, hwaddr addr,
-                                       unsigned size)
+/*
+ * M-3 (D-Ud): with attrs, so a read can fail the bus transaction. The
+ * SDRAM DE with EDACON = 1 latches as before, records the failing
+ * address in the AHBSTAT word and returns MEMTX_ERROR — the AHB error
+ * response the LEON3 CPU turns into the trap 0x09
+ * (sparc_cpu_do_transaction_failed); the FSW's trap handler then reads
+ * AHBSTAT 0x80000F00 (WDT.c:117-123). With EDACON = 0 the flip is
+ * returned raw and MEMTX_OK (D-Uf). CACHE is unchanged: its DE is the
+ * IRQ 6 pulse, never a bus error. The data under an error response is
+ * the flipped word (undefined on real hardware; nothing observes it on
+ * the trap path, qtest does).
+ */
+static MemTxResult stix_edac_overlay_read(void *opaque, hwaddr addr,
+                                          uint64_t *pdata, unsigned size,
+                                          MemTxAttrs attrs)
 {
     StixEdacOverlay *ov = opaque;
     StixEdac *e = ov->e;
@@ -319,11 +336,13 @@ static uint64_t stix_edac_overlay_read(void *opaque, hwaddr addr,
     hwaddr wa = ga & ~(hwaddr)(STIX_EDAC_WORD_SIZE - 1);
     StixEdacPoison *p = stix_edac_poison_get(e, m, wa);
     uint32_t word, out = 0;
+    MemTxResult ret = MEMTX_OK;
     unsigned k;
 
     if (p == NULL) {
-        return ldn_be_p(memory_region_get_ram_ptr(mem->backing) +
-                        (ga - mem->base), size);
+        *pdata = ldn_be_p(memory_region_get_ram_ptr(mem->backing) +
+                          (ga - mem->base), size);
+        return MEMTX_OK;
     }
 
     word = stix_edac_backing_word(mem, wa);
@@ -333,7 +352,10 @@ static uint64_t stix_edac_overlay_read(void *opaque, hwaddr addr,
             e->ded[m] = true;
             e->mems[m].detected++;
             trace_stix_edac_effect(stix_edac_mem_name[m], wa, "ded");
-            if (mem->irq != NULL) {
+            if (m == STIX_EDAC_SDRAM) {
+                e->ahbstat = (uint32_t)wa;
+                ret = MEMTX_ERROR;
+            } else if (mem->irq != NULL) {
                 qemu_irq_pulse(*mem->irq);
             }
             if (!p->persist) {
@@ -367,11 +389,13 @@ static uint64_t stix_edac_overlay_read(void *opaque, hwaddr addr,
         out = (out << 8) | ((word >> (24 - 8 * k)) & 0xffu);
         k = (k + 1) & 3u;
     }
-    return out;
+    *pdata = out;
+    return ret;
 }
 
-static void stix_edac_overlay_write(void *opaque, hwaddr addr,
-                                    uint64_t value, unsigned size)
+static MemTxResult stix_edac_overlay_write(void *opaque, hwaddr addr,
+                                           uint64_t value, unsigned size,
+                                           MemTxAttrs attrs)
 {
     StixEdacOverlay *ov = opaque;
     StixEdacMem *mem = &ov->e->mems[ov->m];
@@ -397,15 +421,22 @@ static void stix_edac_overlay_write(void *opaque, hwaddr addr,
              (ga - mem->base), size, value);
     memory_region_set_dirty(mem->backing, ga - mem->base, size);
     stix_edac_poison_drop(ov->e, ov->m, ga, size, "write-clear");
+    return MEMTX_OK;
 }
 
 static const MemoryRegionOps stix_edac_overlay_ops = {
-    .read = stix_edac_overlay_read,
-    .write = stix_edac_overlay_write,
+    .read_with_attrs = stix_edac_overlay_read,
+    .write_with_attrs = stix_edac_overlay_write,
     .endianness = DEVICE_BIG_ENDIAN,
+    /*
+     * valid up to 8: an aligned SPARC ldd/std (and lddf/stdf) is one
+     * 8-byte io access; memory.c splits it into two 4-byte calls of
+     * the handlers above (impl max 4), so both words see their poisons
+     * and a MEMTX_ERROR from either half still traps
+     */
     .valid = {
         .min_access_size = 1,
-        .max_access_size = 4,
+        .max_access_size = 8,
     },
     .impl = {
         .min_access_size = 1,
@@ -456,6 +487,57 @@ void stix_edac_cache_link(StixEdac *e, volatile uint32_t *cache_cmdsta,
     mem->edacon_reg = cache_cmdsta;
     mem->irq = edac_irq;
 }
+
+/* volatile: the SDRAM controller's register block is declared volatile */
+void stix_edac_sdram_link(StixEdac *e, volatile uint32_t *sdram_edac,
+                          MemoryRegion *ram)
+{
+    StixEdacMem *mem = &e->mems[STIX_EDAC_SDRAM];
+
+    mem->backing = ram;
+    /* the machine RAM maps at 0x40000000 (leon3.c LEON3_RAM_OFFSET) */
+    mem->base = SDRAM_AHB_BASE;
+    mem->edacon_reg = sdram_edac;
+    /* no IRQ: the SDRAM DE is the AHB error/trap path (D-Ud) */
+}
+
+MemoryRegion *stix_edac_ahbstat_mr(StixEdac *e)
+{
+    return &e->ahbstat_mr;
+}
+
+/*
+ * D-Ud: the AHBSTAT failing-address word at 0x80000F00 — the one 32-bit
+ * read the FSW's trap handler does (WDT.c:117-123, per GRLIB AN-0004;
+ * the full layout stays [I]). The latch is written by the SDRAM DE
+ * overlay read only; writes drop (the FSW never writes it).
+ */
+static uint64_t stix_edac_ahbstat_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    StixEdac *e = opaque;
+
+    return e->ahbstat;
+}
+
+static void stix_edac_ahbstat_write(void *opaque, hwaddr addr,
+                                    uint64_t value, unsigned size)
+{
+}
+
+static const MemoryRegionOps stix_edac_ahbstat_ops = {
+    .read = stix_edac_ahbstat_read,
+    .write = stix_edac_ahbstat_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
 
 void stix_edac_host_write(StixEdac *e, StixEdacModule m, hwaddr off,
                           hwaddr len)
@@ -515,9 +597,9 @@ static char *stix_edac_upsets_json(StixEdac *e)
 
 /*
  * upset-inject (D-Ug): "memory,address,bitmask[,mode][,persist]" with
- * memory in {sdram,cache,rotbuf,bram}. M-2 wires CACHE only — the other
- * memories are rejected as unsupported so a caller is never left with a
- * silently unarmed upset. A rejected set changes nothing.
+ * memory in {sdram,cache,rotbuf,bram}. M-3 wires SDRAM and CACHE — the
+ * other memories are rejected as unsupported so a caller is never left
+ * with a silently unarmed upset. A rejected set changes nothing.
  */
 static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
@@ -542,11 +624,12 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
     }
     if (strcmp(fields[0], "cache") == 0) {
         m = STIX_EDAC_CACHE;
-    } else if (strcmp(fields[0], "sdram") == 0 ||
-               strcmp(fields[0], "rotbuf") == 0 ||
+    } else if (strcmp(fields[0], "sdram") == 0) {
+        m = STIX_EDAC_SDRAM;
+    } else if (strcmp(fields[0], "rotbuf") == 0 ||
                strcmp(fields[0], "bram") == 0) {
         error_setg(errp, "%s: memory %s is not supported yet "
-                   "(M-2 wires cache only)", name, fields[0]);
+                   "(M-4/M-5 wire rotbuf and bram)", name, fields[0]);
         goto out;
     } else {
         error_setg(errp, "%s: unknown memory %s (expected sdram, cache, "
@@ -737,6 +820,14 @@ static void stix_edac_realize(DeviceState *dev, Error **errp)
 {
     StixEdac *e = STIX_EDAC(dev);
 
+    /*
+     * M-3 (D-Ud): the AHBSTAT window. The unit is not on a bus, so
+     * leon3.c maps the region (at 0x80000F00, StixIdpu.h
+     * SDRAM_AHBSTAT_BASE) through stix_edac_ahbstat_mr().
+     */
+    memory_region_init_io(&e->ahbstat_mr, OBJECT(e), &stix_edac_ahbstat_ops,
+                          e, "stix-edac-ahbstat", STIX_EDAC_WORD_SIZE);
+
     qemu_register_reset(stix_edac_reset_hook, e);
 }
 
@@ -791,6 +882,72 @@ static void stix_edac_boot_set(Object *obj, Visitor *v, const char *name,
 }
 
 /*
+ * edac-enable (D-Ud, the 2026-11-12 user decision): the runtime EDACON
+ * set the ASW never does — a platform fault verb (not qtest-only, like
+ * edac-at-boot), so a campaign can arm the SDRAM DE -> trap path
+ * mid-run without rebuilding the image. Value: "all-on" or a 3-bit mask
+ * (1 = sdram, 2 = cache, 4 = rotb), like edac-at-boot. It ORs the
+ * EdacOn bit of exactly the given modules into the owners' stored
+ * register words — as much as a software write could set — and never
+ * clears a bit: a module left out keeps its current EDACON state (the
+ * off path is the FSW's own TC(236) write or a reset). A module whose
+ * register owner is not wired is refused and nothing changes (a caller
+ * is never left with a silently missed module). There is deliberately
+ * no "trap with EDACON = 0" knob: with EDAC off the controller detects
+ * nothing, so that would be unphysical.
+ */
+static void stix_edac_enable_set(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    StixEdac *e = STIX_EDAC(obj);
+    char *str;
+    const char *end;
+    unsigned long val;
+    uint32_t mask, m;
+    int ret;
+
+    if (!visit_type_str(v, name, &str, errp)) {
+        return;
+    }
+    if (strcmp(str, "all-on") == 0) {
+        mask = STIX_EDAC_BOOT_ALL_ON;
+    } else {
+        ret = qemu_strtoul(str, &end, 0, &val);
+        if (ret < 0 || *end != '\0' || val > STIX_EDAC_BOOT_ALL_ON) {
+            error_setg(errp, "%s: expected all-on or a 3-bit mask "
+                       "(1 = sdram, 2 = cache, 4 = rotb), not %s",
+                       name, str);
+            g_free(str);
+            return;
+        }
+        mask = val;
+    }
+    if (mask == 0) {
+        error_setg(errp, "%s: an empty mask enables nothing", name);
+        g_free(str);
+        return;
+    }
+    for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
+        if ((mask & (1u << m)) && e->mems[m].edacon_reg == NULL) {
+            error_setg(errp, "%s: memory %s is not wired in this machine",
+                       name, stix_edac_mem_name[m]);
+            g_free(str);
+            return;
+        }
+    }
+    for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
+        unsigned bit = m == STIX_EDAC_CACHE ? STIXCTRL_CACHECMDSTA_EDACON
+                                            : FTSDCTRL16_EDAC_EDACON;
+
+        if (mask & (1u << m)) {
+            *e->mems[m].edacon_reg |= 1u << bit;
+        }
+    }
+    trace_stix_edac_enable(mask);
+    g_free(str);
+}
+
+/*
  * Test-only latch forcing (the plan's edac-strobe qtest; M-1 has no
  * upsets, so nothing else moves the counters). Value: bit 31 =
  * DeDetected, 7:0 = SecCount.
@@ -840,6 +997,18 @@ static void stix_edac_instance_init(Object *obj)
         "EDACON hand-over state at every reset: hw-reset (ICD), "
         "all-on, or a 3-bit mask (1 = sdram, 2 = cache, 4 = rotb)");
 
+    /*
+     * M-3 (D-Ud, the user decision): the runtime EDACON set. Platform
+     * fault verb, write-only like the upset verbs (a get is meaningless
+     * — the registers themselves are the state).
+     */
+    object_property_add(obj, "edac-enable", "string", &str_type_info,
+                        NULL, stix_edac_enable_set, NULL, NULL);
+    object_property_set_description(obj, "edac-enable",
+        "set the EdacOn bits at run time, as a software write would: "
+        "all-on, or a 3-bit mask (1 = sdram, 2 = cache, 4 = rotb); "
+        "only sets, never clears");
+
     for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
         object_property_add(obj, latch[m], "uint32", &uint32_type_info,
                             stix_edac_latch_get, stix_edac_latch_set, NULL,
@@ -858,7 +1027,7 @@ static void stix_edac_instance_init(Object *obj)
                         NULL, stix_edac_inject_set, NULL, NULL);
     object_property_set_description(obj, "upset-inject",
         "inject an upset: \"memory,address,bitmask[,mode][,persist]\" "
-        "(memory: cache in M-2; bitmask bit count 1 = seu, >=2 = de, "
+        "(memory: cache, sdram; bitmask bit count 1 = seu, >=2 = de, "
         "mode overrides; persist=1 keeps the poison after its effect)");
     object_property_add(obj, "upset-clear", "string", &str_type_info,
                         NULL, stix_edac_clear_set, NULL, NULL);
