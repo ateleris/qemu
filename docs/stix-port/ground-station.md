@@ -680,7 +680,7 @@ FDIR.c:768-776).
 
 ### The attenuator
 
-Since the attenuator track (`accepted-diffs.md` "A. Attenuator
+Since the attenuator track (`accepted-diffs.md` §43 "Attenuator
 mechanism and AttnCmdSta") the controller carries a child object,
 `/machine/stixctrl/attenuator` (type `stix-att`), whose faults go over
 the same QMP socket as the properties above. The gate is

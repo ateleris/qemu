@@ -4286,7 +4286,7 @@ tree ASW/):**
    re-arms after DISABLE decides whether such a build has a live
    watchdog at all.
 
-## A. Attenuator mechanism and AttnCmdSta (baseline: plain storage)
+## 43. Attenuator mechanism and AttnCmdSta (baseline: plain storage)
 
 Attenuator plan A-1 and A-2
 (`docs/stix-port/2026-11-11-attenuator-plan.md`, D-Aa..Af, Ah, Ai). The
