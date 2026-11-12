@@ -28,13 +28,16 @@
 OBJECT_DECLARE_SIMPLE_TYPE(StixEdac, STIX_EDAC)
 
 /*
- * The three EDAC memories (FSW EDAC.h:59-67; EEPROM is out of scope, its
- * register keeps today's plain-storage behaviour).
+ * The three EDAC memories (FSW EDAC.h:59-67) plus the BRAM (M-5), which
+ * has no EDAC at all: its upset flips the host bytes at inject time and
+ * stays silent (no edacon_reg, no counters, no poisons, D-Uh). EEPROM is
+ * out of scope, its register keeps today's plain-storage behaviour.
  */
 typedef enum StixEdacModule {
     STIX_EDAC_SDRAM,
     STIX_EDAC_CACHE,
     STIX_EDAC_ROTBUF,
+    STIX_EDAC_BRAM,
     STIX_EDAC_N_MODULE,
 } StixEdacModule;
 
@@ -54,7 +57,9 @@ typedef struct StixEdacOverlay StixEdacOverlay;
  * counters. CACHE is linked in M-2, SDRAM in M-3, ROTBUF in M-4 — the
  * ROTB has no MemoryRegion (the CPU sees only the 512 B block window),
  * so its data is the host-side ring and the reactions run from the
- * window/append paths, not from an overlay.
+ * window/append paths, not from an overlay. BRAM (M-5) sets only
+ * backing/base: no EDAC, so there is no gate, no irq and no overlay —
+ * the flip goes straight into the bytes.
  */
 typedef struct StixEdacMem {
     MemoryRegion *backing;      /* the guest-mapped RAM (stixctrl->sram) */
@@ -80,7 +85,8 @@ typedef struct StixEdacMem {
  * One armed upset (D-Uc): the 32-bit EDAC word at @addr reads with @mask
  * XORed. The mode derives from the mask (1 bit = SEU, >= 2 = DEU/MBU)
  * unless the upset-inject string overrides it; persist=1 keeps the
- * poison after its first effect (D-Uh).
+ * poison after its first effect (D-Uh). The BRAM never creates one (its
+ * flip is the host bytes themselves, M-5).
  */
 typedef struct StixEdacPoison {
     StixEdacModule mem;
@@ -200,6 +206,16 @@ void stix_edac_sdram_link(StixEdac *e, volatile uint32_t *sdram_edac,
  */
 void stix_edac_rotb_link(StixEdac *e, volatile uint32_t *rotb_config,
                          uint8_t *ring, uint32_t blocks, qemu_irq *edac_irq);
+
+/*
+ * M-5: wire the BRAM to the unit, at the stixctrl realize. The BRAM is
+ * the 0x400 lvar window (LVAR0-3, the WDT UNCHANGED_STORAGE, the MemBram
+ * record) mapped at STIXCTRL_LVAR0_START. It has no EDAC: there is no
+ * gate register, no IRQ and no poison — an upset flips the host bytes at
+ * inject time and stays silent (D-Uh: it survives a system reset and
+ * dies only at power cycle).
+ */
+void stix_edac_bram_link(StixEdac *e, MemoryRegion *lvar);
 
 /*
  * M-4 (D-Ue): the reactions for the CPU's read through the 512 B block

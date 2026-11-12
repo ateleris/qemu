@@ -1215,6 +1215,15 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
                         STIXCTRL->rotb_ring, STIXCTRL->rotb_blocks,
                         &STIXCTRL->irq_edac);
 
+    /*
+     * D-Ua, M-5: wire the BRAM to the EDAC unit — the lvar window is the
+     * whole 0x400 BRAM (LVAR0-3 plus the WDT UNCHANGED_STORAGE and the
+     * MemBram record). No EDAC, so there is no gate register and no IRQ:
+     * an upset flips the host bytes at inject time and is silent (D-Uh);
+     * the window survives system reset, a fresh QEMU starts zeroed.
+     */
+    stix_edac_bram_link(&STIXCTRL->edac, &STIXCTRL->lvar);
+
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 
     if (!stix_det_realize(&STIXCTRL->det, STIXCTRL, &STIXCTRL->reg,

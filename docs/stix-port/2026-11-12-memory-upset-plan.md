@@ -1099,6 +1099,58 @@ the merge.
   (nothing I found formats `WDT_resetInfo` into TM); the mechanism and
   the read-every-boot consumer are pinned by code.
 - **Gate impact:** none uninjected.
+- **As built (M-5):**
+  - **The grammar (D-Ug), stated in the property description and here:**
+    `upset-inject` takes `bram,<address>,<bitmask>` — an **absolute**
+    guest address (the form sdram/cache already use, not an offset) in
+    the 0x400 lvar window `0xE0200000..0xE02003FF` (LVAR0-3 included;
+    bounds from the window size, the error names the field), **any
+    alignment** — there is no EDAC word — and the bitmask (strtoull
+    base-0, nonzero, ≤ 32 bits) XORs the four bytes at the address,
+    big-endian, so an `inl` at the address reads the original XORed with
+    the mask at any width. `mode` and `persist` are refused (`"bram
+    takes no mode (no EDAC: ...)"`) — a flip is silent by construction.
+    Each accepted inject flips once; a repeated identical inject on the
+    same address flips again (two events, no record to dedupe against).
+  - **No poison, no counters, no status.** The flip is applied at
+    inject time to the host bytes via `memory_region_get_ram_ptr` +
+    `memory_region_set_dirty` (the stix_det pattern) and nothing is
+    armed: no poison record (so `upset-clear` has nothing to clear — a
+    rewrite of the address cures the cell, like any RAM), no counter
+    movement, and the `upsets-active` counters object stays
+    sdram/cache/rotbuf (a `bram` inject leaves the JSON byte-identical
+    to the uninjected shape). No IRQ, no effect trace — the only trace
+    is the inject's, `stix_edac_inject("bram", addr, mask, "flip")`,
+    from the setter only. No new trace events.
+  - **The wiring:** `STIX_EDAC_BRAM` joins the module enum (the latch
+    array and the counters loop stay three-module — the BRAM has no
+    latch and no counters); the stixctrl realize calls
+    `stix_edac_bram_link(&edac, &lvar)` next to the CACHE/ROTBUF links —
+    backing/base only (base `STIXCTRL_LVAR0_START`, size
+    `memory_region_size(lvar)`), no gate register, no IRQ.
+  - **Lifetime verified, not changed:** the lvar window is plain RAM
+    zeroed at power-on only (`memory_region_init_ram`,
+    `grlib_stixctrl.c:1130`) and `grlib_stixctrl_reset` deliberately
+    leaves the AHB windows alone (`:1230-1233`, D-G; the `test_bram_persist`
+    qtest already pins it) — so a flip survives `system_reset` and a
+    fresh QEMU instance starts from 0 (the power cycle). No reset code
+    touched.
+  - **Zero cost uninjected:** nothing runs outside the inject setter (no
+    overlay, no read hook, no table entry — the bram branch returns
+    before the poison logic); an out-of-window address or one whose four
+    mask bytes cross the window end is refused with the field named.
+  - qtests (registered in `stix_edac_register()`, one-line RED story
+    each): `edac-bram-wdt` (RED on M-4: the bram inject is refused, so
+    the WDT record never flips), `edac-bram-flip` (RED: same refusal,
+    the `EDAC_reboot_module` byte never flips), `edac-bram-reject` (the
+    rejections pass on M-4 for the wrong reason — everything bram is
+    refused there; the trailing good inject is what fails).
+  - FSW-visible targets, per the review-fix note: the WDT
+    `UNCHANGED_STORAGE` record (read every boot; the qtest flips the low
+    half of the bad-trap magic at 0xE02000A8) is the outcome that
+    reaches the ASW; the MemBram record 0xE02003C0 (`EDAC_reboot_module`
+    at 0xE02003C3) is a SuSW-only record with no ASW reader — mechanism
+    regression only.
 
 ### M-6: seeded random, hw-state, catalogue and gate
 - `random-seed`/`random-count` (D-Ug), the `hw-state.edac` accessor,

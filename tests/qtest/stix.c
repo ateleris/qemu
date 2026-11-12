@@ -1607,6 +1607,7 @@ static void test_rotb_reset(void)
 #define AHB_LVAR_LAST  0xE02003FCu  /* last LVAR window word */
 #define AHB_UNCHANGED  0xE02000A8u  /* WDT UNCHANGED_STORAGE (trap info) */
 #define AHB_MEMBRAM    0xE02003C0u  /* MemBram_STORAGE_ADDRESS (op mode) */
+#define AHB_MEMBRAM_MOD 0xE02003C3u /* MemBram EDAC_reboot_module (byte) */
 #define AHB_LTRG       0xE0400000u  /* STIXCTRL_LTRG0_START, 0x100 window */
 #define AHB_LTRG_LAST  0xE04000FCu
 #define AHB_ETRG       0xE0600000u  /* STIXCTRL_ETRG0_START, 0x80 window */
@@ -13976,6 +13977,135 @@ static void test_edac_enable_all(void)
     stix_qtest_cleanup();
 }
 
+/* ---- BRAM silent flips (memory-upset plan M-5) ---- */
+
+/*
+ * /sparc/stix/edac-bram-wdt (M-5): a flip in the WDT UNCHANGED_STORAGE
+ * area (0xE02000A8, the record WDT_callAfterReset reads at every boot,
+ * WDT.c:239-263 — here the low half of the bad-trap magic, WDT.c:74) is
+ * silent — no poison, no counter, no status — the inl reads the flipped
+ * value and system_reset keeps it (the BRAM survives a reboot,
+ * grlib_stixctrl_reset leaves the AHB RAM alone); a fresh QEMU instance
+ * is the power cycle and reads 0. RED on M-4: the bram inject is refused
+ * ("M-5 wires bram"), so the word never flips.
+ */
+static void test_edac_bram_wdt(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = AHB_UNCHANGED;
+    g_autofree char *json;
+    QTestState *fresh;
+
+    qtest_writel(qts, addr, 0x5A5AA5A5u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "bram,0xE02000A8,0x1"));
+
+    /* silent: nothing armed, no counters, no status of any kind */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_null(strstr(json, "\"memory\""));
+    g_assert_null(strstr(json, "\"bram\""));
+
+    /* the flip is the bytes: the inl reads the flipped value */
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x5A5AA5A5u ^ 0x1u);
+
+    /* a reboot does not heal the cell */
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x5A5AA5A5u ^ 0x1u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* a fresh instance is the power cycle: the RAM starts zeroed */
+    fresh = stix_qtest_new();
+    g_assert_cmphex(qtest_readl(fresh, addr), ==, 0);
+    qtest_quit(fresh);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-bram-flip (M-5): the same contract on the MemBram
+ * record (0xE02003C0), flipping its EDAC_reboot_module field byte
+ * (0xE02003C3) — mechanism regression only: the record has no ASW reader
+ * (MemBram.h:10-11, a SuSW-only record). RED on M-4: the bram inject is
+ * refused, so the field byte never flips.
+ */
+static void test_edac_bram_flip(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t rec = AHB_MEMBRAM;
+    const uint32_t fld = AHB_MEMBRAM_MOD;
+    QTestState *fresh;
+
+    qtest_writel(qts, rec, 0x12345678u);
+    /* mask byte 0 lands on the field byte: 0x78 ^ 0xFF = 0x87 */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "bram,0xE02003C3,0xFF000000"));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, rec), ==, 0x12345687u);
+    g_assert_cmphex(qtest_readb(qts, fld), ==, 0x87u);
+
+    /* survives a system reset ... */
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readb(qts, fld), ==, 0x87u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* ... and dies at the power cycle (a fresh instance reads 0) */
+    fresh = stix_qtest_new();
+    g_assert_cmphex(qtest_readl(fresh, rec), ==, 0);
+    qtest_quit(fresh);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-bram-reject (M-5, D-Ug): a bram address below the
+ * window, at its end, one whose four mask bytes cross it, and one that
+ * wraps past it are refused (bounds from the window size), and so are a
+ * zero / over-32-bit mask and a mode (the BRAM has no EDAC); every
+ * refusal changes nothing. RED on M-4: the rejections pass there for
+ * the wrong reason (every bram set is refused) — the trailing good
+ * inject is what fails.
+ */
+static void test_edac_bram_reject(void)
+{
+    QTestState *qts = stix_qtest_new();
+    const uint32_t addr = AHB_UNCHANGED;
+    g_autofree char *json;
+
+    qtest_writel(qts, addr, 0x11223344u);
+
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xE01FFF00,0x1"));   /* below */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xE0200400,0x1"));   /* the end */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xE02003FE,0x1"));   /* +4 crosses */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xFFFFFFFFFFFFFFFF,0x1")); /* wraps */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xE02000A8,0x0"));   /* mask 0 */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xE02000A8,0x1FFFFFFFF")); /* >32 */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xE02000A8,0x1,seu")); /* no mode */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "bram,0xE02000A8,0x1,de,1"));
+
+    /* nothing armed, the word reads untouched */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_null(strstr(json, "\"memory\""));
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x11223344u);
+
+    /* and a good injection still works afterwards */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "bram,0xE02000A8,0x1"));
+    g_assert_cmphex(qtest_readl(qts, addr), ==, 0x11223344u ^ 0x1u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_edac_register(void)
 {
     qtest_add_func("/sparc/stix/edac-reg-reset", test_edac_reg_reset);
@@ -14015,6 +14145,9 @@ static void stix_edac_register(void)
     qtest_add_func("/sparc/stix/edac-rotb-fpga-block",
                    test_edac_rotb_fpga_block);
     qtest_add_func("/sparc/stix/edac-enable-all", test_edac_enable_all);
+    qtest_add_func("/sparc/stix/edac-bram-wdt", test_edac_bram_wdt);
+    qtest_add_func("/sparc/stix/edac-bram-flip", test_edac_bram_flip);
+    qtest_add_func("/sparc/stix/edac-bram-reject", test_edac_bram_reject);
 }
 
 int main(int argc, char **argv)

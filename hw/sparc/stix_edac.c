@@ -9,7 +9,9 @@
  * upsets-active/edac-enable verbs (D-Ug). Since M-4 the ROTBUF upsets
  * ride the same table with no overlay (the ring has no CPU-visible RAM
  * region: stix_edac_rotb_check runs where the CPU reads the 512 B block
- * window); the bram flips follow in M-5.
+ * window). Since M-5 the BRAM flips ride the inject verb but nothing
+ * else: no EDAC, so the host bytes flip at inject time — no poison, no
+ * counters, no status (D-Uh).
  *
  * Traces only fire from the QOM verbs and actual intercepted accesses,
  * never at realize, reset or in a getter (D-Ug, D-Ai).
@@ -154,7 +156,7 @@ uint32_t stix_edac_rotb_status(StixEdac *e)
  */
 
 static const char *const stix_edac_mem_name[STIX_EDAC_N_MODULE] = {
-    "sdram", "cache", "rotbuf",
+    "sdram", "cache", "rotbuf", "bram",
 };
 
 /* the live EDACON bit of the module's stored register word (D-Uf) */
@@ -535,6 +537,23 @@ void stix_edac_rotb_link(StixEdac *e, volatile uint32_t *rotb_config,
 }
 
 /*
+ * M-5: the BRAM link. Only backing/base: no EDAC, so there is no gate
+ * register and no IRQ — the upset flips the host bytes at inject time
+ * and nothing is armed or reported. The lvar window covers LVAR0-3 plus
+ * the BRAM areas behind them: the WDT UNCHANGED_STORAGE (0xE02000A8, the
+ * record WDT_callAfterReset reads at every boot, WDT.c:239-263) and the
+ * MemBram record (0xE02003C0, SuSW-only, no ASW reader).
+ */
+void stix_edac_bram_link(StixEdac *e, MemoryRegion *lvar)
+{
+    StixEdacMem *mem = &e->mems[STIX_EDAC_BRAM];
+
+    mem->backing = lvar;
+    mem->base = STIXCTRL_LVAR0_START;
+    /* no edacon_reg, no irq: a flip is silent (the BRAM has no EDAC) */
+}
+
+/*
  * M-4 (D-Uc/D-Ue): the reactions for the CPU's read through the 512 B
  * block window — the only path the CPU sees the ring through. The
  * semantics are the overlay read's, minus the overlay: the flip lives in
@@ -715,8 +734,13 @@ static char *stix_edac_upsets_json(StixEdac *e)
     qdict_put(root, "poisons", poisons);
 
     for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
-        QDict *c = qdict_new();
+        QDict *c;
 
+        /* the BRAM has no EDAC and no counters (M-5): nothing to report */
+        if (m == STIX_EDAC_BRAM) {
+            continue;
+        }
+        c = qdict_new();
         qdict_put_int(c, "injected", e->mems[m].injected);
         qdict_put_int(c, "corrected", e->mems[m].corrected);
         qdict_put_int(c, "detected", e->mems[m].detected);
@@ -729,14 +753,45 @@ static char *stix_edac_upsets_json(StixEdac *e)
 }
 
 /*
+ * M-5 (D-Uh): the BRAM flip — the one memory with no EDAC and no read
+ * interceptor, so the upset is applied to the host bytes at inject time
+ * (the stix_det pattern: ram_ptr + set_dirty). The mask XORs the four
+ * bytes at the address, big-endian, so an inl at the address reads the
+ * original XORed with the mask. Nothing is armed: no poison record, no
+ * counters, no status, no IRQ, and no effect trace (nothing is ever
+ * intercepted). The window survives a system reset (grlib_stixctrl_reset
+ * leaves the AHB RAM alone); a fresh QEMU zeroes it at power-on.
+ */
+static void stix_edac_bram_flip(StixEdac *e, hwaddr addr, uint32_t mask)
+{
+    StixEdacMem *mem = &e->mems[STIX_EDAC_BRAM];
+    uint8_t *p = memory_region_get_ram_ptr(mem->backing) +
+                 (addr - mem->base);
+    unsigned i;
+
+    for (i = 0; i < STIX_EDAC_WORD_SIZE; i++) {
+        p[i] ^= (mask >> (24 - 8 * i)) & 0xFFu;
+    }
+    memory_region_set_dirty(mem->backing, addr - mem->base,
+                            STIX_EDAC_WORD_SIZE);
+    trace_stix_edac_inject(stix_edac_mem_name[STIX_EDAC_BRAM],
+                           (uint32_t)addr, mask, "flip");
+}
+
+/*
  * upset-inject (D-Ug): "memory,address,bitmask[,mode][,persist]" with
  * memory in {sdram,cache,rotbuf,bram}. rotbuf (M-4) takes
  * "<block>:<offset>" as its address — the block index into the ring
  * (bounds from the ring size) and the byte offset 0..511 in the block,
  * 4-aligned; the poison carries the ring byte offset
- * block * STIXCTRL_BLOCK_SIZE + offset. M-5 wires bram — unsupported
- * memories are rejected so a caller is never left with a silently
- * unarmed upset. A rejected set changes nothing.
+ * block * STIXCTRL_BLOCK_SIZE + offset. bram (M-5) takes an absolute
+ * address in the BRAM window (STIXCTRL_LVAR0_START+0x400, any alignment
+ * — no EDAC word); its mask XORs the four bytes at the address,
+ * big-endian, and the flip lands in the host bytes at once: no poison
+ * record, no counters, no status, no mode and no persist (silent, D-Uh
+ * — it survives a system reset and dies at power cycle). Unsupported or
+ * unwired memories are rejected so a caller is never left with a
+ * silently unarmed upset. A rejected set changes nothing.
  */
 static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
@@ -766,9 +821,7 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
     } else if (strcmp(fields[0], "rotbuf") == 0) {
         m = STIX_EDAC_ROTBUF;   /* "<block>:<offset>", parsed below */
     } else if (strcmp(fields[0], "bram") == 0) {
-        error_setg(errp, "%s: memory %s is not supported yet "
-                   "(M-5 wires bram)", name, fields[0]);
-        goto out;
+        m = STIX_EDAC_BRAM;     /* absolute address, parsed below */
     } else {
         error_setg(errp, "%s: unknown memory %s (expected sdram, cache, "
                    "rotbuf or bram)", name, fields[0]);
@@ -823,19 +876,37 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
             error_setg(errp, "%s: bad address %s", name, fields[1]);
             goto out;
         }
-        if (addr & (STIX_EDAC_WORD_SIZE - 1)) {
-            error_setg(errp, "%s: address 0x%" PRIx64 " is not %u-aligned",
-                       name, addr, STIX_EDAC_WORD_SIZE);
-            goto out;
-        }
         hwaddr end = e->mems[m].base +
                      memory_region_size(e->mems[m].backing);
 
-        if (addr < e->mems[m].base || addr >= end) {
-            error_setg(errp, "%s: address 0x%" PRIx64 " is outside %s "
-                       "(0x%" HWADDR_PRIx "..0x%" HWADDR_PRIx ")", name, addr,
-                       stix_edac_mem_name[m], e->mems[m].base, end);
-            goto out;
+        if (m == STIX_EDAC_BRAM) {
+            /*
+             * no EDAC word, so any alignment goes; the four mask bytes
+             * must fit the window (bounds from the region size, the
+             * span form avoids the addr + 4 overflow)
+             */
+            if (addr < e->mems[m].base ||
+                addr > end - STIX_EDAC_WORD_SIZE) {
+                error_setg(errp, "%s: address 0x%" PRIx64 " (+%u mask "
+                           "bytes) is outside %s (0x%" HWADDR_PRIx
+                           "..0x%" HWADDR_PRIx ")", name, addr,
+                           STIX_EDAC_WORD_SIZE, stix_edac_mem_name[m],
+                           e->mems[m].base, end);
+                goto out;
+            }
+        } else {
+            if (addr & (STIX_EDAC_WORD_SIZE - 1)) {
+                error_setg(errp, "%s: address 0x%" PRIx64 " is not %u-aligned",
+                           name, addr, STIX_EDAC_WORD_SIZE);
+                goto out;
+            }
+            if (addr < e->mems[m].base || addr >= end) {
+                error_setg(errp, "%s: address 0x%" PRIx64 " is outside %s "
+                           "(0x%" HWADDR_PRIx "..0x%" HWADDR_PRIx ")",
+                           name, addr, stix_edac_mem_name[m],
+                           e->mems[m].base, end);
+                goto out;
+            }
         }
     }
     if (qemu_strtou64(fields[2], NULL, 0, &mask) < 0 || mask == 0 ||
@@ -846,6 +917,12 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
     }
     de = ctpop32(mask) != 1;
     if (i >= 4) {
+        if (m == STIX_EDAC_BRAM) {
+            /* no EDAC, so neither mode nor persist applies (M-5) */
+            error_setg(errp, "%s: bram takes no mode (no EDAC: the flip "
+                       "is silent and lives until a power cycle)", name);
+            goto out;
+        }
         if (strcmp(fields[3], "seu") == 0) {
             de = false;
         } else if (strcmp(fields[3], "de") == 0) {
@@ -866,6 +943,11 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
                        name, fields[4]);
             goto out;
         }
+    }
+    if (m == STIX_EDAC_BRAM) {
+        /* the flip is the whole upset: applied now, nothing is armed */
+        stix_edac_bram_flip(e, (hwaddr)addr, (uint32_t)mask);
+        goto out;
     }
     /*
      * a fresh event on an already poisoned word replaces its record
@@ -1166,11 +1248,12 @@ static void stix_edac_latch_set(Object *obj, Visitor *v, const char *name,
 
 static void stix_edac_instance_init(Object *obj)
 {
-    static const char *latch[STIX_EDAC_N_MODULE] = {
+    /* the three EDAC modules only: the BRAM has no latch (no EDAC, M-5) */
+    static const char *const latch[] = {
         "test-latch-sdram", "test-latch-cache", "test-latch-rotb",
     };
     StixEdac *e = STIX_EDAC(obj);
-    StixEdacModule m;
+    unsigned li;
 
     e->boot_str = g_strdup("hw-reset");
     e->boot_mask = STIX_EDAC_BOOT_HW_RESET;
@@ -1193,11 +1276,11 @@ static void stix_edac_instance_init(Object *obj)
         "all-on, or a 3-bit mask (1 = sdram, 2 = cache, 4 = rotb); "
         "only sets, never clears");
 
-    for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
-        object_property_add(obj, latch[m], "uint32", &uint32_type_info,
+    for (li = 0; li < ARRAY_SIZE(latch); li++) {
+        object_property_add(obj, latch[li], "uint32", &uint32_type_info,
                             stix_edac_latch_get, stix_edac_latch_set, NULL,
-                            GUINT_TO_POINTER(m));
-        object_property_set_description(obj, latch[m],
+                            GUINT_TO_POINTER(li));
+        object_property_set_description(obj, latch[li],
             "test-only, under qtest only: force the latch, "
             "bit 31 = DeDetected, 7:0 = SecCount");
     }
@@ -1211,9 +1294,13 @@ static void stix_edac_instance_init(Object *obj)
                         NULL, stix_edac_inject_set, NULL, NULL);
     object_property_set_description(obj, "upset-inject",
         "inject an upset: \"memory,address,bitmask[,mode][,persist]\" "
-        "(memory: cache, sdram, rotbuf; rotbuf takes \"<block>:<offset>\" "
-        "as the address: the block index into the ring and the byte "
-        "offset 0..511 in the block, 4-aligned; bitmask bit count 1 = "
+        "(memory: cache, sdram, rotbuf, bram; rotbuf takes "
+        "\"<block>:<offset>\" as the address: the block index into the "
+        "ring and the byte offset 0..511 in the block, 4-aligned; bram "
+        "takes an absolute address in the BRAM window 0xE0200000+0x400, "
+        "any alignment, and the bitmask XORs the 4 bytes at it, "
+        "big-endian, applied at once - silent: no mode/persist, no "
+        "status, survives reset until power cycle; bitmask bit count 1 = "
         "seu, >=2 = de, mode overrides; persist=1 keeps the poison "
         "after its effect)");
     object_property_add(obj, "upset-clear", "string", &str_type_info,
