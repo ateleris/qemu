@@ -281,6 +281,7 @@ static void leon3_generic_hw_init(MachineState *machine)
     int         prom_size;
     ResetData  *reset_info;
     DeviceState *dev, *irqmpdev, *ctrl;
+    Object *edac;
     int i;
     AHBPnp *ahb_pnp;
     APBPnp *apb_pnp;
@@ -451,6 +452,12 @@ static void leon3_generic_hw_init(MachineState *machine)
     dev = qdev_new(TYPE_GRLIB_STIXCTRL);
     ctrl = dev; /* D-J: the SPW's scet-source link */
     /*
+     * M-1 (D-Ua): the EDAC unit is the ctrl device's child, created in
+     * its instance_init; the SDRAM controller gets it by link below, so
+     * its edac register composes the unit's counters and applies D-Uk.
+     */
+    edac = object_resolve_path_component(OBJECT(dev), "edac");
+    /*
      * P4-2 (D-P4a): a fixed QOM path, /machine/stixctrl, for the fault
      * injection properties (adc-inject[N]) and for tests; unnamed it
      * would be a /machine/unattached/device[N] that moves with the
@@ -484,6 +491,8 @@ static void leon3_generic_hw_init(MachineState *machine)
     /* Allocate SDRAM controller registers (model repair: the FSW's
      * RamUtils_initSDRAM() polls configStatus for the INIT bit). */
     dev = qdev_new(TYPE_GRLIB_STIXSDRAM);
+    /* M-1 (D-Ua): the SDRAM edac register composes from the EDAC unit */
+    object_property_set_link(OBJECT(dev), "edac", edac, &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, SDRAM_APB_BASE);
 

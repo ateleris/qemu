@@ -4801,3 +4801,81 @@ the sidecar's own spec — each leaving `damage-list` unchanged; then
 (197 checks, < 1 s) and the two committed BCH vector files pin the
 offline side. The gate pins the FSW-visible outcomes; its [L] payloads
 came from the live probe runs recorded in the plan's X-4 "As built".
+
+## Accepted diff: memory upsets and EDAC (baseline: no EDAC register semantics)
+
+Plan: `2026-11-12-memory-upset-plan.md` (commits M-1..M-7; this section
+is unnumbered until the merge). M-1 lands the register semantics; the
+upset commits extend it in place.
+
+- **The EDAC unit** (`hw/sparc/stix_edac.[ch]`, TYPE_STIX_EDAC at
+  `/machine/stixctrl/edac`, a QOM child of the stixctrl device): owns
+  the SEC counters and DeDetected latches of the three EDAC memories
+  (SDRAM, CACHE, ROTBUF; EEPROM is out of scope and stays plain
+  storage) and the `edac-at-boot` property (D-Uk). M-1 has no upsets:
+  nothing counts up, the unit traces nothing.
+- **Register semantics (M-1).** The composed fields are read-only and
+  read 0 until a commit counts an upset; the write-1 strobes self-clear
+  and reset counter and latch:
+  - `Sdram:Edac` 0x80000C04: SECCOUNT 7:0 and DEDETECTED 31 composed on
+    read; EDACON/SCRUBRATE stored; the EDACRST strobe (bit 13) clears
+    (the FSW `EDAC.c:294-297` set-then-clear pair).
+  - `CacheCmdSta` 0x80000550: SECCOUNT 15:8 and DEDETECTED 18 composed;
+    OPMODE/SCRUBRATE/EDACON stored; the EDACRESET strobe (bit 17)
+    clears (`EDAC.c:299-302`).
+  - `RotbCmdSta` 0x80000554: SECCOUNT 31:24 and DEDETECTED 4 composed;
+    the 0x54 write filter now treats bit 2 as the strobe (its own
+    comment anticipated this); the FSW's `~(1u << 2)` clear write
+    (0xFFFFFFFB) still lands as RESETFIFO — the documented side effect,
+    unchanged.
+- **cacheCmdSta reset value (declared golden change).** The ICD reset
+  puts EdacOn = 1 (STIX-ICD-0026 txt:2119); the baseline model read 0
+  (plain storage, zeroed at power-on). cacheCmdSta now takes
+  0x00010000 at every device reset. The boot UART golden changes on
+  exactly one line — the boot print's `E_EDAC_MODULE_CACHE = 0`
+  becomes `= 1` (`uart.golden.log` line 19). The trace golden changes
+  on 8 lines (it logs read values and stored write values): the seven
+  0x50 lines (boot print read, `RamUtils_setSRAMModeToCache` RMW,
+  `EDAC_init` strobe pair — the strobe bit never appears in the stored
+  word) and the first 0x54 strobe write (0x4 traces as stored 0x0).
+  The UART golden is updated (boot-smoke diffed exactly that line before
+  the update). The trace golden is a manual reference only (baseline
+  README) and, as for the flash-latency track, is not recaptured; a
+  future recapture shows these 8 lines.
+- **OpMode and ScrubRate keep reset 0 against the ICD** (txt:2124 says
+  OpMode 1, txt:2122 ScrubRate 3): OPMODE 0 keeps the CACHE DE→IRQ path
+  live with no FSW setup (the `EDAC.c:69-76` HW comment: SRAM boots as
+  main memory, ASW switches it to interrupt), ScrubRate 0 keeps the
+  scrub algorithm's OFF early-return (`FDIR/EDAC.c:230-234`).
+- **Sdram:Edac resets at device reset.** grlib_stixsdram gained its
+  first reset handler: the edac register takes its ICD reset
+  (EdacOn 0, ScrubRate 0, txt:3243-3253) at every device reset.
+  configStatus is untouched (the INIT repair owns it). The device
+  reaches the unit through a strong `edac` link set by leon3.c (the
+  scet-source pattern); with no unit linked the register keeps the
+  composed semantics with zero counters (`stix_edac_*` with
+  `e == NULL`), with the ICD reset. Invisible to the goldens: nothing
+  sets or reads SDRAM EDACON (correction 6 of the plan).
+- **`edac-at-boot` (D-Uk).** The property stands in for the unknown
+  SuSW hand-over state (open question Q1): `hw-reset` (default, the ICD
+  values: cache on, sdram/rotb off), `all-on`, or a 3-bit mask
+  (1 = sdram, 2 = cache, 4 = rotb). Applied at every device reset — a
+  watchdog reboot re-loads it, like an FPGA re-loading its defaults.
+  Settable over qom-set on `/machine/stixctrl/edac` or as
+  `-global stix-edac.edac-at-boot=...` (applied at the first reset, so
+  a live gate gets EDACON on from boot). The owners' device resets
+  apply it (stixctrl for cacheCmdSta and rotbConfig, stixsdram for the
+  edac register), not the unit's own reset hook: in this tree a hook
+  registered during realize runs before the sysbus devices reset (the
+  bus joins the root reset container at the end of
+  `machine_run_board_init`, `machine.c:1771`), so the owners would
+  clobber the bits; the unit's hook clears its counters, where the
+  order does not matter. Live SDRAM/ROTB DE gates run `all-on` until
+  Q1 is answered.
+- **Tests:** the `stix_edac_register()` block in `tests/qtest/stix.c`:
+  `edac-reg-reset` and `edac-reg-readonly` are RED on the pre-M-1
+  binary (cacheCmdSta read 0; the composed fields and the 0x54 strobe
+  bit came back from plain storage); `edac-boot-state`, `edac-strobe`
+  and `edac-rotb-strobe-quirk` are red-by-construction (the property
+  and the strobe semantics are new). The strobes are exercised with
+  forced latches via the unit's test-only `test-latch-*` properties.

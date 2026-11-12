@@ -16,7 +16,7 @@
 00:00:00.032  Main             ---------------------------------
 00:00:00.033  Main                 E_EDAC_MODULE_EEPROM          = 0
 00:00:00.033  Main                 E_EDAC_MODULE_SDRAM           = 0
-00:00:00.034  Main                 E_EDAC_MODULE_CACHE           = 0
+00:00:00.034  Main                 E_EDAC_MODULE_CACHE           = 1
 00:00:00.035  Main                 E_EDAC_MODULE_ROTBUF          = 0
 00:00:00.036  Main             init: ParamMgmt
 00:00:00.040  Main             init: ADCs default registers

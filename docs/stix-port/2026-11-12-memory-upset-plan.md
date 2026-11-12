@@ -645,6 +645,53 @@ the merge.
   leon3.c (only 0x500, 0x800-0x8FF and 0xC00 are mapped there), so
   `EDAC_isEnabled(EEPROM)` reads 0 and 0x542F's EEPROM slot stays 0
   (`EDAC.c:290-291`, `:170-171`).
+- **As built (M-1):**
+  - `stix_edac.[ch]` as planned: the QOM child TYPE_STIX_EDAC at
+    `/machine/stixctrl/edac` (`object_initialize_child` in the
+    stixctrl instance_init, realized with its parent), the SEC
+    counters/DeDetected latches, the `edac-at-boot` property and the
+    composition hooks in stixsdram (edac 0xC04), grlib_stixctrl
+    (cacheCmdSta 0x50, the `stixctrl_rotb_cmdsta` composition and the
+    0x54 write filter now treating bit 2 as the strobe). No traces
+    added. Not a sysbus device: its reset is a `qemu_register_reset`
+    hook (registered at realize) that clears the counters.
+  - **Deviation from D-Uk's mechanism, same contract:** the EDACON
+    hand-over state is applied by the *register owners'* device resets
+    (stixctrl for cacheCmdSta/rotbConfig, stixsdram for the edac
+    register), not by the unit's `qemu_register_reset` hook. In this
+    tree a hook registered during a device's realize runs *before* the
+    sysbus devices reset (the bus joins the root reset container only
+    at the end of `machine_run_board_init`, `machine.c:1771`), so the
+    owners would have clobbered the property's EDACON bits (visible
+    with a mask that turns CACHE off). The unit's hook keeps the
+    counter/latch clearing, where the order does not matter.
+  - grlib_stixsdram gained its first device reset: the edac register
+    takes its ICD reset (EdacOn 0, ScrubRate 0, txt:3243-3253) at every
+    device reset plus the D-Uk EDACON state; configStatus is untouched
+    (the INIT repair owns it). The stixsdram device reaches the unit
+    through a strong `edac` link set by leon3.c (the scet-source
+    pattern); with no unit linked the register keeps the composed
+    semantics with zero counters (`stix_edac_*` with `e == NULL`), with
+    the ICD reset.
+  - The strobe qtests force the latches through three test-only unit
+    properties `test-latch-{sdram,cache,rotb}` (bit 31 = DeDetected,
+    7:0 = SecCount); they stay for M-2's qtests.
+  - `edac-at-boot` is settable both over qom-set and as
+    `-global stix-edac.edac-at-boot=...` (dynamic object properties are
+    applied by the -global machinery at instance post-init, before the
+    first reset) — the clean recipe for the M-6 live SDRAM/ROTB gates
+    that need EDACON on from boot; pinned by `edac-boot-state`.
+  - Q2 resolved by the committed trace golden: it logs MMIO read
+    values and stored write values, so M-1 changes it beyond the UART
+    line — the seven 0x50 lines (the boot print's read returns
+    0x10000; the `RamUtils_setSRAMModeToCache` RMW carries it; the
+    `EDAC_init` strobe pair reads/writes 0x10000/0x30000 → the stored
+    word never shows the strobe bit) and the first 0x54 write (0x4
+    traces as stored 0x0, COMMAND only). The 0xC04 accesses are
+    invisible (the sdram device has no trace events). The UART golden
+    line 19 is updated; the trace golden is a manual reference (baseline
+    README) and is not recaptured (see accepted-diffs), the 8-line delta
+    is listed there.
 
 ### M-2: CACHE (FPGA SRAM) upsets
 - The overlay machinery (D-Uc) on `stixctrl->sram`, the EDACON+OPMODE

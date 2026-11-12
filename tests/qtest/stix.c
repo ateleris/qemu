@@ -1288,7 +1288,8 @@ static void test_ctrl_irq_lines(void)
 
 /* the FSW issues every command as a read-modify-write of rotbCmdSta
  * (RotBuf.c RotBuf_advancePointer/RotBuf_clear): clear COMMAND, OR the new
- * one. The device keeps only bits 2:0 of the write, so the BLOCKCOUNT and
+ * one. Since M-1 the device keeps only the COMMAND bits 1:0 of the write
+ * (bit 2 is the self-clearing EdacReset strobe), so the BLOCKCOUNT and
  * READY bits echoed back are ignored. */
 static void rotb_cmd(QTestState *qts, uint32_t cmd)
 {
@@ -12725,6 +12726,310 @@ static void stix_flashdmg_register(void)
     qtest_add_func("/sparc/stix/flash-dmg-reject", test_flash_dmg_reject);
 }
 
+/* ---- EDAC register semantics and reset state (memory-upset plan M-1) ---- */
+
+#define EDAC_SDRAM_EDAC  0x80000C04u  /* Sdram:Edac (FTSDCTRL16) */
+#define EDAC_CACHECMDSTA 0x80000550u  /* StixCtrl:CacheCmdSta */
+#define EDAC_ROTBCMDSTA  0x80000554u
+#define EDAC_ROTBCONFIG  0x80000558u
+#define EDAC_EDAC_PATH   "/machine/stixctrl/edac"
+
+/* Sdram:Edac fields (StixIdpu.h:539-562, ICD txt:3243-3253) */
+#define SDRAM_EDAC_DEDETECTED (1u << 31)
+#define SDRAM_EDAC_EDACRST    (1u << 13)
+#define SDRAM_EDAC_EDACON     (1u << 12)
+#define SDRAM_EDAC_SCRUB(x)   ((x) << 8)
+#define SDRAM_EDAC_SEC(x)     (x)
+
+/* CacheCmdSta fields (StixIdpu.h:742-771, ICD txt:2114-2128) */
+#define CACHE_DEDETECTED (1u << 18)
+#define CACHE_EDACRESET  (1u << 17)
+#define CACHE_EDACON     (1u << 16)
+#define CACHE_SEC(x)     ((x) << 8)
+#define CACHE_SCRUB(x)   ((x) << 4)
+
+/* RotbCmdSta / RotbConfig fields (StixIdpu.h:1188-1232) */
+#define ROTB_DEDETECTED (1u << 4)
+#define ROTB_EDACRESET  (1u << 2)
+#define ROTB_SEC(x)     ((x) << 24)
+#define ROTBCFG_EDACON  (1u << 12)
+
+/*
+ * qom-set of a string property; false when refused (e.g. a bad
+ * edac-at-boot value)
+ */
+static bool stix_qom_set_str(QTestState *qts, const char *path,
+                             const char *prop, const char *value)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %s}}",
+                            path, prop, value);
+    bool ok = qdict_haskey(resp, "return");
+
+    if (!ok) {
+        QDict *err = qdict_get_qdict(resp, "error");
+
+        g_test_message("qom-set %s.%s refused: %s", path, prop,
+                       err != NULL ? qdict_get_try_str(err, "desc") : "?");
+    }
+    qobject_unref(resp);
+    return ok;
+}
+
+/*
+ * /sparc/stix/edac-reg-reset (M-1): the composed fields read 0 at reset
+ * and cacheCmdSta carries its ICD reset value, EdacOn = 1
+ * (STIX-ICD-0026 txt:2119). RED on the pre-M-1 binary: cacheCmdSta was
+ * plain storage and read 0 (the reset-value fix is the commit's declared
+ * boot-golden change, the boot print's CACHE line).
+ */
+static void test_edac_reg_reset(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, CACHE_EDACON);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-reg-readonly (M-1): writes to the composed
+ * SECCOUNT/DEDETECTED fields are dropped, and the EDACRESET strobe never
+ * lands in the stored word. RED on the pre-M-1 binary: 0xC04 and 0x550
+ * were plain storage and the fields came back, and 0x54 kept the strobe
+ * bit (read 0x4).
+ */
+static void test_edac_reg_readonly(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    /* Sdram:Edac: SECCOUNT 7:0 and DEDETECTED 31 do not stick */
+    qtest_writel(qts, EDAC_SDRAM_EDAC, SDRAM_EDAC_DEDETECTED | 0xFFu);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC), ==, 0);
+    /* the stored EDACON/SCRUBRATE fields do */
+    qtest_writel(qts, EDAC_SDRAM_EDAC,
+                 SDRAM_EDAC_EDACON | SDRAM_EDAC_SCRUB(1));
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC), ==,
+                    SDRAM_EDAC_EDACON | SDRAM_EDAC_SCRUB(1));
+
+    /*
+     * CacheCmdSta: SECCOUNT 15:8 and DEDETECTED 18 do not stick (and the
+     * written EDACON = 0 clears the reset bit, it is R/W)
+     */
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_DEDETECTED | CACHE_SEC(0xFF));
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, 0);
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON | CACHE_SCRUB(3));
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==,
+                    CACHE_EDACON | CACHE_SCRUB(3));
+
+    /* rotbCmdSta: the strobe bit never reads back */
+    qtest_writel(qts, EDAC_ROTBCMDSTA,
+                 ROTB_DEDETECTED | ROTB_SEC(0xFF) | ROTB_EDACRESET);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-boot-state (M-1, D-Uk): the edac-at-boot property
+ * decides the EDACON bits at every device reset. Default hw-reset = the
+ * ICD reset values (matches edac-reg-reset); all-on re-arms all three
+ * over a guest write; a 3-bit mask (1 = sdram, 2 = cache, 4 = rotb)
+ * covers single memories; a bad value is refused and changes nothing.
+ * Red-by-construction: the property does not exist before M-1.
+ */
+static void test_edac_boot_state(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    /* default hw-reset: the ICD (cache on, sdram/rotb off) */
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_EDACON,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, CACHE_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG) & ROTBCFG_EDACON,
+                    ==, 0);
+
+    /* all-on at every reset: a guest-cleared bit comes back */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-at-boot",
+                                   "all-on"));
+    qtest_writel(qts, EDAC_SDRAM_EDAC, 0);
+    qtest_writel(qts, EDAC_ROTBCONFIG, 0);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_EDACON,
+                    ==, SDRAM_EDAC_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_EDACON,
+                    ==, CACHE_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG) & ROTBCFG_EDACON,
+                    ==, ROTBCFG_EDACON);
+
+    /*
+     * mask 4 = rotb only: the cache EDACON goes 0 (the owner applies
+     * the hand-over state after its ICD reset)
+     */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-at-boot",
+                                   "4"));
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_EDACON,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG) & ROTBCFG_EDACON,
+                    ==, ROTBCFG_EDACON);
+
+    /*
+     * a bad value is refused (the parse must consume the whole string,
+     * so "4junk" fails too) and the mode is unchanged
+     */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-at-boot",
+                                    "nonsense"));
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-at-boot",
+                                    "4junk"));
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG) & ROTBCFG_EDACON,
+                    ==, ROTBCFG_EDACON);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /*
+     * the -global form (the live-gate recipe, M-6): applied at the first
+     * reset, before the machine boots. Red-by-construction: the type
+     * does not exist before M-1 (the pre-M-1 binary warns and ignores
+     * the global).
+     */
+    qts = stix_qtest_new_extra("-global stix-edac.edac-at-boot=all-on");
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_EDACON,
+                    ==, SDRAM_EDAC_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_EDACON,
+                    ==, CACHE_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG) & ROTBCFG_EDACON,
+                    ==, ROTBCFG_EDACON);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-strobe (M-1): the EDACRST/EDACRESET write-1 strobes
+ * clear the SEC counter and the DeDetected latch, leave EDACON and
+ * SCRUBRATE intact and read back 0 (self-clearing). The latches are
+ * forced through the unit's test-only properties (M-1 has no upsets
+ * yet). Red-by-construction: no EDAC unit and no strobe semantics
+ * before M-1.
+ */
+static void test_edac_strobe(void)
+{
+    QTestState *qts = stix_qtest_new();
+    bool ok;
+
+    /* Sdram:Edac */
+    qtest_writel(qts, EDAC_SDRAM_EDAC,
+                 SDRAM_EDAC_EDACON | SDRAM_EDAC_SCRUB(2));
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH,
+                                   "test-latch-sdram", 0x80000005u));
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC), ==,
+                    SDRAM_EDAC_EDACON | SDRAM_EDAC_SCRUB(2) |
+                    SDRAM_EDAC_DEDETECTED | SDRAM_EDAC_SEC(5));
+    qtest_writel(qts, EDAC_SDRAM_EDAC,
+                 SDRAM_EDAC_EDACON | SDRAM_EDAC_SCRUB(2) |
+                 SDRAM_EDAC_EDACRST);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC), ==,
+                    SDRAM_EDAC_EDACON | SDRAM_EDAC_SCRUB(2));
+    g_assert_cmpuint(stix_qom_get_u64(qts, EDAC_EDAC_PATH,
+                                      "test-latch-sdram", &ok), ==, 0);
+    g_assert_true(ok);
+
+    /* CacheCmdSta */
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON);
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH,
+                                   "test-latch-cache", 0x80000083u));
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==,
+                    CACHE_EDACON | CACHE_DEDETECTED | CACHE_SEC(0x83));
+    qtest_writel(qts, EDAC_CACHECMDSTA, CACHE_EDACON | CACHE_EDACRESET);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, CACHE_EDACON);
+    g_assert_cmpuint(stix_qom_get_u64(qts, EDAC_EDAC_PATH,
+                                      "test-latch-cache", &ok), ==, 0);
+    g_assert_true(ok);
+
+    /* rotbCmdSta */
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH,
+                                   "test-latch-rotb", 0x80000007u));
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA), ==,
+                    ROTB_SEC(7) | ROTB_DEDETECTED);
+    qtest_writel(qts, EDAC_ROTBCMDSTA, ROTB_EDACRESET);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA), ==, 0);
+    g_assert_cmpuint(stix_qom_get_u64(qts, EDAC_EDAC_PATH,
+                                      "test-latch-rotb", &ok), ==, 0);
+    g_assert_true(ok);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-rotb-strobe-quirk (M-1): the FSW's EDAC_reset(ROTBUF)
+ * pair (EDAC.c:305-306) — 0x4 then ~(1u << 2) = 0xFFFFFFFB — still lands
+ * as RESETFIFO (the documented side effect, test_rotb_strobe) and clears
+ * nothing it should not: the strobe write is not a FIFO op, rotbConfig
+ * is untouched, READY stays. Red-by-construction: the strobe is a M-1
+ * semantic.
+ */
+static void test_edac_rotb_strobe_quirk(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    bool ok;
+    uint32_t i;
+
+    rotb_cfg(qts, true, true);
+    for (i = 0; i < 3; i++) {
+        rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 3);
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH,
+                                   "test-latch-rotb", 0x42u));
+
+    /* the FSW's EDACRESET strobe pair, verbatim */
+    ctrl_write(qts, CTRL_ROTBCMDSTA, 0x00000004u);
+    g_assert_cmpuint(rotb_count(qts), ==, 3);   /* not a FIFO op */
+    ctrl_write(qts, CTRL_ROTBCMDSTA, 0xFFFFFFFBu);
+
+    /*
+     * counters cleared, FIFO emptied by RESETFIFO, READY kept; the
+     * stored COMMAND bits (1:0) read back RESETFIFO
+     */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ROTBCMDSTA), ==,
+                    ROTB_STA_READY | ROTB_CMD_RESETFIFO);
+    /* rotbConfig (ENABLE|TESTMODE) untouched by the dance */
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG), ==,
+                    ROTB_CFG_ENABLE | ROTB_CFG_TESTMODE);
+    g_assert_cmpuint(stix_qom_get_u64(qts, EDAC_EDAC_PATH,
+                                      "test-latch-rotb", &ok), ==, 0);
+    g_assert_true(ok);
+
+    /* the ring works on */
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+static void stix_edac_register(void)
+{
+    qtest_add_func("/sparc/stix/edac-reg-reset", test_edac_reg_reset);
+    qtest_add_func("/sparc/stix/edac-reg-readonly", test_edac_reg_readonly);
+    qtest_add_func("/sparc/stix/edac-boot-state", test_edac_boot_state);
+    qtest_add_func("/sparc/stix/edac-strobe", test_edac_strobe);
+    qtest_add_func("/sparc/stix/edac-rotb-strobe-quirk",
+                   test_edac_rotb_strobe_quirk);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -12852,6 +13157,7 @@ int main(int argc, char **argv)
         stix_platform_register();
         stix_att_register();
         stix_flashdmg_register();
+        stix_edac_register();
     }
 
     return g_test_run();

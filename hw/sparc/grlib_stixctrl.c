@@ -19,6 +19,7 @@
 #include "StixIdpu.h"
 #include "stix_det.h"
 #include "stix_att.h"
+#include "stix_edac.h"
 
 #include "trace.h"
 #include "qom/object.h"
@@ -150,6 +151,13 @@ struct STIXCTRL
      */
     StixAttState att;
     StixAttConfig att_cfg;      /* the att-* qdev properties */
+    /*
+     * Memory-upset plan D-Ua (M-1): the EDAC unit, the QOM child at
+     * /machine/stixctrl/edac. It owns the SEC counters and DeDetected
+     * latches the 0x50/0x54 reads compose, and the edac-at-boot state
+     * the reset applies.
+     */
+    StixEdac edac;
 };
 
 #define STIXCTRL_ADC_INJECT_NONE 0xFFFFFFFFu
@@ -312,11 +320,14 @@ static void stixctrl_wdg_write(STIXCTRL *s, uint32_t value)
     trace_stixctrl_watchdog_cmd(cmd, s->wdg_reload, stixctrl_wdg_count(s), s->wdg_running);
 }
 
-/* rotbCmdSta (0x54) is composed on read: the stored COMMAND/EDACRESET
- * strobe bits (2:0) plus live status — READY follows rotbConfig.ENABLE
- * (the FSW's RotBuf_init polls it with a fatal timeout), FULL is the ring
- * state, BLOCKCOUNT (23:7) the block count. DEDETECTED and SECCOUNT read
- * 0 (no EDAC error model yet). */
+/*
+ * rotbCmdSta (0x54) is composed on read: the stored COMMAND bits (1:0)
+ * plus live status — READY follows rotbConfig.ENABLE (the FSW's
+ * RotBuf_init polls it with a fatal timeout), FULL is the ring state,
+ * BLOCKCOUNT (23:7) the block count, and the EDAC status comes from the
+ * EDAC unit (M-1): SECCOUNT (31:24) and DEDETECTED (4), 0 with no
+ * upsets. The EDACRESET strobe (bit 2) is never stored, so it reads 0.
+ */
 static uint32_t stixctrl_rotb_cmdsta(STIXCTRL *s)
 {
     uint32_t cfg = ((volatile const uint32_t *)&s->reg)[0x58 / sizeof(uint32_t)];
@@ -327,7 +338,8 @@ static uint32_t stixctrl_rotb_cmdsta(STIXCTRL *s)
             << STIXCTRL_ROTBCMDSTA_READY) |
            ((s->rotb_full ? 1u : 0u) << STIXCTRL_ROTBCMDSTA_FULL) |
            ((s->rotb_count & STIXCTRL_ROTBCMDSTA_BLOCKCOUNT_MASK)
-            << STIXCTRL_ROTBCMDSTA_BLOCKCOUNT);
+            << STIXCTRL_ROTBCMDSTA_BLOCKCOUNT) |
+           stix_edac_rotb_status(&s->edac);
 }
 
 /*
@@ -837,9 +849,17 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
         (stixctrl_wdg_count(stixctrl) << STIXCTRL_WATCHDOG_COUNT);
 
     /*
-     * 0x54 and 0x88 are composed live (stixctrl_rotb_cmdsta,
-     * stixctrl_hkcmdsta); the rest is stored
+     * 0x50, 0x54 and 0x88 are composed live (cacheCmdSta via the EDAC
+     * unit, stixctrl_rotb_cmdsta, stixctrl_hkcmdsta); the rest is stored
      */
+    if (addr == 0x50 /* cacheCmdSta */) {
+        uint32_t regval = stix_edac_cache_read(&stixctrl->edac,
+                                               stixctrl->reg.cacheCmdSta);
+
+        trace_stixctrl_io_read((uint32_t)addr, regval);
+
+        return regval;
+    }
     if (addr == 0x54 /* rotbCmdSta */)
     {
         uint32_t regval = stixctrl_rotb_cmdsta(stixctrl);
@@ -1032,19 +1052,38 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
                    STIXCTRL_HKCMDSTA_POWERSTAT);
     }
 
-    /* rotbCmdSta (0x54): writable fields are COMMAND (1:0) and the
-     * EDACRESET strobe (bit 2); BLOCKCOUNT, SECCOUNT, READY, FULL and
-     * DEDETECTED are read-only status, composed in the read handler
-     * (stixctrl_rotb_cmdsta). The FSW's EDAC counter reset clears its
-     * strobe with a full-register write of ~(1u << 2) = 0xFFFFFFFB
+    /*
+     * cacheCmdSta (0x50), M-1: OPMODE, SCRUBRATE and EDACON are stored;
+     * SECCOUNT (15:8) and DEDETECTED (18) are composed read-only, and
+     * EDACRESET (bit 17) is a write-1 strobe that self-clears (the
+     * EDAC.c:299-302 set-then-clear pair).
+     */
+    if (addr == 0x50 /* cacheCmdSta */) {
+        value = stix_edac_cache_write(&stixctrl->edac,
+                                      stixctrl->reg.cacheCmdSta,
+                                      (uint32_t)value);
+    }
+
+    /*
+     * rotbCmdSta (0x54): the writable field is COMMAND (1:0); BLOCKCOUNT,
+     * SECCOUNT, READY, FULL and DEDETECTED are read-only status, composed
+     * in the read handler (stixctrl_rotb_cmdsta). The EDACRESET strobe
+     * (bit 2) clears the EDAC counter and latch and self-clears, so it
+     * never lands in the stored word. The FSW's EDAC counter reset clears
+     * its strobe with a full-register write of ~(1u << 2) = 0xFFFFFFFB
      * (EDAC.c); the baseline stored that raw and set BLOCKCOUNT to
      * 131071, so the FSW's HK level check asserted (HKAcquire.c:325) —
      * masked on 5.2 by the SCET abort killing runs ~4 FSW-seconds
      * earlier. The strobe-clear write carries COMMAND = 3, so it
-     * executes RESETFIFO (harmless, see stixctrl_rotb_command). */
+     * executes RESETFIFO (harmless, see stixctrl_rotb_command).
+     */
     if (addr == 0x54 /* rotbCmdSta */)
     {
-        value &= 0x7u;
+        if ((value >> STIXCTRL_ROTBCMDSTA_EDACRESET) &
+            STIXCTRL_ROTBCMDSTA_EDACRESET_MASK) {
+            stix_edac_clear(&stixctrl->edac, STIX_EDAC_ROTBUF);
+        }
+        value &= STIXCTRL_ROTBCMDSTA_COMMAND_MASK;
     }
 
     ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)] = (uint32_t)value;
@@ -1054,7 +1093,7 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
         stixctrl_rotb_command(stixctrl, (uint32_t)value & STIXCTRL_ROTBCMDSTA_COMMAND_MASK);
     }
 
-    /* the stored value: 0x54 and 0x88 are composed on read */
+    /* the stored value: 0x50, 0x54 and 0x88 are composed on read */
     trace_stixctrl_io_write((uint32_t)addr,
                             ((volatile uint32_t *)&stixctrl->reg) /* re-read */
                             [(uint32_t)addr / sizeof(uint32_t)]);
@@ -1074,6 +1113,15 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
 {
     STIXCTRL *STIXCTRL = GRLIB_STIXCTRL(dev);
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+
+    /*
+     * D-Ua: the EDAC unit (created in instance_init) is realized with
+     * its parent; it owns the SEC counters/DeDetected latches and its
+     * reset is its own qemu_register_reset hook
+     */
+    if (!qdev_realize(DEVICE(&STIXCTRL->edac), NULL, errp)) {
+        return;
+    }
 
     /* BLOCKCOUNT is 17 bits (23:7): the ring holds at most 0x1FFFF blocks
      * (the default 104448 costs ~53.5 MB of host RAM) */
@@ -1176,6 +1224,28 @@ static void grlib_stixctrl_reset(DeviceState *d)
     stixctrl->rotb_count = 0;
     stixctrl->rotb_full = false;
 
+    /*
+     * M-1: cacheCmdSta takes its ICD reset at every device reset, EdacOn
+     * = 1 (STIX-ICD-0026 txt:2119; the model read 0 before). OpMode and
+     * ScrubRate keep 0 against the ICD (txt:2124/txt:2122, accepted
+     * diff): OPMODE 0 keeps the CACHE DE-to-IRQ path live with no FSW
+     * setup, ScrubRate 0 keeps the scrub algorithm's OFF early-return.
+     * The EdacOn bit follows the EDAC unit's edac-at-boot state (D-Uk).
+     */
+    stixctrl->reg.cacheCmdSta =
+        stix_edac_boot_edacon(&stixctrl->edac, STIX_EDAC_CACHE)
+        ? (1u << STIXCTRL_CACHECMDSTA_EDACON) : 0;
+
+    /*
+     * D-Uk: rotbConfig's EDACON takes the hand-over state; the other
+     * bits keep today's reset behaviour (untouched)
+     */
+    stixctrl->reg.rotbConfig =
+        (stixctrl->reg.rotbConfig &
+         ~(STIXCTRL_ROTBCONFIG_EDACON_MASK << STIXCTRL_ROTBCONFIG_EDACON)) |
+        (stix_edac_boot_edacon(&stixctrl->edac, STIX_EDAC_ROTBUF)
+         << STIXCTRL_ROTBCONFIG_EDACON);
+
     /* the AHB windows (stixctrl.sram/.lvar/.ltrg/.etrg) are deliberately
      * NOT cleared here: they are plain RAM, zeroed at power-on only, and
      * their contents survive system reset (D-G) — the FSW's BRAM keeps
@@ -1216,6 +1286,7 @@ static void grlib_stixctrl_unrealize(DeviceState *dev)
 {
     STIXCTRL *stixctrl = GRLIB_STIXCTRL(dev);
 
+    qdev_unrealize(DEVICE(&stixctrl->edac));
     g_free(stixctrl->rotb_ring);
     stixctrl->rotb_ring = NULL;
     stix_det_unrealize(&stixctrl->det);
@@ -1454,6 +1525,13 @@ static const Property grlib_stixctrl_properties[] = {
  */
 static void grlib_stixctrl_instance_init(Object *obj)
 {
+    /*
+     * D-Ua: the EDAC unit, the QOM child at /machine/stixctrl/edac (the
+     * attenuator D-Aa pattern). Realized with the parent; its runtime
+     * properties (edac-at-boot, test-latch-*) are its own.
+     */
+    object_initialize_child(obj, "edac", &GRLIB_STIXCTRL(obj)->edac,
+                            TYPE_STIX_EDAC);
     stixctrl_adc_inject_clear(GRLIB_STIXCTRL(obj));
     stix_det_instance_init(&GRLIB_STIXCTRL(obj)->det);
     stixctrl_hk_last_clear(GRLIB_STIXCTRL(obj));
