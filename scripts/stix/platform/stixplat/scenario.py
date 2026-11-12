@@ -124,9 +124,14 @@ def _timeout(d, where):
 def _tm_spec(spec, where, forbid=False):
     p = probe_lib.load()
     try:
-        (p.Forbid if forbid else p.Expect)(spec)
+        x = (p.Forbid if forbid else p.Expect)(spec)
     except ValueError as e:
         raise ScenarioError("%s: %s" % (where, e))
+    # the probe's forbid @SECONDS window (A-4) is not the runner's: a
+    # scenario forbid is windowed by {tm, for_s}, and the runner would
+    # silently forbid for the whole run
+    _need(not (forbid and x.window is not None),
+          "%s: a forbid takes no @window; use {tm, for_s}" % where)
 
 
 def _actions(lst, where):
