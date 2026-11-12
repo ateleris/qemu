@@ -9,12 +9,26 @@ import copy
 import os
 import tomllib
 
+
+def _default_elf():
+    """The gate ELF, the same default scripts/stix/lib/paths.sh derives
+    (a /tmp path does not survive a WSL restart)."""
+    elf = os.environ.get("STIX_DEFAULT_ELF")
+    if elf:
+        return os.path.expanduser(elf)
+    elf_dir = os.environ.get("STIX_ELF_DIR")
+    if elf_dir:
+        return os.path.join(os.path.expanduser(elf_dir),
+                            "ASW_em_baseline.elf")
+    return os.path.expanduser("~/dev/stix-elf/ASW_em_baseline.elf")
+
+
 DEFAULTS = {
     "mode": "interactive",          # "interactive" | "run" (run: PL-5)
     "run_dir": {"path": "/tmp/stix-plat/interactive", "fresh": False},
     "qemu": {
         "binary": "build/qemu-system-sparc",
-        "elf": "/tmp/stix-baseline-run/ASW_em_baseline.elf",
+        "elf": _default_elf(),
         "timecode_source": "obt",    # D-PLb: "obt" | "scet"
         "obt_epoch": 0x10000000 << 16,
         "obt_continuity": "aligned",  # "aligned" | "exact"

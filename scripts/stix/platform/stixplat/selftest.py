@@ -220,12 +220,19 @@ class FakeFs(rundir.RealFs):
 
 
 def t_rundir(env):
-    for bad in ("/tmp/stix-uprev-run", "/tmp/stix-baseline-run",
+    # the persistent master (paths.sh: STIX_UPREV_DIR); none of these
+    # paths needs to exist, guard matches on the realpath
+    master = rundir.SHARED[0]
+    for bad in (master, master + "/", master + "/sub", master + "-s1",
+                "/tmp/stix-uprev-run", "/tmp/stix-baseline-run",
                 "/tmp/stix-plat-run", "/tmp/stix-uprev-run/"):
         raises(rundir.RunDirError, rundir.guard, bad)
     link = os.path.join(env.tmp, "sneaky")
     os.symlink("/tmp/stix-uprev-run", link)
     raises(rundir.RunDirError, rundir.guard, link)
+    mlink = os.path.join(env.tmp, "masterlink")
+    os.symlink(master, mlink)             # dangling if master is absent
+    raises(rundir.RunDirError, rundir.guard, mlink)
     for bad in ("/tmp/stix-uprev-run-s1", "/tmp/stix-uprev-run-s12/x",
                 "/tmp/stix-uprev-run/sub/dir", "/tmp/stix-baseline-run/a",
                 "/", "/tmp/stix-d4-run-s3"):
@@ -235,7 +242,8 @@ def t_rundir(env):
     raises(rundir.RunDirError, rundir.guard, deep)
     # "*" must not cross "/": these are not gate run dirs
     for good in ("/tmp/stix-plat/core-smoke", "/tmp/stix-plat/x-run",
-                 "/tmp/stix-plat/a/b-run-s1", "/tmp/stix-uprev-runner"):
+                 "/tmp/stix-plat/a/b-run-s1", "/tmp/stix-uprev-runner",
+                 master + "ner"):        # .../uprev-runner next to it
         rundir.guard(good)
     d = env.run_dir()
     rundir.preflight(d)                       # the real FS: sparse

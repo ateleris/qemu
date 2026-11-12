@@ -132,10 +132,13 @@ The run dir holds:
 - `flash.bin` (made by QEMU, sparse);
 - `uart.raw`, `qemu.log`, `qmp.sock` and `log.jsonl`.
 
-The controller refuses the gates' run dirs (`/tmp/stix-*-run`). It also
-refuses a filesystem without sparse files or hole punching, and a QEMU
-binary older than 21f898484f: that binary would write a plain 16.5 GB
-flash.
+The controller refuses the gates' run dirs (`/tmp/stix-*-run` and the
+persistent master `~/dev/stix-state/uprev-run`), also their `-s<k>` slot
+copies and anything inside them. Since 2026-11-12 (a WSL restart wiped
+/tmp) the ELF and master flash defaults come from
+`scripts/stix/lib/paths.sh`. It also refuses a filesystem without sparse
+files or hole punching, and a QEMU binary older than 21f898484f: that
+binary would write a plain 16.5 GB flash.
 
 Copy a flash only with `cp --sparse=always`.
 

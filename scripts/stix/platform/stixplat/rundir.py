@@ -16,7 +16,12 @@ GIB = 1 << 30
 # anything inside them), matched on the realpath like slot.sh's
 # stix_run_dir_guard; "*" never crosses a "/"
 FORBIDDEN_RE = re.compile(r"^/tmp/stix-[^/]*-run(-s\d+)?(/.*)?$")
-SHARED = ("/tmp/stix-uprev-run", "/tmp/stix-baseline-run")
+# the master flash dir (paths.sh: STIX_UPREV_DIR) plus the two legacy
+# /tmp ones (STIX_LEGACY_DIRS), refused like the FORBIDDEN_RE dirs
+_uprev = os.environ.get("STIX_UPREV_DIR") or os.path.join(
+    os.environ.get("STIX_STATE_DIR") or "~/dev/stix-state", "uprev-run")
+SHARED = tuple(os.path.expanduser(d) for d in
+               (_uprev, "/tmp/stix-uprev-run", "/tmp/stix-baseline-run"))
 LOCK_NAME = ".stixplat.lock"
 PROBE_NAME = ".stixplat-sparse-probe"
 # the files `fresh = true` removes (its own named files only)

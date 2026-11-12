@@ -22,7 +22,8 @@ DRY=0
 if [ "${1:-}" = --dry-run ]; then DRY=1; shift; fi
 USAGE="usage: run-smoke.sh [--dry-run] <qemu-binary>"
 QEMU_BIN="$(realpath -e "${1:?$USAGE}")" || exit 2
-ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
+. "$(dirname "${BASH_SOURCE[0]}")/../../lib/paths.sh"
+ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=plat-slot.sh
 . "$HERE/plat-slot.sh"
