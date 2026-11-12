@@ -3,10 +3,10 @@
  * FSM, the QL accumulator bank switch and IRQ 3 (D-1), the IDeF-X
  * serial interface with its ASIC register store (D-2), and the
  * synthetic sky with the flare switch (D-4), and the nominal integration
- * with its ROTB science chunks (D-5), behind CTRL's APB offsets
- * 0x00-0x4C. Internal to grlib_stixctrl.c; not a QOM device (its
- * runtime scene properties are added to the controller's class by
- * stix_det_class_init).
+ * with its ROTB science chunks (D-5), and the DSS .dssevs replay (D-7),
+ * behind CTRL's APB offsets 0x00-0x4C. Internal to grlib_stixctrl.c;
+ * not a QOM device (its runtime scene properties are added to the
+ * controller's class by stix_det_class_init).
  *
  * Index spaces: every detector-related name carries its space
  * (fpga_det, grp, asic, quarter, asic_ch, pix, subcol, fe_sc, ebin;
@@ -38,18 +38,47 @@
 #define STIX_DET_N_PIX 13u          /* pix 0..11, 12 = guard ring */
 #define STIX_DET_N_SUBCOL 32u       /* subcol 0..31 (ICD number - 1) */
 #define STIX_DET_N_EBIN 32u         /* ebin 0..31 (science energy bin) */
+#define STIX_DET_N_ADC 4096u        /* adc 0..4095 (raw 12-bit ADC value) */
 /* pix 0..11 are accumulated; the guard ring (pix 12) never is */
 #define STIX_DET_N_PIX_ACC 12u
 
 /*
- * D-4 (D-Db det-source): where the counts come from. replay-dss is
- * added by D-7.
+ * D-4/D-7 (D-Db det-source): where the counts come from. replay-dss
+ * feeds the pre-scanned .dssevs table instead of the synthetic sky.
  */
 typedef enum StixDetSource {
     STIX_DET_SOURCE_ZERO,
     STIX_DET_SOURCE_SYNTHETIC,
+    STIX_DET_SOURCE_REPLAY_DSS,
     STIX_DET_SOURCE__MAX,
 } StixDetSource;
+
+/*
+ * D-7 (D-Dk): when a loaded replay starts. nominal = the first fsmCmd
+ * SetEnable 0->1 edge after a reset (NOMINAL entry); qmp = only a
+ * det-replay-start=true.
+ */
+typedef enum StixDetReplayTrigger {
+    STIX_DET_REPLAY_TRIGGER_NOMINAL,
+    STIX_DET_REPLAY_TRIGGER_QMP,
+    STIX_DET_REPLAY_TRIGGER__MAX,
+} StixDetReplayTrigger;
+
+/*
+ * D-7 (D-Dk): one pre-scanned .dssevs event. t_tick is the replay time
+ * in 100 ms ticks (the file's waits, summed); fpga_det = dss_det (the
+ * identity of plan "Index spaces"); pix is the word's type field
+ * 0..11; adc the raw 12-bit value.
+ */
+typedef struct StixDetReplayEvent {
+    uint32_t t_tick;
+    uint8_t fpga_det;
+    uint8_t pix;
+    uint16_t adc;
+} StixDetReplayEvent;
+
+/* D-7: the event table's cap, 64 Mi events = 512 MiB of table */
+#define STIX_DET_REPLAY_MAX_EVENTS (1u << 26)
 
 /* D-4 (D-Df): the synthetic sky's two spectral profiles */
 enum { STIX_DET_PROFILE_QUIET, STIX_DET_PROFILE_FLARE, STIX_DET_N_PROFILE };
@@ -199,6 +228,34 @@ typedef struct StixDetState {
                     [STIX_DET_N_EBIN];
     /* the chunk being built at a nominal swap */
     uint8_t chunk[STIX_DET_CHUNK_BLOCKS * STIXCTRL_BLOCK_SIZE];
+    /*
+     * D-7 (D-Dk): the DSS .dssevs replay. The table is the realize
+     * pre-scan of det-replay-file; the trigger and offset are scene
+     * knobs (they survive a device reset), a running replay does not
+     * (it stops and re-arms on its trigger).
+     */
+    char *replay_file;          /* det-replay-file (qdev, init-time) */
+    uint32_t replay_trigger;    /* StixDetReplayTrigger (scene knob) */
+    uint64_t replay_offset_ms;  /* det-replay-offset-ms, file ms (scene) */
+    bool replay_start_req;      /* det-replay-start=true, applied next tick */
+    bool replay_running;        /* det-replay-start reads it */
+    bool replay_armed;          /* the nominal trigger is pending */
+    bool replay_stopped;        /* det-replay-start=false stopped it */
+    bool replay_ended;          /* EOF reached (det-replay-status) */
+    bool replay_class_pending;  /* re-classify the ELUT rows next tick */
+    bool replay_loaded;         /* a table was scanned at realize */
+    StixDetReplayEvent *replay_ev;
+    uint32_t replay_n_ev;
+    uint32_t replay_alloc;
+    uint32_t replay_cursor;     /* next table entry to feed */
+    uint32_t replay_time_tick;  /* replay time, 100 ms ticks from 0 */
+    uint64_t replay_events_done;
+    uint64_t replay_dropped;    /* events the D-6 gate dropped (status) */
+    uint64_t replay_unsupported; /* 0xD setup words, not implemented */
+    /* baseline per dss_det (= fpga_det) from the file's 0xE setup words */
+    uint32_t replay_base_dss_det[STIX_DET_N_FPGA_DET];
+    /* the ELUT row (fpga_det, pix) is degenerate: linear fallback */
+    uint8_t replay_row_fallback[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC];
     /* the template (D-Df), built at realize: pix share and ebin shares */
     double pix_share[STIX_DET_N_PIX_ACC];
     double ebin_share[STIX_DET_N_PROFILE][STIX_DET_N_EBIN];
@@ -214,15 +271,17 @@ void stix_det_reset(StixDetState *d);
 void stix_det_instance_init(StixDetState *d);
 /*
  * The runtime scene properties (det-source, det-flare, det-quiet-cps,
- * det-flare-cps) on the owning device class; @det_offset is
- * offsetof(owner, det), so the owner's struct stays private
+ * det-flare-cps, det-replay-trigger, det-replay-offset-ms,
+ * det-replay-start, and the read-only det-replay-status) on the
+ * owning device class; @det_offset is offsetof(owner, det), so the
+ * owner's struct stays private
  */
 void stix_det_class_init(ObjectClass *klass, size_t det_offset);
 
 /* true when the model owns the APB offset (det-model on, 0x00-0x4C) */
 bool stix_det_owns(StixDetState *d, hwaddr addr);
 /*
- * The D-Df event sink (D-6 det-inject; the D-7 replay will use it too):
+ * The D-Df event sink (D-6 det-inject; the D-7 replay feeds it too):
  * add @n integer counts at (pix @pix, fpga_det @fpga_det, ebin @ebin).
  * Call it from tick context; the counts reach the LACC of the finished
  * bank at the next QL swap and EACC at the next nominal swap.

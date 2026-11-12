@@ -1354,6 +1354,12 @@ static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_UINT32("det-seed", STIXCTRL, det.seed, 1),
     /* D-5 (D-Db): off makes no ROTB chunks; the nominal swap stays */
     DEFINE_PROP_BOOL("det-rotb", STIXCTRL, det.rotb, true),
+    /*
+     * D-7 (D-Dk): the .dssevs file, pre-scanned at realize into the
+     * replay table; a missing, unreadable or malformed file is a
+     * realize error naming the path
+     */
+    DEFINE_PROP_STRING("det-replay-file", STIXCTRL, det.replay_file),
 };
 
 /*

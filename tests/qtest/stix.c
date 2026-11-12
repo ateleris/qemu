@@ -6305,6 +6305,19 @@ static bool sky_set_u32(QTestState *qts, const char *prop, uint32_t val)
     return ok;
 }
 
+static bool sky_set_u64(QTestState *qts, const char *prop, uint64_t val)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %" PRIu64 "}}", SKY_CTRL_PATH, prop,
+                            val);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
 /* a string property, or NULL when it is unknown */
 static char *sky_get_str(QTestState *qts, const char *prop)
 {
@@ -7780,6 +7793,778 @@ static void test_det_inject_reset(void)
 
     qtest_quit(qts);
     stix_qtest_cleanup();
+}
+
+
+/* ---- DSS replay (detector plan D-7) ---- */
+
+/*
+ * The .dssevs word [V, detector plan "The user's .dssevs file"]:
+ * big-endian u32, [31:20] val12 | [19:16] type | [15:11] dss_det |
+ * [10:0] wait11 (20 ns units). Types 0x0-0xB are events (type = pix,
+ * val = adc), 0xD/0xE one setup word per dss_det (the 0xE value is the
+ * baseline), 0xF wait-only padding. fpga_det = dss_det (plan "Index
+ * spaces"). Each test generates its own small synthetic file in a temp
+ * dir; the user's file is never read.
+ */
+#define DET7_WORD(val, type, dss_det, wait) \
+    (((uint32_t)(val) << 20) | ((uint32_t)(type) << 16) | \
+     ((uint32_t)(dss_det) << 11) | (wait))
+#define DET7_PAD_WORD   DET7_WORD(2048, 0xF, 0, 0x7FF)
+#define DET7_PAD_NS     (2047 * 20)         /* one 0xF word, 40.94 us */
+/* the FPGA ELUT row (pix, fpga_det) at the start of the SRAM window */
+#define DET7_ELUT_ADDR(pix, fpga_det) \
+    (AHB_SRAM + ((pix) * 32u + (fpga_det)) * 4096u)
+
+/* env keys handing the det-replay-missing subprocess its parameters */
+#define DET7_TEST_GLOBAL_ENV "STIX_TEST_DET7_GLOBAL"
+#define DET7_TEST_FLASH_ENV  "STIX_TEST_DET7_FLASH"
+/* the replay event cap (STIX_DET_REPLAY_MAX_EVENTS in stix_det.h) */
+#define DET7_REPLAY_MAX_EVENTS (1u << 26)
+
+typedef struct Det7File {
+    uint32_t *w;
+    size_t n, alloc;
+} Det7File;
+
+static void det7_word(Det7File *f, uint32_t w)
+{
+    if (f->n == f->alloc) {
+        f->alloc = f->alloc ? f->alloc * 2 : 4096;
+        f->w = g_renew(uint32_t, f->w, f->alloc);
+    }
+    f->w[f->n++] = w;
+}
+
+/*
+ * the setup header: one 0xD (unused) and one 0xE (baseline 2000) word
+ * per dss_det, alternating as the real file does [V]
+ */
+static void det7_setup(Det7File *f)
+{
+    uint32_t dss_det;
+
+    for (dss_det = 0; dss_det < 32; dss_det++) {
+        det7_word(f, DET7_WORD(75, 0xD, dss_det, 0));
+        det7_word(f, DET7_WORD(2000, 0xE, dss_det, 0));
+    }
+}
+
+/* burn @ns with 0xF padding words, like the real file's wait-only tail */
+static void det7_pad(Det7File *f, uint64_t ns)
+{
+    while (ns >= DET7_PAD_NS) {
+        det7_word(f, DET7_PAD_WORD);
+        ns -= DET7_PAD_NS;
+    }
+    if (ns) {
+        det7_word(f, DET7_WORD(2048, 0xF, 0, ns / 20));
+    }
+}
+
+/*
+ * write the word stream as a .dssevs in a fresh temp dir; the caller
+ * unlinks *path and rmdir's *dir when done
+ */
+static void det7_write(const Det7File *f, gchar **dir, gchar **path)
+{
+    GError *err = NULL;
+    FILE *fh;
+    size_t i;
+
+    *dir = g_dir_make_tmp("stix-det-replay-XXXXXX", &err);
+    g_assert_no_error(err);
+    *path = g_build_filename(*dir, "scenario.dssevs", NULL);
+    fh = fopen(*path, "wb");
+    g_assert_nonnull(fh);
+    for (i = 0; i < f->n; i++) {
+        uint8_t b[4];
+
+        stl_be_p(b, f->w[i]);
+        g_assert(fwrite(b, 1, 4, fh) == 4);
+    }
+    g_assert(fclose(fh) == 0);
+}
+
+/* ... to a caller-chosen path (the malformed files) */
+static void det7_write_path(const char *path, const uint32_t *w, size_t n)
+{
+    FILE *fh = fopen(path, "wb");
+    size_t i;
+
+    g_assert_nonnull(fh);
+    for (i = 0; i < n; i++) {
+        uint8_t b[4];
+
+        stl_be_p(b, w[i]);
+        g_assert(fwrite(b, 1, 4, fh) == 4);
+    }
+    g_assert(fclose(fh) == 0);
+}
+
+static QTestState *det7_qtest(const char *replay_file, const char *extra)
+{
+    g_autofree gchar *all = g_strdup_printf(
+        "-global grlib-stixctrl.det-replay-file=%s %s", replay_file,
+        extra ? extra : "");
+
+    return stix_qtest_new_extra(all);
+}
+
+/* a small -D trace log, as text */
+static gchar *det7_read_log(const char *path)
+{
+    gchar *text = NULL;
+
+    g_assert(g_file_get_contents(path, &text, NULL, NULL));
+    return text;
+}
+
+static int det7_count_str(const char *hay, const char *needle)
+{
+    int n = 0;
+    const char *p = hay;
+
+    while ((p = strstr(p, needle)) != NULL) {
+        n++;
+        p++;
+    }
+    return n;
+}
+
+/*
+ * one "key=value" field of the det-replay-status line (D-PLm req 4);
+ * the keys are unique and no value holds a comma, so a strstr of
+ * "key=" finds the field; NULL when the property is absent
+ */
+static char *det7_status_field(QTestState *qts, const char *key)
+{
+    g_autofree char *line = sky_get_str(qts, "det-replay-status");
+    g_autofree char *pat = g_strdup_printf("%s=", key);
+    const char *p = line ? strstr(line, pat) : NULL;
+    const char *end;
+
+    if (!p) {
+        return NULL;
+    }
+    p += strlen(pat);
+    end = strchr(p, ',');
+    return g_strndup(p, end ? (size_t)(end - p) : strlen(p));
+}
+
+/*
+ * the honoured test row: ebin = adc/128, with 32 (unassigned) for
+ * adc < 256 (the plan's det-replay-elut example)
+ */
+static void det7_elut_row_honoured(uint8_t *row)
+{
+    uint32_t adc;
+
+    for (adc = 0; adc < 4096; adc++) {
+        row[adc] = adc < 256 ? 32 : adc / 128;
+    }
+}
+
+/*
+ * det-replay-decode: the word decode. 0x0-0xB are events with
+ * pix = type and fpga_det = dss_det, 0xD/0xE are setup (the baseline
+ * 2000 comes from the 0xE words), 0xF is wait only — and every word's
+ * wait sums into the replay time: the t_tick-0 events land in bank 0
+ * (ticks 1-10 at QlIntTime 9), the event after 2 s of padding (t_tick
+ * 20) in bank 1 and the one after 4 s (t_tick 40) in bank 3. The
+ * linear fallback (the ELUT is all 0 at realize, every row degenerate)
+ * bins (adc - 2000) * 32 / 2096: adc 2001 -> ebin 0, 2262 -> 4, 2393
+ * -> 6, 4095 -> 31; adc at or below the baseline is dropped.
+ * RED on the D-6 binary: det-replay-file is an unknown -global, QEMU
+ * exits.
+ */
+static void test_det_replay_decode(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL;
+    QTestState *qts;
+    SkyBank *b = g_new0(SkyBank, 1);
+
+    det7_setup(&f);
+    det7_word(&f, DET7_WORD(2001, 3, 2, 0));    /* ebin 0 */
+    det7_word(&f, DET7_WORD(2262, 2, 9, 0));    /* ebin 4 */
+    det7_word(&f, DET7_WORD(2000, 2, 9, 0));    /* adc == base: dropped */
+    det7_word(&f, DET7_WORD(1999, 2, 9, 0));    /* adc < base: dropped */
+    det7_pad(&f, 2 * NSEC_PER_SEC);             /* -> t_tick 20 */
+    det7_word(&f, DET7_WORD(2393, 5, 10, 0));   /* ebin 6 */
+    det7_pad(&f, 2 * NSEC_PER_SEC);             /* -> t_tick 40 */
+    det7_word(&f, DET7_WORD(4095, 0, 15, 0));   /* ebin 31 (clamped) */
+    det7_write(&f, &dir, &path);
+
+    qts = det7_qtest(path, NULL);
+    g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);       /* SetEnable starts the replay */
+    /*
+     * each bank is read right after its own swap: the swap zeroes the
+     * newly active bank, so after 40 ticks bank 0 is active (and
+     * zeroed) again
+     */
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(b->lacc[3][2][0], ==, 1);
+    g_assert_cmpuint(b->lacc[2][9][4], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 2);
+    g_assert_cmpuint(b->ltrg_grp[1], ==, 1);    /* fpga_det 2 -> grp 1 */
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[5][10][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    g_assert_cmpuint(b->ltrg_grp[5], ==, 1);    /* fpga_det 10 -> grp 5 */
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 2, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 0);
+    sky_read_bank(qts, 3, b);
+    g_assert_cmpuint(b->lacc[0][15][31], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    g_assert_cmpuint(b->ltrg_grp[7], ==, 1);    /* fpga_det 15 -> grp 7 */
+    /* SUMCNT: the events in SUMEMASK 0xFFE (ebin 4 and 6) */
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), ==, 2);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-replay-elut: both ELUT branches, rows independent, and the branch
+ * switch at the next QL swap. The qtest writes the rows into
+ * 0xE0000000 + (pix * 32 + fpga_det) * 4096 directly:
+ * - (fpga_det 5, pix 0) honoured (ebin = adc/128, 32 for adc < 256,
+ *   dss_det 5's baseline lowered to 64 so the 32-entry region is above
+ *   it): adc 2000 -> ebin 15, adc 100 (a 32 entry) dropped — the
+ *   fallback would have binned it 0;
+ * - (9,2) all-31 and (10,0) all-0 and (15,1) all-31 degenerate: the
+ *   linear fallback from the 0xE baselines;
+ * - (9,2) rewritten to honoured after the swap at tick 10 switches
+ *   branch at the swap at tick 20: its adc-2178 event lands in ebin 17
+ *   (the fallback would give 2).
+ * stixdet_elut_fallback fires once per degenerate row at the
+ * classification (the SetEnable edge), never for the honoured row and
+ * never again for the rewritten one.
+ * RED on the D-6 binary: det-replay-file is an unknown -global.
+ */
+static void test_det_replay_elut(void)
+{
+    Det7File f = { 0 };
+    g_autofree uint8_t *row = g_malloc(4096);
+    g_autofree gchar *dir = NULL, *path = NULL, *log = NULL, *extra = NULL;
+    g_autofree gchar *text = NULL;
+    QTestState *qts;
+    SkyBank *b = g_new0(SkyBank, 1);
+    int fd;
+
+    det7_setup(&f);
+    det7_word(&f, DET7_WORD(64, 0xE, 5, 0));    /* dss_det 5 base 64 */
+    det7_word(&f, DET7_WORD(2262, 1, 15, 0));   /* all-31 row: ebin 4 */
+    det7_word(&f, DET7_WORD(2000, 0, 5, 0));    /* honoured: ebin 15 */
+    det7_word(&f, DET7_WORD(100, 0, 5, 0));     /* honoured 32: dropped */
+    det7_word(&f, DET7_WORD(2393, 0, 10, 0));   /* all-0 row: ebin 6 */
+    det7_word(&f, DET7_WORD(2262, 2, 9, 0));    /* all-31 row: ebin 4 */
+    det7_pad(&f, 12 * 100 * 1000 * 1000);       /* -> t_tick 12 */
+    det7_word(&f, DET7_WORD(2393, 2, 9, 0));    /* still fallback: 6 */
+    det7_pad(&f, 13 * 100 * 1000 * 1000);       /* -> t_tick 25 */
+    det7_word(&f, DET7_WORD(2178, 2, 9, 0));    /* honoured now: 17 */
+    det7_write(&f, &dir, &path);
+
+    fd = g_file_open_tmp("stix-det-replay-trace-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixdet_elut_fallback -D %s", log);
+    qts = det7_qtest(path, extra);
+
+    det7_elut_row_honoured(row);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 5), row, 4096);
+    memset(row, 31, 4096);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(2, 9), row, 4096);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(1, 15), row, 4096);
+    memset(row, 0, 4096);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 10), row, 4096);
+
+    g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 10);            /* bank 0: the t_tick-0 events */
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(b->lacc[1][15][4], ==, 1);
+    g_assert_cmpuint(b->lacc[0][5][15], ==, 1);
+    g_assert_cmpuint(b->lacc[0][5][0], ==, 0);
+    g_assert_cmpuint(b->lacc[0][10][6], ==, 1);
+    g_assert_cmpuint(b->lacc[2][9][4], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 4);
+
+    /* the row switch between two swaps takes effect at the next one */
+    det7_elut_row_honoured(row);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(2, 9), row, 4096);
+    det_step_ticks(qts, 20);            /* banks 1 and 2 */
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[2][9][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    sky_read_bank(qts, 2, b);
+    g_assert_cmpuint(b->lacc[2][9][17], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+
+    text = det7_read_log(log);
+    g_assert_cmpint(det7_count_str(text, "fpga_det 9 pix 2 degenerate"),
+                    ==, 1);
+    g_assert_cmpint(det7_count_str(text, "fpga_det 10 pix 0 degenerate"),
+                    ==, 1);
+    g_assert_cmpint(det7_count_str(text, "fpga_det 15 pix 1 degenerate"),
+                    ==, 1);
+    g_assert_cmpint(det7_count_str(text, "fpga_det 5 pix 0 degenerate"), ==, 0);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    unlink(log);
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-replay-trigger: with trigger nominal (the default) the first
+ * events arrive in the first tick after SetEnable and nothing before
+ * it (the tick only runs while Enable; the qmp case below pins the
+ * start gating); with qmp only det-replay-start=true starts it, false
+ * stops it (a start retracted before the next tick never runs) and the
+ * banks stay empty; det-replay-offset-ms=1000 skips the t_tick-0
+ * event; the end of the file stops the replay (no loop); a
+ * system_reset stops it and re-arms the nominal trigger. At the key
+ * points det-replay-status (D-PLm req 4) reads armed before the
+ * start, running mid-file, ended after the EOF and stopped after a
+ * det-replay-start=false, with events= fed so far and count= the
+ * table's 3 events.
+ * The file: e1 (dss_det 2, pix 3, adc 2262 -> ebin 4) at t_tick 0, e2
+ * (dss_det 9, pix 2, adc 2393 -> ebin 6) at t_tick 10, e3 (dss_det 15,
+ * pix 0, adc 3492 -> ebin 22) at t_tick 60.
+ * RED on the D-6 binary: det-replay-file is an unknown -global.
+ */
+static void test_det_replay_trigger(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL;
+    QTestState *qts;
+    SkyBank *b = g_new0(SkyBank, 1);
+    bool ok;
+
+    det7_setup(&f);
+    det7_word(&f, DET7_WORD(2262, 3, 2, 0));
+    det7_pad(&f, NSEC_PER_SEC);                 /* e2 at t_tick 10 */
+    det7_word(&f, DET7_WORD(2393, 2, 9, 0));
+    det7_pad(&f, 5 * NSEC_PER_SEC);             /* e3 at t_tick 60 */
+    det7_word(&f, DET7_WORD(3492, 0, 15, 0));
+    det7_write(&f, &dir, &path);
+
+    /* a. trigger nominal: the first tick after SetEnable */
+    qts = det7_qtest(path, NULL);
+    g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+    g_assert_cmpstr(sky_get_str(qts, "det-replay-trigger"), ==, "nominal");
+    /* armed before the start; the table's 3 events are count= */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "armed");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "0");
+    g_assert_cmpstr(det7_status_field(qts, "count"), ==, "3");
+    idefx_power_all(qts);
+    sky_start(qts, 0, 0xFFF);       /* a 1-tick period: a swap per tick */
+    det_step_ticks(qts, 1);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "running");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "1");
+    det_step_ticks(qts, 9);         /* tick 10: e2 */
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[2][9][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "2");
+    sky_read_bank(qts, 2, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+    det_step_ticks(qts, 19);        /* tick 29: e3 not yet */
+    sky_read_bank(qts, 3, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+    det_step_ticks(qts, 31);        /* tick 60: e3, then the EOF */
+    sky_read_bank(qts, 3, b);
+    g_assert_cmpuint(b->lacc[0][15][22], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "ended");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "3");
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* b. trigger qmp: only det-replay-start starts; false stops */
+    qts = det7_qtest(path, NULL);
+    g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+    g_assert_true(sky_set_str(qts, "det-replay-trigger", "qmp"));
+    g_assert_cmpstr(sky_get_str(qts, "det-replay-trigger"), ==, "qmp");
+    /* armed: loaded, waiting for det-replay-start=true */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "armed");
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 10);        /* a full period without a start */
+    g_assert_false(stix_qom_get_bool(qts, SKY_CTRL_PATH,
+                                     "det-replay-start", &ok));
+    g_assert_true(ok);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", true));
+    det_step_ticks(qts, 10);        /* tick 20: e1 and e2 in bank 1 */
+    g_assert_true(stix_qom_get_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", &ok));
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 1);
+    g_assert_cmpuint(b->lacc[2][9][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 2);
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "running");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "2");
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", false));
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "stopped");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "2");
+    det_step_ticks(qts, 40);
+    /*
+     * a start retracted before the next tick (true then false) never
+     * runs: the false cancels the stored request (D-Dj), so e3
+     * (t_tick 60) never arrives and the banks stay empty
+     */
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", true));
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", false));
+    det_step_ticks(qts, 10);
+    g_assert_false(stix_qom_get_bool(qts, SKY_CTRL_PATH,
+                                     "det-replay-start", &ok));
+    /* the retracted start never ran: still stopped, events unchanged */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "stopped");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "2");
+    det_expect(qts, QL_LACC(0), QL_LACC_SIZE, 0);
+    det_expect(qts, QL_LACC(1), QL_LACC_SIZE, 0);
+    det_expect(qts, QL_LACC(2), QL_LACC_SIZE, 0);
+    det_expect(qts, QL_LACC(3), QL_LACC_SIZE, 0);
+    /* a restart re-feeds from the offset */
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", true));
+    det_step_ticks(qts, 10);        /* ticks 71-80 -> bank 3 */
+    sky_read_bank(qts, 3, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 1);
+    g_assert_cmpuint(b->lacc[2][9][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 2);
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "running");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "2");
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /*
+     * c. the offset skips the events before it (det-replay-offset-ms,
+     * D-PLm req 3; 1000 ms = the old det-replay-offset=1); the end of
+     * the file stops the replay (no loop). The nominal integration
+     * params are set to a 65536-tick max so no nominal swap resets
+     * SUMCNT in the 250 ticks this sub-case runs.
+     */
+    qts = det7_qtest(path, NULL);
+    g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+    g_assert_true(sky_set_u64(qts, "det-replay-offset-ms", 1000));
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH,
+                                     "det-replay-offset-ms"), ==, 1000);
+    /*
+     * over the cap: 429496729600 ms is 2^32 ticks, one past the u32
+     * tick count the feeder holds; the value is rejected and the old
+     * one kept
+     */
+    g_assert_false(sky_set_u64(qts, "det-replay-offset-ms",
+                               UINT64_C(429496729600)));
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH,
+                                     "det-replay-offset-ms"), ==, 1000);
+    idefx_power_all(qts);
+    sky_start_nom(qts, 39, 0xFFF, 9, 0xFFFF, 1800);
+    det_step_ticks(qts, 45);        /* bank 0 done at tick 40 */
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 0);  /* e1 skipped */
+    g_assert_cmpuint(b->lacc[2][9][6], ==, 1);  /* e2 at the first tick */
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    det_step_ticks(qts, 40);        /* bank 1 done at tick 80 */
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[0][15][22], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    g_assert_false(stix_qom_get_bool(qts, SKY_CTRL_PATH,
+                                     "det-replay-start", &ok));
+    /* the EOF ended it: e2 and e3 fed, e1 skipped by the offset */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "ended");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "2");
+    det_step_ticks(qts, 165);       /* tick 250: both banks re-written */
+    det_expect(qts, QL_LACC(0), QL_LACC_SIZE, 0);
+    det_expect(qts, QL_LACC(1), QL_LACC_SIZE, 0);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), ==, 1);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* d. a system_reset stops the replay and re-arms the trigger */
+    qts = det7_qtest(path, NULL);
+    g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 1);         /* e1 fed, the replay running */
+    g_assert_true(stix_qom_get_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", &ok));
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "running");
+    qtest_system_reset(qts);
+    g_assert_false(stix_qom_get_bool(qts, SKY_CTRL_PATH,
+                                     "det-replay-start", &ok));
+    /* the reset re-arms: armed again, not stopped (D-PLm req 4) */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "armed");
+    idefx_power_all(qts);           /* the reset powered the ASICs off */
+    sky_start(qts, 39, 0xFFF);      /* the nominal trigger re-armed */
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 1);  /* e1 re-fed */
+    g_assert_cmpuint(b->lacc[2][9][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 2);
+    det_step_ticks(qts, 40);        /* tick 80: e3 with a fresh clock */
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[0][15][22], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* e. with trigger qmp a reset stops it and nothing re-arms */
+    qts = det7_qtest(path, NULL);
+    g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+    g_assert_true(sky_set_str(qts, "det-replay-trigger", "qmp"));
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", true));
+    det_step_ticks(qts, 50);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 1);
+    g_assert_cmpuint(b->lacc[2][9][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 2);
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "running");
+    g_assert_cmpstr(det7_status_field(qts, "events"), ==, "2");
+    qtest_system_reset(qts);
+    /* armed again (the re-arm rule), nothing re-starts it though */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "armed");
+    idefx_power_all(qts);           /* else the check below is vacuous */
+    sky_start(qts, 39, 0xFFF);      /* no auto start with trigger qmp */
+    det_step_ticks(qts, 80);
+    det_expect(qts, QL_LACC(0), QL_LACC_SIZE, 0);
+    det_expect(qts, QL_LACC(1), QL_LACC_SIZE, 0);
+    det_expect(qts, QL_LACC(2), QL_LACC_SIZE, 0);
+    det_expect(qts, QL_LACC(3), QL_LACC_SIZE, 0);
+    g_assert_true(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                    "det-replay-start", true));
+    det_step_ticks(qts, 40);        /* ticks 81-120 -> bank 2 */
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 3);
+    sky_read_bank(qts, 2, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 2);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /*
+     * f. det-replay-offset-ms (D-PLm req 3) rounds down to the tick:
+     * 5050 ms is tick 50 (not 51), so the event exactly at t_tick 50
+     * arrives in the first tick after the start — an offset that
+     * rounded up would skip it — and pos_ns reads the tick the feeder
+     * is at. The table: one event (dss_det 2, pix 3, adc 2262 -> ebin
+     * 4) at t_tick 50; the 32 0xD setup words read unsupported=32.
+     */
+    {
+        Det7File f2 = { 0 };
+        g_autofree gchar *dir2 = NULL, *path2 = NULL;
+
+        det7_setup(&f2);
+        det7_pad(&f2, 5 * NSEC_PER_SEC);        /* -> t_tick 50 */
+        det7_word(&f2, DET7_WORD(2262, 3, 2, 0));
+        det7_write(&f2, &dir2, &path2);
+
+        qts = det7_qtest(path2, NULL);
+        g_assert_true(sky_set_str(qts, "det-source", "replay-dss"));
+        g_assert_true(sky_set_u64(qts, "det-replay-offset-ms", 5050));
+        g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH,
+                                         "det-replay-offset-ms"), ==, 5050);
+        g_assert_cmpstr(det7_status_field(qts, "unsupported"), ==, "32");
+        g_assert_cmpstr(det7_status_field(qts, "count"), ==, "1");
+        idefx_power_all(qts);
+        sky_start(qts, 0, 0xFFF);   /* a 1-tick period: a swap per tick */
+        det_step_ticks(qts, 1);     /* tick 51: the t_tick-50 event due */
+        sky_read_bank(qts, 0, b);
+        g_assert_cmpuint(b->lacc[3][2][4], ==, 1);
+        g_assert_cmpuint(sky_total(b), ==, 1);
+        g_assert_cmpstr(det7_status_field(qts, "state"), ==, "ended");
+        g_assert_cmpstr(det7_status_field(qts, "events"), ==, "1");
+        g_assert_cmpstr(det7_status_field(qts, "pos_ns"), ==,
+                        "5100000000");
+        g_assert_cmpstr(det7_status_field(qts, "duration_ns"), ==,
+                        "5000000000");
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+        g_unlink(path2);
+        g_rmdir(dir2);
+        g_free(f2.w);
+    }
+
+    stix_qtest_cleanup();
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+    g_free(b);
+}
+
+/*
+ * det-replay-missing: a missing, unreadable or malformed file is a
+ * realize error naming the path (the subprocess cases, in the
+ * test_plat_realize_error style; the cap case is a sparse file of zero
+ * words, each a type-0 event, one word past the event cap), and
+ * without a table det-source=replay-dss and det-replay-start=true are
+ * rejected while the trigger and offset defaults read back and
+ * det-replay-status reads state=idle (D-PLm req 4).
+ * RED on the D-6 binary: det-replay-file is an unknown -global, so the
+ * subprocess fails with a different message.
+ */
+static void test_det_replay_missing_subprocess(void)
+{
+    const char *global = g_getenv(DET7_TEST_GLOBAL_ENV);
+    const char *flash = g_getenv(DET7_TEST_FLASH_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(global);
+    g_assert_nonnull(flash);
+    /* qtest_init aborts: QEMU realize fails and exits */
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s -global %s",
+                      flash, global);
+    qtest_quit(qts);
+}
+
+static void test_det_replay_missing(void)
+{
+    g_autofree gchar *flash = NULL;
+    g_autofree gchar *dir = g_dir_make_tmp("stix-det-replay-XXXXXX", NULL);
+    g_autofree gchar *sub = stix_test_path("det-replay-missing/subprocess");
+    g_autofree gchar *absent = g_build_filename(dir, "absent.dssevs", NULL);
+    g_autofree gchar *nodir = g_build_filename(dir, "no", "such.dssevs",
+                                               NULL);
+    g_autofree gchar *truncated = g_build_filename(dir, "truncated.dssevs",
+                                                   NULL);
+    g_autofree gchar *badtype = g_build_filename(dir, "badtype.dssevs",
+                                                 NULL);
+    g_autofree gchar *capfile = g_build_filename(dir, "cap.dssevs", NULL);
+    g_autofree gchar *g_absent = NULL, *g_nodir = NULL;
+    g_autofree gchar *g_trunc = NULL, *g_bad = NULL;
+    g_autofree gchar *g_cap = NULL, *g_cap_pat = NULL;
+    struct {
+        const char *global;
+        const char *pattern;
+    } cases[] = {
+        { NULL, "*det-replay-file: cannot read*absent.dssevs*" },
+        { NULL, "*det-replay-file: cannot read*such.dssevs*" },
+        { NULL, "*not a multiple of the 4-byte word size*" },
+        { NULL, "*word 0 has type 0xC*" },
+        { NULL, NULL },
+    };
+    QTestState *qts;
+    Det7File f = { 0 };
+    uint32_t badword = DET7_WORD(0, 0xC, 0, 0);
+    bool ok;
+    int fd;
+    size_t i;
+
+    /* a truncated file: one word and a half */
+    det7_word(&f, DET7_WORD(2048, 0xF, 0, 0));
+    det7_word(&f, DET7_WORD(2048, 0xF, 0, 0));
+    det7_write_path(truncated, f.w, f.n);
+    g_assert(truncate(truncated, 6) == 0);
+    /* a malformed file: one word of the undefined type 0xC */
+    det7_write_path(badtype, &badword, 1);
+    g_free(f.w);
+    f.w = NULL;
+    f.n = 0;
+
+    /*
+     * the cap: a sparse file of zero words, each a type-0 event, one
+     * word past the cap — no 256 MB of disk behind it
+     */
+    fd = open(capfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 4ull * (DET7_REPLAY_MAX_EVENTS + 1)) == 0);
+    close(fd);
+
+    fd = g_file_open_tmp("stix-flash-XXXXXX", &flash, NULL);
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+    g_setenv(DET7_TEST_FLASH_ENV, flash, TRUE);
+
+    /* without a table: the rejections and the defaults */
+    qts = stix_qtest_new();
+    g_assert_false(sky_set_str(qts, "det-source", "replay-dss"));
+    g_assert_false(stix_qom_set_bool(qts, SKY_CTRL_PATH,
+                                     "det-replay-start", true));
+    g_assert_false(sky_set_str(qts, "det-replay-trigger", "whenever"));
+    g_assert_cmpstr(sky_get_str(qts, "det-replay-trigger"), ==, "nominal");
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH,
+                                     "det-replay-offset-ms"), ==, 0);
+    g_assert_false(stix_qom_get_bool(qts, SKY_CTRL_PATH,
+                                     "det-replay-start", &ok));
+    /* idle: no table loaded, no path, nothing to report */
+    g_assert_cmpstr(sky_get_str(qts, "det-replay-status"), ==,
+                    "state=idle,pos_ns=0,events=0,dropped=0,"
+                    "unsupported=0,table=,count=0,duration_ns=0");
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    g_absent = g_strdup_printf("grlib-stixctrl.det-replay-file=%s", absent);
+    g_nodir = g_strdup_printf("grlib-stixctrl.det-replay-file=%s", nodir);
+    g_trunc = g_strdup_printf("grlib-stixctrl.det-replay-file=%s",
+                              truncated);
+    g_bad = g_strdup_printf("grlib-stixctrl.det-replay-file=%s", badtype);
+    g_cap = g_strdup_printf("grlib-stixctrl.det-replay-file=%s", capfile);
+    g_cap_pat = g_strdup_printf("*word %" PRIu64 " has more than %u "
+                                "events (the replay cap)*",
+                                (uint64_t)DET7_REPLAY_MAX_EVENTS,
+                                DET7_REPLAY_MAX_EVENTS);
+    cases[0].global = g_absent;
+    cases[1].global = g_nodir;
+    cases[2].global = g_trunc;
+    cases[3].global = g_bad;
+    cases[4].global = g_cap;
+    cases[4].pattern = g_cap_pat;
+    for (i = 0; i < G_N_ELEMENTS(cases); i++) {
+        g_setenv(DET7_TEST_GLOBAL_ENV, cases[i].global, TRUE);
+        g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+        g_test_trap_assert_failed();
+        g_test_trap_assert_stderr(cases[i].pattern);
+    }
+    close(fd);
+    g_unlink(flash);
+    g_unlink(truncated);
+    g_unlink(badtype);
+    g_unlink(capfile);
+    g_rmdir(dir);
+}
+
+static void stix_det7_register(void)
+{
+    qtest_add_func("/sparc/stix/det-replay-missing/subprocess",
+                   test_det_replay_missing_subprocess);
+    qtest_add_func("/sparc/stix/det-replay-decode", test_det_replay_decode);
+    qtest_add_func("/sparc/stix/det-replay-elut", test_det_replay_elut);
+    qtest_add_func("/sparc/stix/det-replay-trigger",
+                   test_det_replay_trigger);
+    qtest_add_func("/sparc/stix/det-replay-missing",
+                   test_det_replay_missing);
 }
 
 
@@ -9315,6 +10100,7 @@ int main(int argc, char **argv)
                        test_det_inject_gated);
         qtest_add_func("/sparc/stix/det-inject-reset",
                        test_det_inject_reset);
+        stix_det7_register();
         stix_platform_register();
     }
 

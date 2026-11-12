@@ -3714,6 +3714,201 @@ platform + flash latency on, slot 2):
   (136 + 248). Fixed in idefx-trace-check.py (bbd794466b: a QlClear ends
   only a complete run); the failed trace re-judges to 4 x 384.
 
+## 37. DSS .dssevs replay (baseline: no ADC-domain count source)
+
+**Baseline:** the only count sources were the synthetic sky (§34) and
+the det-inject deposit (§36), both generated directly in `ebin` space;
+there was no way to feed the accumulators from the DSS bench data, and
+no count path went through the FPGA ELUT at all.
+
+Detector plan D-7 (`docs/stix-port/2026-11-11-detector-plan.md`,
+"### D-7", decision D-Dk, the line-772 note that the ELUT rule applies
+only to ADC-domain sources, and "The user's `.dssevs` file"; the "As
+built" note there).
+
+**The format.** A `.dssevs` file is a stream of big-endian u32 words
+with no header, decoded from the user's file (plan tag [V]; nothing
+from it is committed or copied): `[31:20] val12 | [19:16] type |
+[15:11] dss_det | [10:0] wait11`, the wait in 20 ns units, and every
+word's wait adds to the replay time. Types 0x0-0xB are events (the type
+is the `pix` 0..11, the value the raw 12-bit `adc`); 0xD and 0xE are
+one setup word per `dss_det` (the 0xE value, about 2000, is the
+baseline; the 0xD one is ignored (setup words are not modelled)); 0xF
+is wait-only padding (the val-3072 marker included). A word of type
+0xC, which the format does not define, a size that is not a multiple
+of 4, and a file longer than 2^32 ticks of replay time are malformed.
+
+**Index spaces.** `fpga_det = dss_det` (identity — the DSS app's
+`fe_sc` → `dss_det` table equals `Detectors_fpgaFromFrontendMinusOne`
+and `utils_oldSubcolIdToFpgaId`, plan "Index spaces"), so a replayed
+event's detector field is used as the `fpga_det` with no lookup; the
+`pix` comes from the type field; the `ebin` comes from the ELUT or the
+fallback below. Every new name carries its space: the table's `t_tick`
+(replay time in 100 ms ticks), `replay_base_dss_det` (the baseline per
+`dss_det`), `replay_row_fallback` (per `fpga_det`, `pix`).
+
+**The pre-scan (D-Dk).** `det-replay-file` (a qdev property on
+`grlib-stixctrl`, init-time) names the file; `stix_det_realize` scans
+it in 1 MB chunks (never whole into memory), decodes each word by its
+type and keeps only the events in a table `{t_tick u32, fpga_det u8,
+pix u8, adc u16}` (about 60 k entries for the user's 176 MB file). The
+scan time and the table size are traced (`stixdet_replay_scan`). A
+missing, unreadable or malformed file is a realize error naming the
+path, so QEMU does not start; the realize-failure path frees the tick
+timer, as the controller does for its own allocations (a realize
+failure does not run the device's unrealize).
+
+**The ELUT (D-Dk, honoured and fallback).** Each event's `ebin` is
+looked up in the FPGA ELUT the FSW wrote — `val[pix][fpga_det][adc]`
+(`Detectors.h:47-52`) at 0xE0000000 — and an entry of 32 (unassigned)
+drops the event, as the FPGA would. A **degenerate** row — all 4096
+entries equal: all 0 (power-on/EDAC), all 31 (what `applyELUT` writes
+from the all-zero boundary table of an empty flash, `LUTMgmt.c:912` —
+its comment "= 0 - 30" is wrong), or any other constant — cannot be a
+calibration, so the row falls back to the non-physical linear binning
+`ebin = (adc − base) × 32 / (4096 − base)` clamped to 0..31, with
+`base` = the `dss_det`'s 0xE baseline from the file (0 if it has none);
+events with `adc ≤ base` are dropped. With base 2000 one bin is 65.5
+`adc`. This **differs from what the FPGA would do with this ELUT**
+(hardware would bin every event into the row's constant); the trace
+`stixdet_elut_fallback(fpga_det, pix, value)` fires once per newly
+degenerate row per classification, with the constant as `value`. The
+rows are classified at each fsmCmd SetEnable 0→1 edge and at each QL
+swap while `det-source=replay-dss` (a 1.5 MiB scan every 4 s only in
+that mode), so a TC(237,8) apply during NOMINAL takes effect within one
+period. The synthetic sky (§34) and det-inject (§36) are unaffected:
+they never go through the ELUT.
+
+**The clock (D-Dk, D-PLm req 3).** The scene knobs `det-replay-trigger`
+(`nominal` — the default, the first SetEnable 0→1 edge after a reset,
+i.e. NOMINAL entry — or `qmp`), `det-replay-offset-ms` (file
+milliseconds at start; renamed per D-PLm req 3 from D-Db's
+`det-replay-offset` uint32 seconds before D-7 landed, so the two never
+coexist) and `det-replay-start` (true starts a loaded replay now,
+false stops it, reading gives the running state) are runtime
+properties on `/machine/stixctrl` like the other scene knobs, and
+survive a device reset; a running replay stops at one and re-arms on
+its trigger (trigger qmp re-arms only through a new
+`det-replay-start=true`). `det-source=replay-dss` is accepted only
+when a table is loaded, so it must be set after QEMU is up (a
+`-global` at startup is applied before the realize scan and rejected);
+the replay replaces the synthetic sky. The setter of
+`det-replay-start` only stores the request (D-Dj); the next 100 ms
+tick applies it. The replay clock is `det-replay-offset-ms` + virtual
+time since the start, advanced one 100 ms tick per tick; the offset
+converts to ticks with integer maths (`offset_ms / 100`), so a
+sub-tick offset rounds down to the tick, and a value past 2^32 ticks
+is rejected. Each tick feeds the events whose `t_tick` falls in it
+through `stix_det_add_counts` — the D-Df event sink of §36 — so the
+D-6 gating (quarter, `grp` enable, ReadMode, R3 TH < 63 per `pix`) and
+the mask rules (SUMDMASK for EACC, the ETRG 1.25× per event, SUMCNT's
+SUMDMASK × SUMEMASK share, LVAR's VARDMASK × VARPMASK × VAREMASK
+share) apply unchanged. The offset skips the events with `t_tick`
+below it (an event exactly at the offset arrives in the first tick).
+At the end of the table the replay stops (counts zero); no loop. Gain
+is fixed at 1× (no knob). Traces: `stixdet_replay_state` at start,
+stop, end of file and device reset.
+
+**The status (D-PLm req 4).** `det-replay-status` is a read-only
+string on `/machine/stixctrl`, built in one getter call (atomic):
+`state=idle|armed|running|ended|stopped,pos_ns=…,events=…,dropped=…,
+unsupported=…,table=…,count=…,duration_ns=…`. `idle` = no table
+loaded; `armed` = loaded, not started (the nominal trigger waiting for
+the SetEnable edge, or trigger qmp waiting for
+`det-replay-start=true`); `running`; `ended` = EOF reached; `stopped`
+= stopped by `det-replay-start=false` — a device reset re-arms
+instead, so it reads `armed` again. `pos_ns` is the replay clock
+position (`t_tick` × 100 ms); `events` the events fed so far (since
+the last start); `dropped` counts only what the D-6 gate dropped (the
+pix gate above; cheap and exact — the ELUT's own drops, an unassigned
+ebin or an adc at or below the fallback baseline, are not counted);
+`unsupported` the words of a kind the model does not implement (the
+0xD setup words; 0xF padding is not one); `table` the file path
+(empty when none); `count` the events in the table; `duration_ns` the
+last event's `t_tick` × 100 ms. D-PLm req 2 (the runtime load by
+path), the STXEVT v1 format and the loop are deferred to the platform
+track.
+
+**qtests** (`tests/qtest/stix.c`, one block after the det-inject
+block, each with its own small synthetic `.dssevs` in a temp dir —
+never the user's file; all RED on the D-6 binary, where
+`det-replay-file` is an unknown `-global` so QEMU exits):
+- `det-replay-decode`: events with `pix` = type and
+  `fpga_det` = `dss_det` (events on `dss_det` 2, 9, 10 and 15 land at
+  those `fpga_det`), the baseline 2000 taken from the 0xE words, 0xF
+  wait-only — and the wait sum pinned by the bank each event lands in
+  (QlIntTime 9: the t_tick-0 events in bank 0, the event after 2 s of
+  padding in bank 1, after 4 s in bank 3); the linear fallback bins
+  adc 2001 → `ebin` 0, 2262 → 4, 2393 → 6, 4095 → 31; adc at or below
+  the baseline is dropped; one LTRG per event per `grp` (1.25×
+  rounded); SUMCNT counts the SUMEMASK share;
+- `det-replay-elut` (the qtest writes the rows into 0xE0000000 +
+  (`pix`·32 + `fpga_det`)·4096 directly): an honoured row (ebin =
+  adc/128, 32 for adc < 256, its `dss_det` baseline lowered to 64 so
+  the 32-entry region lies above it) bins exactly as written and the
+  32 entry drops its event where the fallback would have binned it 0;
+  an all-31 row and an all-0 row both take the linear fallback; the
+  rows are independent in one run; a row rewritten between two swaps
+  switches branch at the next swap; `stixdet_elut_fallback` counted
+  from a `-D` log: once per degenerate row, never for the honoured
+  row, never twice for the rewritten one;
+- `det-replay-trigger`: with trigger nominal the first events arrive in
+  the first tick after SetEnable (QlIntTime 0, one bank per tick) and
+  at their `t_tick` thereafter; with qmp a full period passes empty
+  until `det-replay-start=true`, and false stops it (the banks then
+  stay empty through the event that would have been due);
+  `det-replay-offset-ms=1000` skips the t_tick-0 event, and a
+  non-multiple of 100 rounds down (5050 ms is tick 50: the event at
+  t_tick 50 arrives, an offset past 2^32 ticks is rejected); after the
+  last event the replay stops (no loop, no new counts); a system_reset
+  stops it and re-arms the nominal trigger (the events arrive again
+  with a fresh clock), while with trigger qmp nothing re-arms until a
+  new `det-replay-start=true`. At the key points `det-replay-status`
+  reads `armed` before the start, `running` mid-file, `ended` after
+  the EOF and `stopped` after the `det-replay-start=false`, with
+  `events=` fed so far and `count=` the table's events (and the
+  no-table `idle` line in `det-replay-missing`);
+- `det-replay-missing`: the realize errors (missing path, a path
+  through a missing directory, a 6-byte file, a type-0xC word) via the
+  `g_test_trap_subprocess` pattern of the platform realize-error test,
+  each naming the path or the defect; and, without a table,
+  `det-source=replay-dss` and `det-replay-start=true` are rejected
+  while `det-replay-trigger`/`det-replay-offset-ms`/`det-replay-start`
+  read back their defaults and `det-replay-status` reads
+  `state=idle`.
+
+**Deviations from the plan's D-7 section:**
+- the optional `detector-smoke.sh --replay` gate (SKIP 77 without
+  `STIX_DSSEVS_FILE`, the SSID 32/SSID 30 checks, the fallback-trace
+  assertion) is **not built yet**: this change delivers the replay,
+  the properties and the qtests; the gate and its gate record stay
+  pending (see below);
+- the fallback trace fires once per newly degenerate row per
+  classification, so the first classification of an empty-flash run
+  traces all 384 (`fpga_det`, `pix`) rows once — the plan's "once per
+  row and replay start", read literally;
+- a file longer than 2^32 ticks (about 13.6 years) of replay time is
+  treated as malformed: the table's `t_tick` is u32 by D-Dk;
+- the plan does not say whether a word of the undefined type 0xC is
+  tolerated; the model rejects the file (a clear message beats a
+  silently ignored stream), and the qtest pins it.
+
+**Gate record** (2026-11-12, `stix-uprev-det7` on 6d07ffd4e3 = D-6, with
+the review fixes and the D-PLm req 3/4 pass, slot 2):
+- suite (qt.sh all): 96 of 96 ok, including `det-replay-decode`,
+  `-elut`, `-trigger` and `-missing` (five subprocess cases, the last
+  one the 2^26-event cap on a sparse file: 2.9 s, 532 MB peak);
+  `det-replay-trigger` goes red when the false branch of
+  `det-replay-start` stops retracting a pending start;
+- boot-smoke PASS (golden unchanged); tc-smoke PASS;
+- nominal-smoke PASS, and `--negative` PASS;
+- fault-smoke PASS, and `--negative` PASS;
+- detector-smoke: positive PASS; `--negative` PASS (failed as planned);
+  `--flare` PASS; `--flare --negative` PASS (failed as planned);
+  `--no-rotb` PASS (failed as planned).
+- The optional `detector-smoke --replay` gate is not built (deferred,
+  see above); the replay is covered by the qtests only.
+
 ## 41. Gate ports: slots for parallel gate runs (baseline: one global lock)
 
 Plan: `2026-11-11-gateports-plan.md`. Four tracks (tc, platform, elut,

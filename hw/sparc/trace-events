@@ -64,6 +64,9 @@ stixdet_nominal_swap(uint32_t done_nom_bank, uint32_t active_nom_bank, uint32_t 
 stixdet_chunk(uint32_t done_nom_bank, uint32_t n_blocks, uint32_t scet_coarse_reg, uint32_t scet_fine, uint32_t int_ticks, uint64_t eacc_events, uint32_t rotb_count, int64_t vclock_ns) "chunk: nom_bank %u, %u blocks, scet 0x%08x:0x%04x, int_ticks=%u eacc_events=%" PRIu64 " rotb_count=%u at vclock_ns=%" PRId64
 stixdet_chunk_drop(const char *why, uint32_t done_nom_bank, uint32_t int_ticks, uint32_t rotb_count, int64_t vclock_ns) "chunk dropped (%s): nom_bank %u, int_ticks=%u rotb_count=%u at vclock_ns=%" PRId64
 stixdet_inject(uint32_t fpga_det, uint32_t pix, uint32_t ebin, uint32_t n) "det-inject: fpga_det %u pix %u ebin %u n %u"
+stixdet_replay_scan(const char *path, uint64_t n_words, uint64_t n_events, uint64_t duration_ns, int64_t scan_ns) "replay pre-scan '%s': %" PRIu64 " words, %" PRIu64 " events (fpga_det = dss_det), duration %" PRIu64 " ns, scanned in %" PRId64 " ns"
+stixdet_replay_state(const char *state, const char *why, uint32_t t_tick, uint32_t cursor, uint64_t events_fed) "replay state=%s (%s): t_tick=%u cursor=%u events_fed=%" PRIu64
+stixdet_elut_fallback(uint32_t fpga_det, uint32_t pix, uint32_t value) "ELUT fallback: fpga_det %u pix %u degenerate row (constant %u), linear binning in use"
 
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"

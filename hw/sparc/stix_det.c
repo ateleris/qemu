@@ -13,7 +13,10 @@
  * swap rule over fsmIntTime/fsmIntEvents, ActiveNominal, EACC/ETRG) and
  * the 49-block science chunk it appends to the ROTB ring. D-6: the
  * det-inject one-shot deposit, through the D-Df event sink
- * stix_det_add_counts.
+ * stix_det_add_counts. D-7 (D-Dk): the DSS .dssevs replay — the file
+ * pre-scanned at realize into an event table, the ELUT lookup with the
+ * linear fallback for degenerate rows, and the trigger/offset clock;
+ * its ticks feed stix_det_add_counts like det-inject.
  *
  * FSW references are to STIX-FSW 600a7a72, the ASW tree (BSW =
  * BSW_ASW/src/BSW/...; utils.c, utils.h = ASW/src/utils.*; Detectors.c
@@ -101,8 +104,13 @@ static const hwaddr stix_det_etrg_off[STIX_DET_NOM_BANKS] = {
 static void stix_det_sky_tick(StixDetState *d);
 static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank);
 static void stix_det_sky_clear_expo(StixDetState *d);
+/* D-7 replay helpers used by the FSM write and the QL swap */
+static void stix_det_replay_enable_edge(StixDetState *d);
+static void stix_det_replay_classify(StixDetState *d);
 /* D-6 det-inject (defined after the sky: it uses the sky's gating) */
 static void stix_det_inject_apply(StixDetState *d);
+/* D-7 DSS replay (defined after the event sink it feeds) */
+static void stix_det_replay_tick(StixDetState *d);
 /* D-5 nominal integration (defined after the sky it draws from) */
 static void stix_det_nominal_tick(StixDetState *d);
 static void stix_det_nom_fresh(StixDetState *d);
@@ -195,6 +203,13 @@ static void stix_det_ql_swap(StixDetState *d)
     stix_det_latch_ql_int_time(d);
     d->ql_ready = true;
     trace_stixdet_ql_swap(done, next, d->ql_int_time, irq);
+    /*
+     * D-Dk: re-classify the ELUT rows for the coming period, so a
+     * TC(237,8) apply during NOMINAL takes effect within one period
+     */
+    if (d->replay_loaded && d->source == STIX_DET_SOURCE_REPLAY_DSS) {
+        stix_det_replay_classify(d);
+    }
     if (irq) {
         qemu_irq_pulse(*d->irq);
     }
@@ -219,6 +234,7 @@ static void stix_det_tick(void *opaque)
     /* D-Dj: out-of-MMIO writes into guest-visible memory, see the top */
     guard->engaged_in_io = true;
     stix_det_sky_tick(d);
+    stix_det_replay_tick(d);
     stix_det_inject_apply(d);
     if (slot < STIX_DET_LVAR_SLOTS) {
         stix_det_ram_stl(d->lvar,
@@ -282,6 +298,8 @@ static void stix_det_fsm_cmd(StixDetState *d, uint32_t value)
             stix_det_nom_fresh(d);
         }
         stix_det_tick_start(d);
+        /* D-Dk: the nominal trigger and the ELUT row classification */
+        stix_det_replay_enable_edge(d);
     }
     if (strobes & FSMCMD_BIT(RESET)) {
         d->ql_ready = false;
@@ -924,6 +942,7 @@ static void stix_det_idefx_config(StixDetState *d, uint32_t value)
 static const char *const stix_det_source_name[STIX_DET_SOURCE__MAX] = {
     [STIX_DET_SOURCE_ZERO] = "zero",
     [STIX_DET_SOURCE_SYNTHETIC] = "synthetic",
+    [STIX_DET_SOURCE_REPLAY_DSS] = "replay-dss",
 };
 
 /*
@@ -1244,6 +1263,356 @@ static void stix_det_inject_apply(StixDetState *d)
 }
 
 /*
+ * ---- The DSS .dssevs replay (D-7, plan D-Dk) ----
+ *
+ * The file is a stream of big-endian u32 words, no header (detector
+ * plan "The user's .dssevs file" [V]): [31:20] val12 (the adc of an
+ * event, otherwise a setup value), [19:16] type, [15:11] dss_det,
+ * [10:0] wait in 20 ns units. Every word's wait adds to the replay
+ * time. Types 0x0-0xB are events (type = pix, val = adc); 0xD and 0xE
+ * are one setup word per dss_det (the 0xE value is the baseline the
+ * linear fallback needs, the 0xD one is not implemented and counts as
+ * unsupported for det-replay-status); 0xF is wait-only padding. The
+ * file is pre-scanned once at realize into an event table; each tick
+ * feeds the events due in it through the D-Df event sink, so the
+ * det-inject gating and mask rules apply unchanged.
+ * fpga_det = dss_det (identity, plan "Index spaces").
+ */
+
+/* the word layout [V] */
+#define STIX_DET_DSSEVS_VAL_SHIFT 20
+#define STIX_DET_DSSEVS_VAL_MASK  0xFFFu    /* adc 0..4095 / setup value */
+#define STIX_DET_DSSEVS_TYPE_SHIFT 16
+#define STIX_DET_DSSEVS_TYPE_MASK  0xFu
+#define STIX_DET_DSSEVS_DET_SHIFT 11
+#define STIX_DET_DSSEVS_DET_MASK  0x1Fu     /* dss_det 0..31 */
+#define STIX_DET_DSSEVS_WAIT_MASK 0x7FFu    /* 20 ns units */
+#define STIX_DET_DSSEVS_WAIT_NS 20u
+#define STIX_DET_DSSEVS_TYPE_SETUP_D 0xDu
+#define STIX_DET_DSSEVS_TYPE_SETUP_E 0xEu
+#define STIX_DET_DSSEVS_TYPE_PAD 0xFu
+/*
+ * the FPGA ELUT: uint8 val[pix][fpga_det][adc] at the start of the
+ * SRAM window (Detectors.h:47-52, StixIdpu.h STIXCTRL_ELUT_*)
+ */
+#define STIX_DET_ELUT_ROW_BYTES (STIX_DET_N_FPGA_DET * STIX_DET_N_ADC)
+
+QEMU_BUILD_BUG_ON(STIXCTRL_ELUT_SIZE !=
+                  STIX_DET_N_PIX_ACC * STIX_DET_ELUT_ROW_BYTES);
+
+/* the realize pre-scan reads in 1 MB chunks, never whole into memory */
+#define STIX_DET_REPLAY_SCAN_CHUNK (1024u * 1024u)
+
+static const char *const stix_det_replay_trigger_name
+                                         [STIX_DET_REPLAY_TRIGGER__MAX] = {
+    [STIX_DET_REPLAY_TRIGGER_NOMINAL] = "nominal",
+    [STIX_DET_REPLAY_TRIGGER_QMP] = "qmp",
+};
+
+/*
+ * The pre-scan (D-Dk): read det-replay-file in 1 MB chunks, decode
+ * each word by its type, add every word's wait to the time, and keep
+ * only the events. A missing, unreadable or malformed file is a
+ * realize error naming the path. The scan time and the table size are
+ * traced (stixdet_replay_scan).
+ */
+static bool stix_det_replay_scan(StixDetState *d, Error **errp)
+{
+    g_autofree uint8_t *buf = g_malloc(STIX_DET_REPLAY_SCAN_CHUNK);
+    uint64_t t_ns = 0, n_words = 0, n_bytes = 0;
+    int64_t t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    FILE *f;
+    size_t got;
+
+    f = fopen(d->replay_file, "rb");
+    if (!f) {
+        error_setg(errp, "det-replay-file: cannot read '%s': %s",
+                   d->replay_file, strerror(errno));
+        return false;
+    }
+    d->replay_unsupported = 0;  /* recounted per scan */
+    for (;;) {
+        size_t i, words;
+
+        got = fread(buf, 1, STIX_DET_REPLAY_SCAN_CHUNK, f);
+        if (ferror(f)) {
+            error_setg(errp, "det-replay-file: cannot read '%s': %s",
+                       d->replay_file, strerror(errno));
+            fclose(f);
+            return false;
+        }
+        n_bytes += got;
+        words = got / 4;
+        for (i = 0; i < words; i++) {
+            uint32_t w = ldl_be_p(buf + 4 * i);
+            uint32_t type = (w >> STIX_DET_DSSEVS_TYPE_SHIFT) &
+                            STIX_DET_DSSEVS_TYPE_MASK;
+            uint32_t dss_det = (w >> STIX_DET_DSSEVS_DET_SHIFT) &
+                               STIX_DET_DSSEVS_DET_MASK;
+
+            n_words++;
+            t_ns += (uint64_t)(w & STIX_DET_DSSEVS_WAIT_MASK) *
+                    STIX_DET_DSSEVS_WAIT_NS;
+            if (t_ns / STIX_DET_TICK_NS > UINT32_MAX) {
+                error_setg(errp, "det-replay-file: '%s' word %" PRIu64
+                           " is past 2^32 ticks of replay time",
+                           d->replay_file, n_words - 1);
+                fclose(f);
+                return false;
+            }
+            if (type <= 0xB) {
+                /* an event: type = pix, val = adc; fpga_det = dss_det */
+                if (d->replay_n_ev == STIX_DET_REPLAY_MAX_EVENTS) {
+                    error_setg(errp, "det-replay-file: '%s' word %" PRIu64
+                               " has more than %u events (the replay cap)",
+                               d->replay_file, n_words - 1,
+                               STIX_DET_REPLAY_MAX_EVENTS);
+                    fclose(f);
+                    return false;
+                }
+                if (d->replay_n_ev == d->replay_alloc) {
+                    d->replay_alloc = d->replay_alloc ?
+                                      MIN(d->replay_alloc * 2,
+                                          STIX_DET_REPLAY_MAX_EVENTS) : 1024;
+                    d->replay_ev = g_renew(StixDetReplayEvent, d->replay_ev,
+                                           d->replay_alloc);
+                }
+                d->replay_ev[d->replay_n_ev++] = (StixDetReplayEvent) {
+                    .t_tick = (uint32_t)(t_ns / STIX_DET_TICK_NS),
+                    .fpga_det = dss_det,
+                    .pix = type,
+                    .adc = (w >> STIX_DET_DSSEVS_VAL_SHIFT) &
+                           STIX_DET_DSSEVS_VAL_MASK,
+                };
+            } else if (type == STIX_DET_DSSEVS_TYPE_SETUP_E) {
+                /* the per-dss_det baseline the fallback bins from */
+                d->replay_base_dss_det[dss_det] =
+                    (w >> STIX_DET_DSSEVS_VAL_SHIFT) &
+                    STIX_DET_DSSEVS_VAL_MASK;
+            } else if (type == STIX_DET_DSSEVS_TYPE_SETUP_D) {
+                /*
+                 * a setup word of a kind the model does not implement:
+                 * counted for det-replay-status (D-PLm req 4); a 0xF
+                 * wait-only padding word is not one
+                 */
+                d->replay_unsupported++;
+            } else if (type != STIX_DET_DSSEVS_TYPE_PAD) {
+                error_setg(errp, "det-replay-file: '%s' word %" PRIu64
+                           " has type 0xC, which the .dssevs format does "
+                           "not define", d->replay_file, n_words - 1);
+                fclose(f);
+                return false;
+            }
+        }
+        if (got < STIX_DET_REPLAY_SCAN_CHUNK) {
+            break;              /* short read: end of file */
+        }
+    }
+    fclose(f);
+    if (n_bytes % 4) {
+        error_setg(errp, "det-replay-file: '%s' is %" PRIu64
+                   " bytes, not a multiple of the 4-byte word size",
+                   d->replay_file, n_bytes);
+        return false;
+    }
+    d->replay_loaded = true;
+    d->replay_armed = true;     /* the nominal trigger is pending */
+    trace_stixdet_replay_scan(d->replay_file, n_words, d->replay_n_ev,
+                              t_ns, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) -
+                              t0);
+    return true;
+}
+
+/*
+ * The ebin of one event in the honoured branch: the FPGA ELUT the FSW
+ * wrote, val[pix][fpga_det][adc] (Detectors.h:47-52); 32 (unassigned)
+ * drops the event, as the FPGA would (LUTMgmt.c:834-935).
+ */
+static uint32_t stix_det_replay_elut_ebin(StixDetState *d, uint32_t fpga_det,
+                                          uint32_t pix, uint32_t adc)
+{
+    const uint8_t *elut = memory_region_get_ram_ptr(d->sram);
+
+    return elut[(pix * STIX_DET_N_FPGA_DET + fpga_det) *
+                STIX_DET_N_ADC + adc];
+}
+
+/*
+ * The linear non-physical fallback of one event (D-Dk, for a degenerate
+ * row): ebin = (adc - base) * 32 / (4096 - base) clamped to 0..31, with
+ * the baseline from the file's 0xE setup word; events at or below it
+ * are dropped. This differs from what the FPGA would do with this ELUT
+ * (it would bin everything into the row's constant).
+ */
+static uint32_t stix_det_replay_fallback_ebin(StixDetState *d,
+                                              uint32_t fpga_det,
+                                              uint32_t adc)
+{
+    uint64_t base = d->replay_base_dss_det[fpga_det];
+
+    return MIN(((uint64_t)adc - base) * STIX_DET_N_EBIN /
+               (STIX_DET_N_ADC - base), STIX_DET_N_EBIN - 1);
+}
+
+/*
+ * Classify every (fpga_det, pix) ELUT row (D-Dk): a constant row (all
+ * 0 — the power-on/EDAC state — or all 31 — what applyELUT writes from
+ * the all-zero boundary table of an empty flash, LUTMgmt.c:912 — or
+ * any other constant) cannot be a calibration, so the row falls back
+ * to the linear binning. Runs at each SetEnable 0->1 edge and at each
+ * QL swap while det-source=replay-dss, so a TC(237,8) apply during
+ * NOMINAL takes effect within one period. A row newly classified
+ * degenerate traces stixdet_elut_fallback once.
+ */
+static void stix_det_replay_classify(StixDetState *d)
+{
+    uint32_t fpga_det, pix;
+
+    for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
+        for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+            const uint8_t *row = memory_region_get_ram_ptr(d->sram) +
+                                 (pix * STIX_DET_N_FPGA_DET + fpga_det) *
+                                 STIX_DET_N_ADC;
+            uint32_t adc;
+            bool degenerate = true;
+
+            for (adc = 1; adc < STIX_DET_N_ADC; adc++) {
+                if (row[adc] != row[0]) {
+                    degenerate = false;
+                    break;
+                }
+            }
+            if (degenerate && !d->replay_row_fallback[fpga_det][pix]) {
+                trace_stixdet_elut_fallback(fpga_det, pix, row[0]);
+            }
+            d->replay_row_fallback[fpga_det][pix] = degenerate;
+        }
+    }
+}
+
+/* start (or restart) a loaded replay at det-replay-offset-ms */
+static void stix_det_replay_start(StixDetState *d, const char *why)
+{
+    /*
+     * the offset in the model's 100 ms ticks: integer maths, sub-tick
+     * offsets round down to the tick, and an event exactly at the
+     * offset arrives in the first tick; the setter rejects offsets
+     * past UINT32_MAX ticks
+     */
+    uint64_t off_ticks = d->replay_offset_ms / 100;
+    uint32_t lo = 0, hi = d->replay_n_ev;
+
+    d->replay_running = true;
+    d->replay_armed = false;
+    d->replay_stopped = false;
+    d->replay_ended = false;
+    d->replay_time_tick = (uint32_t)MIN(off_ticks, (uint64_t)UINT32_MAX);
+    /*
+     * the table is sorted by t_tick (the waits accumulate); the offset
+     * skips the events before it
+     */
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+
+        if (d->replay_ev[mid].t_tick < off_ticks) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    d->replay_cursor = lo;
+    d->replay_events_done = 0;
+    d->replay_dropped = 0;
+    trace_stixdet_replay_state("start", why, d->replay_time_tick,
+                               d->replay_cursor, d->replay_events_done);
+}
+
+/*
+ * The SetEnable 0->1 edge (D-Dk): the nominal trigger starts the replay
+ * here (the first edge after a reset — or after realize — re-arms), and
+ * the ELUT rows are classified for the coming period. Only with
+ * det-source=replay-dss.
+ */
+static void stix_det_replay_enable_edge(StixDetState *d)
+{
+    if (!d->replay_loaded || d->source != STIX_DET_SOURCE_REPLAY_DSS) {
+        return;
+    }
+    stix_det_replay_classify(d);
+    d->replay_class_pending = false;
+    if (d->replay_armed && !d->replay_running &&
+        d->replay_trigger == STIX_DET_REPLAY_TRIGGER_NOMINAL) {
+        stix_det_replay_start(d, "nominal");
+    }
+}
+
+/*
+ * One tick of the replay (D-Dk): apply a pending det-replay-start
+ * (D-Dj: the setter stores, the tick applies), advance the replay
+ * clock — det-replay-offset-ms + virtual time since the start — and
+ * feed every event due through stix_det_add_counts. Only with
+ * det-source=replay-dss. Events the D-6 gate drops (the pix gate of
+ * the event sink) are counted in replay_dropped for det-replay-status
+ * (D-PLm req 4); the ELUT's own drops (an unassigned ebin, an adc at
+ * or below the fallback baseline) are not counted there. At the end of
+ * the table the replay stops; no loop.
+ */
+static void stix_det_replay_tick(StixDetState *d)
+{
+    if (!d->replay_loaded) {
+        return;
+    }
+    if (d->replay_class_pending) {
+        d->replay_class_pending = false;
+        stix_det_replay_classify(d);
+    }
+    if (d->replay_start_req) {
+        d->replay_start_req = false;
+        if (!d->replay_running && d->source == STIX_DET_SOURCE_REPLAY_DSS) {
+            stix_det_replay_start(d, "qmp");
+        }
+    }
+    if (!d->replay_running || d->source != STIX_DET_SOURCE_REPLAY_DSS) {
+        return;
+    }
+    if (d->replay_time_tick < UINT32_MAX) {
+        d->replay_time_tick++;
+    }
+    while (d->replay_cursor < d->replay_n_ev &&
+           d->replay_ev[d->replay_cursor].t_tick <= d->replay_time_tick) {
+        const StixDetReplayEvent *e = &d->replay_ev[d->replay_cursor];
+        uint32_t ebin;
+
+        d->replay_cursor++;
+        d->replay_events_done++;
+        if (!((stix_det_pix_gate(d, e->fpga_det) >> e->pix) & 1)) {
+            /* the D-6 gate dropped it, like a real event: count it */
+            d->replay_dropped++;
+            continue;
+        }
+        if (d->replay_row_fallback[e->fpga_det][e->pix]) {
+            if (e->adc <= d->replay_base_dss_det[e->fpga_det]) {
+                continue;       /* at or below the baseline: no bin */
+            }
+            ebin = stix_det_replay_fallback_ebin(d, e->fpga_det, e->adc);
+        } else {
+            ebin = stix_det_replay_elut_ebin(d, e->fpga_det, e->pix,
+                                             e->adc);
+            if (ebin >= STIX_DET_N_EBIN) {
+                continue;       /* 32 = unassigned: the FPGA drops it */
+            }
+        }
+        stix_det_add_counts(d, e->fpga_det, e->pix, ebin, 1);
+    }
+    if (d->replay_cursor == d->replay_n_ev) {
+        d->replay_running = false;
+        d->replay_ended = true;
+        trace_stixdet_replay_state("eof", "end of file", d->replay_time_tick,
+                                   d->replay_cursor, d->replay_events_done);
+    }
+}
+
+/*
  * Draw one accumulator bank from an exposure set (D-Df): each cell
  * [pix][fpga_det][ebin] (u16 big-endian at byte ((pix * 32 + fpga_det)
  * * 32 + ebin) * 2, Detectors.h:68-79, the same layout for LACC and
@@ -1558,13 +1927,22 @@ static void stix_det_source_set(Object *obj, Visitor *v, const char *name,
     }
     for (i = 0; i < STIX_DET_SOURCE__MAX; i++) {
         if (!strcmp(value, stix_det_source_name[i])) {
+            if (i == STIX_DET_SOURCE_REPLAY_DSS && !d->replay_loaded) {
+                error_setg(errp, "%s: replay-dss needs a replay table "
+                           "(set det-replay-file at startup)", name);
+                return;
+            }
             d->source = i;
+            if (i == STIX_DET_SOURCE_REPLAY_DSS) {
+                /* the rows were not classified for this source yet */
+                d->replay_class_pending = true;
+            }
             stix_det_trace_scene(d);
             return;
         }
     }
-    error_setg(errp, "%s: unknown source '%s' (zero or synthetic)", name,
-               value);
+    error_setg(errp, "%s: unknown source '%s' (zero, synthetic or "
+               "replay-dss)", name, value);
 }
 
 static void stix_det_flare_get(Object *obj, Visitor *v, const char *name,
@@ -1759,12 +2137,186 @@ static void stix_det_inject_set(Object *obj, Visitor *v, const char *name,
     trace_stixdet_inject(fpga_det, pix, ebin, n);
 }
 
+/*
+ * det-replay-trigger (D-Db, D-7): nominal (default; the first fsmCmd
+ * SetEnable 0->1 edge after a reset, i.e. NOMINAL entry) or qmp (only
+ * a det-replay-start=true). A scene knob: it survives a device reset.
+ */
+static void stix_det_replay_trigger_get(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    char *value = g_strdup(stix_det_replay_trigger_name[d->replay_trigger]);
+
+    visit_type_str(v, name, &value, errp);
+    g_free(value);
+}
+
+static void stix_det_replay_trigger_set(Object *obj, Visitor *v,
+                                        const char *name, void *opaque,
+                                        Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    g_autofree char *value = NULL;
+    uint32_t i;
+
+    if (!visit_type_str(v, name, &value, errp)) {
+        return;
+    }
+    for (i = 0; i < STIX_DET_REPLAY_TRIGGER__MAX; i++) {
+        if (!strcmp(value, stix_det_replay_trigger_name[i])) {
+            d->replay_trigger = i;
+            stix_det_trace_scene(d);
+            return;
+        }
+    }
+    error_setg(errp, "%s: unknown trigger '%s' (nominal or qmp)", name,
+               value);
+}
+
+/*
+ * det-replay-offset-ms (D-PLm req 3; replaces D-Db's det-replay-offset
+ * before D-7 landed, so the two never coexist): the file time at
+ * start, in milliseconds. The start converts to the model's 100 ms
+ * ticks with integer maths (offset_ms / 100): sub-tick offsets round
+ * down to the tick, and an event exactly at the offset arrives in the
+ * first tick. A value past UINT32_MAX ticks is rejected.
+ */
+static void stix_det_replay_offset_ms_get(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    uint64_t value = stix_det_of(obj, opaque)->replay_offset_ms;
+
+    visit_type_uint64(v, name, &value, errp);
+}
+
+static void stix_det_replay_offset_ms_set(Object *obj, Visitor *v,
+                                          const char *name, void *opaque,
+                                          Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    uint64_t value;
+
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
+    }
+    /* the feeder's 100 ms ticks are u32: reject what they cannot hold */
+    if (value / 100 > UINT32_MAX) {
+        error_setg(errp, "%s: %" PRIu64 " ms is past 2^32 ticks of "
+                   "replay time", name, value);
+        return;
+    }
+    d->replay_offset_ms = value;
+    stix_det_trace_scene(d);
+}
+
+/*
+ * det-replay-status (D-PLm req 4): one atomic read-only line with the
+ * replay's state and progress, for the platform controller. The state
+ * is idle (no table loaded), armed (loaded, waiting for its trigger —
+ * the nominal SetEnable edge or a det-replay-start=true), running,
+ * ended (EOF reached) or stopped (a det-replay-start=false stop; a
+ * device reset re-arms instead, so it reads armed again).
+ */
+static void stix_det_replay_status_get(Object *obj, Visitor *v,
+                                       const char *name, void *opaque,
+                                       Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    uint64_t duration_ns = 0;
+    const char *state;
+    char *value;
+
+    if (!d->replay_loaded) {
+        state = "idle";
+    } else if (d->replay_running) {
+        state = "running";
+    } else if (d->replay_stopped) {
+        state = "stopped";
+    } else if (d->replay_ended) {
+        state = "ended";
+    } else {
+        state = "armed";
+    }
+    if (d->replay_n_ev) {
+        duration_ns = (uint64_t)(d->replay_ev[d->replay_n_ev - 1].t_tick *
+                                 STIX_DET_TICK_NS);
+    }
+    value = g_strdup_printf("state=%s,pos_ns=%" PRIu64 ",events=%" PRIu64
+                            ",dropped=%" PRIu64 ",unsupported=%" PRIu64
+                            ",table=%s,count=%u,duration_ns=%" PRIu64,
+                            state,
+                            (uint64_t)(d->replay_time_tick *
+                                       STIX_DET_TICK_NS),
+                            d->replay_events_done, d->replay_dropped,
+                            d->replay_unsupported,
+                            d->replay_file ? d->replay_file : "",
+                            d->replay_n_ev, duration_ns);
+    visit_type_str(v, name, &value, errp);
+    g_free(value);
+}
+
+/*
+ * det-replay-start (D-Db, D-7): writing true starts a loaded replay
+ * now (applied at the next 100 ms tick, D-Dj), false stops it; reading
+ * gives the running state. Needs det-source=replay-dss.
+ */
+static void stix_det_replay_start_get(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    bool value = stix_det_of(obj, opaque)->replay_running;
+
+    visit_type_bool(v, name, &value, errp);
+}
+
+static void stix_det_replay_start_set(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    bool value;
+
+    if (!visit_type_bool(v, name, &value, errp)) {
+        return;
+    }
+    if (value) {
+        if (!d->replay_loaded) {
+            error_setg(errp, "%s: no replay table (set det-replay-file "
+                       "at startup)", name);
+            return;
+        }
+        if (d->source != STIX_DET_SOURCE_REPLAY_DSS) {
+            error_setg(errp, "%s: needs det-source=replay-dss", name);
+            return;
+        }
+        d->replay_start_req = true;
+    } else {
+        /*
+         * a stop applies at once; a start is tick-deferred (D-Dj), so
+         * false also retracts a start set earlier in the same tick
+         */
+        d->replay_start_req = false;
+        if (d->replay_running) {
+            d->replay_running = false;
+            d->replay_stopped = true;   /* det-replay-status: stopped */
+            trace_stixdet_replay_state("stop", "qmp", d->replay_time_tick,
+                                       d->replay_cursor,
+                                       d->replay_events_done);
+        }
+    }
+}
+
 void stix_det_instance_init(StixDetState *d)
 {
     d->source = STIX_DET_SOURCE_SYNTHETIC;
     d->flare = false;
     d->quiet_cps = STIX_DET_QUIET_CPS_DEFAULT;
     d->flare_cps = STIX_DET_FLARE_CPS_DEFAULT;
+    d->replay_trigger = STIX_DET_REPLAY_TRIGGER_NOMINAL;
+    d->replay_offset_ms = 0;
 }
 
 void stix_det_class_init(ObjectClass *klass, size_t det_offset)
@@ -1775,8 +2327,9 @@ void stix_det_class_init(ObjectClass *klass, size_t det_offset)
                               stix_det_source_get, stix_det_source_set,
                               NULL, opaque);
     object_class_property_set_description(klass, "det-source",
-        "detector count source: zero | synthetic (runtime; survives a "
-        "device reset)");
+        "detector count source: zero | synthetic | replay-dss (the "
+        "pre-scanned .dssevs table; set after QEMU is up, a table is "
+        "scanned at realize) (runtime; survives a device reset)");
     object_class_property_add(klass, "det-flare", "bool", &bool_type_info,
                               stix_det_flare_get, stix_det_flare_set,
                               NULL, opaque);
@@ -1804,6 +2357,43 @@ void stix_det_class_init(ObjectClass *klass, size_t det_offset)
         "count=N; lands in the LACC of the finished QL bank at the next "
         "swap and in EACC (the next chunk) at the next nominal swap, "
         "where the pair is gated on at the next tick (runtime)");
+    object_class_property_add(klass, "det-replay-trigger", "str",
+                              &str_type_info, stix_det_replay_trigger_get,
+                              stix_det_replay_trigger_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-replay-trigger",
+        "when a loaded .dssevs replay starts: nominal (the first fsmCmd "
+        "SetEnable edge after a reset, i.e. NOMINAL entry) | qmp (only "
+        "det-replay-start=true) (runtime; survives a device reset)");
+    object_class_property_add(klass, "det-replay-offset-ms", "uint64",
+                              &uint64_type_info,
+                              stix_det_replay_offset_ms_get,
+                              stix_det_replay_offset_ms_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-replay-offset-ms",
+        "replay start offset into the .dssevs file, milliseconds "
+        "(renamed per D-PLm req 3 from det-replay-offset's seconds; the "
+        "two never coexist); sub-tick offsets round down to the 100 ms "
+        "tick, an event exactly at the offset arrives in the first "
+        "tick; past 2^32 ticks is rejected (runtime; survives a device "
+        "reset)");
+    object_class_property_add(klass, "det-replay-start", "bool",
+                              &bool_type_info, stix_det_replay_start_get,
+                              stix_det_replay_start_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-replay-start",
+        "start (true) or stop (false) a loaded .dssevs replay now, with "
+        "det-source=replay-dss; reads the running state (runtime)");
+    object_class_property_add(klass, "det-replay-status", "str",
+                              &str_type_info, stix_det_replay_status_get,
+                              NULL, NULL, opaque);
+    object_class_property_set_description(klass, "det-replay-status",
+        "read-only replay progress, one atomic line (D-PLm req 4): "
+        "state=idle|armed|running|ended|stopped,pos_ns=...,events=...,"
+        "dropped=...,unsupported=...,table=...,count=...,duration_ns="
+        ".... armed waits for the trigger (the nominal SetEnable edge "
+        "or det-replay-start=true), ended is the EOF, stopped is a "
+        "det-replay-start=false stop (a device reset re-arms, so it "
+        "reads armed); dropped counts only the D-6 gate's drops, "
+        "unsupported the 0xD setup words the model does not implement "
+        "(runtime)");
 }
 
 bool stix_det_owns(StixDetState *d, hwaddr addr)
@@ -1887,8 +2477,9 @@ bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value)
  * RAM banks are kept (they survive a reset, accepted-diffs §13). The
  * sky (D-4) loses its exposure and reseeds its PRNG from det-seed; the
  * nominal integration (D-5) restarts in bank 0; the scene (det-source,
- * det-flare, the rates) is kept: it describes the Sun, not the IDPU
- * (D-Db).
+ * det-flare, the rates, the replay trigger and offset) is kept: it
+ * describes the Sun, not the IDPU (D-Db). A running DSS replay (D-7)
+ * stops and re-arms on its trigger.
  */
 void stix_det_reset(StixDetState *d)
 {
@@ -1929,6 +2520,22 @@ void stix_det_reset(StixDetState *d)
     d->nom_int_events_max = 0;
     /* a pending det-inject is in-flight model state, not a scene knob */
     d->inject_pending = false;
+    /*
+     * D-Dk: a running replay stops and re-arms on its trigger; the
+     * table and the scene knobs (trigger, offset) stay (they describe
+     * the Sun, not the IDPU)
+     */
+    if (d->replay_running) {
+        d->replay_running = false;
+        trace_stixdet_replay_state("reset", "device reset",
+                                   d->replay_time_tick, d->replay_cursor,
+                                   d->replay_events_done);
+    }
+    d->replay_armed = d->replay_loaded;
+    d->replay_stopped = false;      /* the re-arm reads armed, not stopped */
+    d->replay_ended = false;
+    d->replay_start_req = false;
+    d->replay_class_pending = false;
     stix_det_nom_clear_expo(d);
     stix_det_reseed(d);
 }
@@ -1951,6 +2558,23 @@ bool stix_det_realize(StixDetState *d, STIXCTRL *owner, stixCtrlRegs_s *reg,
     d->tick = timer_new_ns(QEMU_CLOCK_VIRTUAL, stix_det_tick, d);
     stix_det_sky_template(d);
     stix_det_reseed(d);
+    /*
+     * D-Dk: the .dssevs pre-scan; a failure here is a realize error.
+     * device_set_realized does not run unrealize for a realize failure,
+     * so the timer is freed here, as the controller does for its own
+     * allocations, and with it the table the scan may have buffered.
+     */
+    if (d->replay_file && *d->replay_file &&
+        !stix_det_replay_scan(d, errp)) {
+        timer_free(d->tick);
+        d->tick = NULL;
+        g_free(d->replay_ev);
+        d->replay_ev = NULL;
+        d->replay_n_ev = 0;
+        d->replay_alloc = 0;
+        d->replay_loaded = false;
+        return false;
+    }
     return true;
 }
 
@@ -1958,4 +2582,8 @@ void stix_det_unrealize(StixDetState *d)
 {
     timer_free(d->tick);
     d->tick = NULL;
+    g_clear_pointer(&d->replay_ev, g_free);
+    d->replay_n_ev = 0;
+    d->replay_alloc = 0;
+    d->replay_loaded = false;
 }
