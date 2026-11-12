@@ -1,6 +1,6 @@
 # Flash damage plan: bad blocks, broken cells and corrupted files as the FSW filesystem sees them
 
-Status: X-1 and X-2 implemented 2026-11-12 (see their "As built"
+Status: X-1, X-2 and X-3 implemented 2026-11-12 (see their "As built"
 notes); the rest is
 draft, 2026-11-12, revised the same day after the independent
 review (`.review-flashdmg.txt`, all 8 findings resolved — see "Review
@@ -466,7 +466,7 @@ These change what the track can deliver. Read them first.
   - `bad-block --block N` (or the framework form
     `--mcm M --chip C --block B`) — marker 0 into the spares of pages
     0/1; `--fs-range` applies it to every FS-scanned block (A: linear
-    blocks 64-1983, B: 32832-34671 with `LIMIT_FS_SIZE=32`), for the
+    blocks 64-1983, B: 32832-34751 with `LIMIT_FS_SIZE=32`), for the
     broken-flash scenario of the unit-test framework's
     `Initialization.BBrokenFlash`;
   - `corrupt-file --type T [--spare S --coarse C --fine F] --mode
@@ -824,6 +824,33 @@ detector/att smokes) at X-4/X-4b and before the merge.
   file lands; the commit's first build shows it green only with the
   tool).
 - Gates: the per-commit set (no C change).
+
+- **As built (2026-11-12, commit X-3).** `scripts/stix/flash-damage.py`
+  (stdlib only) with `bad-block`, `corrupt-file`
+  (`header|data|address`), `show`, `device` and `--self-test` (two
+  synthetic sparse images, 197 checks, < 1 s, its own negatives), as
+  D-X4 says. Notes:
+  - The BCH(13,7) encoder and decoder were cross-checked against the
+    FSW's own `ASW/src/MemoryMgmt/BCH.c`, compiled standalone on the
+    host: the encoder is byte-identical on five patterns, and
+    `BCH_decode` vs the tool agree on 1/7 data flips (corrected), 8
+    flips (uncorrectable), one ECC-bit flip and 6 data + 1 ECC flips.
+    The two reference vectors are committed in
+    `scripts/stix/tests/bch13t7-reference-vector.txt` and pinned by
+    the self-test. Review fixes before the commit: the parity bits are
+    MSB-aligned in the 12 ECC bytes (the 5 pad bits trail), which the
+    self-test's independent division and the decoder's syndrome step
+    had wrong.
+  - `corrupt-file --mode header|data` verifies its deterministic flip
+    pattern with the in-tool decoder before writing (> 7 flips can
+    miscorrect instead of failing; the tool never writes a pattern
+    that would take the corrected path when an uncorrectable one is
+    asked for).
+  - FS B spans blocks 32832-34751 (`MemFilesystem.c:494-500`; both
+    partitions are 1920 blocks, matching the scenario's bad = 3840);
+    the earlier 34671 in this plan was wrong.
+  - Marker writes are single-byte (aux byte 0 of pages 0/1), not the
+    FSW's full-page program: the same guest view, sparser on disk.
 
 ### X-4: `scripts/stix/flash-damage-smoke.sh`
 
