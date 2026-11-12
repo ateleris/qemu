@@ -81,7 +81,8 @@ static void stix_pnp_check(QTestState *qts, unsigned index, uint32_t expected)
 
 /*
  * Flash latency plan D-F6 defaults (tread-us/tprog-us/tbers-us) and the
- * switch the latency qtests pass (the default stays off until F-3).
+ * switch the latency qtests pass explicitly (on by default since F-3; the
+ * explicit switch keeps them testing latency if the default changes).
  */
 #define FLASH_TREAD_US  130
 #define FLASH_TPROG_US  300
@@ -8823,6 +8824,33 @@ static void test_flash_latency_system_reset(void)
 }
 
 /*
+ * /sparc/stix/flash-latency-default (F-3, D-F7): latency is on by
+ * default, at the datasheet defaults, with no -global: a read is still
+ * busy one microsecond before tread-us and done just after it. RED
+ * while the default was off (the read completed inside the cmdSta write).
+ */
+static void test_flash_latency_default(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 0, CMD_PAGE_READ);
+    flash_assert_busy(qts);
+    flash_step_us(qts, FLASH_TREAD_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    flash_step_us(qts, 2);
+    flash_assert_done_ok(qts);
+    g_assert_true(flash_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+    g_assert_true(stix_qom_get_bool(qts, FLASH_QOM_PATH, "latency", NULL));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
  * /sparc/stix/flash-savevm (review SHOULD-1): the flash has no vmstate
  * yet (platform roadmap R-r3), so it is unmigratable: a savevm must be
  * refused naming the device, instead of a snapshot that silently drops
@@ -8872,6 +8900,8 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/flash-latency-system-reset",
                        test_flash_latency_system_reset);
         qtest_add_func("/sparc/stix/flash-savevm", test_flash_savevm);
+        qtest_add_func("/sparc/stix/flash-latency-default",
+                       test_flash_latency_default);
         qtest_add_func("/sparc/stix/spw-tx", test_spw_tx);
         qtest_add_func("/sparc/stix/ctrl", test_ctrl);
         qtest_add_func("/sparc/stix/ctrl-scet", test_ctrl_scet);

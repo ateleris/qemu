@@ -932,8 +932,11 @@ static void grlib_stixflash_reset(DeviceState *d)
 static const Property grlib_stixflash_properties[] = {
     DEFINE_PROP_STRING("flash-file", STIXFLASH, flash_file),
     DEFINE_PROP_BOOL("inverted-storage", STIXFLASH, inverted_storage, true),
-    /* D-F6/D-F7: off until F-3 flips the default */
-    DEFINE_PROP_BOOL("latency", STIXFLASH, latency, false),
+    /*
+     * D-F6/D-F7: on by default (F-3), so the PFM build's FS-init task
+     * blocks on each NAND op as on the IDPU; off = every op inline
+     */
+    DEFINE_PROP_BOOL("latency", STIXFLASH, latency, true),
     /* [A] datasheet-typical K9F8G08X0M timings incl. the page transfer */
     DEFINE_PROP_UINT32("tread-us", STIXFLASH, tread_us, 130),
     DEFINE_PROP_UINT32("tprog-us", STIXFLASH, tprog_us, 300),
