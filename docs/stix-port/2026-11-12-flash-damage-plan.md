@@ -1,6 +1,7 @@
 # Flash damage plan: bad blocks, broken cells and corrupted files as the FSW filesystem sees them
 
-Status: draft, 2026-11-12, revised the same day after the independent
+Status: X-1 implemented 2026-11-12 (see its "As built"); the rest is
+draft, 2026-11-12, revised the same day after the independent
 review (`.review-flashdmg.txt`, all 8 findings resolved — see "Review
 resolutions") and the unit-test framework cross-check; unreviewed.
 Base: track worktree
@@ -89,6 +90,46 @@ code before editing; all eight were accepted.
    row stands. Unit layouts: `TCData.h:429-431` (TC(238,6)),
    `:422-427` (TC(238,5)); the ICD agrees (§7.3, Table 190/191/192).
 
+### Review of X-1 (2026-11-12, post-build)
+
+The X-1 build review (run `glm-x1-review`) reported 6 findings; every
+FSW citation re-verified against the FSW tree before editing. 1, 2 and
+4 are plan corrections applied above (correction 1, the outcome rows,
+X-4/X-4b); 3, 5 and 6 are device fixes in the X-1 working tree.
+
+1. **erase-fail on a free erased block is dormant for `File_write`** —
+   confirmed: `write1` erases only when a page of the target block
+   reads non-0xFF (`File.c:449-470`) and `MemFilesystem_write` does no
+   pre-erase (`MemFilesystem.c:705-757`), so a write to a free erased
+   block lands on the damaged block and succeeds. The free-block
+   outcome rows use program-fail; erase-fail is exercised where an
+   erase is really attempted: `File_remove` (`File.c:768`),
+   `File_freeBlock` (`File.c:810`), TC(238,6) tryEraseBB
+   (`TcService238.c:169-183`), a free-but-dirty block. X-4's check
+   part uses program-fail (bad_after=1 kept).
+2. **whole-block `stuck` at boot never yields 0x543B** — confirmed:
+   the block mask covers the spare and the `File_init` scan
+   (`File.c:318-339`) runs before the context read
+   (`MemFilesystem.c:1029-1039`), so value 0 → marker 0xFE → BAD and
+   value 1 → looks FREE; the file is "not found" (0x8030/0x5439).
+   Outcome rows and X-4b corrected; 0x543B via stuck needs X-2 runtime
+   injection on a catalogued file, page/byte scope, not the spare.
+3. **only the first stuck entry per page applied** — confirmed; the
+   mask now applies every matching stuck entry in list order (the
+   later entry wins on the same bit); qtest `flash-dmg-stuck-multi`
+   pins two stuck-1 bits on one page.
+4. **program-fail on pages 0/1 defeats the grown-bad-block marker** —
+   confirmed: the marker program targets the block's pages 0 and 1
+   (`File.c:589-598`); documented in correction 1 and the D-X2 row;
+   the tool/gates inject program-fail on pages ≥ 2 when persistence is
+   the point.
+5. **seek/tell failure reported as the sidecar cap** — fixed: the
+   loader now reports "cannot determine the size of …" (with the
+   strerror) separately from the 1 MiB cap.
+6. **realize-failure cleanup asymmetry** — fixed: a failed sidecar
+   load closes the backing file and NULLs it before realize returns,
+   mirroring unrealize.
+
 ## Goal
 
 1. The NAND model can be damaged in the ways real NAND fails, and the
@@ -96,8 +137,9 @@ code before editing; all eight were accepted.
    - **factory bad blocks** (the spare-area marker the boot scan reads);
    - **grown bad blocks** (erase/program failures the FSW itself reacts
      to by marking the block bad);
-   - **broken/stuck cells** (bits that read 0 regardless of what was
-     programmed) and read-disturb-style bit flips;
+   - **broken/stuck cells** (bits that read a stuck value, 0 or 1,
+     regardless of what was programmed) and read-disturb-style bit
+     flips;
    - **corrupted stored files** addressed by their FSW filesystem name,
      not by block numbers, so a test never needs to know the layout.
 2. Every fault has a stated FSW-visible outcome (EIDs, TM(238,7) counts,
@@ -124,7 +166,14 @@ These change what the track can deliver. Read them first.
    injecting an erase/program failure makes the FSW produce a persistent,
    boot-surviving bad block in the image on its own. Factory bad blocks
    are the same marker, pre-written by the tool. One mechanism, two
-   origins.
+   origins. One bound, from the X-1 review: the marker program targets
+   the block's **pages 0 and 1** (`File.c:589-598`), so a program-fail
+   injected there defeats the marker — entries on both pages leave no
+   marker at all (the next boot scan reclassifies the block FREE) and a
+   single one leaves only the other marker. The tool and the gates
+   therefore inject program-fail on pages ≥ 2 when the persistent
+   marker is the point (X-4); erase-fail needs no such rule (the FSW
+   marks without checking the erase result, `File.c:592`).
 2. **No device-side "read failure" kind.** A read that completes with
    FAILED hits `MemFilesystem`'s `Read_page` error path, which does
    `ASSERT(0)` ("Flash operation failed, unexpected status",
@@ -350,10 +399,11 @@ These change what the track can deliver. Read them first.
   |---|---|---|
   | `bad-block` (offline only) | block | tool writes marker 0 into the spare of pages 0 and 1; the FSW's scan sees a bad block. The device never writes markers itself. |
   | `erase-fail` | block | every erase op on the block completes FAILED\|READY (+IRQ), nothing erased. The FSW's marking erase also fails (`(void)`, `File.c:592`), the marker program still lands (nuance, documented). |
-  | `program-fail` | page | every program op on the page completes FAILED\|READY, nothing written. |
-  | `stuck0` | page or block | reads return the true page with chosen bits forced to 0 (a stuck cell can only pull to 0 [A]): `page=<p> bit=<byte>.<bit>` for single-bit flips (BCH-correctable), `block=<b>` (bit 0 of every byte) for a whole-block unreadable. Applied after the file read, before the DMA, every read — so it also corrupts a freshly programmed page, like a real stuck cell. |
-  - Deferred, not built: probabilistic wear (fails the Nth op — open
-    question O3), `read-fail` (correction 2), multi-plane quirks.
+  | `program-fail` | page | every program op on the page completes FAILED\|READY, nothing written. The FSW's grown-bad-block marker program targets the block's pages 0 and 1 (`File.c:589-598`), so an injection there defeats the marker (correction 1) — the tool/gates use pages ≥ 2 when persistence is the point. |
+  | `stuck` | page or block | reads return the true page with chosen bits forced to their stuck value 0 or 1 (O4: both polarities; `stuck0` stays as an alias for value 0): `page=<p> bit=<byte>.<bit>` plus `value=<0|1>` for single-bit flips (BCH-correctable), `block=<b>` plus `value=<0|1>` (bit 0 of every byte) for a whole-block unreadable. Applied after the file read, before the DMA, every read — so it also corrupts a freshly programmed page, like a real stuck cell. |
+  - Deferred, not built: probabilistic wear (fails the Nth op — O3
+    resolved: planned later, see "Later"), `read-fail` (correction 2),
+    multi-plane quirks.
   - **Offline, built in v1 after the review (finding 5):**
     `wrong-address` — the TN-required "data block written at the wrong
     address" aspect (STIX-TN-0024 §3.5.5.5, txt:2364-2366 and
@@ -402,7 +452,7 @@ These change what the track can deliver. Read them first.
     property-per-ID needs no params; here the spec is the ID).
   - Entries apply at `stixflash_complete()` only: an erase/program
     still takes its full latency, then fails — the FSW sees a normal
-    slow op that failed, exactly like hardware. `stuck0` applies at
+    slow op that failed, exactly like hardware. `stuck` applies at
     read completion after the file read and before the DMA.
   - Traces: `stixflash_damage_hit(kind, page_address, cmd_sta)` and
     `stixflash_damage_load(n, path)`; both silent with no damage.
@@ -434,7 +484,9 @@ These change what the track can deliver. Read them first.
     (generated by the reviewer, committed as a fixture);
   - `show --type T ...` — prints the file's block/pages (truth
     read-back), for scenarios that then inject runtime faults there;
-  - `device --kind K ... --out flash.bin.dmg` — writes the sidecar;
+  - `device --kind K [--value 0|1] ... --out flash.bin.dmg` — writes
+    the sidecar (kind `stuck` carries `value`, `stuck0` = the value-0
+    alias);
   - addressing: every block/page argument accepts both the linear form
     (`block=<linear>` / `page=<linear>`) and the framework's
     `mcm/chip/block/page/offset` form (D-X2), so a unit-test scenario
@@ -449,7 +501,7 @@ These change what the track can deliver. Read them first.
 - **D-X5: the platform contract.**
   - Catalogue entries in `faults-v1.json` (a new reserved block next to
     the attenuator's, same format [D]): `flash.block.erase_fail`,
-    `flash.page.program_fail`, `flash.cell.stuck0` — class `memory`,
+    `flash.page.program_fail`, `flash.cell.stuck` — class `memory`,
     `changes: "truth"` (the stored data or the op result really
     changes; the D-PLo amendment), `persistence: "until_cleared"`,
     params `{block|page, bit}` with the FSW-linear index space named,
@@ -485,7 +537,8 @@ These change what the track can deliver. Read them first.
   0x542F, the SDRAM DEU trap) owns semiconductor-memory upset outside
   the NAND; the platform plan's R-b ("SEU/DEU injection in flash",
   live single-bit flips) is **folded into this track** — a live flip is
-  `stuck0 page=<p> bit=<b>`, and R-b's "0x543B / rewrite" outcomes are
+  `stuck page=<p> bit=<b> value=<0|1>`, and R-b's "0x543B / rewrite"
+  outcomes are
   exactly this plan's outcome table. No second flash-fault track is
   started.
 
@@ -500,7 +553,7 @@ fresh copy, never by editing the shared master).
 | `flash.block.bad_factory` | offline (image), **setup-only** | block ≥ 64 | boot scan counts it bad; never allocated | new (platform to adopt) |
 | `flash.block.erase_fail` | device | block | erase ops on it fail (FAILED\|READY); FSW marks it bad and moves on | new |
 | `flash.page.program_fail` | device | page | program ops fail; FSW marks the block bad | new |
-| `flash.cell.stuck0` | device | page + bit, or block | reads return forced-0 bits; small = corrected/rewrite path, whole block = 0x543B | new; subsumes the platform plan's R-b flash SEU |
+| `flash.cell.stuck` | device | page + bit, or block; stuck value 0 or 1 | reads return the bits at their stuck value; small = corrected/rewrite path; whole block: BAD or "not found" at boot (the scan reads the masked spare first), 0x543B only via runtime injection on a catalogued file (page/byte scope, not the spare) | new; subsumes the platform plan's R-b flash SEU |
 | `flash.file.corrupt` | offline (image), **setup-only** | file name (type/spare/coarse/fine), header or data, bit count | header: file vanishes at boot (0x8030/0x5439 + defaults); data: 0x543B, or the corrected→rewrite path at ≤7 bits (rewrite from 5) | new |
 | `flash.file.wrong_address` | offline (image), **setup-only** | file name, page(s), wrong spare `pageAddress` (BCH re-encoded) | read reaches the FSW's address check (`File.c:691-699`); error TM with the page address (0x543B on the traced path; 0x543A is the TN-named event — doc-vs-code 7) | new; FDIR-required (TN-0024 §3.5.5.5, TN-0062 §4.6.8.6.5) |
 
@@ -514,15 +567,16 @@ Everything here is [L] until a live run confirms it. "boot" = the
 |---|---|---|
 | none | — | `0032 01 0002 0000 0000 fffe` (fresh flash) [G] |
 | `bad_factory` block 610 (a TMMGMT-partition block: TMBUFFER = CBs 9-11 = blocks 604-783) | boot | 0x0032 bad=1, free−1; TC(238,6) → TM(238,7) bad_before=1; `tryEraseBB` erase fails or succeeds without changing the count |
-| `erase_fail` on a free block, then a context write | runtime | the write lands on another block; TC(238,6) shows bad_after=1 (the FSW's own marker, persistent across reboot: 0x0032 bad=1 after a reset) |
-| `erase_fail` on 2 consecutive free blocks | runtime | one `File_write` burns both and returns `E_FILE_RES_ERROR`; the `MemFilesystem_write` retry picks fresh free blocks and **succeeds** — TC(238,6) shows bad_after=2, the write completes [I → L] |
-| `erase_fail` on 4 free blocks of one partition | runtime | both `File_write` calls (2 × `File_CONFIG_MAX_BB`) exhaust their blocks → `FSW_ERROR_FILE_CORRUPTED` (`MemFilesystem.c:740-741`) [I → L: no TM unless a caller sends one] |
+| `program_fail` on a page of a free block, then a context write | runtime | the write fails there, the FSW marks the block bad and retries on another block; TC(238,6) shows bad_after=1 (the FSW's own marker, persistent across reboot: 0x0032 bad=1 after a reset); keep the FSW's marker pages 0/1 un-injected (correction 1) |
+| `program_fail` on 2 consecutive free blocks | runtime | one `File_write` burns both and returns `E_FILE_RES_ERROR`; the `MemFilesystem_write` retry picks fresh free blocks and **succeeds** — TC(238,6) shows bad_after=2, the write completes [I → L] |
+| `program_fail` on 4 free blocks of one partition | runtime | both `File_write` calls (2 × `File_CONFIG_MAX_BB`) exhaust their blocks → `FSW_ERROR_FILE_CORRUPTED` (`MemFilesystem.c:740-741`) [I → L: no TM unless a caller sends one] |
+| `erase_fail` on a free-but-dirty block, then a write | runtime | `write1` really erases (a page of the block reads non-0xFF, `File.c:449-470`), the erase fails → block marked bad, write retried elsewhere; on a free **erased** block erase-fail is dormant: no erase is attempted, the write lands on the damaged block and succeeds (review of X-1, finding 1) |
 | `erase_fail` on a used block + TC(238,5) free-files (the ICD's "Free data in the filesystem", Table 190) | runtime | `File_remove` erase fails → `FSW_ERROR_FILE_FLASH_IO`, TM(1,8) for the TC (`TcService238.c:56-166, 209`); file survives |
-| `program_fail` on a page of a free block, then a write | runtime | as `erase_fail`: block marked bad, write retried elsewhere |
-| `stuck0` 1 bit in a stored file's page | read | "BCH corrected 1 SEUs"; ≥4 corrections in the block → the file is removed and rewritten (old block freed; `File_rewriteAlmostCorruptedFiles` [I → L: no TM]) |
-| `stuck0` >7 bits in one sub-block | read | 0x543B `flash page CRC check failed` with the page address; file unreadable |
-| `stuck0` whole block (context file) | boot | 0x543B during the init read, then 0x8030 `(1,1)` and default parameters; both context files recreated |
-| `stuck0` whole block (LUT file) | boot | 0x543B, then 0x5439 `LUT not found` + the four `LUTMgmt` UART lines |
+| `stuck` 1 bit (value 0 or 1) in a stored file's page | read | "BCH corrected 1 SEUs"; ≥4 corrections in the block → the file is removed and rewritten (old block freed; `File_rewriteAlmostCorruptedFiles` [I → L: no TM]) |
+| `stuck` >7 bits in one sub-block | read | 0x543B `flash page CRC check failed` with the page address; file unreadable |
+| `stuck` whole block at 0 (context file) | boot | the mask covers the spare and the `File_init` scan runs before the context read (`MemFilesystem.c:1027-1039`): the marker reads 0xFE → BAD (0x0032 bad=1); the context file is "not found" → 0x8030 `(1,1)` and default parameters, both context files recreated; **no 0x543B** (0x543B via stuck needs X-2 runtime injection on a catalogued file, page/byte scope, not the spare) |
+| `stuck` whole block at 1 (context file) | boot | marker reads 0xFF, `emptyPageMarker` reads 0xFF → the block looks **FREE** (an in-use block silently reusable): the context file is "not found" → 0x8030 `(1,1)` + defaults; bad stays 0 |
+| `stuck` whole block at 0 (LUT file) | boot | the scan marks the block BAD (marker 0xFE, as above); the LUT file is "not found" → 0x5439 `LUT not found` + the four `LUTMgmt` UART lines; **no 0x543B** |
 | `wrong-address` on a data page of CONTEXT1 | boot | the init context read (`MemFilesystem.c:1027-1042`, `generateTMs` still TRUE) hits `File.c:691-699` → 0x543B with the page address; CONTEXT0 still found, so **no** 0x8030; 0x0032 unchanged (the block stays `E_FILE_BLOCK_STAT_FILE`) [I → L] |
 | `file.corrupt header` (context) | boot | the file is `E_FILE_BLOCK_STAT_ERROR` ("doesn't exist", error=1 in 0x0032); 0x8030 `(1,1)`; defaults; TC(238,6) frees the block (error before → free after) |
 | `file.corrupt header` (LUT) | boot | error=1 in 0x0032; 0x5439; TC(238,6) frees it |
@@ -544,7 +598,7 @@ wherever they disagree.
 
 | suite/test | what it does | maps to the emulator? |
 |---|---|---|
-| `FileCorruption.ABitflips` (`TestFileCorruption.c:8`) | 300 TMMGMT files, 0-4 flips per 528-B sub-block (≤ `FILE_ECC_BCH_CORRECTIONS`), every `FSread` returns byte-identical data | yes — X-4b scenario 1 (`corrupt-file --bits ≤4` / single-bit `stuck0`): read succeeds silently, "BCH corrected N SEUs" TRACE only, no TM; reboot leg re-reads corrected (the image keeps the damage) |
+| `FileCorruption.ABitflips` (`TestFileCorruption.c:8`) | 300 TMMGMT files, 0-4 flips per 528-B sub-block (≤ `FILE_ECC_BCH_CORRECTIONS`), every `FSread` returns byte-identical data | yes — X-4b scenario 1 (`corrupt-file --bits ≤4` / single-bit `stuck`): read succeeds silently, "BCH corrected N SEUs" TRACE only, no TM; reboot leg re-reads corrected (the image keeps the damage) |
 | `FileCorruption.BNoBitflips` (`:90`) | same loop, no damage (control) | yes — the `--negative` undamaged baseline of X-4 |
 | `FileCorruption.C1BitflipsPre/PostRestart` (`:121-178`) | bitflips across a process restart via a log file; **commented out** in the framework | the shape (damage, restart, re-check) is X-4b scenario 1's reboot leg; the emulator gets image persistence for free (D-X1) |
 | `Initialization.AEmptyFlash` (`TestInitialization.c:11`, `.disabled`) | empty image, `FSInit` completes | already covered: the fresh-flash golden `0032 01 0002 0000 0000 fffe` [G]; no new scenario |
@@ -569,10 +623,10 @@ detector/att smokes) at X-4/X-4b and before the merge.
 
 ### X-1: device damage model + sidecar (from boot)
 
-- `grlib_stixflash.c`: the damage list (kind, mcm/chip/page scope, bit
-  mask), `flash-damage-map` qdev (sidecar parse at realize, D-X3),
+- `grlib_stixflash.c`: the damage list (kind, value, mcm/chip/page
+  scope, bit), `flash-damage-map` qdev (sidecar parse at realize, D-X3),
   `damage-list`, the three hit points in `stixflash_complete()`
-  (erase-fail, program-fail, stuck0-before-DMA), traces
+  (erase-fail, program-fail, stuck-before-DMA), traces
   `stixflash_damage_load/_hit`. The reset handler is untouched; the
   sidecar list survives it.
 - qtests (RED: `flash-damage-map` and `damage-list` are unknown
@@ -581,9 +635,11 @@ detector/att smokes) at X-4/X-4b and before the merge.
     after the full `tbers-us` (with `latency=on` explicitly), one IRQ,
     file bytes unchanged; other blocks unaffected;
   - `flash-dmg-program-fail`: program → FAILED|READY, file unchanged;
-  - `flash-dmg-stuck0`: bit and block forms; the read returns the true
-    page with the bit(s) cleared; a freshly programmed page also reads
-    masked;
+  - `flash-dmg-stuck0`: bit and block forms, both at value 0; the read
+    returns the true page with the bit(s) cleared; a freshly
+    programmed page also reads masked;
+  - `flash-dmg-stuck1` (O4): the value-1 mirror — an erased page
+    (0xFF) is unaffected, a programmed 0 on the bit reads 1;
   - `flash-dmg-marker-plain`: in `inverted-storage=off` mode, a
     hand-written marker in the qtest (0x00 at page offset 4096 — the
     tool does not exist yet at X-1, review finding 4) is read as 0x00,
@@ -596,6 +652,63 @@ detector/att smokes) at X-4/X-4b and before the merge.
     test, like `flash-create-error`); missing file is fine.
 - Gates: the per-commit set; boot-smoke golden must not move (no gate
   passes a map).
+
+- **As built (2026-11-12, commit X-1).** Built as specified, with these
+  details the plan left open:
+  - Entry struct: `{kind, mcm, chip, page, block_scope, byte, bit,
+    value}` — after the parse every entry is canonical (mcm/chip + page
+    inside the chip); erase-fail stores the block's base page and
+    `block_scope`, program-fail the exact page, stuck either plus the
+    masked byte, bit and stuck value (O4: 0 or 1). The whole-block
+    stuck form is "bit 0 of every byte", so it stores no byte.
+  - Sidecar grammar (JSON keys, one entry each): `"block"` (linear
+    block), `"page"` (linear page), or `"mcm"+"chip"` with `"page"`
+    (chip-relative), `"block"` (block in chip) or `"block"+"page"` (the
+    framework form). `"bit"` and `"value"` are stuck-only: `"byte.bit"`
+    with byte < 4224, bit < 8; `"value"` 0 or 1 (O4), given with kind
+    `"stuck"` — `"stuck0"` stays as an alias for value 0 and takes no
+    `"value"`. The framework's `offset=<o>` has no sidecar key —
+    the tool (X-3) resolves it to a bit before writing the file.
+    Unknown keys are rejected. The v1 example of D-X3 parses as is.
+  - The reserved-block rule is applied to the **containing linear
+    block** of every kind (page scopes included), with no override.
+  - `damage-list` rows: `src=file kind=erase-fail block=<linear>`,
+    `src=file kind=program-fail page=<linear>`,
+    `src=file kind=stuck value=<0|1> page=<linear> bit=<byte>.<bit>`,
+    `src=file kind=stuck value=<0|1> block=<linear>` — FSW-linear
+    index space, one row per entry, `\n`-separated, empty string when
+    clean.
+  - Traces: `stixflash_damage_hit` fires after `stixflash_op_done`
+    (one per hit, with the final cmd_sta — FAILED|READY for the two
+    failing kinds, READY for stuck; the hit's kind string is
+    stuck0|stuck1 by value); `stixflash_damage_load(n, path)`
+    fires once after a successful parse, n = 0 for an empty `"damage"`
+    array. Both silent with no sidecar or a missing file. A
+    damage-induced failure also goes through the normal
+    `stixflash_error why=erase-fail|program-fail` line, like every
+    other failure reason.
+  - Realize order: the sidecar is parsed after the backing file opened
+    and before the op timer is created; a missing file is silence
+    (ENOENT only — any other open error fails realize), a sidecar over
+    1 MiB fails realize, and the read is a plain fread (no mmap).
+  - The read was split into `flash_read_file` (file stage, unchanged
+    behaviour) and `flash_read_dma` (the D-F2/D-F3 DMA); stuck applies
+    between the two. The reset handler is untouched; unrealize frees
+    the list.
+  - The qtests live behind one `stix_flashdmg_register()` call from
+    `main()` (the attenuator's `stix_att_register()` pattern), with a
+    dedicated 32 MB sparse flash per test (block 70 / page 5000 live
+    above the reserved 64 blocks). `flash-dmg-marker-plain` hand-writes
+    the marker bytes in both storage modes (F4). The two stale marker
+    comments (correction 4 / doc-vs-code 5) are fixed. The
+    `flash-dmg-quiet` command line enables `stixflash_op_done` so its
+    -D log has a positive control.
+  - RED expectations: the seven tests assert `flash-damage-map` /
+    `damage-list` behaviour that a pre-X-1 binary cannot show (unknown
+    -global property aborts QEMU at startup; the `damage-list` qom-get
+    errors), so each can fail; `flash-dmg-marker-plain` fails if the
+    inversion rule breaks; `flash-dmg-stuck1` (O4) is RED on a pre-O4
+    binary — kind `stuck` fails the parse.
 
 ### X-2: runtime injection + platform contract
 
@@ -624,7 +737,9 @@ detector/att smokes) at X-4/X-4b and before the merge.
   `address` mode end-to-end (rewrite `pageAddress`, re-encode sub-block
   7, then decode with the same BCH to prove the page still reads) and
   pins the BCH(13,7) encoder against the committed reference vector
-  (D-X4); both addressing forms must select the same byte.
+  (D-X4); both addressing forms must select the same byte, and the
+  `device` subcommand emits the O4 stuck grammar (kind `stuck` with
+  `value` 0|1, `stuck0` = the value-0 alias).
 - RED: the self-test fails before the tool exists (CI runs it once the
   file lands; the commit's first build shows it green only with the
   tool).
@@ -642,11 +757,15 @@ detector/att smokes) at X-4/X-4b and before the merge.
     (on AX too — await it; the AX boot itself has no 0x8030), and
     0x0032 with bad=1 and error=1, then hold;
   - **check part** (device, runtime, over QMP): fresh flash; boot;
-    `damage-add erase-fail` on block 65 in **CONTEXT0** (the partition
-    the next context write draws from: `File_findFreeBlock` continues
-    after `mostRecentlyWrittenBlock` = the context file's node 0,
-    `File.c:163` — the exact block is confirmed by the probe run before
-    the expectation freezes [L]); trigger a context write (CONF entry,
+    `damage-add program-fail` on page 4162 (block 65 in **CONTEXT0**,
+    the partition the next context write draws from:
+    `File_findFreeBlock` continues after `mostRecentlyWrittenBlock` =
+    the context file's node 0, `File.c:163` — the exact block and a
+    page the write really reaches are confirmed by the probe run before
+    the expectation freezes [L]; page ≥ 2 of the block keeps the FSW's
+    marker pages 0/1 clean, correction 1; erase-fail would not fire on
+    a free erased block — no erase is attempted before the write,
+    review of X-1, finding 1); trigger a context write (CONF entry,
     nominal-smoke's TC bytes); TC(238,6) `{0, 3839, 1}` (start/end file
     u16 + badBlockHandling u8; layout per ICD:23981-24078 and
     `TCData.h:429-431`, built with nominal-smoke's TC helpers) →
@@ -676,7 +795,13 @@ each; "uncorrectable" reuses the stuck part's boot):
 - **uncorrectable**: the stuck part's `--bits 8` → expected 0x543B
   (BCH `t = FILE_ECC_BCH_CORRECTIONS = 7` corrects ≤ 7 per sub-block;
   beyond that `BCH_decode` fails or miscorrects — which of the two the
-  probe shows decides the expectation, `File.h:106-122`) [I → L];
+  probe shows decides the expectation, `File.h:106-122`) [I → L]. The
+  device-kind route to 0x543B is X-2 runtime injection of ≥ 8
+  page-scope stuck entries in one sub-block of an already-catalogued
+  file; a whole-block stuck at boot never reaches a read — the init
+  scan classifies the block from the masked spare first (value 0 →
+  BAD, value 1 → FREE, the file is "not found", review of X-1
+  finding 2);
 - **broken flash** (`Initialization.BBrokenFlash`): `bad-block
   --fs-range` → 0x0032 with bad=3840 (0x0F00), used=0, free=61696
   (0xF100 — the free count spans the whole device, `MemFilesystem.c:1064`),
@@ -684,8 +809,10 @@ each; "uncorrectable" reuses the stuck part's boot):
   marking the *whole* device would wrap the u16 bad count (65536 & 0xFFFF
   = 0) — the scenario stays inside the FS-scanned blocks;
 - **full FS with grown bad blocks** (`Partitions.FilePartitions30MB`
-  arithmetic): soak archive writes with erase-fail injected on free
-  blocks of the written partition; TM(238,7) shows bad growing 2 per
+  arithmetic): soak archive writes with program-fail injected on the
+  first page of free blocks of the written partition (erase-fail is
+  dormant on free erased blocks — `write1` erases only non-0xFF
+  blocks, review of X-1 finding 1); TM(238,7) shows bad growing 2 per
   exhausted write, and the partition finally reports filled/`FS_FULL`.
   Nuance from the framework's quota tests: once the partition is full
   `File_write` returns `FS_FULL` **before** burning blocks
@@ -698,8 +825,8 @@ each; "uncorrectable" reuses the stuck part's boot):
 ### X-5: docs
 
 - `accepted-diffs.md`: **"## 43. Flash damage injection (baseline: the
-  NAND is always perfect)"** — the model semantics ([A] stuck-cell
-  polarity, the marking-erase nuance), the sidecar/grammar (both
+  NAND is always perfect)"** — the model semantics (the stuck kind's
+  value 0|1 per O4, the marking-erase nuance), the sidecar/grammar (both
   addressing forms, the framework mapping), the tool (incl. the
   BCH(13,7) encoder for the `address` mode), the catalogue mapping.
 - `ground-station.md` "Fault injection": the flash subsection (QOM
@@ -813,19 +940,45 @@ Code wins in each case.
    or Flash.c. ✔ code (0x543B on the traced path); the X-4 boot part
    expects whichever event the probe run shows [L].
 
+## Later (planned, not in X-1..X-5)
+
+Resolved out of O2 and O3; nothing here gates X-1..X-5.
+
+- **Per-entry persistence (O2).** The platform controller re-applies
+  runtime damage after a cold power cycle (default, D-X1). A later
+  per-campaign setting marks, per damage entry, "pre-programmed /
+  persistent" (reloaded at every boot) vs "transient" (gone at the
+  next cold cycle): one field in the sidecar plus the controller's
+  re-apply rule.
+- **Wear and pre-broken presets (O3).** A deterministic wear/aging
+  kind (fail the Nth erase/program of a block) and "permanently broken
+  before the run" presets for campaigns.
+
 ## Open questions for the user
 
-- **O1.** Which ELF should flash-damage-smoke target by default — the
+- **O1.** ~~Which ELF should flash-damage-smoke target by default — the
   AX gate ELF (proposed; the damage is fully visible) or a PFM ELF, or
-  both (PFM as an opt-in flavour like pfm-boot-smoke)?
-- **O2.** Should runtime damage survive a cold power cycle via the
+  both (PFM as an opt-in flavour like pfm-boot-smoke)?~~ — answered
+  2026-11-12: the AX gate ELF by default; a PFM flavour is opt-in
+  (like pfm-boot-smoke).
+- **O2.** ~~Should runtime damage survive a cold power cycle via the
   controller's re-apply (proposed, D-X1), or is per-process lifetime
-  wanted for some scenarios?
-- **O3.** Is a deterministic `wear` kind (fails the Nth erase/program
-  of a block) wanted in v1, or is the explicit per-block list enough?
-- **O4.** Confirm the stuck-cell polarity assumption: a stuck cell only
-  reads 0 (never 1) [A]. If the FPGA reports otherwise the `stuck0`
-  kind generalises to a mask.
+  wanted for some scenarios?~~ — answered 2026-11-12: the controller
+  re-applies runtime damage after a cold power cycle (default, D-X1);
+  a per-campaign per-entry "persistent vs transient" setting is
+  planned later (see "Later (planned, not in X-1..X-5)").
+- **O3.** ~~Is a deterministic `wear` kind (fails the Nth erase/program
+  of a block) wanted in v1, or is the explicit per-block list enough?~~
+  — answered 2026-11-12: no wear kind in v1, the explicit per-block
+  list is enough; wear/aging and "permanently broken before the run"
+  presets are planned later (see "Later (planned, not in X-1..X-5)").
+- **O4.** ~~Confirm the stuck-cell polarity assumption: a stuck cell
+  only reads 0 (never 1) [A]. If the FPGA reports otherwise the
+  `stuck0` kind generalises to a mask.~~ — answered 2026-11-12: stuck
+  cells have BOTH polarities; the kind is now `stuck` with `value`
+  0 or 1 (the sidecar keeps `stuck0` as an alias for value 0); a stuck
+  bit reads its stuck value on every read, the stored file is
+  untouched.
 - **O5.** ~~The TC(238,6) unit bytes~~ — answered from the documents:
   the layout is `{startFile u16, endFile u16, badBlockHandling u8}` per
   the TM/TC ICD §7.3.6 Table 192 (ICD:23981-24078) and `TCData.h:429-431`;

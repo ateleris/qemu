@@ -402,7 +402,9 @@ static void test_flash_error_paths(void)
     g_assert_cmpuint(st.st_size, ==, 1024u * 1024u);
 
     /* 6. D-H: PAGE_WRITE past EOF fails with FAILED + IRQ 1; the file is
-     *    not extended (holes would read 0x00 = bad-block marker). */
+     *    not extended (a hole reads 0x00 in plain mode = bad-block
+     *    marker; with the default inversion it reads 0xFF = erased).
+     */
     qtest_writel(qts, IRQMP_CLEAR, FLASH_IRQ_BIT);
     flash_issue(qts, 0x40000000u, 300, CMD_PAGE_WRITE);
     sta = qtest_readl(qts, FLASH_CMDSTA);
@@ -11647,6 +11649,797 @@ static void stix_att_register(void)
                    test_att_fault_hw_state);
 }
 
+/*
+ * ---- Flash damage: device model + sidecar (flash-damage plan X-1) ----
+ *
+ * Kept in this one appended block behind stix_flashdmg_register(), like
+ * the platform's stix_platform_register() and the attenuator's
+ * stix_att_register(), so a merge with another track touches main() in
+ * one line.
+ */
+
+/*
+ * D-X3 refuses every sidecar block < 64 (the ASW image area), so the
+ * damage tests use their own 32 MB sparse backing file: block 70 (pages
+ * 4480..4543) and page 5000 sit above the common 1 MB file and inside
+ * 32 MB.
+ */
+#define FLASH_DMG_FLASH_BYTES (32u * 1024 * 1024)
+#define FLASH_DMG_BLOCK       70u     /* sidecar block: pages 4480..4543 */
+#define FLASH_PAGENUM_IN_BLOCK 64     /* pages per block (the device's) */
+#define FLASH_DMG_PAGE        4490u   /* a page inside FLASH_DMG_BLOCK */
+#define FLASH_DMG_PROG_PAGE   5000u   /* page-scope target */
+#define FLASH_DMG_SPARE_OFF   4096u   /* badBlockMarker in the spare area */
+
+static char *stix_dmg_flash_path;   /* the damage tests' backing file */
+static char *stix_dmg_map_path;     /* the sidecar passed to the device */
+
+/*
+ * Start QEMU with a 32 MB sparse backing file and a sidecar holding
+ * @json; @extra carries more -global arguments (e.g. FLASH_LATENCY_ON).
+ * The missing-file case of D-X3 is pinned in flash-dmg-map-parse.
+ * Returns NULL when the filesystem cannot do sparse files (skipped).
+ */
+static QTestState *flash_dmg_qtest_new(const char *json, const char *extra)
+{
+    g_autofree gchar *flash = NULL;
+    g_autofree gchar *map = NULL;
+    g_autofree gchar *all = NULL;
+    struct stat st;
+    QTestState *qts;
+    int fd;
+
+    fd = g_file_open_tmp("stix-flash-dmgbin-XXXXXX", &flash, NULL);
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, FLASH_DMG_FLASH_BYTES) == 0);
+    g_assert(fstat(fd, &st) == 0);
+    close(fd);
+    if ((uint64_t)st.st_blocks * 512 > 1024u * 1024u) {
+        g_unlink(flash);
+        g_test_skip("filesystem does not create sparse files");
+        return NULL;
+    }
+
+    fd = g_file_open_tmp("stix-flash-dmgmap-XXXXXX", &map, NULL);
+    g_assert(fd >= 0);
+    g_assert_cmpint(write(fd, json, strlen(json)), ==,
+                    (ssize_t)strlen(json));
+    close(fd);
+
+    all = g_strdup_printf("-global grlib-stixflash.flash-file=%s "
+                          "-global grlib-stixflash.flash-damage-map=%s %s",
+                          flash, map, extra);
+    stix_dmg_flash_path = g_steal_pointer(&flash);
+    stix_dmg_map_path = g_steal_pointer(&map);
+    qts = qtest_initf("-M leon3_generic %s", all);
+    return qts;
+}
+
+static void flash_dmg_cleanup(void)
+{
+    if (stix_dmg_flash_path) {
+        g_unlink(stix_dmg_flash_path);
+        g_clear_pointer(&stix_dmg_flash_path, g_free);
+    }
+    if (stix_dmg_map_path) {
+        g_unlink(stix_dmg_map_path);
+        g_clear_pointer(&stix_dmg_map_path, g_free);
+    }
+}
+
+/* the damage-list string, or NULL when the property is unknown (RED) */
+static gchar *flash_dmg_list(QTestState *qts)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'damage-list'}}",
+                            FLASH_QOM_PATH);
+    QString *str = qobject_to(QString, qdict_get(resp, "return"));
+    gchar *out = str != NULL ? g_strdup(qstring_get_str(str)) : NULL;
+
+    qobject_unref(resp);
+    return out;
+}
+
+/*
+ * /sparc/stix/flash-dmg-erase-fail (X-1): a sidecar erase-fail on block
+ * 70 makes every erase of that block take the full tbers-us and fail
+ * FAILED | READY with one IRQ, erasing nothing; the file keeps the
+ * programmed pattern, a program into the block still lands (the FSW's
+ * marker program survives its failed marking erase), and block 71 is
+ * unaffected.
+ * RED before X-1: flash-damage-map is an unknown property, so QEMU
+ * exits at startup and qtest_initf aborts.
+ */
+static void test_flash_dmg_erase_fail(void)
+{
+    static const char json[] =
+        "{\"v\":1,\"damage\":[{\"kind\":\"erase-fail\",\"block\":70}]}";
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    gchar *list;
+    size_t i;
+
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0x3Cu);
+    }
+
+    qts = flash_dmg_qtest_new(json, FLASH_LATENCY_ON);
+    if (!qts) {
+        return;
+    }
+
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=file kind=erase-fail block=70");
+    g_free(list);
+
+    /* a program into the damaged block lands (the FSW's marker nuance) */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+
+    /* the erase takes its full latency, then fails once */
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_BLOCK_ERASE);
+    flash_assert_busy(qts);
+    flash_step_us(qts, FLASH_TBERS_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    flash_step_us(qts, 2);
+    g_assert_cmpuint(qtest_readl(qts, FLASH_CMDSTA)
+                     & (FTNAND_BUSY | FTNAND_FAILED | FTNAND_READY),
+                     ==, FTNAND_FAILED | FTNAND_READY);
+    g_assert_true(flash_irq_pending(qts));
+    flash_assert_no_more_irq(qts);
+
+    /* nothing was erased: the file still holds the pattern */
+    flash_pread_page(stix_dmg_flash_path,
+                     (uint64_t)FLASH_DMG_PAGE * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+    /* and the read sees it too: erase-fail does not touch reads */
+    flash_ram_fill(qts, FLASH_RAM_B, 0x00);
+    flash_issue(qts, FLASH_RAM_B, FLASH_DMG_PAGE, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+    /* the neighbour block 71 erases normally */
+    flash_irq_clear(qts);
+    flash_issue(qts, FLASH_RAM_A,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK,
+                CMD_BLOCK_ERASE);
+    flash_assert_done_ok(qts);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-erase"), ==, 2);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-dmg-program-fail (X-1): a sidecar program-fail on
+ * page 5000 makes every program of that page fail FAILED | READY after
+ * the full tprog-us with one IRQ, writing nothing (the file keeps its
+ * hole); the neighbouring page programs and reads back normally.
+ * RED before X-1: the property is unknown, QEMU exits at startup.
+ */
+static void test_flash_dmg_program_fail(void)
+{
+    static const char json[] =
+        "{\"v\":1,\"damage\":[{\"kind\":\"program-fail\","
+        "\"mcm\":0,\"chip\":0,\"page\":5000}]}";
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *z0 = g_malloc0(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    gchar *list;
+    size_t i;
+
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0x5Au);
+    }
+
+    qts = flash_dmg_qtest_new(json, FLASH_LATENCY_ON);
+    if (!qts) {
+        return;
+    }
+
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=file kind=program-fail page=5000");
+    g_free(list);
+
+    /* the program takes its full latency, then fails once */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, FLASH_DMG_PROG_PAGE,
+                       CMD_PAGE_WRITE);
+    flash_assert_busy(qts);
+    flash_step_us(qts, FLASH_TPROG_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    flash_step_us(qts, 2);
+    g_assert_cmpuint(qtest_readl(qts, FLASH_CMDSTA)
+                     & (FTNAND_BUSY | FTNAND_FAILED | FTNAND_READY),
+                     ==, FTNAND_FAILED | FTNAND_READY);
+    g_assert_true(flash_irq_pending(qts));
+    flash_assert_no_more_irq(qts);
+
+    /* nothing was written: the erased page is still a host hole */
+    flash_pread_page(stix_dmg_flash_path,
+                     (uint64_t)FLASH_DMG_PROG_PAGE * FLASH_PAGE_BYTES, host);
+    g_assert_cmpint(memcmp(host, z0, FLASH_PAGE_BYTES), ==, 0);
+
+    /* the neighbouring page 5001 is unaffected */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, FLASH_DMG_PROG_PAGE + 1, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_ram_fill(qts, FLASH_RAM_B, 0x00);
+    flash_issue(qts, FLASH_RAM_B, FLASH_DMG_PROG_PAGE + 1, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-prog"), ==, 2);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-dmg-stuck0 (X-1, O4): a page-scope stuck bit with
+ * bit "12.3" and a block-scope stuck block 71, both at value 0, written
+ * with the "stuck0" alias (the O4 grammar's value-0 shorthand). Reads
+ * complete OK (a stuck cell is not an error) but return the true page
+ * with the stuck bits forced to 0 — also for a page programmed in the
+ * same session — and the stored file keeps the true bytes (the mask is
+ * read-side only). A page in neither scope reads back unmasked.
+ * RED before X-1: the property is unknown, QEMU exits at startup.
+ */
+static void test_flash_dmg_stuck0(void)
+{
+    static const char json[] =
+        "{\"v\":1,\"damage\":["
+        "{\"kind\":\"stuck0\",\"page\":4490,\"bit\":\"12.3\"},"
+        "{\"kind\":\"stuck0\",\"block\":71}]}";
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *r = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    gchar *list;
+    size_t i;
+
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0x96u);
+    }
+
+    qts = flash_dmg_qtest_new(json, FLASH_LATENCY_ON);
+    if (!qts) {
+        return;
+    }
+
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=file kind=stuck value=0 page=4490 "
+                              "bit=12.3\nsrc=file kind=stuck value=0 "
+                              "block=71");
+    g_free(list);
+
+    /* the bit form: byte 12 bit 3 reads 0, everything else is true */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);          /* a program into the page is fine */
+    flash_issue(qts, FLASH_RAM_B, FLASH_DMG_PAGE, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);          /* and the read itself is not */
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        uint8_t want = i == 12 ? (uint8_t)(p[i] & ~(1u << 3)) : p[i];
+
+        if (r[i] != want) {
+            g_test_message("byte %zu: got 0x%02x want 0x%02x", i, r[i],
+                           want);
+        }
+        g_assert_cmpuint(r[i], ==, want);
+    }
+    /* the file keeps the true bytes: the mask is read-side only */
+    flash_pread_page(stix_dmg_flash_path,
+                     (uint64_t)FLASH_DMG_PAGE * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+    /*
+     * the block form: every byte of a freshly programmed page in block
+     * 71 reads with bit 0 cleared, two pages deep
+     */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK,
+                CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_issue(qts, FLASH_RAM_B,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK,
+                CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        g_assert_cmpuint(r[i], ==, (uint8_t)(p[i] & ~1u));
+    }
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK + 6,
+                CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_issue(qts, FLASH_RAM_B,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK + 6,
+                CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        g_assert_cmpuint(r[i], ==, (uint8_t)(p[i] & ~1u));
+    }
+
+    /* a page in neither scope reads true */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, 4700, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_issue(qts, FLASH_RAM_B, 4700, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(r, p, FLASH_PAGE_BYTES), ==, 0);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-read"), ==, 4);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-dmg-stuck1 (X-1, O4): the mirror of
+ * flash-dmg-stuck0 with the stuck value 1, written with the general
+ * grammar kind "stuck" + "value": 1. An erased page (0xFF) is
+ * unaffected by a stuck-1 bit (the bit already reads 1), a programmed
+ * 0 on that bit reads 1, and the stored file keeps the true bytes (the
+ * mask is read-side only). The block form forces bit 0 of every byte
+ * to 1, two pages deep.
+ * RED before O4: kind "stuck" is an unknown kind, the sidecar fails
+ * the parse and QEMU exits at startup.
+ */
+static void test_flash_dmg_stuck1(void)
+{
+    static const char json[] =
+        "{\"v\":1,\"damage\":["
+        "{\"kind\":\"stuck\",\"value\":1,\"page\":4490,\"bit\":\"12.3\"},"
+        "{\"kind\":\"stuck\",\"value\":1,\"block\":71}]}";
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *r = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    gchar *list;
+    size_t i;
+
+    /* p[12] = 0x65: bit 3 is a programmed 0, so the stuck-1 read flips it */
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0x69u);
+    }
+
+    qts = flash_dmg_qtest_new(json, FLASH_LATENCY_ON);
+    if (!qts) {
+        return;
+    }
+
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=file kind=stuck value=1 page=4490 "
+                              "bit=12.3\nsrc=file kind=stuck value=1 "
+                              "block=71");
+    g_free(list);
+
+    /* an erased page reads 0xFF with and without the stuck-1 masks */
+    flash_ram_fill(qts, FLASH_RAM_B, 0x00);
+    flash_issue(qts, FLASH_RAM_B, FLASH_DMG_PAGE, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        g_assert_cmpuint(r[i], ==, 0xffu);
+    }
+    flash_issue(qts, FLASH_RAM_B,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK,
+                CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        g_assert_cmpuint(r[i], ==, 0xffu);
+    }
+
+    /* the bit form: byte 12 bit 3 reads 1, everything else is true */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);          /* a program into the page is fine */
+    flash_issue(qts, FLASH_RAM_B, FLASH_DMG_PAGE, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        uint8_t want = i == 12 ? (uint8_t)(p[i] | (1u << 3)) : p[i];
+
+        if (r[i] != want) {
+            g_test_message("byte %zu: got 0x%02x want 0x%02x", i, r[i],
+                           want);
+        }
+        g_assert_cmpuint(r[i], ==, want);
+    }
+    /* the file keeps the true bytes: the mask is read-side only */
+    flash_pread_page(stix_dmg_flash_path,
+                     (uint64_t)FLASH_DMG_PAGE * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+    /*
+     * the block form: every byte of a freshly programmed page in block
+     * 71 reads with bit 0 set, two pages deep
+     */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK,
+                CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_issue(qts, FLASH_RAM_B,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK,
+                CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        g_assert_cmpuint(r[i], ==, (uint8_t)(p[i] | 1u));
+    }
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK + 6,
+                CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_issue(qts, FLASH_RAM_B,
+                (FLASH_DMG_BLOCK + 1) * FLASH_PAGENUM_IN_BLOCK + 6,
+                CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        g_assert_cmpuint(r[i], ==, (uint8_t)(p[i] | 1u));
+    }
+
+    /* a page in neither scope reads true */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, 4700, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_issue(qts, FLASH_RAM_B, 4700, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(r, p, FLASH_PAGE_BYTES), ==, 0);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-read"), ==, 6);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-dmg-stuck-multi (X-1, review finding 3): two stuck
+ * entries on one page of block 70, bits "12.3" and "12.4", both value
+ * 1 — every matching entry applies, so both bits read set. The mask
+ * used to apply only the first matching entry (silently, while
+ * damage-list already showed both rows).
+ * RED before the fix: bit 4 reads true and byte 12 is 0x6d, not 0x7d.
+ */
+static void test_flash_dmg_stuck_multi(void)
+{
+    static const char json[] =
+        "{\"v\":1,\"damage\":["
+        "{\"kind\":\"stuck\",\"value\":1,\"page\":4490,\"bit\":\"12.3\"},"
+        "{\"kind\":\"stuck\",\"value\":1,\"page\":4490,\"bit\":\"12.4\"}]}";
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *r = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    gchar *list;
+    size_t i;
+
+    /*
+     * p[12] = 0x65: bits 3 and 4 are programmed 0, so both stuck-1
+     * bits must flip to 1 on the read
+     */
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0x69u);
+    }
+
+    qts = flash_dmg_qtest_new(json, FLASH_LATENCY_ON);
+    if (!qts) {
+        return;
+    }
+
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=file kind=stuck value=1 page=4490 "
+                              "bit=12.3\nsrc=file kind=stuck value=1 "
+                              "page=4490 bit=12.4");
+    g_free(list);
+
+    /* the bit form: byte 12 reads with bits 3 and 4 set, the rest true */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);          /* a program into the page is fine */
+    flash_issue(qts, FLASH_RAM_B, FLASH_DMG_PAGE, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    qtest_memread(qts, FLASH_RAM_B, r, FLASH_PAGE_BYTES);
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        uint8_t want = i == 12 ? (uint8_t)(p[i] | (1u << 3) | (1u << 4))
+                               : p[i];
+
+        if (r[i] != want) {
+            g_test_message("byte %zu: got 0x%02x want 0x%02x", i, r[i],
+                           want);
+        }
+        g_assert_cmpuint(r[i], ==, want);
+    }
+    /* the file keeps the true bytes: the mask is read-side only */
+    flash_pread_page(stix_dmg_flash_path,
+                     (uint64_t)FLASH_DMG_PAGE * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-dmg-marker-plain (X-1, correction 4 / review
+ * finding 4): the tool writes badBlockMarker = 0 as a data byte, so the
+ * guest must see 0x00 at spare offset 4096 in both storage modes. The
+ * qtest hand-writes the marker bytes (the tool only exists from X-3):
+ * in plain mode 0x00 on disk reads 0x00, in inverted mode 0xFF on disk
+ * reads 0x00.
+ * RED if the inversion rule breaks: in inverted mode the hand-written
+ * 0xFF would read 0xFF, in plain mode the 0xFF fill would read 0x00.
+ */
+static void test_flash_dmg_marker_plain(void)
+{
+    /* plain mode: a 0xFF page with the marker byte 0x00 on disk */
+    {
+        g_autofree gchar *path = NULL;
+        g_autofree gchar *extra = NULL;
+        g_autofree uint8_t *ff = g_malloc(FLASH_PAGE_BYTES);
+        g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+        const uint8_t marker = 0x00;
+        off_t off = (off_t)5 * FLASH_PAGE_BYTES;
+        int fd = g_file_open_tmp("stix-flash-marker-XXXXXX", &path, NULL);
+        QTestState *qts;
+
+        g_assert(fd >= 0);
+        g_assert(ftruncate(fd, 1024 * 1024) == 0);
+        memset(ff, 0xFF, FLASH_PAGE_BYTES);
+        g_assert_cmpint(pwrite(fd, ff, FLASH_PAGE_BYTES, off), ==,
+                        (ssize_t)FLASH_PAGE_BYTES);
+        g_assert_cmpint(pwrite(fd, &marker, 1, off + FLASH_DMG_SPARE_OFF),
+                        ==, 1);
+        close(fd);
+        extra = g_strdup_printf("-global grlib-stixflash.flash-file=%s "
+                                "-global grlib-stixflash.inverted-storage=off",
+                                path);
+        qts = qtest_initf("-M leon3_generic %s", extra);
+        flash_issue(qts, FLASH_RAM_A, 5, CMD_PAGE_READ);
+        qtest_memread(qts, FLASH_RAM_A, host, FLASH_PAGE_BYTES);
+        g_assert_cmpuint(host[FLASH_DMG_SPARE_OFF - 1], ==, 0xFF);
+        g_assert_cmpuint(host[FLASH_DMG_SPARE_OFF], ==, 0x00);
+        g_assert_cmpuint(host[FLASH_DMG_SPARE_OFF + 1], ==, 0xFF);
+        qtest_quit(qts);
+        g_unlink(path);
+    }
+
+    /* inverted mode: the marker byte sits on disk as 0xFF */
+    {
+        g_autofree gchar *path = NULL;
+        g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+        const uint8_t marker = 0xFF;
+        off_t off = (off_t)5 * FLASH_PAGE_BYTES;
+        int fd = g_file_open_tmp("stix-flash-marker-XXXXXX", &path, NULL);
+        QTestState *qts;
+
+        g_assert(fd >= 0);
+        g_assert(ftruncate(fd, 1024 * 1024) == 0);  /* holes = guest 0xFF */
+        g_assert_cmpint(pwrite(fd, &marker, 1, off + FLASH_DMG_SPARE_OFF),
+                        ==, 1);
+        close(fd);
+        qts = qtest_initf("-M leon3_generic "
+                          "-global grlib-stixflash.flash-file=%s", path);
+        flash_issue(qts, FLASH_RAM_A, 5, CMD_PAGE_READ);
+        qtest_memread(qts, FLASH_RAM_A, host, FLASH_PAGE_BYTES);
+        g_assert_cmpuint(host[FLASH_DMG_SPARE_OFF - 1], ==, 0xFF);
+        g_assert_cmpuint(host[FLASH_DMG_SPARE_OFF], ==, 0x00);
+        g_assert_cmpuint(host[FLASH_DMG_SPARE_OFF + 1], ==, 0xFF);
+        qtest_quit(qts);
+        g_unlink(path);
+    }
+}
+
+/*
+ * /sparc/stix/flash-dmg-quiet (X-1, D-X6): with no map configured the
+ * device is byte-identical to the pre-damage model: damage-list is
+ * empty, a read/program/erase round completes with the usual statuses,
+ * counters and one IRQ per op, and no stixflash_damage_* trace line
+ * fires (the golden capture runs -trace 'stix*').
+ * RED before X-1: damage-list is an unknown property, the qom-get
+ * errors and the test aborts.
+ */
+static void test_flash_dmg_quiet(void)
+{
+    g_autofree gchar *log = NULL;
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *text = NULL;
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    QTestState *qts;
+    gchar *list;
+    size_t i;
+    int fd;
+
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0xAu);
+    }
+    fd = g_file_open_tmp("stix-flash-dmgquiet-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("%s -trace stixflash_damage_load "
+                            "-trace stixflash_damage_hit "
+                            "-trace stixflash_op_done -D %s",
+                            FLASH_LATENCY_ON, log);
+    qts = stix_qtest_new_extra(extra);
+
+    list = flash_dmg_list(qts);
+    g_assert_nonnull(list);
+    g_assert_cmpstr(list, ==, "");
+    g_free(list);
+
+    /* the usual round: one IRQ each, normal statuses and counters */
+    flash_ram_fill(qts, FLASH_RAM_A, 0x00);
+    flash_irq_clear(qts);
+    flash_issue(qts, FLASH_RAM_A, 6, CMD_PAGE_READ);
+    flash_assert_done_ok(qts);
+    g_assert_cmphex(qtest_readl(qts, FLASH_RAM_A), ==, 0xffffffffu);
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, 6, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_issue(qts, FLASH_RAM_A, 6, CMD_BLOCK_ERASE);
+    flash_assert_done_ok(qts);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-read"), ==, 1);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-prog"), ==, 1);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-erase"), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_assert(g_file_get_contents(log, &text, NULL, NULL));
+    /* positive control: stixflash_op_done is enabled, the ops landed */
+    g_assert_nonnull(strstr(text, "stixflash_op_done"));
+    g_assert_null(strstr(text, "stixflash_damage"));
+    unlink(log);
+}
+
+#define DMG_TEST_MAP_ENV "STIX_TEST_DMG_MAP"
+
+/* g_test_trap_subprocess child: start QEMU with the sidecar, then quit. */
+static void test_flash_dmg_map_error_subprocess(void)
+{
+    const char *map = g_getenv(DMG_TEST_MAP_ENV);
+    const char *flash = g_getenv(TMTC_TEST_FLASH_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(map);
+    g_assert_nonnull(flash);
+    /* qtest_init aborts: QEMU realize refuses the malformed sidecar */
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s "
+                      "-global grlib-stixflash.flash-damage-map=%s",
+                      flash, map);
+    qtest_quit(qts);
+}
+
+/*
+ * /sparc/stix/flash-dmg-map-parse (X-1, D-X3): a malformed sidecar
+ * fails realize, naming the path and the reason; a missing file is
+ * silence. RED before X-1: the property is unknown, so every child dies
+ * with a different message and the missing-file case cannot boot.
+ */
+static void test_flash_dmg_map_parse(void)
+{
+    static const struct {
+        const char *json;
+        const char *pat;
+    } cases[] = {
+        { "this is not json", "*JSON parse error*" },
+        { "[1,2]", "*top level is not a JSON object*" },
+        { "{\"v\":2,\"damage\":[]}", "*unsupported version 2*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"warp\",\"block\":70}]}",
+          "*'kind' must be*got 'warp'*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"erase-fail\",\"block\":10}]}",
+          "*block 10 is in the reserved ASW*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"program-fail\",\"block\":70}]}",
+          "*program-fail is a page kind*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"stuck0\",\"page\":4490}]}",
+          "*needs a bit as 'byte.bit'*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"stuck0\",\"page\":4490,"
+          "\"bit\":\"12.9\"}]}", "*bit < 8, got '12.9'*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"stuck\",\"page\":4490}]}",
+          "*'value' must be a JSON integer in [0, 1]*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"stuck\",\"page\":4490,"
+          "\"value\":2,\"bit\":\"12.3\"}]}",
+          "*'value' must be a JSON integer in [0, 1]*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"stuck0\",\"page\":4490,"
+          "\"value\":0,\"bit\":\"12.3\"}]}",
+          "*'value' with the 'stuck0' alias*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"erase-fail\",\"block\":70,"
+          "\"value\":1}]}", "*'value' is only valid with kind \"stuck\"*" },
+        { "{\"v\":1,\"damage\":[{\"kind\":\"erase-fail\",\"block\":70,"
+          "\"pages\":3}]}", "*unknown key 'pages'*" },
+    };
+    g_autofree gchar *path = NULL;
+    g_autofree gchar *map = NULL;
+    g_autofree gchar *pat = NULL;
+    g_autofree gchar *sub = stix_test_path("flash-dmg-map-parse/subprocess");
+    size_t i;
+    int fd;
+
+    fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+    close(fd);
+    g_setenv(TMTC_TEST_FLASH_ENV, path, TRUE);
+    g_setenv(DMG_TEST_MAP_ENV, "", TRUE);
+
+    for (i = 0; i < G_N_ELEMENTS(cases); i++) {
+        fd = g_file_open_tmp("stix-flash-dmg-XXXXXX", &map, NULL);
+        g_assert(fd >= 0);
+        g_assert_cmpint(write(fd, cases[i].json, strlen(cases[i].json)),
+                        ==, (ssize_t)strlen(cases[i].json));
+        close(fd);
+        g_setenv(DMG_TEST_MAP_ENV, map, TRUE);
+        pat = g_strdup_printf("*flash-damage-map %s: *%s*", map,
+                              cases[i].pat);
+        g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+        g_test_trap_assert_failed();
+        g_test_trap_assert_stderr(pat);
+        g_unlink(map);
+        g_clear_pointer(&map, g_free);
+        g_clear_pointer(&pat, g_free);
+    }
+    g_unlink(path);
+
+    /* a missing sidecar file is silence: QEMU boots, the list is empty */
+    {
+        g_autofree gchar *missing = g_strdup_printf("%s.does-not-exist",
+                                                    path);
+        g_autofree gchar *all = g_strdup_printf(
+            "-global grlib-stixflash.flash-damage-map=%s", missing);
+        QTestState *qts = stix_qtest_new_extra(all);
+        gchar *list = flash_dmg_list(qts);
+
+        g_assert_nonnull(list);
+        g_assert_cmpstr(list, ==, "");
+        g_free(list);
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+    }
+}
+
+/* X-1: one registration call from main(), the track's merge surface. */
+static void stix_flashdmg_register(void)
+{
+    qtest_add_func("/sparc/stix/flash-dmg-erase-fail",
+                   test_flash_dmg_erase_fail);
+    qtest_add_func("/sparc/stix/flash-dmg-program-fail",
+                   test_flash_dmg_program_fail);
+    qtest_add_func("/sparc/stix/flash-dmg-stuck0", test_flash_dmg_stuck0);
+    qtest_add_func("/sparc/stix/flash-dmg-stuck1", test_flash_dmg_stuck1);
+    qtest_add_func("/sparc/stix/flash-dmg-stuck-multi",
+                   test_flash_dmg_stuck_multi);
+    qtest_add_func("/sparc/stix/flash-dmg-marker-plain",
+                   test_flash_dmg_marker_plain);
+    qtest_add_func("/sparc/stix/flash-dmg-quiet", test_flash_dmg_quiet);
+    qtest_add_func("/sparc/stix/flash-dmg-map-parse/subprocess",
+                   test_flash_dmg_map_error_subprocess);
+    qtest_add_func("/sparc/stix/flash-dmg-map-parse",
+                   test_flash_dmg_map_parse);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -11773,6 +12566,7 @@ int main(int argc, char **argv)
         stix_det7_register();
         stix_platform_register();
         stix_att_register();
+        stix_flashdmg_register();
     }
 
     return g_test_run();

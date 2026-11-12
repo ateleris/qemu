@@ -20,6 +20,10 @@
 
 #include "trace.h"
 #include "qom/object.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
+#include "qobject/qlist.h"
+#include "qobject/qnum.h"
 
 #define STIXFLASH_REG_SIZE 256 /* Size of memory mapped registers */
 #define FLASH_FILE "flash.bin"
@@ -102,6 +106,35 @@ typedef struct StixFlashOp {
     bool sample_failed;
 } StixFlashOp;
 
+/*
+ * Flash damage plan D-X2/D-X3: device-side damage, one list, loaded
+ * from the sidecar at realize (the runtime QOM surface is X-2).
+ * Addresses are canonical: mcm/chip plus the page inside the chip.
+ * erase-fail covers the 64-page block from its base page; program-fail
+ * and stuck hit one page, stuck also in the block-scope form.
+ */
+typedef enum {
+    STIXFLASH_DMG_ERASE_FAIL,
+    STIXFLASH_DMG_PROGRAM_FAIL,
+    STIXFLASH_DMG_STUCK,
+} StixFlashDmgKind;
+
+typedef struct StixFlashDamage {
+    StixFlashDmgKind kind;
+    uint32_t mcm;
+    uint32_t chip;
+    uint32_t page;   /* page in the chip; block scope: the base page */
+    bool block_scope;
+    uint32_t byte;   /* stuck page scope: the masked byte in the page */
+    uint8_t bit;     /* stuck: the stuck bit (block scope: 0) */
+    uint8_t value;   /* stuck: the value the bit reads, 0 or 1 (O4) */
+} StixFlashDamage;
+
+/* blocks < 64 are the ASW image area: no sidecar entry, no override */
+#define STIXFLASH_DMG_RESERVED_BLOCKS 64uLL
+/* the sidecar is a small file; refuse anything larger at realize */
+#define STIXFLASH_DMG_FILE_MAX (1024uLL * 1024)
+
 struct STIXFLASH
 {
     SysBusDevice parent_obj;
@@ -152,6 +185,11 @@ struct STIXFLASH
     uint64_t ops_prog;
     uint64_t ops_erase;
     uint64_t ops_abort;
+
+    /* D-X3: the sidecar qdev property and the damage list it loaded */
+    char *flash_damage_map;
+    StixFlashDamage *damage;
+    size_t damage_len;
 };
 
 /* ---- error contract: guest-commanded failures never abort QEMU ----
@@ -373,7 +411,10 @@ static const char *execute_flash_erase(STIXFLASH *stixflash)
     return NULL;
 }
 
-static const char *execute_flash_read(STIXFLASH *stixflash)
+/*
+ * The file stage of a read: page_data holds the guest page image.
+ */
+static const char *flash_read_file(STIXFLASH *stixflash)
 {
     const StixFlashOp *op = &stixflash->op;
     uint64_t position_in_file = flash_offset(op, op->page);
@@ -403,25 +444,25 @@ static const char *execute_flash_read(STIXFLASH *stixflash)
         }
     }
 
-    /*
-     * D-F2/D-F3: the data lands in guest RAM at completion, under the
-     * re-entrancy guard; a refused or failed DMA fails the command
-     */
-    {
-        bool was = stixflash_guard_enter(stixflash);
-        MemTxResult r = address_space_write(&address_space_memory,
-                                            op->ram_address,
-                                            MEMTXATTRS_UNSPECIFIED,
-                                            stixflash->page_data,
-                                            FLASH_PAGE_SIZE);
-
-        stixflash_guard_exit(stixflash, was);
-        if (r != MEMTX_OK) {
-            return "dma";
-        }
-    }
-
     return NULL;
+}
+
+/*
+ * D-F2/D-F3: the data lands in guest RAM at completion, under the
+ * re-entrancy guard; a refused or failed DMA fails the command.
+ */
+static const char *flash_read_dma(STIXFLASH *stixflash)
+{
+    const StixFlashOp *op = &stixflash->op;
+    bool was = stixflash_guard_enter(stixflash);
+    MemTxResult r = address_space_write(&address_space_memory,
+                                        op->ram_address,
+                                        MEMTXATTRS_UNSPECIFIED,
+                                        stixflash->page_data,
+                                        FLASH_PAGE_SIZE);
+
+    stixflash_guard_exit(stixflash, was);
+    return r != MEMTX_OK ? "dma" : NULL;
 }
 
 /* page_data holds the guest page image sampled at issue */
@@ -443,8 +484,11 @@ static const char *execute_flash_write(STIXFLASH *stixflash)
     }
 
     // a page past the backing file fails the command; the file is never
-    // extended (a hole would read 0x00 = bad-block marker on the next boot
-    // scan, D-H)
+    /*
+     * extended (in plain mode a hole would read 0x00 = bad-block
+     * marker on the next boot scan; with the default inversion it
+     * reads 0xFF = erased, D-H)
+     */
     if (flash_page_beyond_eof(position_in_file, file_size)) {
         return "beyond-backing-file";
     }
@@ -476,6 +520,108 @@ static const char *execute_flash_write(STIXFLASH *stixflash)
 }
 
 /*
+ * ---- D-X2/D-X3: the damage hit points ----
+ *
+ * All damage applies at stixflash_complete() only: a failed erase or
+ * program still takes its full latency and then fails like hardware,
+ * and the stuck kind masks the read after the file stage, before the
+ * DMA.
+ */
+
+/*
+ * Does an entry of @kind hit this op? An erase hits when the erased
+ * block (base = page & ~63) is the damaged one; program and stuck hit
+ * the exact page, a block-scope stuck the whole block. D-X6: with no
+ * damage this NULL check is the only hot-path cost.
+ */
+static const StixFlashDamage *stixflash_damage_find(const STIXFLASH *s,
+                                                    const StixFlashOp *op,
+                                                    StixFlashDmgKind kind)
+{
+    const StixFlashDamage *d;
+    size_t i;
+
+    if (s->damage == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < s->damage_len; i++) {
+        d = &s->damage[i];
+        if (d->kind != kind || d->mcm != op->mcm || d->chip != op->chip) {
+            continue;
+        }
+        if (d->block_scope) {
+            if ((op->page & ~(uint32_t)(FLASH_PAGENUM_IN_BLOCK - 1))
+                == d->page) {
+                return d;
+            }
+        } else if (op->page == d->page) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+/* D-X3: the failing kinds go through the normal failure contract. */
+static const char *stixflash_damage_fail(STIXFLASH *s, const StixFlashOp *op,
+                                         StixFlashDmgKind kind)
+{
+    if (stixflash_damage_find(s, op, kind) == NULL) {
+        return NULL;
+    }
+    return kind == STIXFLASH_DMG_ERASE_FAIL ? "erase-fail" : "program-fail";
+}
+
+/*
+ * D-X2: stuck at read completion — the true page with the stuck bits
+ * forced to their stuck value (0 or 1, O4), on every read, so a
+ * freshly programmed page reads masked too. The stored data is not
+ * touched. Every matching stuck entry applies, in list order: entries
+ * on one page stack across bits, and on the same bit the later entry
+ * in the list wins. The hit trace carries the last applied entry's
+ * kind string. Returns it, NULL when no stuck entry applies.
+ */
+static const char *stixflash_damage_mask(STIXFLASH *s)
+{
+    const StixFlashOp *op = &s->op;
+    const char *kind = NULL;
+    size_t i, j;
+
+    if (s->damage == NULL) {
+        return NULL;
+    }
+    for (i = 0; i < s->damage_len; i++) {
+        const StixFlashDamage *d = &s->damage[i];
+
+        if (d->kind != STIXFLASH_DMG_STUCK ||
+            d->mcm != op->mcm || d->chip != op->chip) {
+            continue;
+        }
+        if (d->block_scope) {
+            if ((op->page & ~(uint32_t)(FLASH_PAGENUM_IN_BLOCK - 1))
+                != d->page) {
+                continue;
+            }
+            for (j = 0; j < (size_t)FLASH_PAGE_SIZE; j++) {
+                s->page_data[j] = d->value
+                    ? (uint8_t)(s->page_data[j] | 1u)
+                    : (uint8_t)(s->page_data[j] & ~1u);
+            }
+        } else {
+            if (op->page != d->page) {
+                continue;
+            }
+            if (d->value) {
+                s->page_data[d->byte] |= (uint8_t)(1u << d->bit);
+            } else {
+                s->page_data[d->byte] &= (uint8_t)~(1u << d->bit);
+            }
+        }
+        kind = d->value ? "stuck1" : "stuck0";
+    }
+    return kind;
+}
+
+/*
  * D-F1 completion: execute the latched op (host file I/O, the read
  * DMA), then set the final status (BUSY 0, READY 1, WRPROT 1, FAILED
  * from the result) and pulse the IRQ once, last, so the FSW's ISR
@@ -486,17 +632,35 @@ static const char *execute_flash_write(STIXFLASH *stixflash)
 static void stixflash_complete(STIXFLASH *stixflash)
 {
     StixFlashOp *op = &stixflash->op;
+    const char *dmg_kind = NULL;
     const char *why;
 
     switch (op->cmd) {
     case COMMAND_BLOCK_ERASE:
-        why = execute_flash_erase(stixflash);
+        why = stixflash_damage_fail(stixflash, op, STIXFLASH_DMG_ERASE_FAIL);
+        if (why != NULL) {
+            dmg_kind = why;     /* nothing erased, the op just fails */
+        } else {
+            why = execute_flash_erase(stixflash);
+        }
         break;
     case COMMAND_PAGE_READ:
-        why = execute_flash_read(stixflash);
+        why = flash_read_file(stixflash);
+        if (why == NULL) {
+            dmg_kind = stixflash_damage_mask(stixflash);
+        }
+        if (why == NULL) {
+            why = flash_read_dma(stixflash);
+        }
         break;
     case COMMAND_PAGE_WRITE:
-        why = execute_flash_write(stixflash);
+        why = stixflash_damage_fail(stixflash, op,
+                                    STIXFLASH_DMG_PROGRAM_FAIL);
+        if (why != NULL) {
+            dmg_kind = why;     /* nothing written, the op just fails */
+        } else {
+            why = execute_flash_write(stixflash);
+        }
         break;
     default:
         g_assert_not_reached(); /* issue latches only these three */
@@ -512,6 +676,10 @@ static void stixflash_complete(STIXFLASH *stixflash)
         stixflash->cmd_sta &= ~(1u << ERROR_CODE_FAILED);
     }
     trace_stixflash_op_done(op->cmd, op->page_address, stixflash->cmd_sta);
+    if (dmg_kind != NULL) {
+        trace_stixflash_damage_hit(dmg_kind, op->page_address,
+                                   stixflash->cmd_sta);
+    }
     qemu_irq_pulse(stixflash->irq);
 }
 
@@ -864,6 +1032,409 @@ static bool stixflash_check_latency(const char *name, uint32_t us,
     return true;
 }
 
+/*
+ * ---- D-X3: the sidecar ----
+ *
+ * {"v":1,"damage":[{...}, ...]}, one small JSON file next to the flash.
+ * A missing file is silence; anything present but unreadable or
+ * malformed fails realize, naming the path and the reason. All entries
+ * are canonical (mcm, chip, page in chip) after the parse.
+ */
+
+/* one JSON integer in [lo, hi] */
+static bool stixflash_dmg_int(const QDict *e, const char *key, int64_t lo,
+                              int64_t hi, uint32_t *out, Error **errp)
+{
+    QObject *o = qdict_get(e, key);
+    int64_t v;
+
+    if (o == NULL || qobject_type(o) != QTYPE_QNUM ||
+        !qnum_get_try_int(qobject_to(QNum, o), &v) || v < lo || v > hi) {
+        error_setg(errp, "'%s' must be a JSON integer in [%lld, %lld]",
+                   key, (long long)lo, (long long)hi);
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+/*
+ * Parse one entry into @d. The addressing grammar of D-X2, in JSON
+ * keys: "block" (linear block), "page" (linear page), or "mcm"+"chip"
+ * with "page" (chip-relative), "block" (block in chip) or "block" +
+ * "page" (the framework's form). "bit" ("byte.bit" inside the page)
+ * and "value" (0 or 1) are stuck-only; the framework's offset=<o> has
+ * no key here (the tool resolves it to a bit before writing the
+ * sidecar).
+ */
+static bool stixflash_dmg_entry(QDict *e, StixFlashDamage *d, Error **errp)
+{
+    const uint32_t blocks_per_mcm = (uint32_t)(FLASH_DEVICES_PER_MCM *
+                                               FLASH_BLOCKS_PER_DEVICE);
+    const uint32_t pages_per_chip = (uint32_t)(FLASH_BLOCKS_PER_DEVICE *
+                                               FLASH_PAGENUM_IN_BLOCK);
+    const uint32_t blocks_total = (uint32_t)(FLASH_NUM_MCMS *
+                                             FLASH_DEVICES_PER_MCM *
+                                             FLASH_BLOCKS_PER_DEVICE);
+    static const char *const keys[] = {
+        "kind", "block", "page", "mcm", "chip", "bit", "value",
+    };
+    const QDictEntry *ent;
+    const char *kind;
+    uint32_t mcm = 0, chip = 0, block = 0, page = 0;
+    bool has_block = qdict_haskey(e, "block");
+    bool has_page = qdict_haskey(e, "page");
+    bool has_mcm = qdict_haskey(e, "mcm");
+    bool page_scope;
+
+    for (ent = qdict_first(e); ent != NULL; ent = qdict_next(e, ent)) {
+        const char *k = qdict_entry_key(ent);
+        size_t j;
+
+        for (j = 0; j < ARRAY_SIZE(keys); j++) {
+            if (strcmp(k, keys[j]) == 0) {
+                break;
+            }
+        }
+        if (j == ARRAY_SIZE(keys)) {
+            error_setg(errp, "unknown key '%s'", k);
+            return false;
+        }
+    }
+
+    kind = qdict_get_try_str(e, "kind");
+    if (kind != NULL && strcmp(kind, "erase-fail") == 0) {
+        d->kind = STIXFLASH_DMG_ERASE_FAIL;
+    } else if (kind != NULL && strcmp(kind, "program-fail") == 0) {
+        d->kind = STIXFLASH_DMG_PROGRAM_FAIL;
+    } else if (kind != NULL && strcmp(kind, "stuck") == 0) {
+        d->kind = STIXFLASH_DMG_STUCK;
+    } else if (kind != NULL && strcmp(kind, "stuck0") == 0) {
+        d->kind = STIXFLASH_DMG_STUCK;      /* alias: stuck at 0 */
+    } else {
+        error_setg(errp, "'kind' must be \"erase-fail\", \"program-fail\", "
+                   "\"stuck\" or \"stuck0\", got '%s'",
+                   kind != NULL ? kind : "(missing)");
+        return false;
+    }
+
+    if (d->kind == STIXFLASH_DMG_STUCK) {
+        uint32_t value = 0;
+
+        if (strcmp(kind, "stuck0") == 0) {
+            /* the alias fixes the value; an explicit one is ambiguous */
+            if (qdict_haskey(e, "value")) {
+                error_setg(errp, "'value' with the 'stuck0' alias; use "
+                           "kind \"stuck\" with \"value\": 0");
+                return false;
+            }
+        } else if (!stixflash_dmg_int(e, "value", 0, 1, &value, errp)) {
+            return false;
+        }
+        d->value = (uint8_t)value;
+    } else if (qdict_haskey(e, "value")) {
+        error_setg(errp, "'value' is only valid with kind \"stuck\"");
+        return false;
+    }
+
+    if (has_mcm != qdict_haskey(e, "chip")) {
+        error_setg(errp, "'mcm' and 'chip' go together");
+        return false;
+    }
+    if (has_mcm &&
+        (!stixflash_dmg_int(e, "mcm", 0, FLASH_NUM_MCMS - 1, &mcm, errp) ||
+         !stixflash_dmg_int(e, "chip", 0, FLASH_DEVICES_PER_MCM - 1, &chip,
+                            errp))) {
+        return false;
+    }
+
+    if (has_block && has_page) {
+        /* the framework form: block in chip + page in block */
+        uint32_t blk, pin;
+
+        if (!has_mcm) {
+            error_setg(errp, "'block' and 'page' together need 'mcm' and "
+                       "'chip'; name one of them alone for the linear "
+                       "form");
+            return false;
+        }
+        if (!stixflash_dmg_int(e, "block", 0, FLASH_BLOCKS_PER_DEVICE - 1,
+                               &blk, errp) ||
+            !stixflash_dmg_int(e, "page", 0, FLASH_PAGENUM_IN_BLOCK - 1,
+                               &pin, errp)) {
+            return false;
+        }
+        block = mcm * blocks_per_mcm + chip * FLASH_BLOCKS_PER_DEVICE + blk;
+        page = blk * FLASH_PAGENUM_IN_BLOCK + pin;
+        page_scope = true;
+    } else if (has_block) {
+        uint32_t blk;
+
+        if (has_mcm) {
+            if (!stixflash_dmg_int(e, "block", 0,
+                                   FLASH_BLOCKS_PER_DEVICE - 1, &blk,
+                                   errp)) {
+                return false;
+            }
+            block = mcm * blocks_per_mcm + chip * FLASH_BLOCKS_PER_DEVICE
+                    + blk;
+        } else {
+            if (!stixflash_dmg_int(e, "block", 0, blocks_total - 1, &block,
+                                   errp)) {
+                return false;
+            }
+            blk = block % FLASH_BLOCKS_PER_DEVICE;
+        }
+        mcm = block / blocks_per_mcm;
+        chip = block / FLASH_BLOCKS_PER_DEVICE % FLASH_DEVICES_PER_MCM;
+        page = blk * FLASH_PAGENUM_IN_BLOCK;
+        page_scope = false;
+    } else if (has_page) {
+        uint32_t lin;
+
+        if (has_mcm) {
+            if (!stixflash_dmg_int(e, "page", 0, pages_per_chip - 1, &page,
+                                   errp)) {
+                return false;
+            }
+        } else {
+            if (!stixflash_dmg_int(e, "page", 0,
+                                   blocks_total * FLASH_PAGENUM_IN_BLOCK - 1,
+                                   &lin, errp)) {
+                return false;
+            }
+            mcm = lin / (blocks_per_mcm * FLASH_PAGENUM_IN_BLOCK);
+            chip = lin / pages_per_chip % FLASH_DEVICES_PER_MCM;
+            page = lin % pages_per_chip;
+        }
+        page_scope = true;
+    } else {
+        error_setg(errp, "needs a 'block' or a 'page'");
+        return false;
+    }
+
+    /* the reserved ASW image area, by the containing block (D-X3) */
+    {
+        uint32_t lin_block = mcm * blocks_per_mcm
+                             + chip * FLASH_BLOCKS_PER_DEVICE
+                             + page / FLASH_PAGENUM_IN_BLOCK;
+
+        if (lin_block < STIXFLASH_DMG_RESERVED_BLOCKS) {
+            error_setg(errp, "block %" PRIu32 " is in the reserved ASW "
+                       "image area (blocks < %llu)", lin_block,
+                       (unsigned long long)STIXFLASH_DMG_RESERVED_BLOCKS);
+            return false;
+        }
+    }
+
+    if (d->kind == STIXFLASH_DMG_ERASE_FAIL && page_scope) {
+        error_setg(errp, "erase-fail is a block kind");
+        return false;
+    }
+    if (d->kind == STIXFLASH_DMG_PROGRAM_FAIL && !page_scope) {
+        error_setg(errp, "program-fail is a page kind");
+        return false;
+    }
+
+    d->mcm = mcm;
+    d->chip = chip;
+    d->page = page;
+    d->block_scope = !page_scope;
+    d->byte = 0;
+    d->bit = 0;
+
+    if (d->kind == STIXFLASH_DMG_STUCK) {
+        if (page_scope) {
+            const char *bitstr = qdict_get_try_str(e, "bit");
+            uint32_t byte, bit;
+            char tail;
+
+            if (bitstr == NULL ||
+                sscanf(bitstr, "%u.%u%c", &byte, &bit, &tail) != 2 ||
+                byte >= FLASH_PAGE_SIZE || bit >= 8) {
+                error_setg(errp, "stuck needs a bit as 'byte.bit' with "
+                           "byte < %u and bit < 8, got '%s'",
+                           (uint32_t)FLASH_PAGE_SIZE,
+                           bitstr != NULL ? bitstr : "(missing)");
+                return false;
+            }
+            d->byte = byte;
+            d->bit = bit;
+        } else if (qdict_haskey(e, "bit")) {
+            error_setg(errp, "block-scope stuck takes no 'bit'");
+            return false;
+        }
+    }
+    return true;
+}
+
+/* D-X3: load the sidecar at realize. */
+static bool stixflash_damage_load(STIXFLASH *stixflash, Error **errp)
+{
+    const char *path = stixflash->flash_damage_map;
+    const QDict *top;
+    const QList *damage;
+    const QListEntry *le;
+    Error *err = NULL;
+    QObject *obj = NULL;
+    gchar *text = NULL;
+    gsize len;
+    size_t n;
+    FILE *f;
+    off_t size;
+
+    if (path == NULL || path[0] == '\0') {
+        return true;    /* no sidecar: no damage, nothing traced (D-X6) */
+    }
+
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        if (errno == ENOENT) {
+            return true;    /* a missing file is silence */
+        }
+        error_setg_errno(errp, errno, "stixflash: cannot read "
+                         "flash-damage-map %s", path);
+        return false;
+    }
+    size = fseeko(f, 0, SEEK_END) == 0 ? ftello(f) : -1;
+    if (size < 0) {
+        error_setg_errno(errp, errno, "stixflash: cannot determine the "
+                         "size of flash-damage-map %s", path);
+        fclose(f);
+        return false;
+    }
+    if ((uint64_t)size > STIXFLASH_DMG_FILE_MAX) {
+        error_setg(errp, "stixflash: flash-damage-map %s is over the "
+                   "%llu-byte sidecar cap", path,
+                   (unsigned long long)STIXFLASH_DMG_FILE_MAX);
+        fclose(f);
+        return false;
+    }
+    rewind(f);
+    text = g_malloc((gsize)size + 1);
+    len = fread(text, 1, (gsize)size, f);
+    fclose(f);
+    if (len != (gsize)size) {
+        error_setg(errp, "stixflash: flash-damage-map %s: short read", path);
+        goto fail_text;
+    }
+    text[len] = '\0';
+
+    obj = qobject_from_json(text, &err);
+    if (obj == NULL) {
+        error_prepend(&err, "stixflash: flash-damage-map %s: JSON parse "
+                      "error: ", path);
+        error_propagate(errp, err);
+        goto fail_text;
+    }
+    top = qobject_to(QDict, obj);
+    if (top == NULL) {
+        error_setg(errp, "stixflash: flash-damage-map %s: the top level is "
+                   "not a JSON object", path);
+        goto fail_obj;
+    }
+    {
+        QObject *vo = qdict_get(top, "v");
+        int64_t vv = 0;
+
+        if (vo == NULL || qobject_type(vo) != QTYPE_QNUM ||
+            !qnum_get_try_int(qobject_to(QNum, vo), &vv) || vv != 1) {
+            error_setg(errp, "stixflash: flash-damage-map %s: unsupported "
+                       "version %lld (want 1)", path, (long long)vv);
+            goto fail_obj;
+        }
+    }
+    damage = qdict_get_qlist(top, "damage");
+    if (damage == NULL) {
+        error_setg(errp, "stixflash: flash-damage-map %s: 'damage' must be "
+                   "a JSON array", path);
+        goto fail_obj;
+    }
+
+    n = qlist_size(damage);
+    if (n != 0) {
+        stixflash->damage = g_new0(StixFlashDamage, n);
+    }
+    QLIST_FOREACH_ENTRY(damage, le) {
+        size_t idx = stixflash->damage_len;
+        QDict *e = qobject_to(QDict, qlist_entry_obj(le));
+
+        if (e == NULL) {
+            error_setg(errp, "stixflash: flash-damage-map %s: entry %zu "
+                       "is not a JSON object", path, idx);
+            goto fail_obj;
+        }
+        if (!stixflash_dmg_entry(e, &stixflash->damage[idx], &err)) {
+            error_prepend(&err, "stixflash: flash-damage-map %s: entry "
+                          "%zu: ", path, idx);
+            error_propagate(errp, err);
+            goto fail_obj;
+        }
+        stixflash->damage_len++;
+    }
+    trace_stixflash_damage_load(stixflash->damage_len, path);
+    qobject_unref(obj);
+    g_free(text);
+    return true;
+
+fail_obj:
+    qobject_unref(obj);
+fail_text:
+    g_free(text);
+    g_free(stixflash->damage);
+    stixflash->damage = NULL;
+    stixflash->damage_len = 0;
+    return false;
+}
+
+/* D-X3: the active specs, one row per entry (X-2 adds src=runtime). */
+static char *stixflash_damage_list_get(Object *obj, Error **errp)
+{
+    STIXFLASH *s = GRLIB_STIXFLASH(obj);
+    const uint32_t blocks_per_mcm = (uint32_t)(FLASH_DEVICES_PER_MCM *
+                                               FLASH_BLOCKS_PER_DEVICE);
+    const uint32_t pages_per_chip = (uint32_t)(FLASH_BLOCKS_PER_DEVICE *
+                                               FLASH_PAGENUM_IN_BLOCK);
+    GString *out = g_string_new(NULL);
+    size_t i;
+
+    for (i = 0; i < s->damage_len; i++) {
+        const StixFlashDamage *d = &s->damage[i];
+        uint32_t block = d->mcm * blocks_per_mcm
+                         + d->chip * FLASH_BLOCKS_PER_DEVICE
+                         + d->page / FLASH_PAGENUM_IN_BLOCK;
+        uint32_t page = d->mcm * blocks_per_mcm * FLASH_PAGENUM_IN_BLOCK
+                        + d->chip * pages_per_chip + d->page;
+
+        if (i != 0) {
+            g_string_append_c(out, '\n');
+        }
+        switch (d->kind) {
+        case STIXFLASH_DMG_ERASE_FAIL:
+            g_string_append_printf(out, "src=file kind=erase-fail block=%u",
+                                   block);
+            break;
+        case STIXFLASH_DMG_PROGRAM_FAIL:
+            g_string_append_printf(out, "src=file kind=program-fail page=%u",
+                                   page);
+            break;
+        case STIXFLASH_DMG_STUCK:
+            if (d->block_scope) {
+                g_string_append_printf(out,
+                                       "src=file kind=stuck value=%u block=%u",
+                                       (uint32_t)d->value, block);
+            } else {
+                g_string_append_printf(out,
+                                       "src=file kind=stuck value=%u page=%u"
+                                       " bit=%u.%u", (uint32_t)d->value, page,
+                                       d->byte, (uint32_t)d->bit);
+            }
+            break;
+        }
+    }
+    return g_string_free(out, FALSE);
+}
+
 static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
 {
     STIXFLASH *stixflash = GRLIB_STIXFLASH(dev);
@@ -889,6 +1460,17 @@ static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
     }
 
     /*
+     * D-X3: the sidecar is parsed at realize; a malformed one fails
+     * realize naming the path and the reason, a missing file is silence
+     */
+    if (!stixflash_damage_load(stixflash, errp)) {
+        /* a failed realize never runs unrealize: close the backing file */
+        fclose(stixflash->f);
+        stixflash->f = NULL;
+        return;
+    }
+
+    /*
      * D-F4: the op state and its timer are set up last, after the
      * backing file opened (realize can fail above); no op is pending yet
      */
@@ -910,6 +1492,9 @@ static void grlib_stixflash_unrealize(DeviceState *dev)
         fclose(stixflash->f);
         stixflash->f = NULL;
     }
+    g_free(stixflash->damage);
+    stixflash->damage = NULL;
+    stixflash->damage_len = 0;
 }
 
 /*
@@ -931,6 +1516,8 @@ static void grlib_stixflash_reset(DeviceState *d)
 
 static const Property grlib_stixflash_properties[] = {
     DEFINE_PROP_STRING("flash-file", STIXFLASH, flash_file),
+    /* D-X3: the damage sidecar, parsed at realize; unset or "" = none */
+    DEFINE_PROP_STRING("flash-damage-map", STIXFLASH, flash_damage_map),
     DEFINE_PROP_BOOL("inverted-storage", STIXFLASH, inverted_storage, true),
     /*
      * D-F6/D-F7: on by default (F-3), so the PFM build's FS-init task
@@ -970,6 +1557,9 @@ static void grlib_stixflash_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "ops-abort", &stixflash->ops_abort,
                                    OBJ_PROP_FLAG_READ);
+    /* D-X3: the active damage specs, read-only (X-2 adds src=runtime) */
+    object_property_add_str(obj, "damage-list", stixflash_damage_list_get,
+                            NULL);
 }
 
 static void grlib_stixflash_class_init(ObjectClass *klass, const void *data)
