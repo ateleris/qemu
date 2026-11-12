@@ -14,8 +14,14 @@ for two events, so the lines read
 FSM Enable bit after the fsmCmd write). A read address block is
 word & 0xFC07F == 0x84000 with reg = (word >> 7) & 0x7F in 1..12
 (Detectors.c:817). Delivered read address blocks form verification runs
-(XrayDetFDIR.c:140-300, 596-690): a run ends at an FSM strobe line or a
-gap > 5 s between two blocks. Each run must be exactly 384 = 12
+(XrayDetFDIR.c:140-300, 596-690): a run ends at an FSM strobe that
+changes Enable (SetEnable/ClearEnable), at a QlClear strobe (Enable
+stays 1) once the run holds 384 blocks, or at a gap > 5 s between two
+blocks. A QlClear does not end an unfinished run: the QL task's 4 s
+QlClear can land inside a ~30 ms run (seen 2026-11-12 in a --flare
+gate: 136 + 248 blocks around a QlClear). With a backward wall-clock
+step between runs, the QlClear after a complete run still separates
+them. Each run must be exactly 384 = 12
 registers x 32 ASICs: for every register, every grp 0..15 (grp =
 fpga_det / 2) exactly twice (asic 0 and 1). At least --min-runs runs
 are required, and an undelivered read address block is a failure.
@@ -76,8 +82,12 @@ def analyse(lines, min_runs=3):
     for line in lines:
         f = FSM.match(line)
         if f:
-            open_run = None                 # a strobe ends a run
             now = f.group(3) == "1"
+            # an Enable change ends a run; a QlClear (Enable stays 1)
+            # only a complete one, as it may land inside a run
+            if now != enable or (open_run is not None and
+                                 len(open_run["reads"]) >= RUN_BLOCKS):
+                open_run = None
             if now and not enable:
                 windows += 1
             enable = now
@@ -224,6 +234,12 @@ def self_test():
     s, f = analyse(nominal([lambda t: synth_run(t, extra_grp=7)] + ok[1:]))
     assert len(f) == 1 and "R5 grp 3 x0" in f[0] and \
         "R5 grp 7 x4" in f[0], f
+    # a QlClear strobe (Enable stays 1) inside a run does not split it
+    def ql_inside(t):
+        r = synth_run(t)
+        return r[:400] + [fsm(t + 0.01, 0x80, 1)] + r[400:]
+    s, f = analyse(nominal([ql_inside] + ok[1:]))
+    assert f == [] and s["runs"] == 3, f
     # two runs only
     s, f = analyse(nominal(ok[:2]))
     assert f == ["2 verification runs, want >= 3"], f
