@@ -295,6 +295,16 @@ the same sequence (gate record in `accepted-diffs.md` §23).
    TM(5,1) EID 0x142E has arrived — the boot-armed TC(20,128) timer
    fires about 30 s after boot, and its reaction would pull the FSW
    back to SAFE. (The gate waits until +50 s.)
+   **PFM builds (the flight ELF) boot much slower**, and the order
+   differs from the AX gate ELF: with the NAND latency model on,
+   TM(5,1) 0x14A3 and 0x142E are NOT gated by FS init (measured on the
+   release ELF: 0x14A3 at +16 s, 0x142E at +32 s, FS init later than
+   +46 s), and the mode change waits on the filesystem/context. So wait
+   for **both** TM(5,1) 0x0032 (Filesystem initialisation finished) and
+   0x142E — in either order — and enter CONFIGURATION only 5 s after
+   the **later** of the two, exactly what `scripts/stix/pfm-boot-smoke.sh`
+   does. Measured FS-init time: about 62 s of guest time on the debug
+   ELF (`accepted-diffs.md` §42); the model lower bound is ≈26 s.
 2. **ZIX36001 "STIX Mode transition"** — TC(236,1) with
    "Operation mode (PIX00080)" = **4** (CONFIGURATION) and
    "Mode transition (PIX00081)" = **0** (MANUAL_NOMINAL, as

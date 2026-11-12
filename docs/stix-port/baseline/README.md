@@ -179,6 +179,12 @@ STIX_DETECTOR_RUN_DIR=/tmp/stix-detector-run \
 # its stdlib checkers, also usable on their own:
 python3 scripts/stix/ql-check.py --self-test          # QL TM(21,6) decode
 python3 scripts/stix/idefx-trace-check.py --self-test # verification runs
+
+# 8. PFM boot gate (flash latency plan F-5, accepted-diffs §42; the PFM
+#    flight build with the NAND latency model on; fresh flash per run,
+#    own slot or the 21000 flock; ~4.5 min positive + 30 s negative):
+STIX_PORT_BASE=auto bash scripts/stix/pfm-boot-smoke.sh \
+    build/qemu-system-sparc          # add --negative, --dry-run
 ```
 
 Notes:
@@ -209,6 +215,24 @@ Notes:
   (`idefx-trace-check.py`). `--negative` (`det-idefx=off`) passes only
   when exactly the UART IDeF-X check and the trace check fail, the
   trace being present and empty.
+- PFM gate: `pfm-boot-smoke.sh` (step 8; `accepted-diffs.md` §42).
+  **PASS** means the PFM flight build boots with the NAND latency model
+  on: boot report 0x0022 by @20 and before 0x0032, 0x14A3 by @40
+  (measured +16 s), 0x142E by 0x14A3 + 25 s (capped @160; measured
+  +32 s), 0x0032 (FS init) and 0x8030 by @150 each, then nominal-smoke's
+  TC sequence anchored on the LATER of 0x142E and 0x0032 (the mode
+  change waits on the filesystem/context; CONF at that +5 s, S20 at
+  +10, NOMINAL at +20), no 0x8021, HK alive after 0x0032, and no
+  watchdog reset (the trace must show a RELOAD, proving it is live).
+  The verdict prints the measured 0x0032 offset. `--negative` (30 s,
+  `latency=off`) passes only on the watchdog's "count expired" reset.
+  The ELFs live in `~/dev/stix-elf/`: release `ASW_pfm_v186.elf`
+  (GitHub release v186) and debug `ASW_pfm_dbg.elf` (`STIX_PFM_DBG=1`;
+  UART key lines checked, no "Fatal error"/"Read timeout"); provenance
+  in `~/dev/stix-elf/PROVENANCE.md`, a sha256 mismatch only WARNs, an
+  AX build is refused, an absent ELF is SKIP 77. Run dir
+  `/tmp/stix-pfm-run` (`-neg`), a fresh sparse flash per run, never the
+  master.
 - **Gate exit codes:**
 
   | Code | Meaning |
@@ -227,7 +251,10 @@ Notes:
 - `qemu-stdout.golden.log` (the `stix*` trace-event stream, captured with
   `-trace 'stix*'` — accepted-diffs §15) is a committed reference for
   MANUAL comparison - no automated gate diffs it yet; it is the
-  designated second net for ground-station-era work.
+  designated second net for ground-station-era work. Since the flash
+  latency model (accepted-diffs §42) a recapture would additionally gain
+  the per-op `stixflash_op_start`/`stixflash_op_done` lines (≈15k per PFM
+  boot); the golden was not recaptured for that track.
 
 ## Watching a run (console, TM, model events)
 
@@ -249,6 +276,7 @@ From Windows the same files are at `\\wsl$\<distro>\tmp\stix-uprev-run\`.
 | `tc-smoke.sh` | `uart.tc.raw` | `qemu-stdout.tc.log` | `tc.smoke.probe.log` (framed units + expectations) |
 | `nominal-smoke.sh` | `uart.nominal.raw` (+ `.txt`) | `qemu-stdout.nominal.log` | `nominal.probe.log` |
 | `detector-smoke.sh` | `uart.detector.raw` (+ `.txt`) | `qemu-stdout.detector.log`; `idefx.trace` (timestamped `stixdet_idefx_cmd`) | `detector.probe.log`; `ql.dump.hex` (whole 0x5DC packets), `ql.check.log` (decoded QL TM) |
+| `pfm-boot-smoke.sh` | `uart.pfm.raw` (+ `.txt`, debug flavour only) | `qemu-stdout.pfm.log`; `wdg.trace` (the watchdog trace) | `pfm.drive.log` (the TM driver; re-judgeable with `pfm-boot-drive.py --replay`) |
 | `capture-golden.sh` | `uart.golden.raw` | `qemu-stdout.golden.log` | — |
 
 All of these are in the run directory. Each run overwrites its own files.

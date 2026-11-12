@@ -546,6 +546,11 @@ gate-ports' `scripts/stix/lib/slot.sh`.
   `system_reset`) mid-sequence leaves `write_counter` 0 (a fresh
   three-write sequence succeeds) and cmdSta 0.
 - Gate: `make check-qtest-sparc` (stix only).
+- Correction (F-6, accepted-diffs §42): the "no behaviour change" above
+  holds only between guest MMIO sequences. The new reset handler is a
+  FIX: before it, a system reset at write_counter 1 or 2 left the stale
+  count, so the next boot's `Flash_reset` RAMAD write failed as a
+  sequence error.
 
 ### F-2: latency timer, BUSY/READY, guarded DMA, properties (default still off)
 
@@ -618,6 +623,42 @@ gate-ports' `scripts/stix/lib/slot.sh`.
   ELF (a `nm` symbol containing `moveStartCoarseT`, the att plan's rule)
   → exit 2. The PFM ELFs have none [M].
 - Sources `slot.sh` (see "Interactions").
+- **As built (2026-11-12, second correction after the first live
+  release-ELF run).** The gate is `scripts/stix/pfm-boot-smoke.sh` plus
+  its TM driver `scripts/stix/pfm-boot-drive.py` (tmtc-probe.py's
+  `--send-at` cannot anchor a send on a TM arrival, and a probe restart
+  per phase would drop the connection, so the driver stays on the
+  socket, stamps every TM with its `[m=...]` offset from the connect and
+  re-schedules the sends itself; `--replay` re-judges a driver log
+  through the same checks). **Measured release-ELF timeline with latency
+  on (first live run, fresh flash):** 0x0022 + 0x0021 (SAFE) at +0.4 s,
+  0x14A3 at +16 s, 0x142E at +32 s, FS init still running at +46 s, 47
+  watchdog RELOADs and no reset — **FDIR and the TC20 boot timer are NOT
+  gated by FS init**, and the mode change waits on the
+  filesystem/context (a CONF sent before 0x0032 was accepted but never
+  executed). Windows now (offsets are probe seconds from the connect,
+  chained ones from the named event's arrival):
+  - TM(5,1) 0x0022 Application SW boot success by @20, and before
+    0x0032 (the witness that the FS task yields);
+  - TM(5,1) 0x14A3 FDIR protection enabled by @40 (measured 16 s);
+  - TM(5,1) 0x142E Preparing for shutdown by 0x14A3 + 25 s, capped @160
+    (failure "no 0x142E by @160");
+  - TM(5,1) 0x0032 Filesystem initialisation finished, status 01, and
+    TM(5,3) 0x8030 Context file(s) not found by @150 each (fresh
+    flash);
+  - then CONF at max(0x142E, 0x0032) + 5 s (no fixed floor), S20 = 0 at
+    CONF + 10 s, NOMINAL at CONF + 20 s, the NOMINAL checks by
+    NOMINAL + 5 s (nominal-smoke's TC bytes and NOMINAL checks);
+  - the deadline checks run before any send is scheduled, so an expired
+    window is named (e.g. "no 0x0032 ... by @150"), never a later
+    step's;
+  - forbidden throughout: TM(5,3) 0x8021 Watchdog failure detected, any
+    `stixctrl_watchdog_reset` trace line, and (debug flavour only) a
+    UART "Read timeout";
+  - `STIX_PFM_SECONDS` default 240 still fits (worst case CONF at
+    155 s + 35 s of checks); `--negative` keeps the 30 s window
+    (`latency=off` must end in the watchdog reset). The measured 0x0032
+    offset is printed in the verdict, per ELF flavour.
 
 ### F-6: docs
 
@@ -646,6 +687,10 @@ gate-ports' `scripts/stix/lib/slot.sh`.
   in pfm-boot-smoke's log [L].
 
 ## PFM boot gate
+
+(Superseded by the "As built" note in F-5: the first live release-ELF
+run showed 0x14A3/0x142E are not gated by FS init, and the windows and
+the CONF anchor changed. Kept for the reasoning.)
 
 What "PFM boots" means, without a UART:
 

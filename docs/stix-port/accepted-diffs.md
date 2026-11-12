@@ -3817,3 +3817,100 @@ tcp:127.0.0.1:N: No such file or directory". `scripts/stix/tests/
 test-run-qemu-gs.sh` runs the script against an argv-recording stub
 (no QEMU): 11 cases; RED against the pre-PL-2 script, the two tcp
 accept cases fail with "STIX_GS_QMP must be an absolute path".
+
+## 42. NAND flash latency: ops complete from a timer (baseline: synchronous inside the cmdSta write)
+
+Plan: `2026-11-11-flash-latency-plan.md` (section number: the next free
+one — §41 is gate ports; the attenuator and platform tracks have not
+claimed theirs yet). The PFM flight build
+(`ASW_pfm_v186.elf`) reset at ≈6.8 s: the FS-init task (priority 250)
+holds the filesystem mutex and is lifted to priority 1 by inheritance
+(`configFSW.h:199`, `MemFilesystem.c:477-481`), and with the baseline's
+zero-latency flash it never blocks during the 130,800-read boot scan, so
+the watchdog task never runs. The fix models the NAND timings; the
+watchdog starvation is then the FSW's own priority-inheritance quirk,
+documented under "FSW oddities" below.
+
+- **Latency, per op** (`-global grlib-stixflash.latency=...`, default
+  **on**): page read 130 µs, page program 300 µs, block erase 1,500 µs
+  (`tread-us`/`tprog-us`/`tbers-us`, each ≤ 40,000 µs, 0 = inline).
+  These are datasheet-typical values **[A]** — the FSW tree and its TSIM
+  flash model carry no timings (`FlashApiTsim.c` is synchronous too).
+  The FSW's own page-wait timeouts are 50 ms (`configFSW.h:336-338`), so
+  the defaults stay far below them.
+- **Issue/complete split.** The cmdSta write only latches the op
+  (BUSY = 1, READY = 0); completion — host file I/O, the read DMA,
+  status, one IRQ pulse, last — runs inline at latency 0 or from a
+  `QEMU_CLOCK_VIRTUAL` timer. A read's file I/O therefore **moves from
+  the cmdSta write to completion** (baseline: everything inside the
+  write). A program still samples guest RAM at issue; WRPROT reads 1 at
+  all times (the clear/restore dance the guest could never observe is
+  gone).
+- **Reset aborts a pending op** (D-F4): no IRQ, nothing committed to the
+  file, trace `stixflash_op_abort`. On hardware an interrupted program
+  can leave a partial page; the model's clean abort is accepted.
+  A non-reset command while busy is dropped (`stixflash_busy_reject`);
+  a sequence error while busy sets no status and pulses no IRQ.
+- **`latency=off` is not byte-identical on error paths.** The read DMA's
+  result is now checked: a refused or failed DMA completes the op
+  FAILED | READY plus the IRQ (trace `stixflash_error "dma"`), where the
+  baseline ignored `physical_memory_write`'s result and completed OK.
+- **The FSW's ISR last-ditch busy-poll** (`Flash.c:257-273, 378-406`:
+  10,000 cmdSta reads after a fatal ISR path) succeeds only if those
+  reads take longer than t_op in host time — the completion timer fires
+  from the main loop between the vCPU's MMIO reads. Fatal-path only.
+- **FIX (correcting F-1's "no behaviour change"):** the new device reset
+  handler (`grlib_stixflash.c:919-928`) returns cmdSta and write_counter
+  to 0. Before it, a guest system reset at write_counter 1 or 2 left the
+  stale count, so the next boot's `Flash_reset` RAMAD write
+  (`Flash.c:81-84, 212`) failed as a sequence error. Qtest
+  `/sparc/stix/flash-reset-state` pins it.
+- **The device is unmigratable** (commit `530a7c441c`): savevm and
+  migrate are refused with a message naming grlib-stixflash, because a
+  snapshot with an op in flight would silently drop the op, its
+  completion IRQ and the sequence state (no STIX device has a vmstate).
+  savevm stays unused until the platform roadmap's savevm item (R-r3)
+  adds one.
+- **Measured PFM boot.** With latency on, the debug ELF
+  (`ASW_pfm_dbg.elf`) reaches "Main delete init" — FS init done — at
+  about **62 s of guest time**. First live release-ELF run
+  (`ASW_pfm_v186.elf`, fresh flash, probe offsets): 0x0022 + 0x0021
+  (SAFE) at +0.4 s, 0x14A3 at +16 s, 0x142E at +32 s, FS init still
+  running at +46 s, 47 watchdog RELOADs and no reset — FDIR and the
+  TC20 timer are **not** gated by FS init, and the mode change waits on
+  the filesystem/context (a CONF sent before 0x0032 was accepted but
+  never executed; the gate now anchors CONF on max(0x142E, 0x0032)).
+  The plan's lower bound is ≈26 s (130,800 page reads at the defaults).
+  Gate: `scripts/stix/pfm-boot-smoke.sh` (positive + `--negative`; the
+  negative proves the gate sees the original failure: latency off ends
+  in the watchdog's "count expired" reset).
+- **Golden note.** `capture-golden.sh` runs `-trace 'stix*'`, so a
+  future recapture of `qemu-stdout.golden.log` grows by the per-op
+  `stixflash_op_start`/`stixflash_op_done` lines (≈15k per PFM boot). No
+  gate compares that file.
+
+**FSW oddities observed (for the FSW team; paths relative to the FSW
+tree ASW/):**
+
+1. `configFSW.h:199` redefines `RTEMS_DEFAULT_SEMAPHORE` as a binary
+   **priority-inheritance** semaphore; `mutexAPI`
+   (`MemFilesystem.c:477-481`) uses it, so the priority-250 FS-init task
+   runs at priority 1 while INIT (1) waits on it — against the intent
+   stated at `configFSW.h:263-268` ("watchdog has highest priority").
+   Safe on hardware only because every NAND op blocks the task.
+2. `MemFilesystem.c:1018-1060`: the async FS-init task holds `mutexAPI`
+   across all partitions: 130,800 page reads on PFM at every boot, even
+   on an empty flash.
+3. `Flash.c:306-318, 352-376`: the polling fast path is commented out;
+   its comments give ~2 ms per read and ~3 ms per write.
+4. `Flash.c:214-221`: `Flash_reset` judges chip health from 2,000 BUSY
+   polls with no time base.
+5. `MemFilesystem.c:41-44`: the comment says the ICD reserves 8 MiB per
+   flash; the code reserves 16 MiB.
+6. `Flash.c:303-323`: the driver masks the flash IRQ around the command
+   start; correctness when an op completes instantly relies on the IRQMP
+   pending latch and RTEMS event latching.
+7. `tasks.vs.json:14`: the default build adds `-DDISABLE_WATCHDOG`.
+8. `WDT.c` `WDT_setWdgInterval` ends with DISABLE; whether RELOAD
+   re-arms after DISABLE decides whether such a build has a live
+   watchdog at all.
