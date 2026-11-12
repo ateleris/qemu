@@ -26,8 +26,10 @@ last match, so anything after it (a mode change, a fallback) is not
 watched — that is why plain probing near a mode change once looked
 like "TM stopped". A --forbid is the negation: a matching unit fails
 the run with "FORBIDDEN TM: ...". It arms at its group's send (the
-connect group arms at connect) and stays armed; a match before its
-group's send is ignored. Forbids take no @window suffix.
+connect group arms at connect); a match before its group's send is
+ignored. Since A-4 an optional @SECONDS suffix disarms the forbid
+that many seconds after its group's send; without it the forbid stays
+armed for the rest of the run.
 
 QMP groups (--qmp PATH, --qmp-cmd JSON; P4-3): PATH is a unix socket or,
 since PL-2b, tcp:HOST:PORT (IPv6 bracketed). A send group can be a
@@ -39,6 +41,13 @@ at the first due --qmp-cmd (it starts before QEMU), does the greeting
 and qmp_capabilities, and for each command skips async events until
 the "return". An "error" reply, a closed socket or no reply within 5 s
 fails the run with "QMP ERROR: ...".
+
+--expect-return VALUE (A-4) attaches to the latest --qmp-cmd group (a
+qom-get) and fails the run at once with "RETURN MISMATCH: ..." unless
+the reply equals VALUE (VALUE is JSON when it parses — numbers, bools,
+null — else the raw string, so a qom-get of a string property takes
+the bare word). On a match the run continues and the group prints
+"RETURN OK".
 
 Full-packet dump (--dump-apid APID:FILE; detector plan D-3): the TM
 lines above show at most 48 bytes of a unit. A dump APPENDS every framed
@@ -53,7 +62,8 @@ Usage:
   tmtc-probe.py [--port P] [--seconds N] --window W [--hold] [--qmp PATH]
       [--send-at S] (--send-hex HEX | --qmp-cmd JSON)
       [--expect APID:TYPE:SUBTYPE[:DATAHEX]]...
-      [--forbid APID:TYPE:SUBTYPE[:DATAHEX]]...
+      [--expect-return VALUE]
+      [--forbid APID:TYPE:SUBTYPE[:DATAHEX][@SECONDS]]...
       TC ingress gate
   either mode also takes [--dump-apid APID:FILE]...
   tmtc-probe.py --self-test
@@ -233,22 +243,23 @@ class CucExpect(Expectation):
 class Forbid(Expect):
     """The negation of an Expect (--forbid, P3-2): a matching TM unit
     FAILS the run instead of satisfying it. Parsing and matching are
-    Expect's; there is no @window suffix (a forbid arms at its group's
-    send — or at the connect for the connect-time group — and stays
-    armed for the whole run), so one is rejected with a clear error."""
+    Expect's. A forbid arms at its group's send — or at the connect for
+    the connect-time group — and stays armed for the whole run, unless
+    an @SECONDS suffix (A-4) disarms it that many seconds after its
+    group's send: a match after the window is not evidence (the gates
+    forbid a TM only while the condition under test can produce it).
+    run_gate sets armed_at; the self-test sets it by hand."""
 
     def __init__(self, spec):
-        if "@" in spec:
-            raise ValueError(
-                "--forbid takes no @window suffix: %s (a forbid arms at "
-                "its group's send and stays armed)" % spec)
         super().__init__(spec)
+        self.armed_at = None
 
 
 class OpAction(argparse.Action):
-    """Record --send-at/--send-hex/--qmp-cmd/--expect in command-line
-    order, so --send-at applies to the following --send-hex or
-    --qmp-cmd and --expect attaches to the most recent of them."""
+    """Record --send-at/--send-hex/--qmp-cmd/--expect/--expect-return in
+    command-line order, so --send-at applies to the following --send-hex
+    or --qmp-cmd and --expect/--expect-return attach to the most recent
+    of them."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         ops = getattr(namespace, "ops", None) or []
@@ -274,6 +285,16 @@ def parse_qmp_cmd(text):
         raise ValueError("--qmp-cmd needs a JSON object with an "
                          "\"execute\" key: %s" % text)
     return cmd
+
+
+def parse_return_value(text):
+    """--expect-return VALUE (A-4): JSON when it parses (a qom-get
+    returns numbers, bools and null), else the raw string (a qom-get of
+    a string property is compared with the bare word)."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
 
 
 class QmpError(Exception):
@@ -438,6 +459,14 @@ def build_groups(args):
             groups[-1]["expects"].append(Expect(val))
         elif op == "--expect-cuc":
             groups[-1]["expects"].append(CucExpect(val))
+        elif op == "--expect-return":
+            g = groups[-1]
+            if not is_send(g) or g.get("qmp") is None:
+                raise ValueError("--expect-return attaches to the latest "
+                                 "--qmp-cmd group (a qom-get), not to %s"
+                                 % ("a --send-hex group"
+                                    if is_send(g) else "no send group yet"))
+            g["expect_return"] = (val, parse_return_value(val))
         elif op == "--forbid":
             groups[-1]["forbids"].append(Forbid(val))
     return groups
@@ -477,13 +506,22 @@ def make_parser():
                     help="a TM expectation on the CUC coarse time in the "
                          "TM data field header (SP[10:14]), hex-prefix "
                          "match (repeatable)")
+    ap.add_argument("--expect-return", action=OpAction, metavar="VALUE",
+                    help="the latest --qmp-cmd group (a qom-get) must "
+                         "return exactly VALUE, else the run fails at "
+                         "once with RETURN MISMATCH (A-4). VALUE is JSON "
+                         "when it parses, else the raw string "
+                         "(repeatable, one per --qmp-cmd)")
     ap.add_argument("--forbid", action=OpAction,
-                    metavar="APID:TYPE:SUBTYPE[:DATAHEX]",
+                    metavar="APID:TYPE:SUBTYPE[:DATAHEX][@SECONDS]",
                     help="the negation of --expect: a matching TM unit "
                          "fails the run. Attaches to the most recent "
                          "--send-hex (or the connect group) and arms at "
                          "that group's send; a match before the send is "
-                         "ignored. No @window suffix (repeatable)")
+                         "ignored. An optional @SECONDS suffix disarms "
+                         "the forbid that many seconds after its group's "
+                         "send (A-4); without it the forbid stays armed "
+                         "for the run (repeatable)")
     ap.add_argument("--qmp", metavar="PATH",
                     help="QEMU QMP unix socket, or tcp:HOST:PORT "
                          "(tcp:[::1]:PORT for IPv6), for the --qmp-cmd "
@@ -574,13 +612,18 @@ def gate_done(all_matched, has_failed, hold, now, t0, seconds):
     return None
 
 
-def match_unit(unit, groups):
+def match_unit(unit, groups, now=None):
     """One framed TM unit against every ARMED group: expectations it
     satisfies are marked ok and returned (newly_ok); the first matching
     forbid is returned (forbidden) and the caller fails the run. A
     group arms when its TC has been sent; the connect-time group is
-    armed from the start, so its forbids cover the whole run. Factored
-    out of run_gate for the self-test (P3-2)."""
+    armed from the start, so its forbids cover the whole run. A forbid
+    with an @SECONDS window is skipped once @now is past armed_at plus
+    the window (A-4); run_gate sets armed_at to the group's send time
+    (the connect for the connect group). Factored out of run_gate for
+    the self-test (P3-2)."""
+    if now is None:
+        now = time.monotonic()
     fields = unit_fields(unit)
     if fields is None:
         return [], None
@@ -596,6 +639,9 @@ def match_unit(unit, groups):
         if is_send(g) and not g["sent"]:
             continue
         for f in g["forbids"]:
+            if f.window is not None and f.armed_at is not None \
+                    and now > f.armed_at + f.window:
+                continue  # A-4: the @SECONDS window disarmed it
             if f.matches(unit):
                 return newly_ok, f
     return newly_ok, None
@@ -668,6 +714,12 @@ def run_gate(sock, args, groups, qmp=None, dump=None):
     QMP failure or (under --hold) a closed connection returns 1. @qmp
     is the QmpClient the --qmp-cmd groups use; @dump the PacketDump."""
     t0 = time.monotonic()
+    # a forbid arms at its group's send; the connect group's at the
+    # connect (A-4 @SECONDS windows count from that instant)
+    for g in groups:
+        for f in g["forbids"]:
+            if f.armed_at is None:
+                f.armed_at = t0
     pending = bytearray()
     total = 0
     held = False
@@ -704,14 +756,28 @@ def run_gate(sock, args, groups, qmp=None, dump=None):
                         return 1
                     g["sent"] = True
                     g["t_sent"] = time.monotonic()
+                    for f in g["forbids"]:
+                        f.armed_at = g["t_sent"]
                     print(f"{ts()} >> qmp {json.dumps(g['qmp'])} -> "
                           f"return {json.dumps(ret)} at +{g['at']:.0f}s "
                           f"{mono()}", flush=True)
+                    er = g.get("expect_return")
+                    if er is not None:
+                        if ret != er[1]:
+                            print(f"RETURN MISMATCH: want {er[0]}, got "
+                                  f"{json.dumps(ret)} "
+                                  f"({json.dumps(g['qmp'])})", flush=True)
+                            print(f"# total {total} bytes")
+                            return 1
+                        print(f"{ts()} RETURN OK: {er[0]} {mono()}",
+                              flush=True)
                     continue
                 payload = bytes.fromhex(g["hex"])
                 sock.sendall(payload)
                 g["sent"] = True
                 g["t_sent"] = time.monotonic()
+                for f in g["forbids"]:
+                    f.armed_at = g["t_sent"]
                 print(f"{ts()} >> sent {len(payload)}B "
                       f"({g['hex'][:32]}...) at +{g['at']:.0f}s {mono()}",
                       flush=True)
@@ -900,14 +966,10 @@ def self_test():
     assert [len(g["expects"]) for g in sends] == [1, 1]
 
     # ---- P3-2: --hold and --forbid (the NOMINAL gate) ----
-    # A forbid reuses Expect's parsing and matching, but an @window
-    # suffix is rejected with a clear error: a forbid arms at its
-    # group's send, there is nothing to tighten.
-    try:
-        Forbid("0x5A7:5:1:00210402@30")
-        raise AssertionError("forbid accepted an @window suffix")
-    except ValueError:
-        pass
+    # A forbid reuses Expect's parsing and matching; since A-4 an
+    # @SECONDS suffix is its disarm window (the window cases follow in
+    # the A-4 block)
+    assert Forbid("0x5A7:5:1:00210402@30").window == 30.0
     fb = Forbid("0x5A7:5:1:00210402")
     assert fb.apid == 0x5A7 and fb.ptype == 5 and fb.subtype == 1
     assert fb.data == bytes.fromhex("00210402")
@@ -997,6 +1059,39 @@ def self_test():
     ok, forb = match_unit(ev_nom_to_safe, groups)
     assert forb is not None  # -> run_gate returns 1 with FORBIDDEN TM
 
+    # ---- A-4: a forbid @SECONDS window disarms after its group's send ----
+    fbw = Forbid("0x5A7:5:1:00210402@5")
+    assert fbw.window == 5.0 and fbw.data == bytes.fromhex("00210402")
+    assert fbw.apid == 0x5A7 and fbw.ptype == 5 and fbw.subtype == 1
+    assert str(fbw) == "0x5A7:5:1:00210402@5"  # the @ shows in failures
+    assert Forbid("0x5A7:5:1:00210402").window is None
+    assert Forbid("0x5A1:1:8@0.2").window == 0.2
+    # the disarm is checked against armed_at (the group's send time,
+    # which run_gate sets; here by hand) and a now past it
+    gwin = {"hex": None, "at": None, "sent": False, "t_sent": None,
+            "expects": [], "forbids": [Forbid("0x5A7:5:1:00210402@5")]}
+    gwin["forbids"][0].armed_at = 100.0
+    ok, forb = match_unit(ev_conf_to_safe, [gwin], now=104.0)
+    assert ok == [] and forb is not None
+    ok, forb = match_unit(ev_conf_to_safe, [gwin], now=105.0)
+    assert ok == [] and forb is not None    # the window ends AT 105.0
+    ok, forb = match_unit(ev_conf_to_safe, [gwin], now=105.5)
+    assert ok == [] and forb is None        # disarmed
+    # a send group's window counts from ITS send, not the connect
+    gconn = {"hex": None, "at": None, "sent": False, "t_sent": None,
+             "expects": [], "forbids": []}
+    gsend = {"hex": "40", "at": 50.0, "sent": True, "t_sent": 100.0,
+             "expects": [], "forbids": [Forbid("0x5A7:5:1:00210502@3")]}
+    gsend["forbids"][0].armed_at = 100.0
+    ok, forb = match_unit(ev_nom_to_safe, [gconn, gsend], now=102.9)
+    assert forb is not None
+    ok, forb = match_unit(ev_nom_to_safe, [gconn, gsend], now=103.1)
+    assert forb is None
+    # without a @suffix the forbid stays armed for the whole run (P3-2)
+    gsend["forbids"] = [Forbid("0x5A7:5:1:00210502")]
+    ok, forb = match_unit(ev_nom_to_safe, [gsend], now=1e9)
+    assert forb is not None
+
     # review m2: run_gate itself, over a socketpair (the peer plays the
     # model: it reads the probe's TC byte, then writes TM units). Each
     # case stays under ~2 s.
@@ -1054,6 +1149,22 @@ def self_test():
     th.join(timeout=3)
     assert not th.is_alive()
     assert box["rc"] == 1
+
+    # d. A-4: a forbidden unit INSIDE a 0.2 s window fails the run (like
+    #    case b), the same unit after the window is ignored: rc 0 at the
+    #    --seconds deadline
+    pargs = make_parser().parse_args(
+        gate_args + ["--forbid", "0x5A7:5:1:00210502@0.2"])
+    groups, gate = setup_mode(pargs)
+    a, b = socket.socketpair()
+    th, box = gate_in_thread(a, pargs, groups)
+    assert b.recv(1) == b"@"
+    time.sleep(0.5)                     # past the 0.2 s window
+    b.sendall(tm11 + ev_nom_to_safe)    # the match, then the disarmed unit
+    th.join(timeout=3)
+    assert not th.is_alive()
+    assert box["rc"] == 0
+    b.close()
 
     # ---- P4-3: QMP groups ----
     # --qmp-cmd is a send group like --send-hex: it takes the preceding
@@ -1192,6 +1303,72 @@ def self_test():
     assert not th.is_alive()
     assert box["rc"] == 1
     assert time.monotonic() - t_start < 0.9  # before the deadline
+    for s_ in (a, b, qa, qb):
+        s_.close()
+
+    # ---- A-4: --expect-return, a qom-get group's return must equal ----
+    # VALUE is JSON when it parses, else the raw string; the option
+    # attaches to the latest --qmp-cmd group and is rejected elsewhere.
+    qget_n = ('{"execute": "qom-get", "arguments": {"path": '
+              '"/machine/stixctrl/attenuator", "property": '
+              '"fsw-accesses"}}')
+    qget_s = ('{"execute": "qom-get", "arguments": {"path": '
+              '"/machine/stixctrl/attenuator", "property": '
+              '"truth.position"}}')
+    p = make_parser().parse_args([
+        "--qmp", "/x/qmp.sock",
+        "--send-at", "45", "--qmp-cmd", qget_n, "--expect-return", "0",
+        "--send-at", "46", "--qmp-cmd", qget_s, "--expect-return", "out",
+    ])
+    groups, gate = setup_mode(p)
+    assert gate is True
+    assert groups[1]["expect_return"] == ("0", 0)
+    assert groups[2]["expect_return"] == ("out", "out")
+    assert groups[0].get("expect_return") is None
+    # JSON values: numbers, bools; a string property takes the bare word
+    assert parse_return_value("1280") == 1280
+    assert parse_return_value("true") is True
+    assert parse_return_value("out") == "out"
+    assert parse_return_value('{"a": 1}') == {"a": 1}
+    # attached to the connect group or to a --send-hex group: rejected
+    for bad in (["--expect-return", "0"],
+                ["--send-at", "5", "--send-hex", "40",
+                 "--expect-return", "0"]):
+        try:
+            setup_mode(make_parser().parse_args(bad))
+            raise AssertionError("--expect-return accepted: %s" % bad)
+        except ValueError:
+            pass
+    # r1. the return equals: RETURN OK, the run passes at the deadline
+    pargs = make_parser().parse_args(
+        ["--hold", "--seconds", "1", "--window", "1",
+         "--send-at", "0", "--qmp-cmd", qget_n, "--expect-return", "0"])
+    groups, gate = setup_mode(pargs)
+    qa, qb = socket.socketpair()
+    qth, qbox = fake_qmp(qb, [ok_ret, b'{"return": 0}\r\n'])
+    a, b = socket.socketpair()
+    th, box = gate_in_thread(a, pargs, groups,
+                             QmpClient(sock=qa, timeout=1.0))
+    th.join(timeout=3)
+    qth.join(timeout=3)
+    assert not th.is_alive() and qbox.get("done") and box["rc"] == 0
+    for s_ in (a, b, qa, qb):
+        s_.close()
+    # r2. a wrong return fails the run at once, before the deadline
+    pargs = make_parser().parse_args(
+        ["--hold", "--seconds", "5", "--window", "1",
+         "--send-at", "0", "--qmp-cmd", qget_n, "--expect-return", "0"])
+    groups, gate = setup_mode(pargs)
+    qa, qb = socket.socketpair()
+    qth, qbox = fake_qmp(qb, [ok_ret, b'{"return": 3}\r\n'])
+    a, b = socket.socketpair()
+    t_start = time.monotonic()
+    th, box = gate_in_thread(a, pargs, groups,
+                             QmpClient(sock=qa, timeout=1.0))
+    th.join(timeout=3)
+    qth.join(timeout=3)
+    assert not th.is_alive() and box["rc"] == 1
+    assert time.monotonic() - t_start < 0.9
     for s_ in (a, b, qa, qb):
         s_.close()
 
