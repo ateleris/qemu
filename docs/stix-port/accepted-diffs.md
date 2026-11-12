@@ -3515,11 +3515,14 @@ has the index-space table, the recipe and the template flash.
   (LUTMgmt.c:635-652 and :722-745 at STIX-FSW 600a7a72), i.e. 8 448 B past
   `ELUT[]` into `Tmno` (the sky LUT, next in the baseline ELF). Harmless
   here: no sky LUT, `Tmno` all zero; flight behaves the same.
-- **Apply time:** in QEMU, TC(237,8) to its TM(1,7) took 0.05 s (apply,
-  4 flash copies, ID set); the NOMINAL entry including the ELUT re-apply
-  3.35 s (monotonic, from the probe's `[m=]` stamps). The ICD's flight
-  figure is about 2 minutes; QEMU's SRAM and flash are much faster than
-  the flight FPGA path, so no timing conclusion carries over.
+- **Apply time:** in QEMU, with the flash latency off, TC(237,8) to its
+  TM(1,7) took 0.05 s (apply, 4 flash copies, ID set); the NOMINAL entry
+  including the ELUT re-apply 3.35 s (monotonic, from the probe's
+  `[m=]` stamps). The ICD's flight figure is about 2 minutes; QEMU's
+  SRAM and flash are much faster than the flight FPGA path, so no
+  timing conclusion carries over.
+  - [L] re-run elut-smoke once flash-latency F-3 makes latency the
+    default.
 - **SpW RX:** the 226-B units are the largest TCs ever sent; the
   `stixspw_rx_truncated` trace stayed silent (QEMU runs with it on).
 - **Disk:** the seeded flash allocates 148 KiB (apparent 16.5 GiB); the
@@ -3530,8 +3533,9 @@ has the index-space table, the recipe and the template flash.
   flight ELUT a DSS replay (baseline about `adc` 2000) lands almost
   entirely in ebin 30/31 (plan "DSS replay caveat"). No gate proves
   that the CSV column `Detector` is `subcol` (0-based); the GSW reader
-  `stx_read_elut.pro`, stixpy and the ICD say so, and the user
-  confirmed it. If it were `fpga_det`, every gate would still pass.
+  `stx_read_elut.pro`, stixpy and the ICD corroborate it, and the user
+  believes so (not certain). If it were `fpga_det`, every gate would
+  still pass.
 
 **Gate record** (2026-11-11, worktree `stix-uprev-elut` on f9853b57d0,
 normal ELF, slot 3, `elut_table_20260529.csv` sha256 919d9055…21ccf2):

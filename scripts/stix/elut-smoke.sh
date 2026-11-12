@@ -58,7 +58,7 @@
 #   STIX_ASW_ELF         as in tc-smoke.sh; absent: SKIP, exit 77
 #   STIX_ELUT_RUN_DIR    run dir (default /tmp/stix-elut-run; --negative
 #                        uses <dir>-neg). Canonicalised; the shared
-#                        uprev/baseline run dirs, their parents and
+#                        uprev/baseline/GS run dirs, their parents and
 #                        children and / are refused.
 #   STIX_PORT_BASE       the slot, see above
 #   STIX_TMTC_PROBE      the probe script (tests substitute a fake)
@@ -107,7 +107,8 @@ if [ "$NEGATIVE" -eq 1 ] && [ -n "$TEMPLATE" ]; then
     exit 2
 fi
 
-ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
+ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 CSV="${STIX_ELUT_CSV:-}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TOOL="$REPO_ROOT/scripts/stix/elut-upload.py"
@@ -137,8 +138,9 @@ fi
 RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 
 # The shared flashes must never see this gate: canonical first, then
-# refuse /, the two shared run dirs, anything inside them and any parent
-# of them (nominal-smoke's guard).
+# refuse /, the shared run dirs (the uprev master, the frozen baseline,
+# the GS flash, the legacy /tmp ones), anything inside them and any
+# parent of them (nominal-smoke's guard).
 RUN_DIR="$(realpath -m -- "$RUN_DIR")"
 refuse_run_dir() {
     echo "refusing run dir $RUN_DIR ($1)"
@@ -147,7 +149,8 @@ refuse_run_dir() {
     exit 2
 }
 [ "$RUN_DIR" != / ] || refuse_run_dir "it is the root directory"
-for shared in /tmp/stix-uprev-run /tmp/stix-baseline-run; do
+for shared in "$STIX_UPREV_DIR" /tmp/stix-uprev-run \
+              /tmp/stix-baseline-run /tmp/stix-gs-run; do
     shared="$(realpath -m -- "$shared")"
     case "$RUN_DIR" in
         "$shared" | "$shared"/*) refuse_run_dir "it is $shared or inside it" ;;
@@ -528,8 +531,8 @@ if [ -n "$TEMPLATE" ]; then
     [ ! -e "$T_ABS" ] || fail "--save-template $T_ABS exists; never overwritten"
     [ "$T_ABS" != "$RUN_DIR/flash.bin" ] ||
         fail "--save-template $T_ABS is the source"
-    for shared in /tmp/stix-uprev-run /tmp/stix-baseline-run \
-                  /tmp/stix-gs-run; do
+    for shared in "$STIX_UPREV_DIR" /tmp/stix-uprev-run \
+                  /tmp/stix-baseline-run /tmp/stix-gs-run; do
         shared="$(realpath -m -- "$shared")"
         case "$T_ABS" in
             "$shared"/*) fail "--save-template $T_ABS is inside $shared" ;;

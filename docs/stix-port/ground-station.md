@@ -396,9 +396,9 @@ boundary is not known here.
 
 **Residual risk.** No gate can prove that the CSV column `Detector`
 means `subcol`. The GSW reader (`stx_read_elut.pro`, `DET_ID 0-31`),
-stixpy and the ICD say it does, and the user confirmed "0 = first
-detector, 31 = last". If it were `fpga_det`, every gate would still pass
-and 29 detectors would be mis-binned.
+stixpy and the ICD say it does, and the user believes so (not certain:
+"0 = first detector, 31 = last"). If it were `fpga_det`, every gate
+would still pass and 29 detectors would be mis-binned.
 
 ### Picking the CSV
 
@@ -439,9 +439,11 @@ python3 scripts/stix/elut-upload.py encode --csv <CSV> --lut-id 1 \
 
 Send the units in order, one every 0.75 s or slower, and wait for each
 TM(1,7) before the next. Then send TC(237,8) and wait for its TM(1,7):
-the FPGA is written and 4 flash copies are stored. **Then enter NOMINAL
-once**: the LUT ID lives in the RAM context until a NOMINAL entry stores
-it, and without that a reboot loads LUT ID 0 again. `--emit probe-args`
+the FPGA is written and 4 flash copies are stored. **Then store the
+context once**: entering NOMINAL stores it, and so does leaving
+MAINTENANCE (its only exit is to SAFE, which runs `ContextMgmt_deinit`,
+OpModeMgmt.c:144-147); until then the LUT ID lives in the RAM context
+and a reboot loads LUT ID 0 again. `--emit probe-args`
 prints the same sequence as `tmtc-probe.py` arguments, with the ack
 expectations.
 

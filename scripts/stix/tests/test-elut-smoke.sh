@@ -4,7 +4,8 @@
 # Tests for scripts/stix/elut-smoke.sh (ELUT plan E-2). Nothing boots:
 # QEMU is tests/fake-qemu.sh (it records its argv, CWD and the inode of
 # ./flash.bin) and the probe is tests/fake-probe.py. The CSV is
-# synthetic (no flight data, D-Ed), the master flash is a small fake, the
+# synthetic (no flight data, D-Ed), a decoy file stands in for the
+# master flash (never wired in: the gate boots a fresh flash), the
 # slot locks live in a temp dir and the disk guard reads a fake df: the
 # real locks, the shared flash.bin files and the real ports are never
 # touched (stub-bin/ss reports no listener).
@@ -45,7 +46,8 @@ echo "dummy elf" > "$W/dummy.elf"
 printf '#!/bin/sh\necho "Avail"\necho 99999999\n' > "$W/df-ok"
 chmod +x "$W/df-ok"
 mkdir -p "$W/locks"
-unset STIX_PORT_BASE STIX_SLOTS STIX_ELUT_RUN_DIR STIX_TMTC_PROBE
+unset STIX_PORT_BASE STIX_SLOTS STIX_ELUT_RUN_DIR STIX_TMTC_PROBE \
+    STIX_UPREV_DIR
 export STIX_ASW_ELF="$W/dummy.elf"
 export STIX_SLOT_LOCK_DIR="$W/locks"
 export STIX_DF_CMD="$W/df-ok"
@@ -61,13 +63,14 @@ with open(sys.argv[2], "w", newline="") as f:
 EOF
 export STIX_ELUT_CSV="$W/synth.csv"
 
-# the fake master: 8 MiB apparent, 16 KiB of data
+# a decoy master file: 8 MiB apparent, 16 KiB of data. The gate never
+# copies the master (it boots a fresh sparse flash), so the file is only
+# an inode the booted flash.bin must not have.
 M="$W/master/flash.bin"
 mkdir -p "$W/master"
 truncate -s 8M "$M"
 dd if=/dev/urandom of="$M" bs=4k count=4 seek=100 conv=notrunc status=none
 MINO="$(stat -c %i "$M")"
-export STIX_FLASH_MASTER="$M"
 
 gate() { # env-assignments... -- args...: rc in $rc, output in $out
     local envs=()
@@ -101,16 +104,21 @@ gate -- --check-guard --negative
 [ "$rc" -eq 0 ] &&
     grep -q "^GUARD OK: run dir /tmp/stix-elut-run-neg " <<< "$out"
 check "guard: --negative suffix" $? "rc=$rc $out"
+UP="$HOME/dev/stix-state/uprev-run"
 for d in /tmp/stix-uprev-run /tmp/stix-uprev-run/ /tmp/stix-uprev-run/x \
-         /tmp/stix-baseline-run//. /tmp / /tmp/../tmp; do
+         /tmp/stix-baseline-run//. /tmp/stix-gs-run /tmp/stix-gs-run/x \
+         "$UP" "$UP/" "$UP/x" /tmp / /tmp/../tmp; do
     gate STIX_ELUT_RUN_DIR="$d" -- --check-guard
     [ "$rc" -eq 2 ] && grep -q 'refusing run dir' <<< "$out"
     check "guard: refuses $d" $? "rc=$rc $out"
 done
 ln -s /tmp/stix-uprev-run "$W/link"
-gate STIX_ELUT_RUN_DIR="$W/link" -- --check-guard
-[ "$rc" -eq 2 ]
-check "guard: refuses a symlink to the uprev dir" $? "rc=$rc $out"
+ln -s "$UP" "$W/ulink"
+for l in "$W/link" "$W/ulink"; do
+    gate STIX_ELUT_RUN_DIR="$l" -- --check-guard
+    [ "$rc" -eq 2 ] && grep -q 'refusing run dir' <<< "$out"
+    check "guard: refuses a symlink to the uprev dir ($l)" $? "rc=$rc $out"
+done
 
 # ---- argument errors
 gate -- --bogus
@@ -233,8 +241,6 @@ grep -qx "cwd: $W/fl-s1" "$W/qargv.slot" &&
     [ "$(stat -c %s "$W/fl-s1/flash.bin")" -eq 17716740096 ]
 check "fake slot: -s1 dir, -global port, probe port, private flash" $? \
     "$(tr '\n' ' ' < "$W/qargv.slot" | cut -c1-300)"
-[ "$(stat -c %i "$M")" = "$MINO" ] && [ "$(du -k "$M" | cut -f1)" -eq 16 ]
-check "the fake master is unchanged" $? ""
 
 echo "test-elut-smoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

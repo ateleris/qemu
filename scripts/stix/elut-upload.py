@@ -733,8 +733,9 @@ def main(argv=None):
               file=sys.stderr)
         return 2
     if not 0 <= args.first_seq <= 0x3FFF - N_ELUT_TCS:
-        print("elut-upload: --first-seq 0x%X: seq 0x%X..+96 must fit in "
-              "14 bits" % (args.first_seq, args.first_seq), file=sys.stderr)
+        print("elut-upload: --first-seq 0x%X: seqs 0x%X..0x%X must fit in "
+              "14 bits" % (args.first_seq, args.first_seq,
+                           args.first_seq + N_ELUT_TCS), file=sys.stderr)
         return 2
     if args.pace <= 0 or args.t0 < 0:
         print("elut-upload: --t0 must be >= 0 and --pace > 0",
