@@ -4302,7 +4302,11 @@ model is invisible; only ATT_C is real on both builds (A-2).
 **Model (hw/sparc/stix_att.c, the child object
 `/machine/stixctrl/attenuator`, type `stix-att`):**
 - **`att-model`** (qdev bool on stixctrl, default on): off keeps 0x5C
-  as plain storage, never reset, with `fsw-accesses` at 0. On is safe
+  as plain storage, never reset, with `fsw-accesses` at 0. It is
+  settable only before realize: a qom-set after realize is rejected by
+  the generic qdev post-realize rule (the error names the property);
+  `-global` applies at device_post_init, before realize, and
+  `att-fault-reject` pins the rejection. On is safe
   because the gate ELF never accesses 0x5C [G, E]: the UART and trace
   goldens are unchanged, and 0x60/0x64 stay plain storage either way.
 - **Timing knobs** (qdev on stixctrl, D-Ah): `att-initial` (out|in,
@@ -4421,3 +4425,79 @@ line never trips at the 620 stall; an 800 injection trips as the
 positive control that the line is armed), and extends `att-model-off`
 and `att-lv-off` (ch 8 reads 20). RED before A-2: ch 8 read the static
 20 in every state.
+
+A-3 adds the fault layer (D-Ag):
+
+**(b) The layering: truth → named fault → forcing, per reader.**
+- **The switches:** the truth switches follow the mechanism; the
+  presented switches apply the `sensor_*.stuck_*` layer and feed both
+  the 0x5C readback and the controller's stop rule (a stuck switch
+  also changes when the motor stops, D-Ae). A stuck-closed target ends
+  the move one debounce after the write — the drive runs that debounce,
+  so the truth ends one debounce of travel off the end (the plan's
+  outcome table shows the truth at the old end; Doc vs code 12 there).
+  A stuck-open target never ends the move, even with the truth already
+  on the end (the FPGA only knows the switch).
+- **ATT_C:** truth (the mechanism) → `current.zero` /
+  `current.offset` (clamp(truth + offset), −4095..4095 raw counts) →
+  adc-inject[8], in the PL-2a split's presented half. The comparator
+  samples at conversions only: a fault set does not trip, the next two
+  consecutive conversions above the threshold do (D-Af).
+- **The mechanism:** `motorN.dead` removes the motor's torque and its
+  draw (the MOTORxUSED flag still sets, [I]); `mechanism.jammed`
+  freezes the shaft while the driven motors stall against it (+300 per
+  motor, like the end stop).
+- **Forcing** is separate from the faults: `force.cmdsta-set` /
+  `force.cmdsta-clear` (uint32, bits 11:5 only, else rejected) apply
+  inside `stix_att_cmdsta()`, so the MMIO read, `presented.cmdsta` and
+  the write-path trace see the same value; a bit in both masks reads 0
+  (the clear wins); no physics — a forced BC bit does not stop a move;
+  cleared on device reset like adc-inject. `fault-clear` does not
+  touch them.
+
+**(c) The catalogue and its persistence.** The nine A-3 rows are the
+platform's dotted IDs (D-PLq), one QOM property each under
+/machine/stixctrl/attenuator: the four `sensor_ab/bc.stuck_open/_closed`,
+`motor1.dead`/`motor2.dead`, `mechanism.jammed` (new, proposed to the
+platform), `current.zero` and `current.offset` (new, renamed from
+`att_c.offset`; `current.scale` stays A-later). They are persistent
+until cleared **and survive a device reset** — a broken switch stays
+broken over an IDPU reboot — which deliberately differs from Phase 4's
+D-P4b; the adc-inject forcings and the cmdsta forcing masks still
+clear on reset. `fault-clear` (an id or "all") sets the inactive value
+back and rejects unknown ids; `faults-active` reads "id=value,..."
+("" when none). Every accepted set or clear emits trace
+`stixatt_fault(id, value)` (redundant sets included, and once per
+member of a `fault-clear "all"`), so the controller's JSONL can mirror
+it. Sets are rejected with an error while `att-model=off` and on
+out-of-range parameters. A mechanism fault set or clear mid-move folds
+the position at the boundary under the old faults and re-solves the
+end from now (piecewise, D-Ag); the ramp end stays anchored at the
+command, so a mid-move inject never extends the drive past it — a
+target end whose debounce no longer fits inside the window ends at
+the ramp end with the timeout semantics. The platform catalogue
+(`scripts/stix/platform/catalogue/faults-v1.json`) carries the nine
+rows with `qom` actions; `expected_detection` stays empty until a live
+PFM run confirms the outcome table (all [L]). The catalogue's schema
+has no per-fault "description" field, so none was added.
+
+A-3 qtests in the same block: one per catalogue row
+(`att-fault-sensor-ab-open`, `-ab-closed`, `-bc-open`, `-bc-closed`,
+`att-fault-motor-dead`, `att-fault-jammed`, `att-fault-current-zero`,
+`att-fault-current-offset`), plus `att-fault-midmove` (set at 250 ms,
+cleared at 700 ms, the end commits at 710 ms with the fault and end
+traces checked), the mid-move set+clear pair for the truth rows
+(`att-fault-m1-dead-midmove`: frozen at 500000 ppm from the 250 ms
+set to the 500 ms clear, the end re-solved to 760 ms;
+`att-fault-jammed-midmove`: the same fold with the 320 stall, the end
+re-solved to 610 ms), `att-fault-window-end` (a stuck-closed set at
+1595 ms ends at the 1600 ms ramp end with TIMEOUT, never past it),
+`att-fault-reset` (the fault survives, the masks do
+not), `att-fault-trip` (the set does not sample, the second conversion
+trips), `att-fault-reject`, `att-force-cmdsta`, `att-fault-verbs` and
+`att-fault-hw-state` (six hw-state polls across one move, each
+asserting the attenuator object). RED before A-3: the properties are
+unknown to
+qom-set and 0x5C reads carry no forced bits. With no fault set the
+model is untouched: the getters do not trace and the boot/trace
+goldens stay identical.

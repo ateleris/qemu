@@ -2,11 +2,12 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * STIX IDPU attenuator model (attenuator plan A-1/A-2, D-Aa..Af, Ah,
- * Ai): the mechanism (one shaft, two motors, the AB/BC end switches),
- * the AttnCmdSta controller behind CTRL APB offset 0x5C, and the ATT_C
- * current profile (hkAdc ch 8), at /machine/stixctrl/attenuator.
- * Internal to grlib_stixctrl.c; the truth/presented properties are
- * added to the child object's class by stix_att.c. No faults (A-3).
+ * Ai; the fault layer is A-3, D-Ag): the mechanism (one shaft, two
+ * motors, the AB/BC end switches), the AttnCmdSta controller behind
+ * CTRL APB offset 0x5C, and the ATT_C current profile (hkAdc ch 8), at
+ * /machine/stixctrl/attenuator. Internal to grlib_stixctrl.c; the
+ * truth/presented properties, the faults and the verbs are added to
+ * the child object's class by stix_att.c.
  */
 
 #ifndef HW_SPARC_STIX_ATT_H
@@ -15,6 +16,7 @@
 #include "qapi/error.h"
 #include "qom/object.h"
 #include "system/memory.h"
+#include "qobject/qdict.h"
 #include "hw/sparc/grlib_stix.h"
 #include "StixIdpu.h"
 
@@ -79,6 +81,7 @@ struct StixAttState {
     uint32_t move_motors;
     bool move_powered;          /* LVEN sampled at the command [A] */
     bool move_override;         /* ERRORMASK: the switches are ignored */
+    int64_t ramp_end_ns;        /* the drive window, anchored at the cmd */
     /* the move's end, solved at the command (D-Ac) */
     int64_t end_ns;
     uint32_t end_pos;
@@ -92,6 +95,21 @@ struct StixAttState {
     bool op_status;             /* OPERATIONSTATUS: 1 = finished/idle */
     bool timeout;
     uint32_t motors_used;
+
+    /*
+     * The A-3 fault layer (D-Ag): named failures, persistent until
+     * cleared and across a device reset (a broken switch stays broken
+     * over an IDPU reboot). f_* are the catalogue rows; force_set /
+     * force_clear are the bits-11:5 read masks, which are cleared on
+     * reset like the adc-inject forcing.
+     */
+    bool f_ab_open, f_ab_closed;    /* sensor_ab.stuck_open / stuck_closed */
+    bool f_bc_open, f_bc_closed;    /* sensor_bc.stuck_open / stuck_closed */
+    bool f_m1_dead, f_m2_dead;      /* motor1.dead / motor2.dead */
+    bool f_jammed;                  /* mechanism.jammed */
+    bool f_c_zero;                  /* current.zero */
+    int32_t f_c_offset;             /* current.offset, raw ADC counts */
+    uint32_t force_set, force_clear; /* force.cmdsta-set / -clear */
 
     /* bookkeeping */
     uint64_t moves;
@@ -120,5 +138,13 @@ uint32_t stix_att_cmdsta(StixAttState *a);
  */
 uint32_t stix_att_att_c_truth(StixAttState *a);
 uint32_t stix_att_att_c_presented(StixAttState *a);
+
+/*
+ * A-3 (D-Ah): the hw-state "attenuator" object for the controller's
+ * stixctrl_get_hw_state(): truth, presented, fsw_accesses and
+ * faults_active. Pure like the getters (no trace, the lazy advance is
+ * idempotent); the caller owns the returned QDict.
+ */
+QDict *stix_att_hw_state(StixAttState *a);
 
 #endif

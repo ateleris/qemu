@@ -9990,7 +9990,8 @@ static void test_flash_savevm(void)
  * att-travel-ms=500: the plan's +250/+510 expectations and att-override's
  * "reaches IN at 500 ms" predate its Q3 answer, so the default (1000)
  * stays and the property is set explicitly. A-2 adds the ATT_C current
- * profile (hkAdc ch 8, D-Af) to the same block.
+ * profile (hkAdc ch 8, D-Af) and A-3 the fault layer, the forcing
+ * masks and the verbs (D-Ag) to the same block.
  */
 
 #define ATT_PATH  "/machine/stixctrl/attenuator"
@@ -10696,6 +10697,894 @@ static void test_att_current_prot(void)
     stix_qtest_cleanup();
 }
 
+/* ---- A-3: the fault layer, the forcing and the verbs (D-Ag) ---- */
+
+/*
+ * qom-set of the signed attenuator.current.offset; true when QEMU
+ * accepted it. (stix_qom_set_u64 is unsigned, so the negative half of
+ * the range needs its own helper.)
+ */
+static bool att_offset_set(QTestState *qts, int32_t val)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'attenuator.current.offset',"
+                            " 'value': %d}}",
+                            ATT_PATH, val);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+/* the fault-clear verb: a fault id or "all"; true when accepted */
+static bool att_fault_clear(QTestState *qts, const char *id)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'fault-clear', 'value': %s}}",
+                            ATT_PATH, id);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+/*
+ * att-fault-sensor-ab-open: the open (AB) switch reads 0 wherever the
+ * truth is. Open M1 from IN: the shaft travels to OUT (500 ms) but the
+ * stop never fires, so the drive stalls there until the 1600 ms ramp
+ * end ends the move with TIMEOUT; clearing the fault unmasks the
+ * switch (the plan's outcome row, [L]).
+ */
+static void test_att_fault_sensor_ab_open(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1, to IN */
+    qtest_clock_step(qts, 510 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_ab.stuck_open", true));
+    ctrl_write(qts, CTRL_ATT, 1);             /* open M1, back to OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U | ATT_BC);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U);
+    att_qom_str_is(qts, "truth.position", "moving-out");
+    g_assert(att_qom_bool(qts, "truth.motor1-driving"));
+    qtest_clock_step(qts, 260 * ATT_MS_NS);   /* the truth is at OUT */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+    att_qom_str_is(qts, "truth.position", "out");
+    g_assert(att_qom_bool(qts, "truth.sensor-ab"));
+    g_assert(!att_qom_bool(qts, "presented.sensor-ab"));
+    hk_check(qts, 8, 320);                    /* driven but not moving */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U);
+    qtest_clock_step(qts, 1100 * ATT_MS_NS);  /* the 1600 ms ramp end */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_TO | ATT_OP);
+    att_qom_str_is(qts, "truth.last-end", "timeout");
+    hk_check(qts, 8, 20);
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_ab.stuck_open",
+                                    false));
+    g_assert(att_qom_bool(qts, "presented.sensor-ab"));
+    g_assert(!att_qom_bool(qts, "presented.sensor-bc"));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-sensor-ab-closed: AB reads 1 everywhere. Open M1 from IN:
+ * the (stuck) target switch reads actuated at the write, so the drive
+ * runs one debounce and stops — the truth ends one debounce of travel
+ * off IN (the plan's outcome row says "IN"; the drive does run the
+ * debounce, see the As built). Clearing recovers the true switch.
+ */
+static void test_att_fault_sensor_ab_closed(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1, to IN */
+    qtest_clock_step(qts, 510 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_ab.stuck_closed",
+                                    true));
+    ctrl_write(qts, CTRL_ATT, 1);             /* open M1 at IN */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    1u | ATT_M1U | ATT_AB | ATT_BC);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* the debounce commits */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 980000);
+    att_qom_str_is(qts, "truth.position", "between");
+    att_qom_str_is(qts, "truth.last-end", "target");
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_OP | ATT_AB);
+    g_assert(!att_qom_bool(qts, "truth.sensor-ab"));
+    g_assert(att_qom_bool(qts, "presented.sensor-ab"));
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_ab.stuck_closed",
+                                    false));
+    /*
+     * a real open from 980000 ppm: 490 ms of travel to OUT, then the
+     * 10 ms debounce on the (healthy) AB switch
+     */
+    ctrl_write(qts, CTRL_ATT, 1);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U);
+    qtest_clock_step(qts, 495 * ATT_MS_NS);   /* on AB, debouncing */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U | ATT_AB);
+    qtest_clock_step(qts, 5 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_OP | ATT_AB);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-sensor-bc-open: the close (BC) switch reads 0 wherever the
+ * truth is. Close M1 from OUT: the truth reaches IN and stalls there
+ * until the ramp end ends the move with TIMEOUT; the register never
+ * shows BC. Clearing unmasks it and a redundant close then ends on the
+ * (healthy) switch after the debounce.
+ */
+static void test_att_fault_sensor_bc_open(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_open", true));
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_AB);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U);
+    att_qom_str_is(qts, "truth.position", "moving-in");
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+    g_assert(!att_qom_bool(qts, "presented.sensor-bc"));
+    qtest_clock_step(qts, 260 * ATT_MS_NS);   /* the truth is at IN */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+    att_qom_str_is(qts, "truth.position", "in");
+    g_assert(att_qom_bool(qts, "truth.sensor-bc"));
+    g_assert(!att_qom_bool(qts, "presented.sensor-bc"));
+    hk_check(qts, 8, 320);                    /* stalls at IN */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U);
+    qtest_clock_step(qts, 1100 * ATT_MS_NS);  /* the 1600 ms ramp end */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_TO | ATT_OP);
+    att_qom_str_is(qts, "truth.last-end", "timeout");
+    hk_check(qts, 8, 20);
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_open",
+                                    false));
+    g_assert(att_qom_bool(qts, "presented.sensor-bc"));
+    ctrl_write(qts, CTRL_ATT, 4);             /* redundant close at IN */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_BC);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-sensor-bc-closed: BC reads 1 everywhere. Close M1 from
+ * OUT: the stuck target switch reads actuated at the write, so the
+ * move ends after the debounce with the truth one debounce of travel
+ * off OUT and the FSW (and SID2) seeing IN — the plan's silence case.
+ */
+static void test_att_fault_sensor_bc_closed(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_closed",
+                                    true));
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | ATT_M1U | ATT_AB | ATT_BC);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* the debounce commits */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 20000);
+    att_qom_str_is(qts, "truth.position", "between");
+    att_qom_str_is(qts, "truth.last-end", "target");
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+    g_assert(!att_qom_bool(qts, "truth.sensor-bc"));
+    g_assert(att_qom_bool(qts, "presented.sensor-bc"));
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_closed",
+                                    false));
+    g_assert(!att_qom_bool(qts, "presented.sensor-bc"));
+    g_assert(!att_qom_bool(qts, "presented.sensor-ab"));
+    ctrl_write(qts, CTRL_ATT, 1);             /* open back to OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U);
+    qtest_clock_step(qts, 20 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_OP | ATT_AB);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-motor-dead: a dead motor has no torque and draws no
+ * current, while MOTORxUSED (the drive flag) still sets; the mechanism
+ * stays and the move runs out the window to TIMEOUT. One motor, the
+ * other, and both together; clearing restores the move.
+ */
+static void test_att_fault_motor_dead(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.motor1.dead", true));
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_AB);
+    g_assert(!att_qom_bool(qts, "truth.motor1-driving"));
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+    att_qom_str_is(qts, "truth.position", "out");
+    hk_check(qts, 8, 20);                     /* a dead motor draws 0 */
+    qtest_clock_step(qts, 1360 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | ATT_TO | ATT_OP | ATT_AB);
+    att_qom_str_is(qts, "truth.last-end", "timeout");
+    g_assert_true(att_fault_clear(qts, "attenuator.motor1.dead"));
+    ctrl_write(qts, CTRL_ATT, 4);             /* recovery: the move runs */
+    qtest_clock_step(qts, 510 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.motor2.dead", true));
+    ctrl_write(qts, CTRL_ATT, 2);             /* open M2 from IN */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 2u | ATT_M2U | ATT_BC);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+    hk_check(qts, 8, 20);
+    qtest_clock_step(qts, 1360 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    2u | ATT_TO | ATT_OP | ATT_BC);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.motor2.dead", false));
+    ctrl_write(qts, CTRL_ATT, 2);             /* recovery */
+    qtest_clock_step(qts, 510 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 2u | ATT_OP | ATT_AB);
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.motor1.dead", true));
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.motor2.dead", true));
+    ctrl_write(qts, CTRL_ATT, 12);            /* close both from OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    12u | ATT_M1U | ATT_M2U | ATT_AB);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+    hk_check(qts, 8, 20);
+    qtest_clock_step(qts, 1360 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    12u | ATT_TO | ATT_OP | ATT_AB);
+    g_assert_true(att_fault_clear(qts, "all"));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-jammed: the shaft does not move but the motors keep
+ * driving it: the truth stays at OUT, the register never sees BC, and
+ * ATT_C reads the one-motor stall (320) for the whole window until the
+ * TIMEOUT; the torque flag stays set. Clearing unjams the mechanism.
+ */
+static void test_att_fault_jammed(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.mechanism.jammed", true));
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_AB);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+    att_qom_str_is(qts, "truth.position", "out");
+    g_assert(att_qom_bool(qts, "truth.motor1-driving"));
+    hk_check(qts, 8, 320);                    /* driven but not moving */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_AB);
+    qtest_clock_step(qts, 1360 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | ATT_TO | ATT_OP | ATT_AB);
+    att_qom_str_is(qts, "truth.last-end", "timeout");
+    hk_check(qts, 8, 20);
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.mechanism.jammed", false));
+    ctrl_write(qts, CTRL_ATT, 4);             /* recovery: it moves now */
+    qtest_clock_step(qts, 510 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-current-zero: the presented ATT_C reads 0 at all times
+ * ("motion with no current") while truth.att-c keeps the mechanism's
+ * draw; the register is unaffected. adc-inject[8] forcing still wins
+ * over the fault (the truth -> fault -> forcing order, D-Af).
+ */
+static void test_att_fault_current_zero(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.current.zero", true));
+    hk_check(qts, 8, 0);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.att-c"), ==, 20);
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    hk_check(qts, 8, 0);                      /* motion with no current */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.att-c"), ==, 120);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U);
+    qtest_clock_step(qts, 260 * ATT_MS_NS);
+    hk_check(qts, 8, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+
+    g_assert_true(att_fault_clear(qts, "attenuator.current.zero"));
+    hk_check(qts, 8, 20);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.current.zero", true));
+    g_assert_true(adc_inject_set(qts, 8, 2000));
+    hk_check(qts, 8, 2000);                   /* the forcing wins */
+    g_assert_true(adc_inject_set(qts, 8, ADC_INJECT_NONE));
+    hk_check(qts, 8, 0);
+    g_assert_true(att_fault_clear(qts, "all"));
+    hk_check(qts, 8, 20);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-current-offset: the presented ATT_C is clamp(truth +
+ * offset) at all times, truth.att-c keeps the mechanism draw, and
+ * hw-state hk_adc.8 shows the split. The clamp catches both ends and
+ * clearing restores the raw value.
+ */
+static void test_att_fault_current_offset(void)
+{
+    QTestState *qts = att_qtest_new("");
+    QDict *st, *ch;
+
+    g_assert_true(att_offset_set(qts, 800));
+    hk_check(qts, 8, 820);                    /* 20 idle + 800 */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.att-c"), ==, 20);
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    hk_check(qts, 8, 920);                    /* 120 moving + 800 */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.att-c"), ==, 120);
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    ch = plat_hk_ch(st, 8);
+    g_assert_cmpint(qdict_get_int(ch, "truth"), ==, 120);
+    g_assert_cmpint(qdict_get_int(ch, "presented"), ==, 920);
+    qobject_unref(st);
+
+    g_assert_true(att_offset_set(qts, -150));
+    hk_check(qts, 8, 0);                      /* 120 - 150 clamps at 0 */
+    g_assert_true(att_offset_set(qts, 4000));
+    hk_check(qts, 8, 4095);                   /* 4120 clamps at 4095 */
+    g_assert_true(att_fault_clear(qts, "attenuator.current.offset"));
+    hk_check(qts, 8, 120);
+    qtest_clock_step(qts, 260 * ATT_MS_NS);   /* the end, on time */
+    hk_check(qts, 8, 20);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-midmove (D-Ag, piecewise): sensor_bc.stuck_open set at
+ * 250 ms re-solves the running close from now — the end leaves 510 ms
+ * for the 1600 ms ramp end (the truth stalls at IN from 500 ms).
+ * Clearing at 700 ms re-solves again: the switch is healthy now and
+ * the truth sits on it, so the move ends at 710 ms (target + debounce).
+ */
+static void test_att_fault_midmove(void)
+{
+    g_autofree gchar *log = NULL, *extra = NULL;
+    g_autofree gchar *text = NULL;
+    QTestState *qts;
+    uint64_t v0, end_ns;
+    bool ok;
+    int fd;
+
+    fd = g_file_open_tmp("stix-att-fault-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixatt_fault -trace stixatt_end "
+                            "-D %s", log);
+    qts = att_qtest_new(extra);
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_open", true));
+    qtest_clock_step(qts, 260 * ATT_MS_NS);   /* the old end, 510 ms */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+    att_qom_str_is(qts, "truth.position", "in");
+    hk_check(qts, 8, 320);                    /* stalled at IN */
+    qtest_clock_step(qts, 190 * ATT_MS_NS);   /* 700 ms */
+    v0 = stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns", &ok);
+    g_assert(ok);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_open",
+                                    false));
+    qtest_clock_step(qts, 5 * ATT_MS_NS);     /* 705: in the debounce */
+    /* the healthy switch reads actuated at once (monitored constantly) */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_BC);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* 715: past the end */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+    att_qom_str_is(qts, "truth.last-end", "target");
+    end_ns = att_qom_u64(qts, "truth.last-end-ns");
+    g_assert_cmpuint(end_ns - v0, ==, 10 * ATT_MS_NS);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_assert(g_file_get_contents(log, &text, NULL, NULL));
+    g_assert_nonnull(strstr(text, "fault attenuator.sensor_bc.stuck_open"
+                            " = 1"));
+    g_assert_nonnull(strstr(text, "fault attenuator.sensor_bc.stuck_open"
+                            " = 0"));
+    g_assert_nonnull(strstr(text, "stixatt_end"));
+    unlink(log);
+}
+
+/*
+ * att-fault-m1-dead-midmove (D-Ag, piecewise): motor1.dead set at
+ * 250 ms freezes the one-motor close at 500000 ppm (250 ms of travel,
+ * 2000 ppm/ms) and re-solves the end to the 1600 ms ramp end — no live
+ * motor. The clear at 500 ms re-solves from the frozen position:
+ * 500000 ppm to IN is 250 ms, plus the 10 ms debounce, so the end
+ * moves to 760 ms and commits on the (healthy) BC switch.
+ */
+static void test_att_fault_m1_dead_midmove(void)
+{
+    QTestState *qts = att_qtest_new("");
+    uint64_t v0, end_ns;
+    bool ok;
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.motor1.dead", true));
+    /* frozen at the fold: 250 ms of travel, the dead motor draws 0 */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+    g_assert(!att_qom_bool(qts, "truth.motor1-driving"));
+    hk_check(qts, 8, 20);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);   /* 500 ms, still frozen */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+
+    v0 = stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns", &ok);
+    g_assert(ok);
+    g_assert_true(att_fault_clear(qts, "attenuator.motor1.dead"));
+    /* resumed: 500000 ppm to IN in 250 ms, then the 10 ms debounce */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);   /* 750 ms: on BC */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_BC);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* 760: the end commits */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+    att_qom_str_is(qts, "truth.last-end", "target");
+    end_ns = att_qom_u64(qts, "truth.last-end-ns");
+    g_assert_cmpuint(end_ns - v0, ==, 260 * ATT_MS_NS);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-jammed-midmove (D-Ag, piecewise): mechanism.jammed set at
+ * 250 ms freezes the close at 500000 ppm with the motor driving but
+ * stalled against the jam (ATT_C 320, the torque flag stays) and
+ * re-solves the end to the 1600 ms ramp end. The clear at 350 ms
+ * re-solves from the frozen position: 500000 ppm to IN is 250 ms, plus
+ * the 10 ms debounce, so the end moves to 610 ms.
+ */
+static void test_att_fault_jammed_midmove(void)
+{
+    QTestState *qts = att_qtest_new("");
+    uint64_t v0, end_ns;
+    bool ok;
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.mechanism.jammed",
+                                    true));
+    /* frozen at the fold: the motor drives, the shaft holds (320) */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+    g_assert(att_qom_bool(qts, "truth.motor1-driving"));
+    hk_check(qts, 8, 320);
+    qtest_clock_step(qts, 100 * ATT_MS_NS);   /* 350 ms, still frozen */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+
+    v0 = stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns", &ok);
+    g_assert(ok);
+    g_assert_true(att_fault_clear(qts, "attenuator.mechanism.jammed"));
+    /* resumed: 500000 ppm to IN in 250 ms, then the 10 ms debounce */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);   /* 600 ms: on BC */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_BC);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* 610: the end commits */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+    att_qom_str_is(qts, "truth.last-end", "target");
+    end_ns = att_qom_u64(qts, "truth.last-end-ns");
+    g_assert_cmpuint(end_ns - v0, ==, 260 * ATT_MS_NS);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-window-end (D-Ag): a mid-move inject never extends the
+ * drive past the anchored ramp end. sensor_bc.stuck_open keeps the
+ * close running to the 1600 ms window end (the truth stalls at IN from
+ * 500 ms); a stuck-closed target set 5 ms before it re-solves to
+ * now + debounce = 1605 ms, which no longer fits, so the move ends at
+ * the 1600 ms ramp end with the timeout semantics, not one debounce
+ * later.
+ */
+static void test_att_fault_window_end(void)
+{
+    QTestState *qts = att_qtest_new("");
+    uint64_t v0, end_ns;
+    bool ok;
+
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_open",
+                                    true));
+    att_lv_on(qts);
+    v0 = stix_qom_get_u64(qts, "/machine/stixspw", "vclock-ns", &ok);
+    g_assert(ok);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    qtest_clock_step(qts, 1595 * ATT_MS_NS);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_closed",
+                                    true));
+    qtest_clock_step(qts, 5 * ATT_MS_NS);     /* 1600: the ramp end */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | ATT_TO | ATT_OP | ATT_BC);
+    att_qom_str_is(qts, "truth.last-end", "timeout");
+    end_ns = att_qom_u64(qts, "truth.last-end-ns");
+    g_assert_cmpuint(end_ns - v0, ==, 1600 * ATT_MS_NS);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* 1610: no second end */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | ATT_TO | ATT_OP | ATT_BC);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-reset (D-Ag): a fault survives system_reset (a broken
+ * switch stays broken over an IDPU reboot) while the forcing masks do
+ * not (they clear like adc-inject, D-P4b).
+ */
+static void test_att_fault_reset(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1, to IN */
+    qtest_clock_step(qts, 510 * ATT_MS_NS);
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_ab.stuck_closed",
+                                    true));
+    g_assert_true(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0x800));
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | 0x800u | ATT_OP | ATT_BC | ATT_AB);
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_BC | ATT_AB);
+    att_qom_str_is(qts, "faults-active",
+                   "attenuator.sensor_ab.stuck_closed=1");
+    g_assert_cmpuint(att_qom_u64(qts, "force.cmdsta-set"), ==, 0);
+    g_assert_cmpuint(att_qom_u64(qts, "force.cmdsta-clear"), ==, 0);
+    g_assert(!att_qom_bool(qts, "truth.sensor-ab"));
+    g_assert(att_qom_bool(qts, "presented.sensor-ab"));
+    g_assert_true(att_fault_clear(qts, "all"));
+    att_qom_str_is(qts, "faults-active", "");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-trip: current.offset = 800 with the ATT_C protection line
+ * armed the way the FSW does after 0x14A3. The set itself does not
+ * sample (D-Af); the next conversions do, and the second consecutive
+ * one above 751 trips PROTSTAT and the HK IRQ.
+ */
+static void test_att_fault_trip(void)
+{
+    const uint32_t bit = 1u << (8 - HK_PROT_ATT);
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    hk_prot_write_unlocked(qts, HK_PROT_ATT, HKPROT_EN | 751);
+    ctrl_write(qts, CTRL_HKIRQSTA, bit);      /* IRQEN for the line */
+
+    g_assert_true(att_offset_set(qts, 800));
+    g_assert_cmphex(hk_protstat(qts), ==, 0); /* the set does not sample */
+    g_assert_false(hk_irq_pending(qts));
+    hk_check(qts, 8, 820);                    /* sample 1: high */
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+    hk_check(qts, 8, 820);                    /* sample 2: trips */
+    g_assert_cmphex(hk_protstat(qts), ==, bit);
+    g_assert_cmpuint(hk_hotsample(qts), ==, 820);
+    g_assert_true(hk_irq_pending(qts));
+
+    g_assert_true(att_fault_clear(qts, "attenuator.current.offset"));
+    hk_check(qts, 8, 20);                     /* low again */
+    g_assert_cmphex(hk_protstat(qts), ==, bit); /* latched */
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-reject: the rejected sets fail with an error and change
+ * nothing (D-Ag): forcing bits outside 11:5, an offset outside
+ * -4095..4095, an unknown id in fault-clear, qom-set on the read-only
+ * faults-active, an att-model change after realize (the generic qdev
+ * post-realize rule; the error names the property), and any fault or
+ * forcing set with att-model=off.
+ */
+static void test_att_fault_reject(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert(!stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0x1u));
+    g_assert(!stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0x10u));
+    g_assert(!stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-clear", 0x1001u));
+    g_assert(!stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set",
+                               0xFFFFFFFFu));
+    g_assert(!att_offset_set(qts, 4096));
+    g_assert(!att_offset_set(qts, -4096));
+    g_assert(!att_fault_clear(qts, "attenuator.nonsense"));
+    g_assert(!att_fault_clear(qts, "sensor_bc.stuck_open"));
+    g_assert(!att_qom_set_str(qts, "faults-active", ""));
+    g_assert(!stix_qom_set_bool(qts, "/machine/stixctrl", "att-model",
+                                false));
+    /* the att-model reject changed nothing: the model still runs */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_AB);
+    /* the valid neighbours are accepted */
+    g_assert(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0x800u));
+    g_assert(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-clear", 0x400u));
+    g_assert(att_offset_set(qts, 4095));
+    g_assert(att_offset_set(qts, -4095));
+    g_assert_cmpuint(att_qom_u64(qts, "force.cmdsta-set"), ==, 0x800u);
+    g_assert_cmpuint(att_qom_u64(qts, "force.cmdsta-clear"), ==, 0x400u);
+    att_qom_str_is(qts, "faults-active", "attenuator.current.offset=-4095");
+    g_assert_true(att_fault_clear(qts, "all"));
+    /* fault-clear does not touch the forcing masks */
+    g_assert_cmpuint(att_qom_u64(qts, "force.cmdsta-set"), ==, 0x800u);
+    g_assert_cmpuint(att_qom_u64(qts, "force.cmdsta-clear"), ==, 0x400u);
+    att_qom_str_is(qts, "faults-active", "");
+    g_assert(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0));
+    g_assert(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-clear", 0));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    qts = att_qtest_new("-global grlib-stixctrl.att-model=off");
+    g_assert(!stix_qom_set_bool(qts, ATT_PATH,
+                                "attenuator.sensor_ab.stuck_open", true));
+    g_assert(!att_offset_set(qts, 10));
+    g_assert(!stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0x800u));
+    g_assert(!att_fault_clear(qts, "all"));
+    att_qom_str_is(qts, "faults-active", "");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-force-cmdsta (D-Ag): the forcing masks are applied to what a
+ * 0x5C read returns, after everything else — no physics. They show in
+ * presented.cmdsta, they are no faults (faults-active stays empty and
+ * fault-clear leaves them), and a forced BC bit does not stop a move.
+ */
+static void test_att_force_cmdsta(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert_true(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0x800));
+    g_assert_cmpuint(att_qom_u64(qts, "force.cmdsta-set"), ==, 0x800);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    0x800u | ATT_OP | ATT_AB);
+    g_assert_cmphex(att_qom_u64(qts, "presented.cmdsta"), ==,
+                    0x800u | ATT_OP | ATT_AB);
+    g_assert_true(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-clear",
+                                   ATT_OP));
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0x800u | ATT_AB);
+    /* no physics: the truth is untouched and the masks are no faults */
+    att_qom_str_is(qts, "truth.position", "out");
+    att_qom_str_is(qts, "truth.last-end", "none");
+    att_qom_str_is(qts, "faults-active", "");
+    g_assert_true(att_fault_clear(qts, "all"));
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0x800u | ATT_AB);
+
+    /* a forced BC bit does not stop a close */
+    g_assert_true(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0));
+    g_assert_true(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-clear", 0));
+    g_assert_true(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set",
+                                   ATT_BC));
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_BC);
+    att_qom_str_is(qts, "truth.position", "moving-in");
+    qtest_clock_step(qts, 260 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | ATT_OP | ATT_BC);
+    att_qom_str_is(qts, "truth.last-end", "target");
+    g_assert_true(stix_qom_set_u64(qts, ATT_PATH, "force.cmdsta-set", 0));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-verbs: faults-active lists every fault off its inactive
+ * value in catalogue order as id=value,..., fault-clear removes one id
+ * or all of them, and clearing an inactive id is accepted.
+ */
+static void test_att_fault_verbs(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_qom_str_is(qts, "faults-active", "");
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_ab.stuck_closed",
+                                    true));
+    att_qom_str_is(qts, "faults-active",
+                   "attenuator.sensor_ab.stuck_closed=1");
+    g_assert_true(att_offset_set(qts, 800));
+    att_qom_str_is(qts, "faults-active",
+                   "attenuator.sensor_ab.stuck_closed=1,"
+                   "attenuator.current.offset=800");
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.sensor_bc.stuck_open",
+                                    true));
+    att_qom_str_is(qts, "faults-active",
+                   "attenuator.sensor_ab.stuck_closed=1,"
+                   "attenuator.sensor_bc.stuck_open=1,"
+                   "attenuator.current.offset=800");
+
+    g_assert_true(att_fault_clear(qts, "attenuator.sensor_ab.stuck_closed"));
+    att_qom_str_is(qts, "faults-active",
+                   "attenuator.sensor_bc.stuck_open=1,"
+                   "attenuator.current.offset=800");
+    g_assert_true(att_fault_clear(qts, "all"));
+    att_qom_str_is(qts, "faults-active", "");
+    g_assert_true(att_fault_clear(qts, "attenuator.sensor_bc.stuck_open"));
+    att_qom_str_is(qts, "faults-active", "");
+    g_assert_true(att_offset_set(qts, -4095));
+    att_qom_str_is(qts, "faults-active", "attenuator.current.offset=-4095");
+    g_assert_true(att_fault_clear(qts, "attenuator.current.offset"));
+    att_qom_str_is(qts, "faults-active", "");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-fault-hw-state (D-Ah): the controller's hw-state carries an
+ * attenuator object with truth, presented, fsw_accesses and
+ * faults_active. Six polls across one close (0, 100, 250, 400 and
+ * 500 ms, then one with a fault) each see the exact model state: the
+ * travel is 2000 ppm/ms, the draw 120 while moving and 320 stalled on
+ * BC from 500 ms (the end commits at 510 ms); at the command instant
+ * the shaft is commanded (moving-in) but still at OUT with AB
+ * actuated. The polls are pure (the PL-1/PL-2 note): they do not
+ * disturb the move, and fsw_accesses only counts the guest 0x5C
+ * accesses.
+ */
+static void test_att_fault_hw_state(void)
+{
+    static const struct {
+        int ms;                 /* the step since the last poll */
+        uint32_t ppm;           /* the shaft position at the poll */
+        const char *pos;        /* truth.position at the poll */
+        uint32_t att_c;         /* the mechanism draw at the poll */
+        bool ab, bc;            /* the truth (== presented) switches */
+    } polls[] = {
+        {   0,       0, "moving-in", 120, true,  false },
+        { 100,  200000, "moving-in", 120, false, false },
+        { 150,  500000, "moving-in", 120, false, false },
+        { 150,  800000, "moving-in", 120, false, false },
+        { 100, 1000000, "in",        320, false, true  },
+    };
+    QTestState *qts = att_qtest_new("");
+    QDict *st, *att, *tr, *pr, *model;
+    size_t i;
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 from OUT */
+    for (i = 0; i < G_N_ELEMENTS(polls); i++) {
+        if (polls[i].ms) {          /* qtest refuses a zero step */
+            qtest_clock_step(qts, polls[i].ms * ATT_MS_NS);
+        }
+        st = plat_hw_state(qts, "/machine/stixctrl");
+        model = plat_dict(st, "model");
+        g_assert(qdict_get_bool(model, "att_model"));
+        att = plat_dict(st, "attenuator");
+        tr = plat_dict(att, "truth");
+        pr = plat_dict(att, "presented");
+        g_assert_cmpstr(qdict_get_str(tr, "position"), ==, polls[i].pos);
+        g_assert_cmpint(qdict_get_int(tr, "position_ppm"), ==,
+                        polls[i].ppm);
+        g_assert_cmpint(qdict_get_bool(tr, "sensor_ab"), ==, polls[i].ab);
+        g_assert_cmpint(qdict_get_bool(tr, "sensor_bc"), ==, polls[i].bc);
+        g_assert_cmpint(qdict_get_bool(pr, "sensor_ab"), ==, polls[i].ab);
+        g_assert_cmpint(qdict_get_bool(pr, "sensor_bc"), ==, polls[i].bc);
+        g_assert_cmpint(qdict_get_int(tr, "att_c"), ==, polls[i].att_c);
+        g_assert_cmpint(qdict_get_int(tr, "moves"), ==, 1);
+        g_assert_cmpstr(qdict_get_str(tr, "last_end"), ==, "none");
+        g_assert(qdict_get_bool(tr, "motor1_driving"));
+        g_assert(!qdict_get_bool(tr, "motor2_driving"));
+        g_assert_cmpint(qdict_get_int(pr, "att_c"), ==, polls[i].att_c);
+        g_assert_cmpint(qdict_get_int(pr, "cmdsta"), ==,
+                        4u | ATT_M1U | (polls[i].ab ? ATT_AB : 0u) |
+                        (polls[i].bc ? ATT_BC : 0u));
+        g_assert_cmpint(qdict_get_int(att, "fsw_accesses"), ==, 1);
+        g_assert_cmpstr(qdict_get_str(att, "faults_active"), ==, "");
+        qobject_unref(st);
+    }
+
+    /* a sixth poll: current.zero changes only the presented half */
+    g_assert_true(stix_qom_set_bool(qts, ATT_PATH,
+                                    "attenuator.current.zero", true));
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    att = plat_dict(st, "attenuator");
+    tr = plat_dict(att, "truth");
+    pr = plat_dict(att, "presented");
+    g_assert_cmpint(qdict_get_int(tr, "att_c"), ==, 320);
+    g_assert_cmpint(qdict_get_int(pr, "att_c"), ==, 0);
+    g_assert_cmpstr(qdict_get_str(att, "faults_active"), ==,
+                    "attenuator.current.zero=1");
+    qobject_unref(st);
+
+    /* the polls and the fault set did not disturb the move */
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* the end, 510 ms */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+    g_assert_true(att_fault_clear(qts, "all"));
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    att = plat_dict(st, "attenuator");
+    g_assert_cmpint(qdict_get_int(plat_dict(att, "presented"), "att_c"),
+                    ==, 20);
+    g_assert_cmpstr(qdict_get_str(att, "faults_active"), ==, "");
+    qobject_unref(st);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_att_register(void)
 {
     qtest_add_func("/sparc/stix/att-reset", test_att_reset);
@@ -10726,6 +11615,36 @@ static void stix_att_register(void)
     qtest_add_func("/sparc/stix/att-current-inject",
                    test_att_current_inject);
     qtest_add_func("/sparc/stix/att-current-prot", test_att_current_prot);
+    /* A-3: one test per catalogue row, plus the verbs and forcing */
+    qtest_add_func("/sparc/stix/att-fault-sensor-ab-open",
+                   test_att_fault_sensor_ab_open);
+    qtest_add_func("/sparc/stix/att-fault-sensor-ab-closed",
+                   test_att_fault_sensor_ab_closed);
+    qtest_add_func("/sparc/stix/att-fault-sensor-bc-open",
+                   test_att_fault_sensor_bc_open);
+    qtest_add_func("/sparc/stix/att-fault-sensor-bc-closed",
+                   test_att_fault_sensor_bc_closed);
+    qtest_add_func("/sparc/stix/att-fault-motor-dead",
+                   test_att_fault_motor_dead);
+    qtest_add_func("/sparc/stix/att-fault-jammed", test_att_fault_jammed);
+    qtest_add_func("/sparc/stix/att-fault-current-zero",
+                   test_att_fault_current_zero);
+    qtest_add_func("/sparc/stix/att-fault-current-offset",
+                   test_att_fault_current_offset);
+    qtest_add_func("/sparc/stix/att-fault-midmove", test_att_fault_midmove);
+    qtest_add_func("/sparc/stix/att-fault-m1-dead-midmove",
+                   test_att_fault_m1_dead_midmove);
+    qtest_add_func("/sparc/stix/att-fault-jammed-midmove",
+                   test_att_fault_jammed_midmove);
+    qtest_add_func("/sparc/stix/att-fault-window-end",
+                   test_att_fault_window_end);
+    qtest_add_func("/sparc/stix/att-fault-reset", test_att_fault_reset);
+    qtest_add_func("/sparc/stix/att-fault-trip", test_att_fault_trip);
+    qtest_add_func("/sparc/stix/att-fault-reject", test_att_fault_reject);
+    qtest_add_func("/sparc/stix/att-force-cmdsta", test_att_force_cmdsta);
+    qtest_add_func("/sparc/stix/att-fault-verbs", test_att_fault_verbs);
+    qtest_add_func("/sparc/stix/att-fault-hw-state",
+                   test_att_fault_hw_state);
 }
 
 int main(int argc, char **argv)

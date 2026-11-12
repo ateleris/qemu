@@ -6,14 +6,11 @@
 # a link carries nothing), presented for a wrong reading (the HK ADC
 # forcings): the attenuator plan's amendment to D-PLo.
 #
-# Reserved for the attenuator track (its plan's fault catalogue; they
-# arrive as "qom" actions on /machine/stixctrl*):
-#   attenuator.sensor_ab.stuck_open, attenuator.sensor_ab.stuck_closed,
-#   attenuator.sensor_bc.stuck_open, attenuator.sensor_bc.stuck_closed,
-#   attenuator.motor1.dead, attenuator.motor2.dead,
-#   attenuator.mechanism.jammed, attenuator.current.zero,
-#   attenuator.current.offset;
-#   later: attenuator.move.slow, attenuator.mechanism.partial,
+# The attenuator track's A-3 set is in the list below: one qom
+# property per id on /machine/stixctrl/attenuator (their plan's fault
+# catalogue, D-Ag; expected_detection stays empty until a live PFM run
+# confirms the outcomes). The A-later rows stay reserved:
+#   attenuator.move.slow, attenuator.mechanism.partial,
 #   attenuator.motor1.flag_lost, attenuator.motor2.flag_lost,
 #   attenuator.controller.fail_flag, attenuator.current.scale.
 {
@@ -91,6 +88,104 @@
      "action": {"kind": "adc", "ch": 4},
      "preconditions": [], "expected_detection": [
        {"tm": "0x5A7:5:3:943405", "within_s": 20,
-        "note": "the HK protection comparator (fault-smoke)"}]}
+        "note": "the HK protection comparator (fault-smoke)"}]},
+    {"id": "attenuator.sensor_ab.stuck_open", "class": "signal",
+     "changes": "presented",
+     "target": "instrument.attenuator.sensor_ab", "mode": "stuck_at",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.sensor_ab.stuck_open",
+                "value": true},
+     "preconditions": [
+       "needs a PFM ELF for the FSW to see it (AX never reads 0x5C)"],
+     "expected_detection": []},
+    {"id": "attenuator.sensor_ab.stuck_closed", "class": "signal",
+     "changes": "presented",
+     "target": "instrument.attenuator.sensor_ab", "mode": "stuck_at",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.sensor_ab.stuck_closed",
+                "value": true},
+     "preconditions": [
+       "needs a PFM ELF; one stuck switch is TM-silent, the evidence is SID2 status4 bits 14/13"],
+     "expected_detection": []},
+    {"id": "attenuator.sensor_bc.stuck_open", "class": "signal",
+     "changes": "presented",
+     "target": "instrument.attenuator.sensor_bc", "mode": "stuck_at",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.sensor_bc.stuck_open",
+                "value": true},
+     "preconditions": [
+       "needs a PFM ELF for the FSW to see it"],
+     "expected_detection": []},
+    {"id": "attenuator.sensor_bc.stuck_closed", "class": "signal",
+     "changes": "presented",
+     "target": "instrument.attenuator.sensor_bc", "mode": "stuck_at",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.sensor_bc.stuck_closed",
+                "value": true},
+     "preconditions": [
+       "needs a PFM ELF; one stuck switch is TM-silent, the evidence is SID2 status4 bits 14/13"],
+     "expected_detection": []},
+    {"id": "attenuator.motor1.dead", "class": "component",
+     "changes": "truth",
+     "target": "instrument.attenuator.motor1", "mode": "open_circuit",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.motor1.dead", "value": true},
+     "preconditions": [
+       "needs a PFM ELF (0x5436 on the next single-motor move)"],
+     "expected_detection": []},
+    {"id": "attenuator.motor2.dead", "class": "component",
+     "changes": "truth",
+     "target": "instrument.attenuator.motor2", "mode": "open_circuit",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.motor2.dead", "value": true},
+     "preconditions": [
+       "needs a PFM ELF (0x5436 on the next single-motor move)"],
+     "expected_detection": []},
+    {"id": "attenuator.mechanism.jammed", "class": "component",
+     "changes": "truth",
+     "target": "instrument.attenuator.mechanism", "mode": "jammed",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.mechanism.jammed",
+                "value": true},
+     "preconditions": [
+       "needs a PFM ELF (0x5436 and the 320 stall current)"],
+     "expected_detection": []},
+    {"id": "attenuator.current.zero", "class": "signal",
+     "changes": "presented",
+     "target": "instrument.hk_adc.8", "mode": "zero",
+     "params": {},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.current.zero", "value": true},
+     "preconditions": [
+       "visible on AX too; no TM (255-sample persistence, the plan's outcome table)"],
+     "expected_detection": []},
+    {"id": "attenuator.current.offset", "class": "signal",
+     "changes": "presented",
+     "target": "instrument.hk_adc.8", "mode": "offset",
+     "params": {"offset": {"type": "integer", "min": -4095, "max": 4095,
+                           "default": 0, "unit": "adc",
+                           "index_space": "ch"}},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/attenuator",
+                "property": "attenuator.current.offset",
+                "param": "offset"},
+     "preconditions": [
+       "visible on AX too; 800 with the ATT_C line armed trips 0x9434"],
+     "expected_detection": []}
   ]
 }

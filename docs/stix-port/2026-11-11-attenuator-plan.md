@@ -766,6 +766,11 @@ construction):**
   - realize rejects `att-travel-ms`/`att-ramp-ms` = 0 (a zero travel
     would divide by zero) and an `att-initial` other than out|in, like
     `timecode-source`;
+  - `att-model` cannot change at runtime: a qom-set after realize is
+    rejected by the generic qdev post-realize rule (the error names
+    the property), like every stixctrl qdev property; the tests switch
+    it with `-global`, which is applied at device_post_init, before
+    realize (`att-fault-reject` pins the rejection);
   - `truth.att-c`/`presented.att-c` are A-2, as is the ATT_C wiring;
     `truth.last-end` = fail exists but never sets before A-3.
 - Gates: the per-commit set.
@@ -838,6 +843,64 @@ construction):**
     - an offset outside −4095..4095;
     - an unknown ID in `fault-clear`;
     - any fault set with `att-model=off`.
+- **As built (A-3, 2026-11-12):** implemented in `stix_att.[ch]`, one
+  `hw-state` hunk in `grlib_stixctrl.c` and the `stixatt_fault` trace,
+  with these choices where the plan left room:
+  - the end solver is shared by the command and the fault boundary:
+    `stix_att_move_resolve()` re-solves a running move from the
+    current position under the current faults; the ramp end stays
+    anchored at the command (`ramp_end_ns`), so a mid-move inject
+    cannot extend the drive window — a target end (stuck-closed or
+    the truth already on the switch) whose debounce no longer fits
+    inside the window ends at the ramp end with the timeout
+    semantics;
+  - a mechanism fault set or clear (`motorN.dead`, `jammed`, and the
+    stuck sensors through the stop rule) advances silently, folds the
+    position at the boundary under the old faults, stores, traces and
+    re-solves from now (D-Ag piecewise); `current.*` never touches the
+    move;
+  - the stop rule reads the *presented* target switch (D-Ae), so a
+    stuck-closed target ends the move one debounce after the write —
+    and the drive runs that debounce, so the truth ends one debounce
+    of travel off the end (the outcome table's OUT/IN for those rows
+    is approximate; Doc vs code 12). A stuck-open target never ends
+    the move, even with the truth already on the end (the FPGA only
+    knows the switch);
+  - the forcing masks apply inside `stix_att_cmdsta()`, so the MMIO
+    read, `presented.cmdsta` and the write-path trace all see the same
+    value; a bit in both masks reads 0 (the clear wins); they are
+    rejected outside bits 11:5 and cleared on reset like `adc-inject`;
+  - `stixatt_fault(id, value)` fires on every accepted set or clear,
+    redundant ones included and once per member of a
+    `fault-clear "all"`; `fault-clear` does not touch the forcing
+    masks;
+  - `faults-active` is "" when nothing is active; the bools read 1 and
+    the offset its raw value, catalogue order;
+  - every fault and forcing set is rejected with an error while
+    `att-model=off` (D-Ag); the getters still read (the stored, all
+    inactive values);
+  - the `hw-state` `attenuator` object exists (the PL-2 accessor is
+    there): truth (position, position_ppm, the truth sensors, the
+    motor driving flags, att_c, moves, last_end, last_end_ns),
+    presented (sensor_ab/bc, cmdsta, att_c), `fsw_accesses` and
+    `faults_active`; the top-level `model` dict gained `att_model`;
+  - `truth.last-end` = fail still never sets (`controller.fail_flag`
+    is A-later); bit 11 is reachable only through `force.cmdsta-set`.
+- The tests live in the `stix` binary's A-1 block behind
+  `stix_att_register()`: one per catalogue row
+  (`att-fault-sensor-ab-open`, `-ab-closed`, `-bc-open`, `-bc-closed`,
+  `att-fault-motor-dead` with M1, M2 and both, `att-fault-jammed`,
+  `att-fault-current-zero`, `att-fault-current-offset`), plus
+  `att-fault-midmove`; the mid-move set+clear pair for the truth rows,
+  `att-fault-m1-dead-midmove` and `att-fault-jammed-midmove` (the
+  shaft freezes on the set, resumes on the clear, the end re-solved
+  from the fold); `att-fault-window-end` (a stuck-closed set 5 ms
+  before the ramp end ends at the ramp end, TIMEOUT);
+  `att-fault-reset`, `att-fault-trip`, `att-fault-reject`,
+  `att-force-cmdsta`, `att-fault-verbs` and `att-fault-hw-state` (six
+  polls across one move, each asserting the attenuator object). RED
+  before A-3: the properties are unknown to qom-set and the forcing
+  masks do not exist.
 - Gates: **the full set**, including att-smoke's AX subset once A-4
   exists (until then, a manual AX `current.offset` probe run). The
   accepted-diff sections (b) and (c).
@@ -1092,6 +1155,24 @@ Code wins in each case. The model follows the column marked ✔.
     The code `break`s and reports again (`:213`). For the attenuator,
     HWConfig sends nothing (`HWConfig.c:853, 946`), and AttCtrl reports
     at FINISH. ✔ code: two TM(1,7) per TC move (correction 3).
+11. **The register reset values (the ICD, doc.txt:2230-2250).** The
+    ICD's Reset column is 0x0 for every AttnCmdSta bit, and
+    PositionAB/BC say "clear during FPGA reset and monitored
+    constantly otherwise". The model idles at 0x500 (OPERATIONSTATUS
+    1, the live switches presented) after a reset (D-Ae), because a
+    PFM ELF reading 0 would wait "moving" forever and sit 3 s at every
+    SAFE entry. ✔ code (the model is unchanged); the ICD's "monitored
+    constantly" suggests the real FPGA also re-presents the switches
+    promptly, so only OPERATIONSTATUS truly differs.
+12. **The stuck-closed outcome rows (the outcome table).** The
+    `sensor_*_stuck_closed` rows show the truth still at the old end
+    with both presented switches actuated (the SID2 both-bits
+    evidence). In the model the drive runs the 10 ms debounce first —
+    the same rule that keeps MOTORxUSED set for the FSW's post-write
+    sample (D-Ae) — so the truth ends one debounce of travel off the
+    end and the other, healthy, presented switch reads 0. ✔ code; the
+    FSW-visible difference (one SID2 bit, not two) waits for the live
+    run [L] (A-4's silence case).
 
 ## Open questions for the user
 
@@ -1102,14 +1183,32 @@ Code wins in each case. The model follows the column marked ✔.
    on the gate ELF (the att-smoke AX subset). The other option, poking the AX stub's `isAB`/`isBC` in
    guest RAM, emulates the FSW's own stub, not hardware, and is
    rejected.
-2. **Q2: the HSWICD AttnCmdSta/AttnConfig1 section.** Can you extract it
-   into the notes? It would settle:
-   - the OPERATIONSTATUS reset value;
-   - stop-on-switch and the override;
-   - whether a timeout also sets OPERATIONSTATUS;
-   - FAILFLAG's cause;
-   - the ramp quant unit;
-   - whether a command toward an already-actuated switch drives at all.
+2. **Q2: the HSWICD AttnCmdSta/AttnConfig1 section — ANSWERED in part
+   (2026-11-12).** The HW/SW ICD landed at
+   `~/dev/stix-doc-notes/sources/STIX-ICD-0026-SRC_I1R0_STIX_IDPU_Hardware_to_Software_ICD.txt`
+   (§4.42/§4.43, doc.txt:2224-2294). It settles:
+   - the OPERATIONSTATUS reset value: 0; "Set to '1' after move
+     procedure is finished. Reset on new command" (doc.txt:2240-2241);
+   - FAILFLAG: "set to 1 after timeout or second switch check
+     failure. Cleared with next command" (doc.txt:2232-2233);
+   - ERRORMASK bit 4: "the Attenuator controller ignores activation
+     of position sensors" (doc.txt:2248-2249) — the override;
+   - the ramp quanta count PWM periods between duty-cycle decreases;
+     FastRampTimeQuant resets to 0x4D, SlowRampTimeQuant to 0x1C8
+     (doc.txt:2286-2292), so the FSW's written 0x1E0E4000 (fast 30,
+     slow 228) is a configured value, not the reset;
+   - the bit layout and the command values match StixIdpu.h
+     (doc.txt:2230-2274).
+   **Still open:** whether a timeout also sets OPERATIONSTATUS (the
+   ICD's "after move procedure is finished" does not say which ends
+   count; the `att-timeout-finishes` knob stands, Q4); stop-on-switch,
+   the debounce and the drive window (the ICD only says ERRORMASK
+   ignores the sensors); whether a command toward an already-actuated
+   switch drives at all (the model drives one debounce); MOTORxUSED
+   "Cleared at capacitor discharge after move" (doc.txt:2242-2245) is
+   read as "cleared at the move end". The one conflict with the A-1
+   model (the ICD reset column vs the idle 0x500) is Doc vs code 11;
+   the model is unchanged.
 3. **Q3: the real travel time and the motor currents** (default 500 ms;
    100 raw moving, 300 stalled per motor). Any EM/PFM test log number
    would do.
@@ -1126,7 +1225,9 @@ Code wins in each case. The model follows the column marked ✔.
 
 Q7-Q10 (scope, ID ownership, AX blindness and the SKIP convention) came
 up in the review. They are decided as overridable defaults (see the
-status block and "Review resolutions"). Q1-Q6 stay open.
+status block and "Review resolutions"). Q1 and Q3-Q6 stay open; Q2 is
+answered in part by the ICD (above), with the timeout/finished and
+already-actuated readings still open.
 
 ## Out of scope
 
@@ -1174,7 +1275,9 @@ is kept outside the repo. Each row below says where the item is folded.
 | Q9 AX blindness in the UI | decided: `fsw-accesses`; the UI shows "FSW does not read the attenuator on this ELF" | Correction 1; D-Ah |
 | Q10 SKIP convention | decided: exit 77; SKIP listed separately from PASS | A-4; Commits preamble; A-5 |
 
-Q1-Q6 remain open for the user (see "Open questions for the user").
+Q1-Q6 remain open for the user (see "Open questions for the user");
+Q2 is answered in part by the ICD (2026-11-12), with the
+timeout/finished and already-actuated readings still open.
 
 ## Note from the platform PL-1/PL-2 implementation review (2026-11-11)
 

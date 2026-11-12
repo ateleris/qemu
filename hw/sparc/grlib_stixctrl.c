@@ -1312,6 +1312,7 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     qdict_put_bool(model, "powerstat", s->powerstat);
     qdict_put_bool(model, "hk_prot", s->hk_prot);
     qdict_put_bool(model, "det_model", s->det.model);
+    qdict_put_bool(model, "att_model", s->att.cfg.model);
     qdict_put(root, "model", model);
 
     /* hkCmdSta bits 4:0 (LV, HV01, HV17, SPW0, SPW1) and POWERSTAT 9:5 */
@@ -1402,6 +1403,9 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     }
     qdict_put(det, "quarter_on", qon);
     qdict_put(root, "det", det);
+
+    /* A-3 (D-Ah): the attenuator's truth/presented/faults summary */
+    qdict_put(root, "attenuator", stix_att_hw_state(&s->att));
 
     json = qobject_to_json(QOBJECT(root));
     return g_string_free(json, false);
