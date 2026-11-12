@@ -1,8 +1,9 @@
 # Flash damage plan: bad blocks, broken cells and corrupted files as the FSW filesystem sees them
 
-Status: X-1 to X-4 implemented 2026-11-12 (see their "As built"
-notes); the rest is
-draft, 2026-11-12, revised the same day after the independent
+Status: X-1 to X-5 implemented 2026-11-12 (see their "As built"
+notes). X-4b is not implemented in v1 (later); the correctable
+flavour's expectations must first be re-derived for F19. The plan body
+is draft, 2026-11-12, revised the same day after the independent
 review (`.review-flashdmg.txt`, all 8 findings resolved — see "Review
 resolutions") and the unit-test framework cross-check; unreviewed.
 Base: track worktree
@@ -943,6 +944,9 @@ detector/att smokes) at X-4/X-4b and before the merge.
 
 ### X-4b: framework-derived scenarios
 
+(Not implemented in v1 (later); the correctable flavour's expectations
+must first be re-derived for F19 — see the Status line.)
+
 The four scenarios the unit-test framework motivates (see the scenario
 catalogue), as optional flavours of flash-damage-smoke (one QEMU run
 each; "uncorrectable" reuses the stuck part's boot):
@@ -995,6 +999,22 @@ each; "uncorrectable" reuses the stuck part's boot):
   + `cont` pattern for damage from boot).
 - `baseline/README.md`: the suite line gains flash-damage-smoke.
 - This plan's "As built".
+
+- **As built (2026-11-12, commit X-5).** Docs only, no code change:
+  accepted-diffs.md gained **§44** "Flash damage injection (baseline:
+  the NAND is always perfect)" — §43 is the attenuator track's on the
+  integration branch, which this branch does not have yet, so 44 is the
+  next free number here; ground-station.md's "Fault injection" gained
+  the "NAND flash damage" subsection (QOM recipes, the tool recipes
+  with `--spare any` and the type names, the expected outcomes with the
+  F20 "no 0x543B as TM at boot" note, the `-S` + `damage-add` + `cont`
+  pattern); baseline/README.md's suite list gained flash-damage-smoke
+  (positive + `--negative`, step 9 + a Notes bullet); the Status line
+  now says X-1..X-5 implemented and marks X-4b not implemented in v1
+  (later), repeated under the X-4b heading. Content follows the
+  X-1..X-4 "As built" notes wherever they differ from the plan body
+  (F18/F19/F20, the seed, check page 0, MAINTENANCE-only TC(238,6),
+  badBlockHandling = 0).
 
 ## Goldens and gate impact
 

@@ -189,6 +189,12 @@ python3 scripts/stix/idefx-trace-check.py --self-test # verification runs
 #    own slot or the 21000 flock; ~4.5 min positive + 30 s negative):
 STIX_PORT_BASE=auto bash scripts/stix/pfm-boot-smoke.sh \
     build/qemu-system-sparc          # add --negative, --dry-run
+
+# 9. Flash damage gate (flash damage plan X-4, accepted-diffs §44; the AX
+#    gate ELF; slot mode REQUIRED — the offline damage edits a private
+#    copy of the master flash; the seeded parts are two QEMU runs each):
+STIX_PORT_BASE=auto bash scripts/stix/flash-damage-smoke.sh \
+    build/qemu-system-sparc          # add --negative, --dry-run
 ```
 
 Notes:
@@ -237,6 +243,19 @@ Notes:
   AX build is refused, an absent ELF is SKIP 77. Run dir
   `/tmp/stix-pfm-run` (`-neg`), a fresh sparse flash per run, never the
   master.
+- Flash damage gate: `flash-damage-smoke.sh` (step 9;
+  `accepted-diffs.md` §44). **PASS** means the boot part's factory-bad
+  block 610 shows in 0x0032 (`0032 01 0002 0001 <err>`, a seeded LUT
+  file's header damage adding 0x5439 and error=1); the check part's
+  runtime program-fail shows in the QMP `damage-list` read-back,
+  TM(238,7) bad_after=1 on APID 0x5A8, and the second boot's 0x0032
+  bad+1 (the FSW's own grown marker persists); the addr and stuck parts
+  end in the F20 boot crash (QEMU exits by itself under `-no-reboot`,
+  the UART has the read-error line, the TMBuffer ASSERT and no
+  "init: TM buffer"). `--negative` (the boot part undamaged) passes
+  only when the boot part's damage expectations are exactly the
+  unmatched set. Needs the master flash and slot mode; SKIP 77 without
+  the ELF.
 - **Gate exit codes:**
 
   | Code | Meaning |

@@ -780,6 +780,101 @@ EOF
 }
 ```
 
+### NAND flash damage
+
+Since the flash-damage track (`accepted-diffs.md` §44) the NAND itself
+can be damaged — offline in the image, or at runtime over QMP — and the
+FSW's filesystem reacts the way it does on real NAND (bad blocks,
+BCH-corrected reads, corrupted files). The gate
+`flash-damage-smoke.sh` pins the outcomes below; it needs slot mode
+(`STIX_PORT_BASE`) and only damages private copies of the master flash.
+
+**Runtime injection on `/machine/stixflash`.** The value of
+`damage-add` is one sidecar `"damage"` entry as a JSON object *string*
+(escaped quotes — the device parses the string with the sidecar
+parser), so with the `qom_set` function above:
+
+```bash
+qom_set $RUN/qmp.sock /machine/stixflash damage-add \
+    '"{\"kind\": \"erase-fail\", \"block\": 610}"'
+qom_set $RUN/qmp.sock /machine/stixflash damage-add \
+    '"{\"kind\": \"stuck\", \"page\": 4483, \"bit\": \"100.7\", \"value\": 1}"'
+qom_set $RUN/qmp.sock /machine/stixflash damage-remove all
+```
+
+| kind | spec | effect |
+|---|---|---|
+| `erase-fail` | `{"kind": "erase-fail", "block": 610}` | every erase of the block completes FAILED\|READY after the full `tbers-us`; the FSW marks the block bad itself and moves on |
+| `program-fail` | `{"kind": "program-fail", "page": 4288}` | every program to the page fails; the FSW marks the block bad |
+| `stuck`, one bit | `{"kind": "stuck", "page": 4483, "bit": "100.7", "value": 1}` | every read returns that bit at its stuck value (0 or 1); <= 7 bits in one 528-B sub-block = the BCH path, more = uncorrectable |
+| `stuck`, whole block | `{"kind": "stuck", "block": 610, "value": 0}` | bit 0 of every byte of every read of the block |
+
+`stuck0` is the value-0 alias. Both address forms are accepted: FSW
+linear (`block`/`page`) or the framework's `mcm`/`chip` with `page`/`block`.
+`damage-remove` takes `all` or the exact spec; only runtime rows are
+removable. Entries survive a guest reset (they model broken cells); a
+rejected set errors and changes nothing. Read the active specs back
+with `qom-get damage-list` (one row per spec, `src=map` for sidecar
+entries, `src=runtime` for injected ones) — the `qom_set` helper only
+sets, so use the probe (`--qmp PATH --qmp-cmd JSON`, §27) or a
+`qom-get` one-liner for it.
+
+**Damage from boot without a sidecar.** The verbs exist before the
+device is realized, so start QEMU frozen (`-S`), inject, then resume:
+`-qmp unix:$RUN/qmp.sock,server=on,wait=off -S`, then over QMP the
+`qom-set` above followed by `{"execute": "cont"}`. Without `-S`, the
+same injection lands mid-run (it applies from the next op completion
+on); damage that must exist while the boot scan runs (the first
+~seconds) needs `-S` or the sidecar
+(`-global grlib-stixflash.flash-damage-map=<run dir>/flash.bin.dmg`,
+written by `flash-damage.py device`).
+
+**Offline image damage** (`scripts/stix/flash-damage.py`, before QEMU
+starts, on a private copy — the tool refuses the shared master dirs):
+
+```bash
+F=/tmp/stix-my-run/flash.bin
+# what is stored where (truth read-back; --spare any because context
+# names carry the build's CONTEXT_VERSION in name byte 1):
+python3 scripts/stix/flash-damage.py show --type context1 --spare any \
+    --duration 0xffff $F
+# factory bad block (610 is a TMMGMT block; --fs-range marks every
+# FS-scanned block, A 64-1983 + B 32832-34751):
+python3 scripts/stix/flash-damage.py bad-block --block 610 $F
+# a stored file, by name: header (the file vanishes at boot), data
+# (--bits <= 7 the corrected path, > 7 uncorrectable), or a wrong spare
+# pageAddress with the header BCH re-encoded:
+python3 scripts/stix/flash-damage.py corrupt-file --type lut --spare any \
+    --mode header $F
+python3 scripts/stix/flash-damage.py corrupt-file --type context1 \
+    --spare any --duration 0xffff --mode data --bits 8 --page 0 \
+    --sub-block 0 $F
+python3 scripts/stix/flash-damage.py corrupt-file --type context1 \
+    --spare any --duration 0xffff --mode address --page 0 $F
+```
+
+`--type` takes the FSW file-type names `aspect raw-counts tmmgmt flare
+user-requests context0 context1 lut` (context0 = 6, context1 = 7,
+lut = 8 — FSW finding F18) or the number. The damage is permanent in
+the image: undo it by re-copying a fresh flash, never by editing the
+shared master.
+
+**Expected outcomes** (all pinned by the gate, §44):
+
+| Case | Injection | Expected |
+|---|---|---|
+| Factory bad block | `bad-block --block 610` before boot | TM(5,1) 0x0032 at boot with bad=1 (used=0002 on the gate's seeded copy, the two context files); with a LUT file also header-damaged: TM(5,2) 0x5439 `<lutType> <lutId>` at boot. On AX a missing LUT file alone sends **no** 0x5439 (the golden UART has the four "could not find LUT" lines). |
+| Grown bad block | `damage-add` program-fail on the block the next context store draws from, then enter NOMINAL | the store burns the block (the FSW writes the marker itself); TC(238,6) → TM(238,7) on APID 0x5A8 with bad_after=1; after a guest reset the next 0x0032 has bad+1 (the marker persists in the image). TC(238,6) is MAINTENANCE-only (NOMINAL → SAFE → MAINTENANCE first) and must carry badBlockHandling = 0: with 1 the check erases the grown-bad block and it heals before the reset. |
+| Uncorrectable or wrong-address file damage | `corrupt-file --mode data --bits 8` (or `--mode address`) on a context file, then boot | **no TM**: the boot-time context read error is fatal (FSW finding F20) — the 0x543B report hits TMBuffer before it exists, ASSERT (TMBuffer.c:276), Halting → reset, every boot; QEMU exits by itself under `-no-reboot`. The UART shows the read-error line ("Unrecoverable error in file", or "address corrupt" for the wrong-address mode) and no "init: TM buffer". **0x543B is not observable as TM for context damage at boot.** |
+| Corrected flip | `corrupt-file --mode data --bits <= 7` | not gated in v1 (the X-4b correctable flavour; its expectations must first be re-derived for F19). The UART TRACE prints `BCH corrected N SEUs`, but the flip is NOT corrected in flight (FSW finding F19): the LEON's BCH applies its fixes at word-swapped indices, so the page reads back with the original error plus a mirrored one. |
+
+Notes:
+- The emulator does not model ECC; the guest does (`File.h:106-122`,
+  `MemoryMgmt/BCH.c`). Damage is plain bits in the image.
+- Blocks < 64 (the ASW image area) are refused everywhere;
+  `damage-add` needs the `allow-reserved` qdev property to lift the
+  rule, the sidecar has none.
+
 ## Notes and limits
 
 - **Order doesn't matter.** The bridge retries the QEMU connection. QEMU

@@ -4557,3 +4557,247 @@ the currents — are inferred [I] (Q2-Q5); AX blindness: only
 there, not cleared on reset) is the R5/Q9 label that keeps the AX
 artefact out of the mismatch reports; and the two TM(1,7) per TC move
 (correction 3) are never used as evidence that a move ended.
+
+## 44. Flash damage injection (baseline: the NAND is always perfect)
+
+Plan: `2026-11-12-flash-damage-plan.md` (X-1..X-5, each with its
+"As built" note; those notes are the source of truth here). The
+operator recipes are in `ground-station.md`, "Fault injection" →
+"NAND flash damage"; the gate is in the suite list of
+`baseline/README.md`.
+
+**Baseline:** nothing could damage the NAND. Erase and program always
+succeeded, every read returned the stored bytes bit-exactly, and a
+flash image stayed perfect forever: no bad blocks, no stuck cells, no
+corrupted files. The FSW's grown-bad-block marking, BCH correction and
+corrupted-file paths all existed but could never fire. With no damage
+configured nothing changes (D-X6): one `damage == NULL` check per op,
+no `stixflash_damage_*` trace line, status/timing/IRQ behaviour
+unchanged, the goldens byte-identical (qtest `flash-dmg-quiet`).
+
+**Model (X-1/X-2, `grlib_stixflash.c`):** one per-instance damage
+list, two sources, one entry grammar.
+- Kinds: `erase-fail` (block scope), `program-fail` (page), `stuck`
+  (page with `bit=<byte>.<bit>`, or whole block = bit 0 of every byte),
+  with `value` 0 or 1 (O4: stuck cells have both polarities; `stuck0`
+  stays as the value-0 alias and takes no `value`). After the parse
+  every entry is canonical (mcm/chip + the page inside the chip).
+- All damage applies at `stixflash_complete()` only: a failing erase or
+  program still takes its full latency (§42's timer, on by default),
+  then completes FAILED|READY with one IRQ and commits nothing — the
+  FSW sees a normal slow op that failed. `stuck` applies between the
+  file read and the DMA, on every read, so it also corrupts a freshly
+  programmed page, like a real stuck cell. The guest-facing failure
+  walks the same `stixflash_error why=erase-fail|program-fail` line as
+  every other failure.
+- **The grown-bad-block marker is the FSW's own (correction 1):** a
+  failed erase/program inside `File_write` makes the FSW erase the
+  block and program `badBlockMarker = 0` into pages 0 and 1 itself
+  (`BSW_ASW/src/BSW/Flash/File.c:582-598`), so the device never marks
+  anything and the marker the FSW writes persists in the image across
+  reboots — the factory→grown lifecycle of real NAND with one
+  mechanism. Two documented nuances: the marking erase also fails under
+  erase-fail and the marker program lands anyway (the model overwrites
+  pages cleanly, `(void)Erase_block`, `File.c:592`; real NAND could
+  stay unmarked — accepted); and a program-fail on both marker pages
+  defeats the marker, while one on a single page leaves the other
+  (the scan marks BAD when either page carries one,
+  `File.c:318-339`). The gate's check part injects page 0 of the
+  one-page context store and the persistence still shows (X-4 As built
+  5).
+- Traces: `stixflash_damage_load(n, path)` once after a successful
+  sidecar parse (n = 0 for an empty `"damage"` array),
+  `stixflash_damage_hit(kind, page_address, cmd_sta)` once per hit
+  (kind `stuck0|stuck1` by value). Both silent with no sidecar or no
+  runtime entries.
+
+**The surface (D-X3):**
+- Sidecar: qdev `flash-damage-map` (string, default "" = none), e.g.
+  `-global grlib-stixflash.flash-damage-map=<run dir>/flash.bin.dmg`,
+  parsed at realize. JSON `{"v":1,"damage":[...]}`, a small file next
+  to the flash. A missing file is silence (ENOENT only — any other open
+  error fails realize), a malformed one fails realize naming the path
+  and the reason, over 1 MiB fails realize
+  (`flash-dmg-map-parse`/`stix.c`).
+- Runtime verbs on `/machine/stixflash` (added in instance_init, so
+  they exist before realize): `damage-add` (write-only; one sidecar
+  `"damage"` entry as a JSON object **string**), `damage-remove`
+  (write-only; `all` or the exact spec), `damage-list` (read-only). A
+  spec that is already active (map or runtime) is rejected ("the spec
+  is already active"); the list is capped at 65536 entries (map +
+  runtime); a rejected set errors and changes nothing (D-Ag).
+  `damage-remove` matches by the canonical record, so any written form
+  of the same spec (linear or mcm/chip, `stuck` or `stuck0`) removes
+  it; only `src=runtime` rows are removable — `all` drops every runtime
+  row and is idempotent, the sidecar rows are boot configuration and
+  only go away by rebooting without the sidecar.
+- Reset: the entries survive a guest/system reset (they model broken
+  cells; the reset handler touches only the op state). A reset drops a
+  pending op before completion, so an aborted op can never take a hit
+  (D-F4, pinned by `flash-dmg-reset`); an add/remove while an op is
+  pending takes effect at that op's completion.
+- Reserved rule: the containing linear block must be >= 64 (the
+  ASW-image area is not FSW-visible on the gate ELF,
+  `MemFilesystem.c:43-44`). The sidecar has no override; `damage-add`
+  honours the `allow-reserved` qdev bool (default false);
+  `damage-remove` is never blocked (removing injects nothing).
+- `damage-list` rows (the controller's read-back truth), FSW-linear
+  index space, `\n`-separated, map rows first (sidecar order) then
+  runtime rows in add order:
+  `src=map|runtime kind=erase-fail block=<linear>`,
+  `src=... kind=program-fail page=<linear>`,
+  `src=... kind=stuck value=<0|1> page=<linear> bit=<byte>.<bit>`,
+  `src=... kind=stuck value=<0|1> block=<linear>`.
+
+**The grammar (both addressing forms):** JSON keys `kind`, `block`,
+`page`, `mcm`, `chip`, `bit`, `value`; either the FSW-linear form
+(`block` or `page` alone) or the unit-test framework's `mcm`+`chip`
+with `page` (chip-relative), `block` (in the chip) or `block`+`page`
+(the argument list of `Flash_Curr_Img_DirectWrite`,
+`BSW_ASW/src/BSW/Flash/Flash.c:280-310`: linear page =
+`mcm<<21 | chip<<18 | block*64 + page`; the framework's `offset=<o>`
+has no sidecar key — the tool resolves it to the bit `offset.bit`).
+`bit` is stuck-only, `"byte.bit"` with byte < 4224 and bit < 8; unknown
+keys are rejected. One parser serves sidecar and verbs
+(`stixflash_dmg_entry`); the tool's `validate_spec` mirrors it so the
+tool never writes a map the device would reject at realize.
+
+**The offline tool (X-3, `scripts/stix/flash-damage.py`, stdlib only):**
+- `bad-block --block N` (or the framework form `--mcm M --chip C
+  --block B`; `--fs-range` for every FS-scanned block: A 64-1983,
+  B 32832-34751 with `LIMIT_FS_SIZE=32`) — marker 0 into the spares of
+  pages 0 and 1, single-byte writes (the same guest view as the FSW's
+  full-page marker program, sparser on disk).
+- `corrupt-file --type T [--spare S --coarse C --fine F --duration D]
+  --mode header|data|address` — locates the file by its 10-byte name
+  (chunked spare-area scan of the FS regions, one file per block) and
+  flips a deterministic pattern, each candidate verified with the
+  tool's own BCH decoder before anything is written: `header`
+  (uncorrectable first-page header — the file "does not exist" at
+  boot), `data` (> 7 flips in one 528-B sub-block uncorrectable,
+  `--bits` given; `--sub-block` selects it), `address` (review finding
+  5, the TN-required "data block written at the wrong address" aspect:
+  the spare `pageAddress` u32 rewritten to a wrong but valid page and
+  sub-block 7's ECC re-encoded, so the read passes BCH and reaches the
+  FSW's address check, `File.c:691-699`).
+- `show --type T ...` — truth read-back: the file's block (linear and
+  mcm/chip/block) and pages with `pageAddress`, `fileSize`,
+  `logicalWriteTime`; `device` — writes the sidecar with the O4 stuck
+  grammar. `--self-test` runs fully offline (two synthetic sparse
+  images, both storage modes, its own negatives) and pins the encoder
+  against the committed reference vectors.
+- Guards: it applies the inversion itself (default; `--plain` for
+  `inverted-storage=off`), never writes past EOF (the file size is the
+  capacity, §7 D-H), re-checks the 64 MiB sparse cap after every edit,
+  refuses the shared master dirs unless `--allow-shared`, and refuses
+  blocks < 64 unless `--allow-reserved`.
+- Names: context names carry the build's CONTEXT_VERSION in name byte 1
+  (`ContextMgmt.h:11` says 35; the AX gate ELF stores 0x22), so
+  `show`/`corrupt-file` take `--spare any` (FSW finding F18). The type
+  codes are the sequential enum values — context0 = 6, context1 = 7,
+  lut = 8; the header's per-line comments say 8/9 and are wrong
+  (`FilesystemDefinition.h:81-92`).
+
+**Flight-BCH facts the tool depends on (FSW finding F19).**
+`encode_bch` byte-swaps every aligned 32-bit word unconditionally
+(`MemoryMgmt/BCH.c:300-310`, the Linux `cpu_to_be32` hard-coded for a
+little-endian host), so on the big-endian LEON the stored ECC is the
+standard BCH of the **word-swapped** sub-block — and `BCH_decode`
+applies its fixes at swapped-stream indices (`BCH.c:1480-1486`): a real
+error in byte b is "corrected" in byte b^3, same bit — the decode
+returns ok with fixes = 1 and the page reads back with the original
+error plus the mirrored one. **The emulator does not model ECC at all**
+(the model stores raw pages, the plan's correction 3); the guest does
+(`File.h:106-122`, `MemoryMgmt/BCH.c`). The tool's `bch_encode`/
+`bch_decode` are the flight forms; the standard core stays pinned by
+`scripts/stix/tests/bch13t7-reference-vector.txt`, the flight forms by
+`bch13t7-leon-vector.txt` (the master flash's stored header ECC plus a
+LEON-faithful build of `BCH.c`). Consequence for the outcome rows: a
+"correctable" flip is NOT corrected in flight, and the >= 4-corrections
+rewrite path (`MemFilesystem.c:604-655`) stores the miscorrected data
+with a fresh, valid ECC — the X-4b correctable flavour's expectations
+must first be re-derived from this before it graduates (X-4b is not
+implemented in v1, later).
+
+**Boot-time context damage is fatal (FSW finding F20).** INIT waits for
+the FILE task's context reads (`MemFilesystem.c:542-544`,
+`:1038-1051`) before `TMBuffer_init` (`main.c:136-140`); the read
+error's TM(5,2) 0x543B report then hits the uncreated TMBuffer
+semaphores → ASSERT (`TcTm/TMBuffer.c:276`) → Halting → trap → reset,
+every boot while the file is damaged. Under `-no-reboot` QEMU exits by
+itself; the UART shows the read-error line ("address corrupt" for the
+wrong-address mode, "Unrecoverable error in file" for the uncorrectable
+one) and no "init: TM buffer"; the ASSERT's backtrace (0x543B in some
+frame) is printed only sometimes and is reported, not pinned. **0x543B
+is therefore not observable as TM for context damage at boot** — the
+smoke pins the crash instead.
+
+**Catalogue mapping (D-X5).** `scripts/stix/platform/catalogue/
+faults-v1.json` reserves the `flash.*` IDs as whole-line comments next
+to the attenuator's (the loader has no reserved/disabled-row form, so
+comments are the only non-injectable form): the three device rows
+`flash.block.erase_fail`, `flash.page.program_fail`, `flash.cell.stuck`
+(class memory, `changes: "truth"`, `until_cleared`, action qom
+`damage-add` with `damage-remove` as the clear on `/machine/stixflash`
+— adopting them needs a platform amendment, hence comment-only) and the
+three offline rows `flash.block.bad_factory`, `flash.file.corrupt`,
+`flash.file.wrong_address` (setup-only, no `action`: pre-boot steps,
+the planned `hooks.*` verb `flash.damage` running the tool).
+
+**The gate (X-4, `scripts/stix/flash-damage-smoke.sh`):** positive +
+`--negative`, AX gate ELF only (O1; a PFM flavour is opt-in later),
+slot mode only (the offline damage edits a private copy of the master).
+Four parts, each in its own run dir; the parts that need stored files
+run a SEED first (a mode drive whose TC(236,6) param change makes the
+NOMINAL-entry store re-write both context files, waited on CONTEXT1's
+`logicalWriteTime`, then a clean QMP quit):
+- **boot** (offline, before QEMU): `bad-block --block 610` (TMMGMT,
+  blocks 604-783) + `corrupt-file --mode header` on a LUT file when the
+  seed left one → 0x0032 `0032 01 0002 0001 <err>` (used=0002: the two
+  context files; bad=1; error=1 only with the LUT damaged) and 0x5439
+  only when the LUT exists — on AX a missing LUT file alone sends none
+  (the golden UART has the four "could not find LUT" lines) [L]. No
+  context damage here (F20).
+- **check** (device, runtime): `damage-add` program-fail on page 0 of
+  the first free CB0 block after the context files (show-derived at run
+  time), `damage-list` read-back over QMP; the param TC (4094 vs the
+  seeded 4095) makes the run's NOMINAL-entry store fire and burn the
+  block; TC(238,6) `{0, 3839, 0}` (MAINTENANCE-only, entered via
+  NOMINAL → SAFE → MAINTENANCE; `badBlockHandling=0` because with 1 the
+  check erases the grown-bad block — a program-fail-only block erases
+  fine, so it healed before the reset, seen live) → TM(238,7) on APID
+  0x5A8 with bad_after=1 [L]; then a QMP `system_reset` and the second
+  boot's 0x0032 shows bad+1 — the persistence point, D-X1 [L].
+- **addr** and **stuck** (offline): `corrupt-file --mode address` /
+  `--mode data --bits 8` on CONTEXT1 page 0 → the F20 boot crash, QEMU
+  exits by itself.
+- `--negative` runs the boot part undamaged and passes only when
+  exactly the boot part's damage expectations are unmatched and nothing
+  else failed. Every [L] payload was confirmed by a live probe run
+  before it froze (X-4's "As built", seven live-driven changes: the
+  file-type enum, the flight BCH, the seed wait on `logicalWriteTime`,
+  the F20 crash, the check page 0, TC(238,6) MAINTENANCE-only, and
+  `badBlockHandling=0`). The `--flavour` plumbing for the X-4b
+  scenarios exists in the script, but the X-4b flavours are not
+  implemented in v1 (later).
+
+**Evidence:** 11 qtests behind `stix_flashdmg_register()`
+(`tests/qtest/stix.c`), all RED on the pre-X-1/pre-X-2 binaries (the
+property or the verb is unknown, so the first assert aborts): X-1's
+`flash-dmg-erase-fail` (FAILED|READY after the full `tbers-us`, one
+IRQ, the file bytes unchanged, the FSW-style marker program still
+landing), `-program-fail`, `-stuck0`, `-stuck1` (O4: an erased page
+unaffected, a programmed 0 on the bit reads 1), `-stuck-multi` (two
+stuck bits on one page, the later entry wins), `-marker-plain` (the
+inversion rule pinned in both storage modes), `-quiet`, `-map-parse`
+(malformed sidecar fails realize, missing file fine); X-2's
+`-runtime-add` (inject → full-latency erase fails with one hit →
+remove the identical spec → erase succeeds), `-reset` (the entries
+survive `system_reset`; the dropped pending op takes no hit),
+`-reject` (unknown kind, reserved block with `allow-reserved` off,
+non-JSON, unknown key, duplicate add, remove of an unknown spec or of
+the sidecar's own spec — each leaving `damage-list` unchanged; then
+`all`, and the `allow-reserved=on` positive). The tool's self-test
+(197 checks, < 1 s) and the two committed BCH vector files pin the
+offline side. The gate pins the FSW-visible outcomes; its [L] payloads
+came from the live probe runs recorded in the plan's X-4 "As built".
