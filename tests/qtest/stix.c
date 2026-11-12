@@ -9989,7 +9989,8 @@ static void test_flash_savevm(void)
  * LV on through hkCmdSta LVEN (0x88). The move timelines use
  * att-travel-ms=500: the plan's +250/+510 expectations and att-override's
  * "reaches IN at 500 ms" predate its Q3 answer, so the default (1000)
- * stays and the property is set explicitly.
+ * stays and the property is set explicitly. A-2 adds the ATT_C current
+ * profile (hkAdc ch 8, D-Af) to the same block.
  */
 
 #define ATT_PATH  "/machine/stixctrl/attenuator"
@@ -10203,6 +10204,7 @@ static void test_att_lv_off(void)
     /* nothing travels: the truth stays at the end stop */
     att_qom_str_is(qts, "truth.position", "out");
     g_assert(!att_qom_bool(qts, "truth.motor1-driving"));
+    hk_check(qts, 8, 20);                     /* no powered motor: no draw */
     qtest_clock_step(qts, 1350 * ATT_MS_NS);
     g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
                     4u | ATT_TO | ATT_OP | ATT_AB);
@@ -10322,6 +10324,14 @@ static void test_att_model_off(void)
     /* the QOM face shows what the guest reads, not the model's idle */
     g_assert_cmphex(att_qom_u64(qts, "presented.cmdsta"), ==, 0xFFFF0004u);
     g_assert_cmpuint(att_qom_u64(qts, "fsw-accesses"), ==, 0);
+    /*
+     * A-2 (D-Ab): the current stays at the static table 20; with the
+     * model off no move can run, LVEN or not
+     */
+    ctrl_write(qts, CTRL_HKCMDSTA, 0x1u);
+    ctrl_write(qts, CTRL_ATT, 0x4u);        /* plain storage, no move */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    hk_check(qts, 8, 20);
 
     qtest_quit(qts);
     stix_qtest_cleanup();
@@ -10385,7 +10395,7 @@ static void test_att_determinism(void)
             att_qom_u64(qts, "fsw-accesses");
         }
         r[i][1] = ctrl_read(qts, CTRL_ATT);
-        /* the ATT_C conversion (ch 8): static 20 until A-2 wires it */
+        /* the ATT_C conversion (ch 8): 120 with the one motor moving */
         ctrl_write(qts, CTRL_HKADC, 8);
         c[i] = (ctrl_read(qts, CTRL_HKADC) >> HKADC_VAL_SHIFT) &
                HKADC_VAL_MASK;
@@ -10510,6 +10520,182 @@ static void test_att_reject_readonly(void)
     stix_qtest_cleanup();
 }
 
+/* ---- A-2: the ATT_C current profile (hkAdc ch 8, D-Af) ---- */
+
+#define HK_PROT_ATT 5u  /* the ATT_C protection line, threshold 751 */
+
+/*
+ * att-current (D-Af): hkAdc ch 8 reads 20 idle, 120 with one powered
+ * motor moving and 220 with two, and 20 again once the drive stops at
+ * the move end.
+ */
+static void test_att_current(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    hk_check(qts, 8, 20);                     /* idle at OUT */
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    hk_check(qts, 8, 120);                    /* one motor moving */
+    qtest_clock_step(qts, 260 * ATT_MS_NS);   /* the end, 510 ms */
+    hk_check(qts, 8, 20);                     /* the drive stopped */
+    ctrl_write(qts, CTRL_ATT, 3);             /* open both */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    hk_check(qts, 8, 220);                    /* two motors moving */
+    qtest_clock_step(qts, 260 * ATT_MS_NS);
+    hk_check(qts, 8, 20);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-current-override (D-Af): an override close drives the full ramp
+ * window: 120/220 to the end stop at 500 ms, then 320/620 while the
+ * motor(s) stall at IN, and 20 again once the drive stops at the
+ * 1600 ms ramp end.
+ */
+static void test_att_current_override(void)
+{
+    static const struct {
+        uint32_t cmd;
+        uint32_t moving, stall;
+    } cases[] = {
+        {  4u | 0x10u, 120, 320 },      /* close M1 with ERRORMASK */
+        { 12u | 0x10u, 220, 620 },      /* both motors */
+    };
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(cases); i++) {
+        QTestState *qts = att_qtest_new("");
+
+        att_lv_on(qts);
+        ctrl_write(qts, CTRL_ATT, cases[i].cmd);
+        qtest_clock_step(qts, 490 * ATT_MS_NS);
+        hk_check(qts, 8, cases[i].moving);      /* still travelling */
+        qtest_clock_step(qts, 110 * ATT_MS_NS); /* at IN, 600 ms: stalled */
+        hk_check(qts, 8, cases[i].stall);
+        qtest_clock_step(qts, 990 * ATT_MS_NS); /* 1590 ms: still driven */
+        hk_check(qts, 8, cases[i].stall);
+        qtest_clock_step(qts, 20 * ATT_MS_NS);  /* past the ramp end */
+        hk_check(qts, 8, 20);
+        att_qom_str_is(qts, "truth.last-end", "override");
+
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+    }
+}
+
+/*
+ * att-current-redundant (D-Af): the stall also covers the 10 ms
+ * debounce of a redundant command at the end stop: the powered drive
+ * is on with the shaft unable to move, so ch 8 reads 20 + 300 right
+ * after the write and 20 once the debounce commits the move end.
+ */
+static void test_att_current_redundant(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 */
+    qtest_clock_step(qts, 510 * ATT_MS_NS);   /* settled at IN */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+    hk_check(qts, 8, 20);
+
+    ctrl_write(qts, CTRL_ATT, 4);             /* the same command again */
+    hk_check(qts, 8, 320);                    /* stalled in the debounce */
+    qtest_clock_step(qts, 10 * ATT_MS_NS);    /* the debounce commits */
+    hk_check(qts, 8, 20);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-current-inject (D-Af): with no fault, the platform's hw-state
+ * hk_adc.8 shows truth = presented; adc-inject[8] is forcing and wins
+ * at the conversion, in hw-state and in the child's QOM face
+ * (truth.att-c/presented.att-c), while the truth keeps the
+ * mechanism's value. The polls and conversions do not disturb the
+ * move: it still ends on time.
+ */
+static void test_att_current_inject(void)
+{
+    QTestState *qts = att_qtest_new("");
+    QDict *st, *ch;
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);             /* close M1 */
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    ch = plat_hk_ch(st, 8);
+    g_assert_cmpint(qdict_get_int(ch, "truth"), ==, 120);
+    g_assert_cmpint(qdict_get_int(ch, "presented"), ==, 120);
+    g_assert(!qdict_get_bool(ch, "injected"));
+    qobject_unref(st);
+    /* the child's QOM face reads the same pair (D-Ah) */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.att-c"), ==, 120);
+    g_assert_cmpuint(att_qom_u64(qts, "presented.att-c"), ==, 120);
+
+    g_assert_true(adc_inject_set(qts, 8, 2000));
+    hk_check(qts, 8, 2000);
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    ch = plat_hk_ch(st, 8);
+    g_assert_cmpint(qdict_get_int(ch, "truth"), ==, 120);
+    g_assert_cmpint(qdict_get_int(ch, "presented"), ==, 2000);
+    g_assert(qdict_get_bool(ch, "injected"));
+    qobject_unref(st);
+    /* the injection wins there too; the truth keeps the mechanism draw */
+    g_assert_cmpuint(att_qom_u64(qts, "truth.att-c"), ==, 120);
+    g_assert_cmpuint(att_qom_u64(qts, "presented.att-c"), ==, 2000);
+    g_assert_true(adc_inject_set(qts, 8, ADC_INJECT_NONE));
+    hk_check(qts, 8, 120);
+
+    /* the polls did not disturb the move: still running at 250 ms */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U);
+    qtest_clock_step(qts, 260 * ATT_MS_NS);   /* the end, 510 ms */
+    hk_check(qts, 8, 20);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-current-prot (D-Af): with the ATT_C line armed the way the FSW
+ * does after 0x14A3 FDIR protection enabled (unlock + ProtEn, the
+ * reset threshold 751, D-P4d), the 620 two-motor stall never trips it;
+ * an 800 injection trips on the second sample, as the positive control
+ * that the line is armed.
+ */
+static void test_att_current_prot(void)
+{
+    const uint32_t bit = 1u << (8 - HK_PROT_ATT);
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    hk_prot_write_unlocked(qts, HK_PROT_ATT, HKPROT_EN | 751);
+    ctrl_write(qts, CTRL_HKIRQSTA, bit);      /* IRQEN for the line */
+
+    ctrl_write(qts, CTRL_ATT, 12u | 0x10u);   /* override close, both */
+    qtest_clock_step(qts, 600 * ATT_MS_NS);   /* stalled at IN */
+    hk_check(qts, 8, 620);
+    hk_check(qts, 8, 620);
+    hk_check(qts, 8, 620);
+    g_assert_cmphex(hk_protstat(qts), ==, 0);
+    g_assert_false(hk_irq_pending(qts));
+
+    g_assert_true(adc_inject_set(qts, 8, 800));
+    hk_check(qts, 8, 800);
+    g_assert_cmphex(hk_protstat(qts), ==, bit);
+    g_assert_cmpuint(hk_hotsample(qts), ==, 800);
+    g_assert_true(hk_irq_pending(qts));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_att_register(void)
 {
     qtest_add_func("/sparc/stix/att-reset", test_att_reset);
@@ -10532,6 +10718,14 @@ static void stix_att_register(void)
                    test_att_reject_restart);
     qtest_add_func("/sparc/stix/att-reject-readonly",
                    test_att_reject_readonly);
+    qtest_add_func("/sparc/stix/att-current", test_att_current);
+    qtest_add_func("/sparc/stix/att-current-override",
+                   test_att_current_override);
+    qtest_add_func("/sparc/stix/att-current-redundant",
+                   test_att_current_redundant);
+    qtest_add_func("/sparc/stix/att-current-inject",
+                   test_att_current_inject);
+    qtest_add_func("/sparc/stix/att-current-prot", test_att_current_prot);
 }
 
 int main(int argc, char **argv)

@@ -557,7 +557,9 @@ These change what the track can deliver. Read them first.
   - **Getters never trace.** A trace is emitted only by an advance from
     an MMIO access or a conversion, and edge traces carry the computed
     `at_ns`. Otherwise the platform's 2 Hz polling would make the order of
-    the trace lines depend on the host.
+    the trace lines depend on the host. A-2 supersedes the "or a
+    conversion" part: conversions and hw-state polls advance silently,
+    and the end is traced by the next 0x5C access (see A-2 As built).
   - A qtest checks the lazy design's real invariant, **determinism**:
     the same `clock_step` script gives identical 0x5C and ATT_C reads
     with and without interleaved qom-gets. This replaces a
@@ -786,6 +788,34 @@ construction):**
   - with hk-prot armed (unlock + ProtEn on line 5), the 620 stall never
     trips 751;
   - `att-model=off` reads the static 20.
+- **As built (A-2, 2026-11-12):** implemented in `stix_att.c` and the
+  two split halves of `grlib_stixctrl.c`, with these choices where the
+  plan left room:
+  - the stall (+300 per motor) applies whenever a powered, driven
+    motor has the shaft on its target end stop: the override between
+    the end stop and the ramp end, and the 10 ms debounce after the
+    target switch actuates, redundant commands included (D-Af's "at an
+    end"; the block point and the jam are A-3);
+  - grlib's two halves gate ch 8 on `att-model` and fall back to the
+    static table 20 (D-Ab); `truth.att-c`/`presented.att-c` read
+    through that same split (two small accessors in `grlib_stix.h`),
+    so `presented.att-c` includes `adc-inject[8]` (D-Ah) and the
+    properties read the static 20 with the model off; the child gained
+    an owner back-pointer to the controller, set at realize like
+    `stix_det`'s;
+  - a ch 8 conversion or hw-state poll that commits a move end stays
+    silent (D-Ai: the 2-20 Hz hw-state poll runs the same code), so
+    threading a trace flag through the platform's split was not worth
+    it — the end is traced with its computed event time by the next
+    0x5C access, and `att-determinism`'s contract is unchanged;
+  - the tests live in the `stix` binary's A-1 block behind
+    `stix_att_register()` (as in A-1, no separate binary):
+    `att-current`, `att-current-override`, `att-current-redundant`,
+    `att-current-inject`, `att-current-prot`; `att-model-off` and
+    `att-lv-off` gained a ch 8 = 20 check and `att-current-prot` arms
+    the ATT_C line (index 5, the reset threshold 751) with the unlock +
+    ProtEn helper and proves it armed with an 800 injection trip as a
+    positive control.
 - Gates: the per-commit set. The fault-smoke DET_C/1V5/PSU_T steps are
   unaffected.
 

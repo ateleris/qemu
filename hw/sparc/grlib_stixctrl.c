@@ -489,7 +489,8 @@ static const MemoryRegionOps grlib_stixctrl_rotb_ops = {
  * PFM) and a flash context with flight limits do not matter. Unused
  * channels read 0. The state-dependent entries (3, 4, 12, 16, 20, 48,
  * 52) are never read — stixctrl_hk_value() overrides them; they are
- * kept as the off/base value for documentation. The FSW checks the
+ * kept as the off/base value for documentation. ATT_C (8) only with
+ * att-model=off (A-2). The FSW checks the
  * SPW0/1_V, ATT_V and HV lines only while POWERSTAT reports the supply
  * on (HKMonitor.c:357-370); since P4-1 it does (stixctrl_hkcmdsta), and
  * the "on" values here pass those checks.
@@ -501,11 +502,9 @@ static const uint16_t stixctrl_hk_adc_table[STIXCTRL_HK_CHANNELS] = {
     [3] = 50,    /* DPU_SPW_C: overridden from SPWEN, 0 lines 0..294 */
     [4] = 20,    /* DET_C: overridden, 0 quarters 0..80 */
     /*
-     * ATT_C, 0 motors 0..166: static, the attenuator is not modelled
-     * to move. Latent: below the PFM two-motor minimum of 28 (ATT2M_C);
-     * no NOMINAL path moves the attenuator (RateCtrl_reset(FALSE)), and
-     * a future TC-driven test needs a motion value of 110..255
-     * (AttCtrl.c:342 sums only < 0x100).
+     * A-2 (D-Af): overridden from the attenuator mechanism (idle 20;
+     * 120/220 with one/both motors moving, 320/620 stalled); with
+     * att-model=off this static 20 is what ch 8 reads
      */
     [8] = 20,
     [12] = 10,   /* ATT_V off; on: 1670 from LVEN, 585..3370 */
@@ -545,11 +544,12 @@ static const uint16_t stixctrl_hk_adc_table[STIXCTRL_HK_CHANNELS] = {
 /*
  * The "truth" ADC value for one channel (platform plan D-PLo, PL-2a):
  * the static nominal table plus the overrides that follow the CURRENT
- * commanded register state (hkCmdSta and idefxConfig, as they stand
- * when the hkAdc write happens), without any injection. POWERSTAT
- * (hkCmdSta bits 9:5) is not consulted: the values follow the
- * commanded enables, which POWERSTAT mirrors (stixctrl_hkcmdsta).
- * Pure: no register or state is written.
+ * commanded register state (hkCmdSta, idefxConfig and, for ch 8, the
+ * attenuator mechanism — as they stand when the hkAdc write happens),
+ * without any injection. POWERSTAT (hkCmdSta bits 9:5) is not
+ * consulted: the values follow the commanded enables, which POWERSTAT
+ * mirrors (stixctrl_hkcmdsta). Pure: no register is written (the ch 8
+ * advance is idempotent, see stix_att.c).
  */
 static uint32_t stixctrl_hk_truth(STIXCTRL *s, uint32_t ch)
 {
@@ -572,6 +572,13 @@ static uint32_t stixctrl_hk_truth(STIXCTRL *s, uint32_t ch)
          * (Detectors.c:555-558)
          */
         return 20u + 75u * ctpop32(s->reg.idefxConfig & 0xFu);
+    case STIXCTRL_HKADC_ADDR_V_HK_ATT_C: /* 8 */
+        /*
+         * A-2 (D-Af): the mechanism's current; att-model=off keeps the
+         * static table value (D-Ab)
+         */
+        return s->att.cfg.model ? stix_att_att_c_truth(&s->att)
+                                : stixctrl_hk_adc_table[ch];
     case STIXCTRL_HKADC_ADDR_V_HK_ATT_V: /* 12 */
         return ((cmdsta >> STIXCTRL_HKCMDSTA_LVEN) &
                 STIXCTRL_HKCMDSTA_LVEN_MASK) ? 1670 : 10;
@@ -594,15 +601,32 @@ static uint32_t stixctrl_hk_truth(STIXCTRL *s, uint32_t ch)
 
 /*
  * The value the FSW reads (the "presented" value, D-PLo): P4-2's
- * injection beats the table and the state overrides; otherwise the
- * truth. Identical to the pre-split stixctrl_hk_value.
+ * injection beats everything (D-Af); otherwise the truth, with ATT_C
+ * (ch 8) through the attenuator's presented layer (A-2).
  */
 static uint32_t stixctrl_hk_value(STIXCTRL *s, uint32_t ch)
 {
     if (s->adc_inject[ch] != STIXCTRL_ADC_INJECT_NONE) {
         return s->adc_inject[ch];
     }
+    if (ch == STIXCTRL_HKADC_ADDR_V_HK_ATT_C && s->att.cfg.model) {
+        return stix_att_att_c_presented(&s->att);
+    }
     return stixctrl_hk_truth(s, ch);
+}
+
+/*
+ * A-2 (D-Af): the same split for the attenuator child's truth.att-c /
+ * presented.att-c getters (grlib_stix.h); no guest access involved.
+ */
+uint32_t stixctrl_hk_att_c_truth(STIXCTRL *s)
+{
+    return stixctrl_hk_truth(s, STIXCTRL_HKADC_ADDR_V_HK_ATT_C);
+}
+
+uint32_t stixctrl_hk_att_c_presented(STIXCTRL *s)
+{
+    return stixctrl_hk_value(s, STIXCTRL_HKADC_ADDR_V_HK_ATT_C);
 }
 
 /*
@@ -1112,7 +1136,7 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    if (!stix_att_realize(&STIXCTRL->att, &STIXCTRL->att_cfg,
+    if (!stix_att_realize(&STIXCTRL->att, STIXCTRL, &STIXCTRL->att_cfg,
                           &STIXCTRL->reg, errp)) {
         stix_det_unrealize(&STIXCTRL->det);
         timer_free(STIXCTRL->wdg_timer);

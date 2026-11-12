@@ -1,12 +1,12 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * STIX IDPU attenuator model (attenuator plan A-1, D-Aa..Ae, Ah, Ai):
- * the mechanism (one shaft, two motors, the AB/BC end switches) and the
- * AttnCmdSta controller behind CTRL APB offset 0x5C, at
- * /machine/stixctrl/attenuator. Internal to grlib_stixctrl.c; the
- * truth/presented properties are added to the child object's class by
- * stix_att.c. No faults (A-3) and no ATT_C profile (A-2).
+ * STIX IDPU attenuator model (attenuator plan A-1/A-2, D-Aa..Af, Ah,
+ * Ai): the mechanism (one shaft, two motors, the AB/BC end switches),
+ * the AttnCmdSta controller behind CTRL APB offset 0x5C, and the ATT_C
+ * current profile (hkAdc ch 8), at /machine/stixctrl/attenuator.
+ * Internal to grlib_stixctrl.c; the truth/presented properties are
+ * added to the child object's class by stix_att.c. No faults (A-3).
  */
 
 #ifndef HW_SPARC_STIX_ATT_H
@@ -65,6 +65,12 @@ struct StixAttState {
     /* bound by stix_att_realize: LVEN is sampled from it per command */
     stixCtrlRegs_s *reg;
 
+    /*
+     * bound by stix_att_realize, like stix_det's owner: presented.att-c
+     * reads the controller's ch 8 split (adc-inject[8], D-Ah)
+     */
+    STIXCTRL *owner;
+
     /* the mechanism (truth) */
     uint32_t pos_ppm;           /* survives a device reset (D-Ad) */
     bool moving;
@@ -94,7 +100,8 @@ struct StixAttState {
     uint64_t fsw_accesses;      /* guest 0x5C accesses since realize */
 };
 
-bool stix_att_realize(StixAttState *a, const StixAttConfig *cfg,
+bool stix_att_realize(StixAttState *a, STIXCTRL *owner,
+                      const StixAttConfig *cfg,
                       stixCtrlRegs_s *reg, Error **errp);
 void stix_att_unrealize(StixAttState *a);
 void stix_att_reset(StixAttState *a);
@@ -104,5 +111,14 @@ uint32_t stix_att_read(StixAttState *a, hwaddr addr);
 void stix_att_write(StixAttState *a, hwaddr addr, uint32_t value);
 /* the 0x5C readback as the FSW sees it now (no access counter) */
 uint32_t stix_att_cmdsta(StixAttState *a);
+
+/*
+ * The ATT_C current (hkAdc ch 8, A-2 = D-Af): the mechanism's raw draw,
+ * and what the FSW converts (== truth until the A-3 fault layer).
+ * Called from the PL-2a split's two halves; both advance the lazy state
+ * idempotently and never trace (D-Ai).
+ */
+uint32_t stix_att_att_c_truth(StixAttState *a);
+uint32_t stix_att_att_c_presented(StixAttState *a);
 
 #endif

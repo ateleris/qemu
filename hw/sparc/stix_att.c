@@ -21,7 +21,8 @@
  * calls address_space_* or a stixctrl MMIO handler, so the
  * a83fe9a3a5 guard rule does not apply. The 0x5C hook covers 0x5C
  * only; 0x60/0x64 stay plain storage, so the trace golden is
- * unchanged (D-Aa). No faults (A-3), no ATT_C profile (A-2).
+ * unchanged (D-Aa). The ATT_C current (hkAdc ch 8) follows the
+ * mechanism (A-2 = D-Af); no faults (A-3).
  */
 
 #include "qemu/osdep.h"
@@ -242,11 +243,61 @@ void stix_att_write(StixAttState *a, hwaddr addr, uint32_t value)
     }
 }
 
+/* ---- the ATT_C current (hkAdc ch 8, A-2 = D-Af) ---- */
+
+/*
+ * Raw ADC counts [A] (Q3 left the real currents unknown): 20 idle; each
+ * powered, live, driven motor adds 100 while the shaft moves and 300
+ * while it is driven but not moving — stalled on its target end stop
+ * (a block point or a jam would read the same; both arrive with A-3).
+ * 120/220 stay under 0x100, so the FSW sums them (AttCtrl.c:344), and
+ * inside the PFM soft limits; the 320/620 stalls leave the sum and
+ * stay below the 751 HW-protection threshold (no trip, D-P4d).
+ */
+#define STIX_ATT_C_IDLE  20u
+#define STIX_ATT_C_MOVE  100u
+#define STIX_ATT_C_STALL 300u
+
+/*
+ * The truth for stixctrl_hk_truth() (PL-2a's split). Advances the lazy
+ * state like a getter and never traces (D-Ai): the 2-20 Hz hw-state
+ * poll runs through the same code, and a move end committed here is
+ * traced with its computed event time by the next 0x5C access.
+ */
+uint32_t stix_att_att_c_truth(StixAttState *a)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t pos, add, c = STIX_ATT_C_IDLE;
+
+    stix_att_advance(a, now, false);
+    if (!a->moving || !a->move_powered) {
+        return c;               /* no powered motor is driven */
+    }
+    pos = stix_att_pos_at(a, now);
+    add = pos == (a->dir_in ? STIX_ATT_PPM : 0u) ? STIX_ATT_C_STALL
+                                                 : STIX_ATT_C_MOVE;
+    if (a->move_motors & STIX_ATT_M1) {
+        c += add;
+    }
+    if (a->move_motors & STIX_ATT_M2) {
+        c += add;
+    }
+    return c;
+}
+
+/* what the FSW converts; the current.* fault layer arrives with A-3 */
+uint32_t stix_att_att_c_presented(StixAttState *a)
+{
+    return stix_att_att_c_truth(a);
+}
+
 /* ---- lifecycle ---- */
 
-bool stix_att_realize(StixAttState *a, const StixAttConfig *cfg,
+bool stix_att_realize(StixAttState *a, STIXCTRL *owner,
+                      const StixAttConfig *cfg,
                       stixCtrlRegs_s *reg, Error **errp)
 {
+    a->owner = owner;
     a->cfg = *cfg;
     a->reg = reg;
     if (a->cfg.travel_ms == 0 || a->cfg.ramp_ms == 0) {
@@ -405,6 +456,27 @@ static void stix_att_m2_get(Object *obj, Visitor *v, const char *name,
     visit_type_bool(v, name, &value, errp);
 }
 
+/* the mechanism's draw, through the controller's truth half (D-Af) */
+static void stix_att_truth_c_get(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    StixAttState *a = STIX_ATT(obj);
+    uint32_t value = stixctrl_hk_att_c_truth(a->owner);
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+/* what the FSW converts, adc-inject[8] forcing included (D-Ah) */
+static void stix_att_presented_c_get(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    StixAttState *a = STIX_ATT(obj);
+    uint32_t value = stixctrl_hk_att_c_presented(a->owner);
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
 static void stix_att_moves_get(Object *obj, Visitor *v, const char *name,
                                void *opaque, Error **errp)
 {
@@ -506,6 +578,16 @@ static void stix_att_class_init(ObjectClass *klass, const void *data)
                               NULL);
     object_class_property_set_description(klass, "truth.motor2-driving",
         "M2 produces torque (read-only)");
+    object_class_property_add(klass, "truth.att-c", "uint32",
+                              &uint32_type_info, stix_att_truth_c_get, NULL,
+                              NULL, NULL);
+    object_class_property_set_description(klass, "truth.att-c",
+        "ATT_C (hkAdc ch 8) the mechanism draws, raw counts (read-only)");
+    object_class_property_add(klass, "presented.att-c", "uint32",
+                              &uint32_type_info, stix_att_presented_c_get,
+                              NULL, NULL, NULL);
+    object_class_property_set_description(klass, "presented.att-c",
+        "the ATT_C the FSW converts, adc-inject[8] included (read-only)");
     object_class_property_add(klass, "truth.moves", "uint64",
                               &uint64_type_info, stix_att_moves_get, NULL,
                               NULL, NULL);

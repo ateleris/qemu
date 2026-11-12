@@ -4288,9 +4288,10 @@ tree ASW/):**
 
 ## A. Attenuator mechanism and AttnCmdSta (baseline: plain storage)
 
-Attenuator plan A-1 (`docs/stix-port/2026-11-11-attenuator-plan.md`,
-D-Aa..Ae, Ah, Ai). The heading is non-numeric on purpose: it gets a
-number at the merge, like P-1 above.
+Attenuator plan A-1 and A-2
+(`docs/stix-port/2026-11-11-attenuator-plan.md`, D-Aa..Af, Ah, Ai). The
+heading is non-numeric on purpose: it gets a number at the merge, like
+P-1 above.
 
 **Baseline:** AttnCmdSta (0x5C) was plain storage. A PFM ELF would read
 OPERATIONSTATUS = 0, "moving", forever, wait 3 s at every SAFE entry and
@@ -4318,7 +4319,8 @@ model is invisible; only ATT_C is real on both builds (A-2).
   nominal speed; a motor is powered iff hkCmdSta LVEN was set at the
   command (LV sampled at the command [A]).
 - **Lazy evaluation (D-Ac):** no timer, BH, DMA or IRQ. Every 0x5C
-  access and every state getter (`truth.position*`, `truth.last-end`,
+  access, every ATT_C conversion or hw-state poll of ch 8 (A-2) and
+  every state getter (`truth.position*`, `truth.last-end`,
   the sensors, `presented.*`; not the counters `truth.moves` and
   `fsw-accesses`) advances the pure state to QEMU_CLOCK_VIRTUAL;
   `truth.position` reads `moving-*` only while the shaft really
@@ -4347,6 +4349,23 @@ model is invisible; only ATT_C is real on both builds (A-2).
   kept, the registers go idle including the bits-4:0 readback, and
   `truth.last-end` = reset — recorded only when a move was actually
   running).
+- **The ATT_C current (A-2, D-Af):** the PL-2a split carries hkAdc
+  ch 8: `stixctrl_hk_truth(8)` is the mechanism — 20 idle, +100 per
+  powered, live, driven motor while the shaft moves, +300 while it is
+  driven but not moving (stalled on its target end stop: the override
+  between the end stop and the ramp end, and the debounce after the
+  target switch actuates, redundant commands included; the block point
+  and the jam arrive with A-3) — and `stixctrl_hk_value(8)` is
+  adc-inject[8] forcing first, else the model's presented value (==
+  truth until A-3). att-model=off keeps the static table 20 in both
+  halves. 120/220 stay under 0x100, so the FSW sums them
+  (AttCtrl.c:344) and inside the PFM soft limits; the 320/620 stalls
+  leave the sum and stay below the 751 HW threshold (no trip, D-P4d).
+  The truth/presented functions advance the lazy state idempotently
+  and never trace (the 2-20 Hz hw-state poll runs through them, the
+  PL-1/PL-2 purity note); a move end a conversion commits is traced
+  with its computed event time by the next 0x5C access. ATT_V stays
+  derived from LVEN and ATT_T static 2450: no thermal model.
 - **QOM (D-Ah), all read-only:** `truth.position` (out|in|moving-in|
   moving-out|between), `truth.position-ppm`, `truth.sensor-ab`/`-bc`,
   `truth.motor1-driving`/`motor2-driving` (torque, not the flag),
@@ -4354,15 +4373,20 @@ model is invisible; only ATT_C is real on both builds (A-2).
   (none|target|timeout|override|emergency|fail|reset; fail is A-3),
   `truth.last-end-ns`, `presented.sensor-ab`/`-bc` (== truth until
   A-3), `presented.cmdsta` (the 0x5C readback as a read returns it
-  now, no side effects) and `fsw-accesses` (guest 0x5C accesses since
+  now, no side effects), `fsw-accesses` (guest 0x5C accesses since
   realize, not cleared on reset; 0 on the AX gate ELF — the R5/Q9 AX
-  artefact label). `truth.att-c`/`presented.att-c` come with A-2.
+  artefact label) and, with A-2, `truth.att-c` (through
+  stixctrl_hk_truth, so the static 20 with att-model=off) and
+  `presented.att-c` (through stixctrl_hk_value, so adc-inject[8]
+  included); for those the child holds an owner back-pointer to the
+  controller, set at realize like stix_det's.
   There are no setters yet (A-3): qom-set is rejected ("is not
   writable").
 - **Traces:** `stixatt_cmd(cmd, override, pos_ppm)` on every 0x5C
-  write; `stixatt_end(reason, at_ns, pos_ppm)` when an MMIO access
-  commits a move end, carrying the computed event time. The unit is
-  silent at realize, at reset and on 0x60/0x64, so the
+  write; `stixatt_end(reason, at_ns, pos_ppm)` when a 0x5C access
+  commits a move end, carrying the computed event time (a ch 8
+  conversion that commits one stays silent; see the ATT_C bullet).
+  The unit is silent at realize, at reset and on 0x60/0x64, so the
   `-trace 'stix*'` golden is unchanged.
 - **The [I]/[A] semantics recorded for A-later (Q2-Q5):** the
   stop-on-presented-switch rule and the 10 ms debounce, the
@@ -4384,3 +4408,16 @@ attenuator object and its properties do not exist and 0x5C is plain
 storage (0, not 0x500). The move-timing tests set
 `att-travel-ms=500`: the plan's +250/+510 timelines predate its Q3
 answer (the default stays 1000).
+
+A-2 adds `att-current` (20 idle, 120/220 with one/both motors moving,
+20 after the end), `att-current-override` (120/220 to the end stop at
+500 ms, then 320/620 stalled at IN until the 1600 ms ramp end, then
+20), `att-current-redundant` (a redundant close at IN reads 320 during
+the 10 ms debounce, then 20), `att-current-inject` (hw-state hk_adc.8
+shows truth = presented with no fault; adc-inject[8] wins at the
+conversion, in hw-state and in truth.att-c/presented.att-c while the
+truth keeps the mechanism) and `att-current-prot` (the armed ATT_C
+line never trips at the 620 stall; an 800 injection trips as the
+positive control that the line is armed), and extends `att-model-off`
+and `att-lv-off` (ch 8 reads 20). RED before A-2: ch 8 read the static
+20 in every state.

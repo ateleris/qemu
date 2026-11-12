@@ -53,6 +53,15 @@ typedef void (*StixCtrlScetCommitFn)(void *opaque);
 void stixctrl_set_scet_commit_hook(STIXCTRL *s,
                                    StixCtrlScetCommitFn fn, void *opaque);
 
+/*
+ * A-2 (D-Af): hkAdc ch 8 (ATT_C) through the PL-2a split, for the
+ * attenuator child's truth.att-c / presented.att-c getters: the
+ * mechanism's draw, and the value the FSW converts (adc-inject[8]
+ * forcing included).
+ */
+uint32_t stixctrl_hk_att_c_truth(STIXCTRL *s);
+uint32_t stixctrl_hk_att_c_presented(STIXCTRL *s);
+
 /* The IDPU's custom devices were (deliberately, like-for-like with the
  * 2022 model) registered in the AMBA PnP table under the FTMCTRL device
  * id — drvmgr sees three FTMCTRLs. Pinned by the PnP qtest. */
