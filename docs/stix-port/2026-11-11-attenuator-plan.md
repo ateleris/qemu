@@ -981,6 +981,47 @@ construction):**
     forbid bites.
   - **AX subset:** skip the `current.offset` set; the 0x9434
     expectation must fail.
+- **As built (A-4, 2026-11-12):** implemented in `tmtc-probe.py` (two
+  hunks after D-3's `--dump-apid` work, each with self-test cases in
+  `--self-test`) plus the new `scripts/stix/att-smoke.sh` and
+  `scripts/stix/att-sid2-check.py`, with these choices where the plan
+  left room:
+  - `--expect-return VALUE` attaches to the latest `--qmp-cmd` group
+    and fails the run unless the return equals VALUE — JSON when it
+    parses (a qom-get uint64, bool or string), the raw string otherwise;
+  - the forbid window: `--forbid ID@SECONDS` disarms the forbid that
+    many seconds after its group's send; without the suffix the forbid
+    stays armed for the whole run, as before;
+  - att-smoke keeps the three parts and the record line, is built on
+    the slot library (its own slot, a QMP socket in the run dir, a
+    private sparse flash; legacy mode makes a fresh empty sparse flash,
+    the fault-smoke pattern, and leaves the 21000 flock to the caller),
+    refuses the shared flash dirs and their parents, and takes
+    `--negative`, `--dry-run` and `--check-guard`;
+  - the AX subset's TC(236,1/4/5) units are built in the script (the
+    CRC-16 computed; `TC_CONF` is pinned to nominal-smoke's known
+    bytes at startup, exit 2 otherwise);
+  - the flavour boot reads `fsw-accesses` over QMP at +35 s: 0 on a
+    non-AX ELF is an environment error (exit 2);
+  - the silence run's SID2 check is `att-sid2-check.py
+    --expect-bc-closed` on the probe's `--dump-apid` dump of 0x5A4:
+    **status4 bit 13 (BC) set and bit 14 (AB) clear** — the model ends
+    the stuck-closed move one 10 ms debounce off OUT (the drive runs
+    the debounce, Doc vs code 12), which releases the healthy AB. This
+    differs from the outcome table's "both bits set"
+    (`HKAcquire.c:378-379`), which is the plan's approximation;
+  - the PFM sequence keeps this section's fixed connect-relative
+    offsets although the flash-latency handoff ("Blocking change")
+    voided them: with no PFM ELF (Q1) the part cannot run, and
+    re-anchoring on FS-ready (0x0032, then 0x142E; the
+    `pfm-boot-drive.py` pattern) is open (A-later). Every PFM payload
+    stays [L];
+  - lived on the gate ELF (AX), 2026-11-12: positive "ATT-SMOKE: PASS
+    (AX subset), SKIP (PFM sequence), SKIP (silence run)", exit 77 —
+    the evidence 0x14A3, then `9434 06 0334 02EF` inside the 5 s window
+    after the @35 `current.offset` = 800 set, and `fsw-accesses` = 0 at
+    +45 s; `--negative` fails exactly at the 0x9434 expectation;
+    `--check-guard` passes.
 - Gates: the full set plus att-smoke ± (the AX subset on the gate ELF;
   the PFM parts only with a PFM ELF).
 
@@ -1004,6 +1045,34 @@ construction):**
   - the `-S` + qom-set + `cont` recipe for a fault present from boot.
 - `baseline/README.md`: the suite recipe gains `build/tests/qtest/stix-att`.
 - This plan's "As built" section.
+- **As built (A-5, 2026-11-12):** the docs commit of the series whose
+  commits are "stix: attenuator mechanism and AttnCmdSta (A-1)",
+  "stix: attenuator ATT_C motor current on HK ADC channel 8 (A-2)" and
+  "stix: attenuator fault model, hw-state and catalogue faults (A-3)"
+  (rebased onto the detector tip with D-7), with A-4 (the probe
+  extensions and att-smoke) in the tree as this was written. It writes:
+  - `accepted-diffs.md` "A. Attenuator mechanism and AttnCmdSta" (the
+    non-numeric heading A-1 chose; numbered at the merge like P-1):
+    the A-4 paragraphs — the probe extensions, the gate record (d)
+    with the lived AX-subset run, the unconfirmed PFM parts, and the
+    known limits;
+  - `ground-station.md` "Fault injection": the new "### The
+    attenuator" subsection — the QOM paths and the qom-set recipes,
+    the expected events, the trip latency (two consecutive
+    conversions, D-Af), and the `-S` + qom-set + `cont` recipe for a
+    fault present from boot;
+  - `baseline/README.md`: the suite recipe states what is true — the
+    att qtests (`/sparc/stix/att-*`) run inside the existing `stix`
+    binary behind `stix_att_register()`; `tests/qtest/meson.build` is
+    untouched and the `build/tests/qtest/stix-att` binary this section
+    drafted above does not exist (the A-1 as-built choice);
+  - this "As built" section: A-1..A-3 were written at their commits;
+    this commit adds the A-4 and A-5 entries.
+  - The rebase onto D-7 also added
+    `stix_det_unrealize(&STIXCTRL->det)` on the att-realize failure
+    path in `grlib_stixctrl.c` — a realize failure must free what
+    realize allocated, because `device_set_realized` does not run
+    unrealize (the rule D-7's `stix_det.c` split records).
 
 ### A-later (deferred; waits for Q1 and Q2)
 - The faults `move.slow`, `mechanism.partial`, `motorN.flag_lost`,

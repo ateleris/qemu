@@ -139,6 +139,10 @@ docs alone (paths assume this repo; the ASW ELF path is overridden with
 # 2. Device regression suite against the NEW build (from any CWD - the
 #    qtest passes -global grlib-stixflash.flash-file=<temp file> so no
 #    flash.bin is created in the CWD). qt.sh builds and takes a slot:
+#    the attenuator tests (/sparc/stix/att-*) are part of this suite;
+#    they live in the `stix` binary behind stix_att_register() - there
+#    is no separate build/tests/qtest/stix-att binary (the attenuator
+#    plan's A-1 choice; A-5).
 scripts/stix/qt.sh                 # or: scripts/stix/qt.sh <test-name>
 
 # 3. Device regression suite against the OLD repaired 5.2 baseline (the

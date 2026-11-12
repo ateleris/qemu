@@ -4501,3 +4501,59 @@ unknown to
 qom-set and 0x5C reads carry no forced bits. With no fault set the
 model is untouched: the getters do not trace and the boot/trace
 goldens stay identical.
+
+A-4 adds the probe extensions and the gate. `tmtc-probe.py` (each
+change its own hunk after D-3's `--dump-apid` work, self-tested):
+`--expect-return VALUE` attaches to the latest `--qmp-cmd` group and
+fails the run unless the return equals VALUE — JSON when it parses (a
+qom-get uint64, bool or string), the raw string otherwise;
+`--forbid APID:T:S[:HEX]@SECONDS` disarms the forbid that many seconds
+after its group's send, and without the suffix the forbid stays armed
+for the whole run as before. The gate is `scripts/stix/att-smoke.sh`
+(slot mode per §41: `STIX_PORT_BASE=<k|auto> scripts/stix/att-smoke.sh
+<qemu> [--negative|--check-guard|--dry-run]`; legacy mode leaves the
+21000 flock to the caller) with the SID2 checker
+`scripts/stix/att-sid2-check.py`.
+
+**(d) The gate record — PASS and SKIP listed separately.** att-smoke
+decides the ELF flavour positively: `nm` finding a symbol whose name
+contains `moveStartCoarseT` (suffixed, `.555127` on the gate ELF) means
+AX; otherwise the script boots once and reads `fsw-accesses` over QMP
+after the boot — 0 accesses on a non-AX ELF is an environment error
+(exit 2), so a stripped or `HW_VERSION_FSW_IDPU` ELF cannot pass as
+PFM. On the gate ELF only the AX subset runs; the record line lists the
+parts, and the process exits 77 (the SKIP convention, the README's
+exit-code table):
+
+    ATT-SMOKE: PASS (AX subset), SKIP (PFM sequence), SKIP (silence run)
+
+Lived 2026-11-12 on the gate ELF: 0x14A3, then `9434 06 0334 02EF`
+inside the 5 s window after the @35 `current.offset` = 800 set, and
+`fsw-accesses` = 0 at +45 s — the att → presented → comparator wiring,
+live on AX. The `--negative` (the set skipped, the inactive value 0)
+passes only when exactly the 0x9434 expectation goes unmatched;
+`--check-guard` runs the run-dir guards without booting.
+
+The PFM sequence and the silence run are implemented but unconfirmed
+live (no PFM ELF, Q1): every PFM payload stays [L], and there is no PFM
+UART golden (att-smoke's expectations are its own). The silence run's
+SID2 evidence is `att-sid2-check.py --expect-bc-closed` on the probe's
+`--dump-apid` dump of 0x5A4 and expects **status4 bit 13 (BC) set and
+bit 14 (AB) clear** (`HKAcquire.c:378-379`), not the plan's original
+"both bits set": the model ends the stuck-closed move one 10 ms debounce
+off OUT (the drive runs the debounce, Doc vs code 12), which releases
+the healthy AB. The PFM sequence still uses the fixed connect-relative
+offsets although the flash-latency handoff voided them (the plan's
+"Blocking change"): re-anchoring on FS-ready (0x0032, then 0x142E) is
+open (A-later).
+
+**Known limits:** no thermal model (ATT_T static 2450, ATT_V derived
+from LVEN); LV sampled at the command, not continuously [A]; the switch
+polarity is assumed, not documented (Q5: `stuck_open` = the bit reads
+0); the FPGA semantics behind the knobs — stop-on-switch, the debounce,
+the timeout/finished relation, override, FAILFLAG, the travel time and
+the currents — are inferred [I] (Q2-Q5); AX blindness: only
+`current.offset` reaches the FSW on the gate ELF, and `fsw-accesses` (0
+there, not cleared on reset) is the R5/Q9 label that keeps the AX
+artefact out of the mismatch reports; and the two TM(1,7) per TC move
+(correction 3) are never used as evidence that a move ended.

@@ -678,6 +678,108 @@ re-enter NOMINAL afterwards with the recipe above. Time-code loss and
 link-down do not change the mode in the source (Timing.c:63-91,
 FDIR.c:768-776).
 
+### The attenuator
+
+Since the attenuator track (`accepted-diffs.md` "A. Attenuator
+mechanism and AttnCmdSta") the controller carries a child object,
+`/machine/stixctrl/attenuator` (type `stix-att`), whose faults go over
+the same QMP socket as the properties above. The gate is
+`att-smoke.sh` (positive and `--negative`; the plan is
+`docs/stix-port/2026-11-11-attenuator-plan.md`). Unlike `adc-inject`,
+the nine faults are persistent: they **survive a device reset** (a
+broken switch stays broken over an IDPU reboot), while the forcing
+masks and `adc-inject[N]` clear — and `run-qemu-gs.sh` passes
+`-no-reboot`, so a reset stops QEMU anyway.
+
+| QOM path | Property | Values | Effect |
+|---|---|---|---|
+| `/machine/stixctrl/attenuator` | `attenuator.sensor_ab.stuck_open` / `.stuck_closed`, same for `sensor_bc` | bool | The presented switch reads stuck whatever the mechanism does (`stuck_open`: the bit reads 0). A stuck-closed target also ends the move one 10 ms debounce after the command; a stuck-open target never ends it. |
+| `/machine/stixctrl/attenuator` | `attenuator.motor1.dead`, `attenuator.motor2.dead` | bool | The motor loses torque and current draw; the FSW's MOTORxUSED flag still sets. |
+| `/machine/stixctrl/attenuator` | `attenuator.mechanism.jammed` | bool | The shaft freezes; driven motors draw the +300 stall current each. |
+| `/machine/stixctrl/attenuator` | `attenuator.current.zero` | bool | ATT_C reads 0. |
+| `/machine/stixctrl/attenuator` | `attenuator.current.offset` | int32 −4095..4095 | ATT_C reads clamp(truth + offset); 800 gives 820. |
+| `/machine/stixctrl/attenuator` | `fault-clear` | `"all"` or one id | Sets the fault back to its inactive value; unknown ids are rejected. `faults-active` (read-only) shows `"id=value,..."`. |
+| `/machine/stixctrl/attenuator` | `force.cmdsta-set` / `force.cmdsta-clear` | uint32, bits 11:5 only | Force bits in the 0x5C readback — MMIO, `presented.cmdsta` and the trace see the same value. No physics; cleared on reset. |
+| `/machine/stixctrl/attenuator` | `truth.*`, `presented.*`, `fsw-accesses` | read-only | The mechanism, what the FSW sees, and the guest's 0x5C access count (0 on the gate ELF). |
+
+Recipes (the `qom_set` function from "Sending qom-set commands"; values
+are JSON — numbers bare, `true`, strings quoted):
+
+```bash
+A=/machine/stixctrl/attenuator
+qom_set $RUN/qmp.sock $A 'attenuator.current.offset' 800      # ATT_C 820
+qom_set $RUN/qmp.sock $A 'attenuator.sensor_bc.stuck_closed' true
+qom_set $RUN/qmp.sock $A 'attenuator.motor1.dead' true
+qom_set $RUN/qmp.sock $A 'fault-clear' '"all"'
+```
+
+**Trip latency:** a `current.*` fault does not sample at its set (that
+is the `adc-inject` setter's behaviour). The comparator only sees the
+guest's conversions of ATT_C — one per second idle, every 50 ms during
+a move — and trips on the second consecutive one above the threshold
+(D-Af), so the 0x9434 lands up to about 2 s after the set. `att-smoke`
+allows 5 s; the 2026-11-12 gate-ELF run landed inside it.
+`adc-inject[8]` still wins over the fault at the conversion.
+
+**Expected TM:**
+
+| Case | Set | Expected TM |
+|---|---|---|
+| ATT_C over the HW threshold (any ELF) | `current.offset` = 800 | TM(5,3) `9434 06 0334 02EF` (id 6, sample 820, threshold 751) within 5 s, then the move to SAFE: from CONF TM(1,1) `0021 04 02`; from SAFE no mode event. Lived 2026-11-12. |
+| ATT_C zero (any ELF) | `current.zero` = true | nothing on the gate ELF (0 is inside the AX limits) |
+| Dead motor (PFM ELF [L]) | `motor1.dead` = true, then close TC(236,5) `04 01` | TM(5,2) `5436 04 01 00 01 00` within 6 s; the manual re-enable is TM(5,1) `1423 0000 0002` |
+| Stuck-closed target (PFM ELF [L]) | `sensor_bc.stuck_closed` = true, then close at OUT | nothing — the correlation check passes, so 0x5436 must NOT fire. The SID2 TM(3,25) on 0x5A4 (every 64 s) is the evidence: status4 bit 13 (BC) set, bit 14 (AB) clear — one 10 ms debounce off OUT (Doc vs code 12) |
+
+Notes:
+- Wait for TM(5,1) 0x14A3 first (the nine HW protection lines arm
+  there). ATT_C needs no limit tightening: its reset threshold is 751
+  and 820 is over it.
+- After a trip the FSW masks the line's IRQ: a second set on the same
+  line in the same boot gives no second 0x9434.
+- The gate ELF is an **AX build: the FSW never touches 0x5C** and
+  `fsw-accesses` stays 0, so only the ATT_C rows are visible on it; the
+  motor and switch rows need a PFM ELF (the plan's Q1) and are [L]. The
+  two TM(1,7) per TC move are never evidence (correction 3).
+- `STIX_PORT_BASE=<k|auto> scripts/stix/att-smoke.sh <qemu>
+  [--negative|--check-guard|--dry-run]` gates all of this; on the gate
+  ELF it ends "PASS (AX subset), SKIP (PFM sequence), SKIP (silence
+  run)", exit 77.
+
+**A fault present from boot:** the faults are settable while the
+machine is paused, so `-S` + qom-set + `cont` gives one from the first
+instruction. `run-qemu-gs.sh` has no `-S`, so start QEMU by hand (the
+same flags as the script, plus `-S`):
+
+```bash
+qemu-system-sparc -M leon3_generic -m 64M -no-reboot -display none \
+    -monitor none -serial file:"$RUN/uart.raw" -kernel "$ELF" -S \
+    -qmp unix:"$RUN/qmp.sock",server=on,wait=off &
+qom_set $RUN/qmp.sock /machine/stixctrl/attenuator \
+    'attenuator.sensor_bc.stuck_closed' true
+qmp_cont $RUN/qmp.sock
+```
+
+`qmp_cont` sends `{"execute": "cont"}` (QMP wants `qmp_capabilities`
+first, like `qom_set` does):
+
+```bash
+qmp_cont() {  # qmp_cont <socket>: resume a -S machine
+    python3 - "$1" <<'EOF'
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+f = s.makefile("rw")
+f.readline()  # the greeting
+for cmd in ({"execute": "qmp_capabilities"}, {"execute": "cont"}):
+    f.write(json.dumps(cmd) + "\n")
+f.flush()
+while "event" in (reply := json.loads(f.readline())):
+    pass
+print(json.dumps(reply))
+EOF
+}
+```
+
 ## Notes and limits
 
 - **Order doesn't matter.** The bridge retries the QEMU connection. QEMU
