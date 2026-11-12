@@ -386,6 +386,10 @@ StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
     for (i = 0; i < n_blocks; i++) {
         memcpy(&s->rotb_ring[s->rotb_wr * STIXCTRL_BLOCK_SIZE],
                blocks + i * STIXCTRL_BLOCK_SIZE, STIXCTRL_BLOCK_SIZE);
+        /* M-4 (D-Uc write rule): the FPGA rewrite cures the cell */
+        stix_edac_host_write(&s->edac, STIX_EDAC_ROTBUF,
+                             (hwaddr)s->rotb_wr * STIXCTRL_BLOCK_SIZE,
+                             STIXCTRL_BLOCK_SIZE);
         stixctrl_rotb_push(s);
     }
     *rotb_count = s->rotb_count;
@@ -456,17 +460,23 @@ static void stixctrl_rotb_command(STIXCTRL *s, uint32_t cmd)
                             s->rotb_full);
 }
 
-/* BLOCK window (0xE0800000, one 512 B block): the SW view of the ring.
+/*
+ * BLOCK window (0xE0800000, one 512 B block): the SW view of the ring.
  * Reads show the block at the read pointer, in any mode; TESTMODE writes
- * land in the block at the write pointer. */
+ * land in the block at the write pointer. M-4: the EDAC reactions run
+ * where the CPU touches the ring (stix_edac_rotb_check on the read, the
+ * write-clear on the store; no overlay — the ring has no MemoryRegion).
+ */
 static uint64_t grlib_stixctrl_rotb_read(void *opaque, hwaddr addr,
                                          unsigned size)
 {
     STIXCTRL *s = opaque;
     hwaddr off = addr & (STIXCTRL_BLOCK_SIZE - 1);
+    const uint8_t *p = &s->rotb_ring[s->rotb_rd * STIXCTRL_BLOCK_SIZE + off];
+    uint64_t val = ldn_be_p(p, size);
 
-    return ldn_be_p(&s->rotb_ring[s->rotb_rd * STIXCTRL_BLOCK_SIZE + off],
-                    size);
+    stix_edac_rotb_check(&s->edac, s->rotb_rd, (uint32_t)off, size, &val);
+    return val;
 }
 
 static void grlib_stixctrl_rotb_write(void *opaque, hwaddr addr,
@@ -489,6 +499,8 @@ static void grlib_stixctrl_rotb_write(void *opaque, hwaddr addr,
 
     stn_be_p(&s->rotb_ring[s->rotb_wr * STIXCTRL_BLOCK_SIZE + off], size,
              value);
+    /* M-4 (D-Uc): the store cures every poisoned word it touches */
+    stix_edac_rotb_write(&s->edac, s->rotb_wr, (uint32_t)off, size);
 }
 
 static const MemoryRegionOps grlib_stixctrl_rotb_ops = {
@@ -1191,6 +1203,17 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
      */
     stix_edac_cache_link(&STIXCTRL->edac, &STIXCTRL->reg.cacheCmdSta,
                          &STIXCTRL->sram, &STIXCTRL->irq_edac);
+
+    /*
+     * D-Ua, M-4: wire the ROTBUF memory to the EDAC unit — the ring the
+     * detectors fill and the 512 B window exposes (no MemoryRegion, so
+     * no overlay: the reactions run in the window handlers and the
+     * append), the stored rotbConfig word gates (EDACON bit 12) and the
+     * EDAC sysbus slot pulses the shared IRQMP line 6 (D-Ue).
+     */
+    stix_edac_rotb_link(&STIXCTRL->edac, &STIXCTRL->reg.rotbConfig,
+                        STIXCTRL->rotb_ring, STIXCTRL->rotb_blocks,
+                        &STIXCTRL->irq_edac);
 
     STIXCTRL->wdg_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, stixctrl_wdg_expired, STIXCTRL);
 

@@ -996,6 +996,85 @@ the merge.
     writes it — the FPGA write clears the poison (a rewritten cell is
     fixed), matching D-Uc's write rule.
 - **Gate impact:** none uninjected (the composition is M-1).
+- **As built (M-4):**
+  - Orchestrator check: the shared IRQ 6 for a ROTB DED is the ICD's
+    interrupt table (ICD-0026 txt:3304-3307: line 6 covers DED in the
+    detector cache or the rotating buffer's SDRAM; the cache case only
+    with OpMode 0). RED-checked: with the append hook removed,
+    `edac-rotb-fpga-block` fails.
+  - The grammar (D-Ug), stated in the property description and here:
+    `upset-inject` takes
+    `rotbuf,<block>:<offset>,<bitmask>[,mode][,persist]` — `<block>` is
+    the index into the ring (0..rotb-blocks-1; bounds from the ring
+    size, the error names the bound), `<offset>` the byte offset in the
+    block (0..511, 4-aligned — the EDAC word is the unit), both numbers
+    in the C `strtoull` base-0 syntax like the other grammars. The
+    poison carries the ring byte offset `block * 512 + offset` as its
+    `address`; `upsets-active` keeps `address` an integer for every
+    memory and rotbuf records additionally carry `block` and `offset`
+    (the grammar's terms, round-trippable into upset-inject). Every
+    rejection names the offending field (grammar, block range, offset
+    range, offset alignment) and changes nothing; `bram` is still
+    refused ("M-5 wires bram").
+  - No overlay (D-Uc as planned): the ROTB has no CPU-visible RAM
+    region — the ring is host RAM (`g_malloc0` at the stixctrl realize)
+    the CPU sees only through the 512 B window at 0xE0800000, which
+    shows the block at the read pointer. The unit takes the ring
+    pointer, the block count, the stored rotbConfig word (the EDACON
+    gate source) and the EDAC sysbus slot from `stix_edac_rotb_link()`
+    at the stixctrl realize, next to the CACHE link.
+  - The check (`stix_edac_rotb_check()`) runs in the window read
+    handler; the semantics are the overlay read's, minus the overlay —
+    the clean word comes from the ring. SEU with EDACON = 1 returns the
+    corrected word (nothing to write back: the ring already holds it),
+    counts SECCOUNT (rotbCmdSta bits 31:24) and self-retires; DE with
+    EDACON = 1 returns the flip, latches DEDETECTED (bit 4), pulses the
+    shared IRQ 6 and one-shot retires (`persist=1` keeps it, D-Uh);
+    EDACON = 0 returns the flip raw and stays armed. ROTBUF never
+    returns MEMTX_ERROR — no trap path (the plan's matrix; the window
+    ops stay plain `.read`/`.write`). Sub-word reads slice the
+    presented word big-endian like the overlays. The DE line is the
+    shared IRQ_STIXCTRL_EDAC = 6 ("Errors (DED) in Detector's Cache
+    Memory or in Rotating Buffer's SDRAM memory", the StixIdpu.h IRQ
+    table, :1548 in this tree / :1547 as the plan cites it; the ICD
+    cross-check stays open — the sources txt was not reachable from the
+    sandbox — the FSW header and the one ISR that polls CACHE then
+    ROTBUF on that line, `EDAC.c:51-87`, pin it).
+  - The FPGA append (`stixctrl_rotb_append`) clears the poisons of
+    every block it memcpy's (`stix_edac_host_write`, trace kind
+    "host-clear") — the D-Uc write rule, gate-independent; a CPU store
+    through the window (the TESTMODE fill path, so only when the store
+    is not ignored) clears the words it touches with the guest-write
+    kind "write-clear" (`stix_edac_rotb_write()`). This moves the
+    plan's append-side `stix_edac_rotb_check()` parenthetical to the
+    write rule: the check is the read side, the append is the write
+    side.
+  - The EDACRESET strobe needed no new code: M-1's 0x54 filter already
+    treats bit 2 as the strobe and calls `stix_edac_clear(ROTBUF)`; the
+    ded qtest pins it. Poisons survive the strobe and the FIFO commands
+    (clearing the status is not curing the cell; D-Uh).
+  - Zero cost uninjected: the window read/write and the append
+    early-return on an empty table (`n_armed == 0`), one branch; the
+    M-2/M-3 stale-TLB window does not apply (the block window is MMIO,
+    never cached in a RAM TLB entry). Goldens untouched (the register
+    composition is M-1's).
+  - `edac-enable` now accepts 4 (rotb) and "all-on" — M-3 refused both
+    while rotbuf was unwired (its all-or-nothing rule); no M-3 test
+    asserted the refusal, so none changed. The enable loop names the
+    per-module EDACON bit (Sdram:Edac 12, CacheCmdSta 16, RotbConfig
+    12 — sdram/rotb share the value 12, the names differ).
+  - Traces: rotbuf effects trace the ring byte offset as the address;
+    kinds sec/ded/raw/write-clear/host-clear as M-2. No new trace
+    events.
+  - qtests (registered in `stix_edac_register()`, one-line RED story
+    each): `edac-rotb-seu` (RED on M-3: the rotbuf inject is refused,
+    SECCOUNT stays 0 — also pins the grammar rejections, skipping the
+    small-ring bound when the rotb-blocks -global is unsupported),
+    `edac-rotb-ded` (RED: no flip, no IRQ 6, no latch),
+    `edac-rotb-fpga-block` (RED: nothing can arm before the swap; the
+    det-chunk pattern, 10-tick integrations, det-source=zero, a
+    64-block ring for the 49-block chunk), `edac-enable-all` (RED on
+    M-3: both the "4" and "all-on" sets are refused).
 
 ### M-5: BRAM silent flips
 - The lvar flip helper (host byte flip + `set_dirty`), addressed in the

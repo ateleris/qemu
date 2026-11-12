@@ -6,8 +6,10 @@
  * over the backing RAMs, the SEU correct-on-read / DE flip + DEDETECTED
  * paths (D-Ue), the SDRAM DE as an AHB error response (MEMTX_ERROR +
  * the AHBSTAT word, D-Ud) and the upset-inject/upset-clear/
- * upsets-active/edac-enable verbs (D-Ug). The rotbuf/bram upsets follow
- * in M-4/M-5 on the same table and overlay code.
+ * upsets-active/edac-enable verbs (D-Ug). Since M-4 the ROTBUF upsets
+ * ride the same table with no overlay (the ring has no CPU-visible RAM
+ * region: stix_edac_rotb_check runs where the CPU reads the 512 B block
+ * window); the bram flips follow in M-5.
  *
  * Traces only fire from the QOM verbs and actual intercepted accesses,
  * never at realize, reset or in a getter (D-Ug, D-Ai).
@@ -168,7 +170,8 @@ static bool stix_edac_gate(StixEdac *e, StixEdacModule m)
     if (m == STIX_EDAC_SDRAM) {
         return (*e->mems[m].edacon_reg >> FTSDCTRL16_EDAC_EDACON) & 1u;
     }
-    return false;               /* ROTBUF link comes in M-4 */
+    /* ROTBUF: rotbConfig EDACON (bit 12), wired since M-4 */
+    return (*e->mems[m].edacon_reg >> STIXCTRL_ROTBCONFIG_EDACON) & 1u;
 }
 
 /*
@@ -189,6 +192,15 @@ static bool stix_edac_de_gate(StixEdac *e, StixEdacModule m)
 {
     return m == STIX_EDAC_CACHE ? stix_edac_cache_de_gate(e)
                                 : stix_edac_gate(e, m);
+}
+
+/* the module's data path is wired (the register owner's realize ran) */
+static bool stix_edac_wired(StixEdac *e, StixEdacModule m)
+{
+    if (m == STIX_EDAC_ROTBUF) {
+        return e->mems[m].ring != NULL;
+    }
+    return e->mems[m].backing != NULL;
 }
 
 struct StixEdacOverlay {
@@ -501,6 +513,119 @@ void stix_edac_sdram_link(StixEdac *e, volatile uint32_t *sdram_edac,
     /* no IRQ: the SDRAM DE is the AHB error/trap path (D-Ud) */
 }
 
+/*
+ * M-4: the ROTBUF link. The poisons are keyed by ring byte offsets
+ * (block * STIXCTRL_BLOCK_SIZE + offset), so base stays 0 and there is
+ * no backing MemoryRegion and no overlay — the clean word comes from the
+ * ring when stix_edac_rotb_check needs it. The DE pulses the same sysbus
+ * slot as the CACHE DE: IRQ_STIXCTRL_EDAC = 6 is shared (the StixIdpu.h
+ * IRQ table; the FSW's one ISR checks CACHE then ROTBUF on it,
+ * EDAC.c:51-87).
+ */
+void stix_edac_rotb_link(StixEdac *e, volatile uint32_t *rotb_config,
+                         uint8_t *ring, uint32_t blocks, qemu_irq *edac_irq)
+{
+    StixEdacMem *mem = &e->mems[STIX_EDAC_ROTBUF];
+
+    mem->base = 0;
+    mem->edacon_reg = rotb_config;
+    mem->ring = ring;
+    mem->ring_bytes = blocks * STIXCTRL_BLOCK_SIZE;
+    mem->irq = edac_irq;
+}
+
+/*
+ * M-4 (D-Uc/D-Ue): the reactions for the CPU's read through the 512 B
+ * block window — the only path the CPU sees the ring through. The
+ * semantics are the overlay read's, minus the overlay: the flip lives in
+ * the poison table, the clean word comes from the ring, SEU with
+ * EDACON = 1 counts and self-retires (nothing to write back: the ring
+ * already holds the corrected word), DE latches DEDETECTED, pulses IRQ 6
+ * and returns the flip — ROTBUF never errors the bus (no trap path, the
+ * plan's matrix). EDACON = 0 leaves the poison armed ("raw").
+ */
+void stix_edac_rotb_check(StixEdac *e, uint32_t block, uint32_t off,
+                          unsigned size, uint64_t *val)
+{
+    StixEdacMem *mem;
+    StixEdacPoison *p;
+    hwaddr wa;
+    uint32_t word, out = 0;
+    unsigned k;
+
+    /* zero cost uninjected: one branch on the armed count */
+    if (e == NULL || e->n_armed == 0 ||
+        e->mems[STIX_EDAC_ROTBUF].ring == NULL) {
+        return;
+    }
+    mem = &e->mems[STIX_EDAC_ROTBUF];
+    wa = (hwaddr)block * STIXCTRL_BLOCK_SIZE +
+         (off & ~(hwaddr)(STIX_EDAC_WORD_SIZE - 1));
+    p = stix_edac_poison_get(e, STIX_EDAC_ROTBUF, wa);
+    if (p == NULL) {
+        return;
+    }
+
+    word = ldl_be_p(mem->ring + wa);
+    if (p->de) {
+        if (stix_edac_de_gate(e, STIX_EDAC_ROTBUF)) {
+            word ^= p->mask;
+            e->ded[STIX_EDAC_ROTBUF] = true;
+            mem->detected++;
+            trace_stix_edac_effect(stix_edac_mem_name[STIX_EDAC_ROTBUF],
+                                   wa, "ded");
+            if (mem->irq != NULL) {
+                qemu_irq_pulse(*mem->irq);
+            }
+            if (!p->persist) {
+                stix_edac_poison_retire(e, p);
+            }
+        } else {
+            /* EDACON = 0: the flip, raw, stays armed */
+            word ^= p->mask;
+            trace_stix_edac_effect(stix_edac_mem_name[STIX_EDAC_ROTBUF],
+                                   wa, "raw");
+        }
+    } else {
+        if (stix_edac_gate(e, STIX_EDAC_ROTBUF)) {
+            if (e->sec[STIX_EDAC_ROTBUF] < 0xFF) {
+                e->sec[STIX_EDAC_ROTBUF]++;  /* 8-bit fields saturate */
+            }
+            mem->corrected++;
+            trace_stix_edac_effect(stix_edac_mem_name[STIX_EDAC_ROTBUF],
+                                   wa, "sec");
+            if (!p->persist) {
+                stix_edac_poison_retire(e, p);
+            }
+        } else {
+            word ^= p->mask;            /* EDACON = 0: raw, stays armed */
+            trace_stix_edac_effect(stix_edac_mem_name[STIX_EDAC_ROTBUF],
+                                   wa, "raw");
+        }
+    }
+
+    /* slice the presented word big-endian, as the window reads are */
+    k = off & (STIX_EDAC_WORD_SIZE - 1);
+    while (size-- > 0) {
+        out = (out << 8) | ((word >> (24 - 8 * k)) & 0xffu);
+        k = (k + 1) & 3u;
+    }
+    *val = out;
+}
+
+/* M-4 (D-Uc): the window's TESTMODE store cures the words it touches */
+void stix_edac_rotb_write(StixEdac *e, uint32_t block, uint32_t off,
+                          unsigned size)
+{
+    if (e == NULL || e->n_armed == 0 ||
+        e->mems[STIX_EDAC_ROTBUF].ring == NULL) {
+        return;
+    }
+    stix_edac_poison_drop(e, STIX_EDAC_ROTBUF,
+                          (hwaddr)block * STIXCTRL_BLOCK_SIZE + off, size,
+                          "write-clear");
+}
+
 MemoryRegion *stix_edac_ahbstat_mr(StixEdac *e)
 {
     return &e->ahbstat_mr;
@@ -542,10 +667,13 @@ static const MemoryRegionOps stix_edac_ahbstat_ops = {
 void stix_edac_host_write(StixEdac *e, StixEdacModule m, hwaddr off,
                           hwaddr len)
 {
-    if (e == NULL || e->mems[m].backing == NULL) {
+    if (e == NULL || !stix_edac_wired(e, m)) {
         return;
     }
-    /* the caller speaks backing offsets; the poisons carry addresses */
+    /*
+     * the caller speaks backing offsets (ring byte offsets for ROTBUF);
+     * the poisons carry addresses
+     */
     stix_edac_poison_drop(e, m, e->mems[m].base + off, len, "host-clear");
 }
 
@@ -574,6 +702,11 @@ static char *stix_edac_upsets_json(StixEdac *e)
         qdict_put_int(rec, "id", id++);
         qdict_put_str(rec, "memory", stix_edac_mem_name[p->mem]);
         qdict_put_int(rec, "address", p->addr);
+        if (p->mem == STIX_EDAC_ROTBUF) {
+            /* the rotbuf address in its grammar's terms (M-4) */
+            qdict_put_int(rec, "block", p->addr / STIXCTRL_BLOCK_SIZE);
+            qdict_put_int(rec, "offset", p->addr % STIXCTRL_BLOCK_SIZE);
+        }
         qdict_put_int(rec, "mask", p->mask);
         qdict_put_str(rec, "mode", p->de ? "de" : "seu");
         qdict_put_bool(rec, "persist", p->persist);
@@ -597,9 +730,13 @@ static char *stix_edac_upsets_json(StixEdac *e)
 
 /*
  * upset-inject (D-Ug): "memory,address,bitmask[,mode][,persist]" with
- * memory in {sdram,cache,rotbuf,bram}. M-3 wires SDRAM and CACHE — the
- * other memories are rejected as unsupported so a caller is never left
- * with a silently unarmed upset. A rejected set changes nothing.
+ * memory in {sdram,cache,rotbuf,bram}. rotbuf (M-4) takes
+ * "<block>:<offset>" as its address — the block index into the ring
+ * (bounds from the ring size) and the byte offset 0..511 in the block,
+ * 4-aligned; the poison carries the ring byte offset
+ * block * STIXCTRL_BLOCK_SIZE + offset. M-5 wires bram — unsupported
+ * memories are rejected so a caller is never left with a silently
+ * unarmed upset. A rejected set changes nothing.
  */
 static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
@@ -626,37 +763,80 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
         m = STIX_EDAC_CACHE;
     } else if (strcmp(fields[0], "sdram") == 0) {
         m = STIX_EDAC_SDRAM;
-    } else if (strcmp(fields[0], "rotbuf") == 0 ||
-               strcmp(fields[0], "bram") == 0) {
+    } else if (strcmp(fields[0], "rotbuf") == 0) {
+        m = STIX_EDAC_ROTBUF;   /* "<block>:<offset>", parsed below */
+    } else if (strcmp(fields[0], "bram") == 0) {
         error_setg(errp, "%s: memory %s is not supported yet "
-                   "(M-4/M-5 wire rotbuf and bram)", name, fields[0]);
+                   "(M-5 wires bram)", name, fields[0]);
         goto out;
     } else {
         error_setg(errp, "%s: unknown memory %s (expected sdram, cache, "
                    "rotbuf or bram)", name, fields[0]);
         goto out;
     }
-    if (e->mems[m].backing == NULL) {
+    if (!stix_edac_wired(e, m)) {
         error_setg(errp, "%s: memory %s is not wired in this machine",
                    name, fields[0]);
         goto out;
     }
-    if (qemu_strtou64(fields[1], NULL, 0, &addr) < 0) {
-        error_setg(errp, "%s: bad address %s", name, fields[1]);
-        goto out;
-    }
-    if (addr & (STIX_EDAC_WORD_SIZE - 1)) {
-        error_setg(errp, "%s: address 0x%" PRIx64 " is not %u-aligned",
-                   name, addr, STIX_EDAC_WORD_SIZE);
-        goto out;
-    }
-    if (addr < e->mems[m].base ||
-        addr >= e->mems[m].base + memory_region_size(e->mems[m].backing)) {
-        error_setg(errp, "%s: address 0x%" PRIx64 " is outside %s "
-                   "(0x%" HWADDR_PRIx "..0x%" HWADDR_PRIx ")", name, addr,
-                   stix_edac_mem_name[m], e->mems[m].base,
-                   e->mems[m].base + memory_region_size(e->mems[m].backing));
-        goto out;
+    if (m == STIX_EDAC_ROTBUF) {
+        /*
+         * M-4 grammar: "<block>:<offset>", both numbers in the strtoull
+         * base-0 syntax. Every rejection names the field; the bounds
+         * come from the ring size (the rotb-blocks property).
+         */
+        const char *colon, *end;
+        uint64_t block, offset;
+
+        if (qemu_strtou64(fields[1], &colon, 0, &block) < 0 ||
+            *colon != ':') {
+            error_setg(errp, "%s: rotbuf takes \"<block>:<offset>\", "
+                       "not \"%s\"", name, fields[1]);
+            goto out;
+        }
+        if (qemu_strtou64(colon + 1, &end, 0, &offset) < 0 ||
+            *end != '\0') {
+            error_setg(errp, "%s: bad rotbuf offset in \"%s\"",
+                       name, fields[1]);
+            goto out;
+        }
+        if (block >= e->mems[m].ring_bytes / STIXCTRL_BLOCK_SIZE) {
+            error_setg(errp, "%s: rotbuf block %" PRIu64 " is out of "
+                       "range (the ring holds %u blocks)", name, block,
+                       e->mems[m].ring_bytes / STIXCTRL_BLOCK_SIZE);
+            goto out;
+        }
+        if (offset >= STIXCTRL_BLOCK_SIZE) {
+            error_setg(errp, "%s: rotbuf offset %" PRIu64 " is out of "
+                       "range (0..%u)", name, offset,
+                       STIXCTRL_BLOCK_SIZE - 1);
+            goto out;
+        }
+        if (offset & (STIX_EDAC_WORD_SIZE - 1)) {
+            error_setg(errp, "%s: rotbuf offset %" PRIu64 " is not "
+                       "%u-aligned", name, offset, STIX_EDAC_WORD_SIZE);
+            goto out;
+        }
+        addr = block * STIXCTRL_BLOCK_SIZE + offset;
+    } else {
+        if (qemu_strtou64(fields[1], NULL, 0, &addr) < 0) {
+            error_setg(errp, "%s: bad address %s", name, fields[1]);
+            goto out;
+        }
+        if (addr & (STIX_EDAC_WORD_SIZE - 1)) {
+            error_setg(errp, "%s: address 0x%" PRIx64 " is not %u-aligned",
+                       name, addr, STIX_EDAC_WORD_SIZE);
+            goto out;
+        }
+        hwaddr end = e->mems[m].base +
+                     memory_region_size(e->mems[m].backing);
+
+        if (addr < e->mems[m].base || addr >= end) {
+            error_setg(errp, "%s: address 0x%" PRIx64 " is outside %s "
+                       "(0x%" HWADDR_PRIx "..0x%" HWADDR_PRIx ")", name, addr,
+                       stix_edac_mem_name[m], e->mems[m].base, end);
+            goto out;
+        }
     }
     if (qemu_strtou64(fields[2], NULL, 0, &mask) < 0 || mask == 0 ||
         mask > 0xFFFFFFFFull) {
@@ -717,7 +897,8 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
         .persist = persist,
         .armed = true,
     };
-    if (!stix_edac_overlay_find(&e->mems[m],
+    if (e->mems[m].backing != NULL &&
+        !stix_edac_overlay_find(&e->mems[m],
                                 addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1))) {
         stix_edac_overlay_add(e, m,
                               addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1));
@@ -890,11 +1071,13 @@ static void stix_edac_boot_set(Object *obj, Visitor *v, const char *name,
  * EdacOn bit of exactly the given modules into the owners' stored
  * register words — as much as a software write could set — and never
  * clears a bit: a module left out keeps its current EDACON state (the
- * off path is the FSW's own TC(236) write or a reset). A module whose
- * register owner is not wired is refused and nothing changes (a caller
- * is never left with a silently missed module). There is deliberately
- * no "trap with EDACON = 0" knob: with EDAC off the controller detects
- * nothing, so that would be unphysical.
+ * off path is the FSW's own TC(236) write or a reset). Since M-4 all
+ * three modules are wired in the leon3 machine, so "all-on" works (M-3
+ * refused it while rotbuf was unwired); a module whose register owner
+ * is not wired is still refused and nothing changes (a caller is never
+ * left with a silently missed module). There is deliberately no "trap
+ * with EDACON = 0" knob: with EDAC off the controller detects nothing,
+ * so that would be unphysical.
  */
 static void stix_edac_enable_set(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
@@ -937,7 +1120,8 @@ static void stix_edac_enable_set(Object *obj, Visitor *v, const char *name,
     }
     for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
         unsigned bit = m == STIX_EDAC_CACHE ? STIXCTRL_CACHECMDSTA_EDACON
-                                            : FTSDCTRL16_EDAC_EDACON;
+                     : m == STIX_EDAC_ROTBUF ? STIXCTRL_ROTBCONFIG_EDACON
+                     : FTSDCTRL16_EDAC_EDACON;
 
         if (mask & (1u << m)) {
             *e->mems[m].edacon_reg |= 1u << bit;
@@ -1027,8 +1211,11 @@ static void stix_edac_instance_init(Object *obj)
                         NULL, stix_edac_inject_set, NULL, NULL);
     object_property_set_description(obj, "upset-inject",
         "inject an upset: \"memory,address,bitmask[,mode][,persist]\" "
-        "(memory: cache, sdram; bitmask bit count 1 = seu, >=2 = de, "
-        "mode overrides; persist=1 keeps the poison after its effect)");
+        "(memory: cache, sdram, rotbuf; rotbuf takes \"<block>:<offset>\" "
+        "as the address: the block index into the ring and the byte "
+        "offset 0..511 in the block, 4-aligned; bitmask bit count 1 = "
+        "seu, >=2 = de, mode overrides; persist=1 keeps the poison "
+        "after its effect)");
     object_property_add(obj, "upset-clear", "string", &str_type_info,
                         NULL, stix_edac_clear_set, NULL, NULL);
     object_property_set_description(obj, "upset-clear",

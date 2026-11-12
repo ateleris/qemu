@@ -51,7 +51,10 @@ typedef struct StixEdacOverlay StixEdacOverlay;
  * One EDAC memory's upset state (D-Ua): the backing RAM the overlays sit
  * on, the owner's stored register word that gates the reactions (EDACON,
  * and for CACHE OPMODE), the DE IRQ line, and the upsets-active
- * counters. Only CACHE is linked in M-2; SDRAM follows in M-3.
+ * counters. CACHE is linked in M-2, SDRAM in M-3, ROTBUF in M-4 — the
+ * ROTB has no MemoryRegion (the CPU sees only the 512 B block window),
+ * so its data is the host-side ring and the reactions run from the
+ * window/append paths, not from an overlay.
  */
 typedef struct StixEdacMem {
     MemoryRegion *backing;      /* the guest-mapped RAM (stixctrl->sram) */
@@ -60,6 +63,13 @@ typedef struct StixEdacMem {
     qemu_irq *irq;              /* the module's DE line (sysbus slot) */
     StixEdacOverlay *overlays;  /* live 4 KB page overlays */
     StixEdacOverlay *spares;    /* removed overlays, parked for reuse */
+    /*
+     * ROTBUF only (M-4): the ring bytes and their size; the poison
+     * addresses are ring byte offsets (block * STIXCTRL_BLOCK_SIZE +
+     * offset), so base stays 0
+     */
+    uint8_t *ring;
+    uint32_t ring_bytes;
     /* upsets-active counters (D-Ug): injects and their effects */
     uint32_t injected;
     uint32_t corrected;
@@ -178,6 +188,41 @@ void stix_edac_sdram_link(StixEdac *e, volatile uint32_t *sdram_edac,
                           MemoryRegion *ram);
 
 /*
+ * M-4: wire the ROTBUF memory to the unit, at the stixctrl realize. The
+ * ROTB has no CPU-visible RAM region — the CPU sees a 512 B window at
+ * STIXCTRL_BLOCK_START showing the ring block at the read pointer (D-Uc)
+ * — so there is no overlay: the reactions run from stix_edac_rotb_check/
+ * stix_edac_rotb_write in the window handlers and the append clears
+ * through stix_edac_host_write. @rotb_config is the stored RotbConfig
+ * word whose EDACON (bit 12) gates the reactions, @ring the ring bytes
+ * (@blocks blocks of STIXCTRL_BLOCK_SIZE), @edac_irq the sysbus slot
+ * that pulses the shared IRQMP line 6 (D-Ue).
+ */
+void stix_edac_rotb_link(StixEdac *e, volatile uint32_t *rotb_config,
+                         uint8_t *ring, uint32_t blocks, qemu_irq *edac_irq);
+
+/*
+ * M-4 (D-Ue): the reactions for the CPU's read through the 512 B block
+ * window. @block is the ring block at the read pointer, @off the byte
+ * offset in it, @size the access width; @val carries the clean read and
+ * is replaced by the presented value when a poison covers the word.
+ * SEU with EDACON = 1: corrected + SECCOUNT, self-retiring; DE: flip +
+ * DEDETECTED + IRQ 6, one-shot unless persist (D-Uh); EDACON = 0: raw,
+ * stays armed. ROTBUF never errors the bus (no trap path, the plan's
+ * matrix). Zero cost uninjected: an early return on an empty table.
+ */
+void stix_edac_rotb_check(StixEdac *e, uint32_t block, uint32_t off,
+                          unsigned size, uint64_t *val);
+
+/*
+ * M-4 (D-Uc): a CPU store through the window (the TESTMODE fill path)
+ * retires every poison it touches, like a guest write — a rewrite cures
+ * the cell. Zero cost uninjected: an early return on an empty table.
+ */
+void stix_edac_rotb_write(StixEdac *e, uint32_t block, uint32_t off,
+                          unsigned size);
+
+/*
  * M-3 (D-Ud): the AHBSTAT window's MemoryRegion (4 bytes at
  * 0x80000F00); leon3.c maps it into the system memory.
  */
@@ -185,9 +230,10 @@ MemoryRegion *stix_edac_ahbstat_mr(StixEdac *e);
 
 /*
  * M-2 (D-Uc, the host-side writer rule): a host write into a linked
- * memory (stix_det's LACC/EACC materialization) retires every poison it
- * overwrites, like a guest write — a rewrite cures the cell. @off and
- * @len are byte offsets in the backing RAM.
+ * memory (stix_det's LACC/EACC materialization, and since M-4 the rotb
+ * append) retires every poison it overwrites, like a guest write — a
+ * rewrite cures the cell. @off and @len are byte offsets in the backing
+ * RAM (for ROTBUF: ring byte offsets).
  */
 void stix_edac_host_write(StixEdac *e, StixEdacModule m, hwaddr off,
                           hwaddr len);

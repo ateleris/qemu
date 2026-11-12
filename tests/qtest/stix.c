@@ -13804,6 +13804,178 @@ static void test_edac_sdram_ded_trap_runtime(void)
     g_unlink(elf);
 }
 
+/* ---- ROTBUF upsets (memory-upset plan M-4) ---- */
+
+/*
+ * /sparc/stix/edac-rotb-seu (M-4): a 1-bit upset in the ring block the
+ * window shows is corrected on read with rotbConfig EDACON = 1, counts
+ * one SEC and self-retires (the flip lives in the poison table, keyed by
+ * the ring byte offset block*512+offset). The grammar rejections (block
+ * out of range, offset out of range/unaligned, no block:offset) name the
+ * field and change nothing. RED on M-3: the rotbuf inject is refused, so
+ * SECCOUNT stays 0.
+ */
+static void test_edac_rotb_seu(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    g_autofree char *json;
+
+    /* the grammar rejections: nothing armed, nothing counted */
+    if (rotb_blocks_supported()) {
+        g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                        "rotbuf,8:0,0x1"));   /* ring holds 8 */
+    }
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "rotbuf,0x20000:0,0x1")); /* out of range */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "rotbuf,0:512,0x1"));     /* offset OOR */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "rotbuf,0:2,0x1"));       /* unaligned */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "rotbuf,0,0x1"));         /* no offset */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                    "rotbuf,x:0,0x1"));       /* bad block */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_nonnull(json);
+    g_assert_null(strstr(json, "\"memory\""));
+
+    /* fill block 0 through the window in TESTMODE, make it a block */
+    rotb_cfg(qts, true, true);
+    qtest_writel(qts, ROTB_WINDOW, 0x12345678u);
+    qtest_writel(qts, ROTB_WINDOW + 4u, 0x9ABCDEF0u);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+
+    /* rotbConfig EDACON = 1 (the FSW's RotAccumulator_EDAC_on path) */
+    qtest_writel(qts, EDAC_ROTBCONFIG, ROTB_CFG_ENABLE | ROTBCFG_EDACON);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "rotbuf,0:0,0x1"));
+
+    /* the window shows block 0 (rd = 0): corrected, one SEC */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW), ==, 0x12345678u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA) & ROTB_SEC(0xFF),
+                    ==, ROTB_SEC(1));
+
+    /* the poison retired: a second read counts no more */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW), ==, 0x12345678u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA) & ROTB_SEC(0xFF),
+                    ==, ROTB_SEC(1));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-rotb-ded (M-4, D-Ue): a 2-bit flip returns the
+ * corrupted block data, latches DEDETECTED (rotbCmdSta bit 4) and pulses
+ * the shared EDAC IRQ 6 (StixIdpu.h:1548, the FSW's one ISR checks CACHE
+ * then ROTBUF on it); ROTBUF never errors the bus — no trap path. The
+ * FSW's EDACRESET strobe pair (EDAC.c:305-306) clears the latch. RED on
+ * M-3: the rotbuf inject is refused — no flip, no IRQ, no latch.
+ */
+static void test_edac_rotb_ded(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+
+    qtest_writel(qts, IRQMP_CLEAR, EDAC_IRQ_BIT);
+    rotb_cfg(qts, true, true);
+    qtest_writel(qts, ROTB_WINDOW, 0xA5A5A5A5u);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    qtest_writel(qts, EDAC_ROTBCONFIG, ROTB_CFG_ENABLE | ROTBCFG_EDACON);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "rotbuf,0:0,0x5"));
+
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW), ==, 0xA5A5A5A5u ^ 0x5u);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA) & ROTB_DEDETECTED,
+                    ==, ROTB_DEDETECTED);
+    g_assert_cmphex(qtest_readl(qts, IRQMP_PENDING) & EDAC_IRQ_BIT,
+                    ==, EDAC_IRQ_BIT);
+
+    /* one-shot: the detected read retired the poison */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW), ==, 0xA5A5A5A5u);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+
+    /* the FSW's EDACRESET strobe pair: the latch clears, the ring stays */
+    qtest_writel(qts, EDAC_ROTBCMDSTA, ROTB_EDACRESET);
+    qtest_writel(qts, EDAC_ROTBCMDSTA, 0xFFFFFFFBu);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA) & ROTB_DEDETECTED,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW), ==, 0xA5A5A5A5u);
+
+    qtest_writel(qts, IRQMP_CLEAR, EDAC_IRQ_BIT);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-rotb-fpga-block (M-4, D-Uc write rule): the detector
+ * append (stixctrl_rotb_append, the FPGA fill path) rewrites the blocks
+ * it lands in and cures their poisons — the rewritten cell is fixed, the
+ * window reads the chunk data clean and no counter moves. RED on M-3:
+ * the rotbuf inject is refused, so nothing can arm before the swap.
+ */
+static void test_edac_rotb_fpga_block(void)
+{
+    QTestState *qts = rotb_qtest_new(64);
+
+    rotb_cfg(qts, true, false);                 /* the append's mode */
+    sky_set_str(qts, "det-source", "zero");
+    det_start_nom(qts, 39, 0, 9, 0xFFFFFFFFu);  /* 10-tick integrations */
+
+    /* block 0 is the append target (wr = 0): poison a data word */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "rotbuf,0:16,0x1"));
+    g_assert_cmpuint(edac_poison_count(qts), ==, 1);
+    /* EDACON = 0: the raw row shows the flip while the cell is armed */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 16u), ==, 0x1u);
+
+    det_step_ticks(qts, 10);    /* the first chunk lands on block 0 */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 16u), ==, 0);
+    g_assert_cmpuint(edac_poison_count(qts), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 16u), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCMDSTA)
+                    & (ROTB_SEC(0xFF) | ROTB_DEDETECTED), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-enable-all (M-4): with rotbuf wired, edac-enable
+ * takes 4 (rotb, RotbConfig EDACON bit 12) and "all-on" sets all three
+ * EdacOn bits — as software writes would; a masked set leaves the
+ * modules left out alone, "0" is refused. RED on M-3: both sets are
+ * refused (rotbuf unwired) and rotbConfig EDACON stays 0.
+ */
+static void test_edac_enable_all(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    /* mask 4 = rotb only: the others keep their hand-over state */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-enable", "4"));
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG) & ROTBCFG_EDACON,
+                    ==, ROTBCFG_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_EDACON,
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA), ==, CACHE_EDACON);
+
+    /* all-on: the remaining two set, nothing clears */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-enable",
+                                   "all-on"));
+    g_assert_cmphex(qtest_readl(qts, EDAC_SDRAM_EDAC) & SDRAM_EDAC_EDACON,
+                    ==, SDRAM_EDAC_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_CACHECMDSTA) & CACHE_EDACON,
+                    ==, CACHE_EDACON);
+    g_assert_cmphex(qtest_readl(qts, EDAC_ROTBCONFIG) & ROTBCFG_EDACON,
+                    ==, ROTBCFG_EDACON);
+
+    /* an empty mask enables nothing and is refused */
+    g_assert_false(stix_qom_set_str(qts, EDAC_EDAC_PATH, "edac-enable", "0"));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_edac_register(void)
 {
     qtest_add_func("/sparc/stix/edac-reg-reset", test_edac_reg_reset);
@@ -13838,6 +14010,11 @@ static void stix_edac_register(void)
                    test_edac_sdram_ded_trap_runtime);
     qtest_add_func("/sparc/stix/edac-sdram-persist",
                    test_edac_sdram_persist);
+    qtest_add_func("/sparc/stix/edac-rotb-seu", test_edac_rotb_seu);
+    qtest_add_func("/sparc/stix/edac-rotb-ded", test_edac_rotb_ded);
+    qtest_add_func("/sparc/stix/edac-rotb-fpga-block",
+                   test_edac_rotb_fpga_block);
+    qtest_add_func("/sparc/stix/edac-enable-all", test_edac_enable_all);
 }
 
 int main(int argc, char **argv)
