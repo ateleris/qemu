@@ -284,8 +284,11 @@ if [ "$FLAVOUR" = debug ]; then
             uart.pfm.txt
         fail "a forbidden UART line"
     fi
-    # the key lines, in this order: SAFE, LUT type=1..4, delete init
+    # the key lines, in this order: SAFE, LUT type=1..4, delete init.
+    # The FSW ends its lines with \n\r, so each line starts with a CR:
+    # strip it, or $1 (the UART time) carries it.
     ORDER="$(awk '
+        { gsub(/\r/, "") }
         /init: SAFE mode/ && !s { s = NR }
         s && /could not find LUT \(type=[1-4],/ {
             match($0, /type=[1-4]/); t = substr($0, RSTART + 5, 1)

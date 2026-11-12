@@ -3884,6 +3884,19 @@ documented under "FSW oddities" below.
   Gate: `scripts/stix/pfm-boot-smoke.sh` (positive + `--negative`; the
   negative proves the gate sees the original failure: latency off ends
   in the watchdog's "count expired" reset).
+  Live gate record 2026-11-12 (slot 4, latency on): release PASS
+  (0x0032 at +58.3 s), `--negative` PASS (count expired, QEMU exited),
+  `STIX_PFM_DBG=1` PASS (0x0032 at +56.3 s; UART "delete init" at
+  00:00:54.0). The first live runs found two gate bugs, fixed:
+  - SID2 HK on the PFM comes every 64 s
+    (`HK_TM_SID2_REPORTING_PERIOD` 512 x 125 ms, `ParamMgmtDef.h:204`,
+    `HKReport.c:183`; no context file, so the default), so the NOMINAL
+    group's SID2 mode-5 check has its own 70 s window, not the
+    group's 5 s; the first run reached NOMINAL (0x0021 04 05) and
+    failed only on that window.
+  - The FSW ends UART lines with `\n\r`, so each line of
+    `uart.pfm.txt` starts with a CR; the key-line order check strips
+    it (it made the UART time `\r00:00:54.5` and the check fail).
 - **Golden note.** `capture-golden.sh` runs `-trace 'stix*'`, so a
   future recapture of `qemu-stdout.golden.log` grows by the per-op
   `stixflash_op_start`/`stixflash_op_done` lines (≈15k per PFM boot). No
