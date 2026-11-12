@@ -422,6 +422,15 @@ These change what the track can deliver. Read them first.
   code 1). If the raise hits a wall the review did not foresee, the
   fallback stays status-only SDRAM DE (DEDETECTED + SECCOUNT, no
   reboot) with the trap as A-later.
+  **User decision (2026-11-12): a DEU may lead to a trap on purpose.**
+  One-shot stays the default, and the trap must be reachable from a
+  test without rebuilding the image. It is reached through EDACON=1
+  in two ways: `edac-at-boot=all-on` at reset (D-Uk), or at run time
+  through the `edac-enable` QOM write on `/machine/stixctrl/edac` (a
+  mask like `edac-at-boot`, applied as if software had written the
+  EdacOn bits; M-3). There is deliberately no "trap with EDACON=0" knob:
+  with EDAC off the controller detects nothing, so that trap would be
+  unphysical. The flipped word is returned raw (the D-Ue row).
 - **D-Ue: DE/SEU status and IRQ semantics.**
   - CACHE: DEDETECTED (cacheCmdSta bit 18) latches, IRQ 6 pulses, and
     the corrupted word is returned — **only when EDACON=1 and
@@ -740,7 +749,13 @@ the merge.
   `ldst_helper.c` is not touched), the AHBSTAT window at 0x80000F00
   (the one failing-address word), SDRAM EDACON/EDACRST gating. The
   live-FSW variants need SDRAM EDACON=1: run with
-  `edac-at-boot=all-on` (D-Uk) unless Q1 says SuSW does it.
+  `edac-at-boot=all-on` (D-Uk); SuSW does not (Q1, user). M-3 adds
+  the run-time `edac-enable` write (D-Ud user decision), so a campaign
+  can arm the DE → trap path mid-run. Unlike `test-latch-*` it is not
+  qtest-only: it is a platform fault verb, and it only sets the EdacOn
+  bits a software write could set. qtest `edac-sdram-ded-trap-runtime`:
+  boot with hw-reset, DE read → raw word, no trap; `edac-enable` sdram;
+  DE read → trap 0x09.
 - Optional, and separate from this track: making the HWSelftest trap
   selftest actually trap (`HWSelftest.c:277-282` stores to 0xF0000000,
   silent today — correction 3). Out of scope unless it falls out of the
