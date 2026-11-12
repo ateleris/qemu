@@ -4,7 +4,10 @@
 # nothing (silent), exits 1 immediately (crash), appends a line every
 # 0.5 s until killed or FAKE_QEMU_RUN_SECONDS elapse (heartbeat), or
 # appends for FAKE_QEMU_FREEZE_AFTER seconds and then stays alive but
-# silent — a hung guest (freeze).
+# silent — a hung guest (freeze). For pfm-boot-smoke: pfm writes one
+# watchdog RELOAD into the -trace file and stays alive (the positive
+# run's live trace), pfm-reset writes a watchdog "count expired" reset
+# and exits at once (the latency-off negative).
 #
 # FAKE_QEMU_ARGV_FILE, when set, gets one record per invocation appended:
 # "argv:" plus the arguments one per line, "cwd: <dir>" and
@@ -23,6 +26,7 @@ if [ -n "${FAKE_QEMU_ARGV_FILE:-}" ]; then
     } >> "$FAKE_QEMU_ARGV_FILE"
 fi
 SERIAL_OUT=""
+TRACE_FILE=""
 prev=""
 for a in "$@"; do
     if [ "$prev" = "-serial" ]; then
@@ -30,7 +34,8 @@ for a in "$@"; do
     fi
     # -trace ...,file=X: create X empty, like QEMU with no event fired
     if [ "$prev" = "-trace" ] && [ "${a#*file=}" != "$a" ]; then
-        : > "${a#*file=}"
+        TRACE_FILE="${a#*file=}"
+        : > "$TRACE_FILE"
     fi
     prev="$a"
 done
@@ -62,6 +67,17 @@ case "$MODE" in
     crash)
         echo "fake-qemu: simulated crash" >&2
         exit 1
+        ;;
+    pfm)
+        # one live watchdog RELOAD (cmd=1), as the FSW feeds it
+        echo "stixctrl_watchdog_cmd watchdog cmd=1 reload=536870912" \
+            "count=536870912 running=1" >> "$TRACE_FILE"
+        sleep "${FAKE_QEMU_RUN_SECONDS:-30}"
+        ;;
+    pfm-reset)
+        # the latency-off negative: the watchdog expires, QEMU exits
+        echo "stixctrl_watchdog_reset watchdog resets the IDPU:" \
+            "count expired" >> "$TRACE_FILE"
         ;;
     *)
         echo "fake-qemu: unknown FAKE_QEMU_MODE '$MODE'" >&2
