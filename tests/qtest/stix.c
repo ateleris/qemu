@@ -7459,6 +7459,329 @@ static void test_det_chunk_guard(void)
     stix_qtest_cleanup();
 }
 
+/* ---- det-inject: the index-space end-to-end deposit (plan D-6) ---- */
+
+/* one LACC cell as the FSW reads it: u16 big-endian at
+ * ((pix * 32 + fpga_det) * 32 + ebin) * 2 (Detectors.h:68-79) */
+static uint16_t inject_lacc_cell(QTestState *qts, uint32_t bank,
+                                 uint32_t pix, uint32_t fpga_det,
+                                 uint32_t ebin)
+{
+    uint8_t raw[2];
+
+    qtest_memread(qts, QL_LACC(bank) +
+                  ((pix * 32u + fpga_det) * 32u + ebin) * 2u, raw, 2);
+    return lduw_be_p(raw);
+}
+
+/*
+ * det-inject-lacc: a deposit at (fpga_det F, pix P, ebin B) through the
+ * write-only det-inject property lands exactly at the big-endian u16
+ * LACC offset ((P * 32 + F) * 32 + B) * 2 of the finished bank, and
+ * nowhere else: with the zero sky every neighbour cell (F +- 1, P +- 1,
+ * B +- 1) and the whole bank total stay at N. Three deposits on three
+ * different banks, covering the range ends.
+ * RED on the D-5 binary: no det-inject property, the bank stays 0.
+ */
+static void test_det_inject_lacc(void)
+{
+    static const struct {
+        uint32_t fpga_det, pix, ebin, n;
+    } dep[] = {
+        { 5, 0, 20, 250 },
+        { 16, 7, 3, 1000 },
+        { 30, 11, 30, 61 },
+    };
+    static const struct { int df, dp, db; } nb[] = {
+        { -1, 0, 0 }, { 1, 0, 0 }, { 0, -1, 0 },
+        { 0, 1, 0 }, { 0, 0, -1 }, { 0, 0, 1 },
+    };
+    QTestState *qts =
+        stix_qtest_new_extra("-global grlib-stixctrl.det-source=zero");
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint32_t i, k, bank;
+
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    for (i = 0; i < ARRAY_SIZE(dep); i++) {
+        g_autofree char *val = g_strdup_printf(
+            "fpga_det=%u,pix=%u,ebin=%u,count=%u",
+            dep[i].fpga_det, dep[i].pix, dep[i].ebin, dep[i].n);
+
+        g_assert_true(sky_set_str(qts, "det-inject", val));
+        det_step_ticks(qts, 40);
+        g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, (i + 1) & 3);
+        bank = i & 3;
+        sky_read_bank(qts, bank, b);
+        /* the raw offset and byte order, then the same cell decoded */
+        g_assert_cmphex(inject_lacc_cell(qts, bank, dep[i].pix,
+                                         dep[i].fpga_det, dep[i].ebin),
+                        ==, dep[i].n);
+        g_assert_cmpuint(b->lacc[dep[i].pix][dep[i].fpga_det]
+                         [dep[i].ebin], ==, dep[i].n);
+        for (k = 0; k < ARRAY_SIZE(nb); k++) {
+            int32_t fn = (int32_t)dep[i].fpga_det + nb[k].df;
+            int32_t pn = (int32_t)dep[i].pix + nb[k].dp;
+            int32_t bn = (int32_t)dep[i].ebin + nb[k].db;
+
+            if (fn < 0 || fn > 31 || pn < 0 || pn > 11 || bn < 0 ||
+                bn > 31) {
+                continue;
+            }
+            g_assert_cmpuint(b->lacc[pn][fn][bn], ==, 0);
+        }
+        g_assert_cmpuint(sky_total(b), ==, dep[i].n);
+    }
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-inject-chunk: the same deposit lands in EACC, so the next chunk's
+ * payload holds it at the matching offset (the chunk stream is the EACC
+ * bank [pix][fpga_det][ebin], RotAccuCompactor.c:174-245), and ETRG of
+ * grp = fpga_det / 2 grows by 1.25 x N (rounded), every other grp
+ * staying 0. EACC keeps the SUMDMASK rule (D-Df): a deposit at an
+ * fpga_det outside SUMDMASK stays out of the chunk's EACC and counts in
+ * ETRG only, through the nominal exposure's extra-trigger draw.
+ * RED on the D-5 binary: no det-inject property, the ring stays empty.
+ */
+static void test_det_inject_chunk(void)
+{
+    /* the zero sky, so the neighbours and ETRG are exact */
+    QTestState *qts = stix_qtest_new_extra(
+        "-global grlib-stixctrl.rotb-blocks=128 "
+        "-global grlib-stixctrl.det-source=zero");
+    NomChunk *c = g_new0(NomChunk, 1);
+    uint64_t extra, total;
+    uint32_t fpga_det, grp;
+
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+    sky_start_nom(qts, 39, 0xFFF, 9, 49, 0xFFFFFFFFu);
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "fpga_det=5,pix=0,ebin=20,count=250"));
+    det_step_ticks(qts, 50);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    nom_read_chunk(qts, c);
+    g_assert_cmpuint(c->eacc[0][5][20], ==, 250);
+    /* the neighbours F +- 1, P + 1, B +- 1 stay zero */
+    g_assert_cmpuint(c->eacc[0][4][20], ==, 0);
+    g_assert_cmpuint(c->eacc[0][6][20], ==, 0);
+    g_assert_cmpuint(c->eacc[1][5][20], ==, 0);
+    g_assert_cmpuint(c->eacc[0][5][19], ==, 0);
+    g_assert_cmpuint(c->eacc[0][5][21], ==, 0);
+    g_assert_cmpuint(nom_fpga_det_sum(c, 5), ==, 250);
+    /* the whole chunk's EACC sums to the deposit, like the LACC total */
+    total = 0;
+    for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+        total += nom_fpga_det_sum(c, fpga_det);
+    }
+    g_assert_cmpuint(total, ==, 250);
+    g_assert_cmpuint(c->etrg_grp[2], ==, (5 * 250 + 2) / 4);
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        if (grp != 2) {
+            g_assert_cmpuint(c->etrg_grp[grp], ==, 0);
+        }
+    }
+    /* read and clear: the bank is zero after the swap */
+    det_expect(qts, DET_EACC(0), DET_EACC_SIZE, 0);
+    det_expect(qts, DET_ETRG(0), DET_ETRG_SIZE, 0);
+
+    /* the SUMDMASK rule: fpga_det 7 masked, so its deposit is ETRG-only */
+    ctrl_write(qts, CTRL_FSMSUMDMASK, ~(1u << 7));
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "fpga_det=7,pix=3,ebin=10,count=500"));
+    det_step_ticks(qts, 50);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    nom_read_chunk(qts, c);
+    g_assert_cmpuint(c->eacc[3][7][10], ==, 0);
+    g_assert_cmpuint(nom_fpga_det_sum(c, 7), ==, 0);
+    /* grp 3 = fpga_det 6 (zero sky, no deposit) + 1.25 x ~500 extra */
+    extra = c->etrg_grp[3];
+    g_test_message("ETRG grp 3 from the masked deposit: %" PRIu64, extra);
+    g_assert_cmpuint(extra, >, 400);
+    g_assert_cmpuint(extra, <, 850);
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        if (grp != 3) {
+            g_assert_cmpuint(c->etrg_grp[grp], ==, 0);
+        }
+    }
+
+    g_free(c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-inject-props: the write-only det-inject rejects a missing key, an
+ * unknown key, a duplicate key, an empty or malformed value, a value
+ * that is not a number, count 0 and an index outside its space
+ * (fpga_det > 31, pix > 11 — the guard ring is never accumulated —,
+ * ebin > 31); a rejected set stores nothing, so the bank then holds
+ * only the one valid deposit. The keys may come in any order, and the
+ * space ends are inclusive.
+ * RED on the D-5 binary: no det-inject property.
+ */
+static void test_det_inject_props(void)
+{
+    static const char *const bad[] = {
+        "fpga_det=5,pix=0,ebin=20",                     /* count missing */
+        "fpga_det=5,pix=0,count=250",                   /* ebin missing */
+        "pix=0,ebin=20,count=250",                      /* fpga_det miss. */
+        "fpga_det=5,pix=0,ebin=20,count=250,subcol=9",  /* unknown key */
+        "fpga_det=5,pix=0,ebin=20,count=250,count=1",   /* duplicate */
+        "fpga_det=32,pix=0,ebin=20,count=250",          /* fpga_det > 31 */
+        "fpga_det=5,pix=12,ebin=20,count=250",          /* pix > 11 */
+        "fpga_det=5,pix=0,ebin=32,count=250",           /* ebin > 31 */
+        "fpga_det=5,pix=0,ebin=20,count=0",             /* no counts */
+        "fpga_det=x,pix=0,ebin=20,count=250",           /* not a number */
+        "fpga_det=5,pix=0,ebin=20,count=+250",          /* leading '+' */
+        "fpga_det= 5,pix=0,ebin=20,count=250",          /* leading space */
+        "fpga_det=5, pix=0, ebin=20, count=250",        /* a space */
+        "fpga_det=5,,pix=0,ebin=20,count=250",          /* empty field */
+        "",
+        "fpga_det=5",
+    };
+    QTestState *qts =
+        stix_qtest_new_extra("-global grlib-stixctrl.det-source=zero");
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint32_t i;
+
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+
+    /* write-only (D-Db): qom-get answers "is not readable" */
+    g_assert_null(sky_get_str(qts, "det-inject"));
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "count=250,ebin=20,pix=0,fpga_det=5"));
+    for (i = 0; i < ARRAY_SIZE(bad); i++) {
+        g_test_message("bad: '%s'", bad[i]);
+        g_assert_false(sky_set_str(qts, "det-inject", bad[i]));
+    }
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(b->lacc[0][5][20], ==, 250);
+    g_assert_cmpuint(sky_total(b), ==, 250);
+
+    /* the space ends are inclusive */
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "fpga_det=31,pix=11,ebin=31,count=1"));
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[11][31][31], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 1);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-inject-gated: a deposit at a (fpga_det, pix) pair that
+ * stix_det_pix_gate has off at the applying tick is dropped whole —
+ * the gate check comes before the inj_ql increment — while the same
+ * deposit at a gated-on pair in the same run lands. The gate: TH = 63
+ * on asic_ch 1 = pix 3 of fpga_det 18 (as det-chunk-format sets it),
+ * so 18/3 is off and 18/2 is on. The dropped deposit leaves the
+ * finished LACC bank all zero and the next chunk's EACC (and ETRG) all
+ * zero; the landed one shows at its own cell in both.
+ * RED on the D-5 binary: no det-inject property.
+ */
+static void test_det_inject_gated(void)
+{
+    /* the zero sky, so the banks and the chunk are exact */
+    QTestState *qts = stix_qtest_new_extra(
+        "-global grlib-stixctrl.rotb-blocks=128 "
+        "-global grlib-stixctrl.det-source=zero");
+    NomChunk *c = g_new0(NomChunk, 1);
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint32_t pix, fpga_det, ebin, grp;
+    uint8_t r3[24];
+
+    idefx_power_all(qts);
+    sky_r3_wire(r3, 1, 63);             /* asic_ch 1 = pix 3 */
+    idefx_write_reg(qts, 9, 0, 3, r3, sizeof(r3));
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+    sky_start_nom(qts, 39, 0xFFF, 9, 49, 0xFFFFFFFFu);
+
+    /* gated off: nothing lands, not even a trigger */
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "fpga_det=18,pix=3,ebin=20,count=250"));
+    det_step_ticks(qts, 40);            /* the QL swap */
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    det_expect(qts, QL_LACC(0), QL_LACC_SIZE, 0);
+    det_step_ticks(qts, 10);            /* the nominal swap */
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    nom_read_chunk(qts, c);
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+                g_assert_cmpuint(c->eacc[pix][fpga_det][ebin], ==, 0);
+            }
+        }
+    }
+    for (grp = 0; grp < SKY_N_GRP; grp++) {
+        g_assert_cmpuint(c->etrg_grp[grp], ==, 0);
+    }
+    det_expect(qts, DET_EACC(0), DET_EACC_SIZE, 0);
+    det_expect(qts, DET_ETRG(0), DET_ETRG_SIZE, 0);
+
+    /* the same deposit at the gated-on 18/2 lands in both */
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "fpga_det=18,pix=2,ebin=20,count=250"));
+    det_step_ticks(qts, 30);            /* the next QL swap */
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 2);
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[2][18][20], ==, 250);
+    g_assert_cmpuint(sky_total(b), ==, 250);
+    det_step_ticks(qts, 20);            /* the next nominal swap */
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    nom_read_chunk(qts, c);
+    g_assert_cmpuint(c->eacc[2][18][20], ==, 250);
+    g_assert_cmpuint(nom_fpga_det_sum(c, 18), ==, 250);
+    g_assert_cmpuint(c->etrg_grp[9], ==, (5 * 250 + 2) / 4);
+
+    g_free(c);
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-inject-reset: a device reset drops a pending det-inject
+ * (in-flight model state, not a scene knob): the deposit is set, the
+ * reset (the qtest system_reset the other tests use) comes before any
+ * tick, and after the scene is re-armed — with the pair gated on, so a
+ * surviving request would land at the first tick — the LACC bank past
+ * the QL swap is all zero, and SUMCNT with it.
+ * RED on the D-5 binary: no det-inject property.
+ */
+static void test_det_inject_reset(void)
+{
+    QTestState *qts =
+        stix_qtest_new_extra("-global grlib-stixctrl.det-source=zero");
+
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "fpga_det=5,pix=0,ebin=20,count=250"));
+    /* the reset lands before any tick applies the deposit */
+    qtest_system_reset(qts);
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    det_expect(qts, QL_LACC(0), QL_LACC_SIZE, 0);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_FSMEVENTS), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 
 /* ---- Platform controller (PL-1): OBT source, one-shot, inject ---- */
 
@@ -8983,6 +9306,15 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/det-chunk-sumdmask",
                        test_det_chunk_sumdmask);
         qtest_add_func("/sparc/stix/det-chunk-guard", test_det_chunk_guard);
+        qtest_add_func("/sparc/stix/det-inject-lacc", test_det_inject_lacc);
+        qtest_add_func("/sparc/stix/det-inject-chunk",
+                       test_det_inject_chunk);
+        qtest_add_func("/sparc/stix/det-inject-props",
+                       test_det_inject_props);
+        qtest_add_func("/sparc/stix/det-inject-gated",
+                       test_det_inject_gated);
+        qtest_add_func("/sparc/stix/det-inject-reset",
+                       test_det_inject_reset);
         stix_platform_register();
     }
 

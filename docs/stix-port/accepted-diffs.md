@@ -3551,6 +3551,152 @@ normal ELF, slot 3, `elut_table_20260529.csv` sha256 919d9055…21ccf2):
   `test-elut-smoke.sh` 44/44, the tool's self-test and the probe
   self-test PASS.
 
+## 36. det-inject: the index-space end-to-end deposit (baseline: no way to place a count)
+
+**Baseline:** the only count source was the synthetic sky (§34), whose
+counts are template-shaped and uniform; there was no way to place
+counts at a chosen (`pix`, `fpga_det`, `ebin`) cell, and the one
+non-1:1 step of the detector chain — `fpga_det` ↔ `subcol`
+("Index spaces"; the ICD never mentions `fpga_det`) — was pinned only
+by the model's own conversion tables and self-check (§32), never
+end to end through the real FSW and its TM.
+
+Detector plan D-6 (`docs/stix-port/2026-11-11-detector-plan.md`,
+"### D-6", decisions D-Db and D-Df; "Index spaces", "End-to-end
+check"; the "As built" note there).
+
+**FSW tree:** the one FSW fact in this section is STIX-FSW 600a7a72
+`utils_subcolIdFromFpgaId[5] = 10` (`ASW/ASW/src/utils.c:113-119`,
+the table the model transcribed in §32). Nothing is copied from the
+FSW beyond that cited value.
+
+**The property (D-Db).** `det-inject` (str, write-only, on
+`/machine/stixctrl`, added by `stix_det_class_init` like the other
+scene knobs): `fpga_det=F,pix=P,ebin=B,count=N` — a one-shot deposit
+of N counts at (pix P, fpga_det F, ebin B). The keys are mandatory, so
+the index spaces are explicit. Rejected, storing nothing: a missing
+key, an unknown key, a duplicate key, an empty or malformed field, a
+value that is not a number, `count=0`, and an index outside its space
+(`fpga_det` > 31, `pix` > 11 — the guard ring is never accumulated —,
+`ebin` > 31); the space ends are inclusive. The setter only stores the
+request and traces (D-Dj); `qom-get` answers "is not readable"
+(write-only).
+
+**The sink (D-Df event sink).** `stix_det_add_counts(fpga_det, pix,
+ebin, n)` (declared in `stix_det.h` for the D-7 replay to share) adds
+the counts per cell to two new deposit arrays, `inj_ql` and `inj_nom`,
+on top of the drawn sky — a deposit must land at its own cell, so the
+template's `pix`/`ebin` shares stay out of it. `stix_det_draw_acc`
+(§34/§35) adds the cell's deposit to its Poisson draw and clears it,
+so the counts wrap at 16 bits with the draw and reach:
+
+- the LACC of the finished QL bank at the next QL swap (inj_ql), and
+  through it the QL products;
+- EACC — and so the next ROTB chunk (§35) — at the next nominal swap
+  (inj_nom), **keeping the SUMDMASK rule** [D, RP-0067, the same as the
+  sky's]: a deposit at an `fpga_det` outside SUMDMASK does not land in
+  EACC and counts in ETRG only, through the nominal exposure's
+  `nom_trg_extra_grp` (the triggers are not masked [I]); QLACC is not
+  masked.
+
+The sky's per-tick gating applies, read live at the applying tick: the
+(fpga_det, pix) pair counts only where `stix_det_pix_gate` has the pix
+on — where it is off, the deposit is dropped, like a real event.
+SUMCNT takes the SUMDMASK × SUMEMASK share and LVAR the VARDMASK ×
+VARPMASK × VAREMASK share (the inject is applied before the LVAR slot
+write, so the share goes into the slot this tick writes). The triggers
+get the same 1.25 × per event as drawn counts. The setter applies the
+request at the next 100 ms tick (D-Dj); the deposits are cleared with
+the exposure they belong to (a fresh enable, a device reset), and a
+device reset also drops a not-yet-applied request (in-flight model
+state, not a scene knob). Trace: `stixdet_inject(fpga_det, pix, ebin,
+n)`, fired by the setter.
+
+**qtests** (`tests/qtest/stix.c`; all five RED on the D-5 binary):
+- `det-inject-lacc`: three deposits (fpga_det 5/pix 0/ebin 20 ×250,
+  16/7/3 ×1000, 30/11/30 ×61) on three banks of the zero sky; the
+  big-endian u16 at LACC byte ((P·32+F)·32+B)·2 equals N (read raw and
+  decoded), the six in-range neighbours F±1, P±1, B±1 are 0, and the
+  bank total is exactly N;
+- `det-inject-chunk`: the 250-count deposit reaches the next chunk's
+  payload at the matching offset (`nom_read_chunk`'s
+  `[pix][fpga_det][ebin]` decode), the neighbours are 0, the whole
+  chunk's EACC sums to exactly 250, ETRG grp 2 is
+  (5·250+2)/4 with every other grp 0, the banks read zero after the
+  swap; then with `fpga_det` 7 masked out of SUMDMASK a 500-count
+  deposit stays out of EACC and lifts ETRG grp 3 by 1.25 × ~500 (the
+  Poisson draw, 5σ bounds);
+- `det-inject-props`: every rejection above; a rejected set stores
+  nothing (the bank then holds only the one valid deposit); the keys
+  may come in any order; `qom-get` fails (write-only, D-Db);
+- `det-inject-gated`: with TH = 63 on asic_ch 1 = pix 3 of fpga_det 18
+  (the det-chunk-format gate), a deposit at the gated-off 18/3 is
+  dropped whole — the gate check comes before the inj_ql increment —:
+  the finished LACC bank and the next chunk's EACC (and ETRG) stay all
+  zero, while the same deposit at the gated-on 18/2 in the same run
+  lands at its own cell in both;
+- `det-inject-reset`: a deposit set and then hit by a system reset
+  before any tick is gone (in-flight model state, not a scene knob):
+  after the scene is re-armed — with the pair gated on, so a surviving
+  request would land at the first tick — the LACC bank past the QL
+  swap is all zero and SUMCNT is 0.
+
+**Gates.** `detector-smoke.sh` carries the deposit in its `--flare`
+modes only (see the deviation below): at @85 — T_nom is due within 10 s
+of the @70 TC, so this is T_nom + 5..15 s, always inside the first 8 QL
+periods (T_nom + 32 s) that SSID 32 sums — the probe sends
+`qom-set /machine/stixctrl det-inject "fpga_det=5,pix=0,ebin=20,
+count=250"` through the existing QMP socket. The deposit lands in the
+quiet phase (@85 < 135), so the SSID 32 dump holds the deposit plus a
+few quiet counts. A new check `ql-inject` runs
+`ql-check.py --ssid32-inject 10 20 0x2F 0x10` on the dump, where 10 =
+`utils_subcolIdFromFpgaId[5]` (the one FSW-sourced index value in the
+scripts — `stix_det.c` already carries the full table, §32 —, cited at
+the check), 0x2F is the S0 byte of 250 (monotone, so the
+few quiet counts on top only raise it) and 0x10 the quiet-sky bound. It
+asserts, in the one SSID 32 dump of the exit flush:
+- the sample whose detector byte (0-based `subcol`, ICD Table 105) is
+  10 holds ≥ 0x2F at byte 21 (= `ebin` 20 + 1);
+- byte 21 of every other sample is < 0x10;
+- the target's other bytes are only compared with its `subcol` 9/11
+  neighbours' range and logged — the plan's [L] item, resolved by the
+  log until a live run says otherwise.
+
+The deposit also shows as a one-sample spike in SSID 30 band 3
+(`ebin` 17-22 contains `ebin` 20) and in SSID 33; the sky checks see
+both, nothing asserts them. QLDetPerf stays below red: the target
+collects about 250 + 160 counts in one 8 s check (above Cbad 300 but
+below 5 × median ≈ 800, and only once — going red needs Nrep 15
+consecutive checks), and the gate forbids 0x942E/0x5437 anyway.
+
+`ql-check.py` gains `--ssid32-inject SUBCOL EBIN MIN_SPIKE MAX_QUIET`
+(hex tolerated) and `check_ssid32_inject`; its self-test adds the six
+cases above (a passing dump, the deposit at the wrong `subcol` — two
+mismatches: the quiet target and the spiking neighbour —, a too-small
+deposit, a leak into another sample, a dump without the target
+`subcol`, and a dump with no SSID 32 product at all).
+
+**Deviations from the plan's D-6 section:**
+- the deposit runs in the `--flare` modes only (`--flare` and
+  `--flare --negative`, which injects too: the deposit does not depend
+  on the flare switch). The plan's D-3 modes keep their zero sky and
+  their byte-for-byte checks — a deposit would break the zero-flush
+  contract ("every value byte 0") at SSID 30, 32 and 33 — and the
+  expected-failure sets of `--negative` (`uart-idefx trace-verif`),
+  `--no-rotb` (`uart-chunk chunk`) and `--flare --negative`
+  (`ql-contrast chunk-flare`) are unchanged, since `ql-inject` passes
+  in every mode that runs it;
+- the deposit is sent at @85, not at exactly T_nom + 8 s: the probe has
+  no send-after-expect group, and a fixed offset in [T_nom + 5,
+  T_nom + 15] is inside the 8-period window for every T_nom the probe
+  accepts (≤ 80);
+- in the TM the check can only see the `subcol` dimension (the SSID 32
+  sample sums all `pix`), so the `pix` and `ebin` neighbours are
+  pinned by the qtests at the LACC/EACC offsets, as the plan's
+  "End-to-end check" paragraph already assigns.
+
+**Gate record:** pending; no run from this worktree is recorded yet.
+
 ## 41. Gate ports: slots for parallel gate runs (baseline: one global lock)
 
 Plan: `2026-11-11-gateports-plan.md`. Four tracks (tc, platform, elut,

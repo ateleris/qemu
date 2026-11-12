@@ -11,7 +11,9 @@
  * LACC/LTRG materialization at the swap, the flare switch and the
  * scene properties. Tier 3 (D-5, D-Dg): the nominal integration (the
  * swap rule over fsmIntTime/fsmIntEvents, ActiveNominal, EACC/ETRG) and
- * the 49-block science chunk it appends to the ROTB ring.
+ * the 49-block science chunk it appends to the ROTB ring. D-6: the
+ * det-inject one-shot deposit, through the D-Df event sink
+ * stix_det_add_counts.
  *
  * FSW references are to STIX-FSW 600a7a72, the ASW tree (BSW =
  * BSW_ASW/src/BSW/...; utils.c, utils.h = ASW/src/utils.*; Detectors.c
@@ -99,6 +101,8 @@ static const hwaddr stix_det_etrg_off[STIX_DET_NOM_BANKS] = {
 static void stix_det_sky_tick(StixDetState *d);
 static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank);
 static void stix_det_sky_clear_expo(StixDetState *d);
+/* D-6 det-inject (defined after the sky: it uses the sky's gating) */
+static void stix_det_inject_apply(StixDetState *d);
 /* D-5 nominal integration (defined after the sky it draws from) */
 static void stix_det_nominal_tick(StixDetState *d);
 static void stix_det_nom_fresh(StixDetState *d);
@@ -215,6 +219,7 @@ static void stix_det_tick(void *opaque)
     /* D-Dj: out-of-MMIO writes into guest-visible memory, see the top */
     guard->engaged_in_io = true;
     stix_det_sky_tick(d);
+    stix_det_inject_apply(d);
     if (slot < STIX_DET_LVAR_SLOTS) {
         stix_det_ram_stl(d->lvar,
                          stix_det_lvar_off[d->active_ql_bank] +
@@ -1040,6 +1045,8 @@ static uint64_t stix_det_poisson(StixDetState *d, double lambda)
 static void stix_det_sky_clear_expo(StixDetState *d)
 {
     memset(d->expo, 0, sizeof(d->expo));
+    /* the injected counts belong to the period, like the exposure */
+    memset(d->inj_ql, 0, sizeof(d->inj_ql));
 }
 
 /*
@@ -1172,16 +1179,84 @@ static void stix_det_sky_tick(StixDetState *d)
 }
 
 /*
+ * The D-Df event sink (D-6 det-inject; the D-7 replay will call it too):
+ * add @n integer counts at (pix @pix, fpga_det @fpga_det, ebin @ebin).
+ * The counts are kept per cell in inj_ql / inj_nom, on top of the drawn
+ * sky, so they land at their own cell (the template shares stay out of
+ * it) in the LACC of the finished bank at the next QL swap and in EACC
+ * — and so the next chunk — at the next nominal swap, wrapping at 16
+ * bits with the draw. The same rules as the sky, read live:
+ * - the pair counts only where stix_det_pix_gate has the pix on; where
+ *   it is off the deposit is dropped, like a real event;
+ * - EACC is SUMDMASK-gated [D, RP-0067]: a deposit at an fpga_det
+ *   outside SUMDMASK does not land in EACC and counts in ETRG only,
+ *   through nom_trg_extra_grp, as the sky's does (the triggers are not
+ *   masked [I]);
+ * - SUMCNT takes the SUMDMASK x SUMEMASK share, LVAR the VARDMASK x
+ *   VARPMASK x VAREMASK share (the inject is applied before the LVAR
+ *   slot write, so the share goes into the slot this tick writes);
+ * - QLACC is not masked.
+ */
+void stix_det_add_counts(StixDetState *d, uint32_t fpga_det, uint32_t pix,
+                         uint32_t ebin, uint32_t n)
+{
+    uint32_t varp_pix = (d->reg->fsmQlConfig >>
+                         STIXCTRL_FSMQLCONFIG_QLVARPMASK) &
+                        STIXCTRL_FSMQLCONFIG_QLVARPMASK_MASK;
+    uint64_t lvar;
+
+    g_assert(fpga_det < STIX_DET_N_FPGA_DET);
+    g_assert(pix < STIX_DET_N_PIX_ACC);
+    g_assert(ebin < STIX_DET_N_EBIN);
+    if (!((stix_det_pix_gate(d, fpga_det) >> pix) & 1)) {
+        return;
+    }
+    d->inj_ql[fpga_det][pix][ebin] += n;
+    if ((d->reg->fsmSumDmask >> fpga_det) & 1) {
+        d->inj_nom[fpga_det][pix][ebin] += n;
+        if ((d->reg->fsmSumEmask >> ebin) & 1) {
+            d->sumcnt = n > UINT32_MAX - d->sumcnt ? UINT32_MAX :
+                        d->sumcnt + n;
+        }
+    } else {
+        d->nom_trg_extra_grp[stix_det_grp_of(fpga_det)] += n;
+    }
+    if (((d->reg->fsmQlVarDMask >> fpga_det) & 1) &&
+        ((varp_pix >> pix) & 1) &&
+        ((d->reg->fsmQlVarEMask >> ebin) & 1)) {
+        lvar = (uint64_t)d->lvar_tick_count + n;
+        d->lvar_tick_count = (uint32_t)MIN(lvar, (uint64_t)UINT32_MAX);
+    }
+}
+
+/*
+ * The pending det-inject request (D-Dj: the setter stores, the tick
+ * applies): one call into the event sink, then gone.
+ */
+static void stix_det_inject_apply(StixDetState *d)
+{
+    if (!d->inject_pending) {
+        return;
+    }
+    d->inject_pending = false;
+    stix_det_add_counts(d, d->inject_fpga_det, d->inject_pix,
+                        d->inject_ebin, d->inject_n);
+}
+
+/*
  * Draw one accumulator bank from an exposure set (D-Df): each cell
  * [pix][fpga_det][ebin] (u16 big-endian at byte ((pix * 32 + fpga_det)
  * * 32 + ebin) * 2, Detectors.h:68-79, the same layout for LACC and
- * EACC) is Poisson(sum over profiles of ebin share x exposure), wrapping
- * at 16 bits. Adds the drawn events per grp to @grp_events; returns the
- * total.
+ * EACC) is Poisson(sum over profiles of ebin share x exposure), plus
+ * any injected counts (D-6) at the cell, wrapping at 16 bits. Adds the
+ * drawn events per grp to @grp_events; returns the total. The consumed
+ * deposits are cleared here.
  */
 static uint64_t stix_det_draw_acc(StixDetState *d,
                                   double (*expo_set)[STIX_DET_N_PIX_ACC]
                                                     [STIX_DET_N_PROFILE],
+                                  uint32_t (*inj)[STIX_DET_N_PIX_ACC]
+                                                 [STIX_DET_N_EBIN],
                                   uint8_t *acc,
                                   uint64_t grp_events[STIX_DET_N_GRP])
 {
@@ -1198,8 +1273,10 @@ static uint64_t stix_det_draw_acc(StixDetState *d,
                      d->ebin_share[STIX_DET_PROFILE_QUIET][ebin] +
                      expo[STIX_DET_PROFILE_FLARE] *
                      d->ebin_share[STIX_DET_PROFILE_FLARE][ebin]);
-                uint64_t n = stix_det_poisson(d, lambda);
+                uint64_t n = stix_det_poisson(d, lambda) +
+                             inj[fpga_det][pix][ebin];
 
+                inj[fpga_det][pix][ebin] = 0;
                 stw_be_p(acc + ((pix * STIX_DET_N_FPGA_DET + fpga_det) *
                                 STIX_DET_N_EBIN + ebin) * sizeof(uint16_t),
                          (uint16_t)n);
@@ -1232,7 +1309,8 @@ static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
     uint64_t lacc_events;
     uint32_t grp;
 
-    lacc_events = stix_det_draw_acc(d, d->expo, lacc, grp_events);
+    lacc_events = stix_det_draw_acc(d, d->expo, d->inj_ql, lacc,
+                                    grp_events);
     memory_region_set_dirty(d->sram, stix_det_lacc_off[ql_bank],
                             STIXCTRL_LACC0_SIZE);
 
@@ -1296,6 +1374,8 @@ static void stix_det_nom_clear_expo(StixDetState *d)
 {
     memset(d->nom_expo, 0, sizeof(d->nom_expo));
     memset(d->nom_trg_extra_grp, 0, sizeof(d->nom_trg_extra_grp));
+    /* the injected counts belong to the integration, like the exposure */
+    memset(d->inj_nom, 0, sizeof(d->inj_nom));
 }
 
 /* the parameters are latched at the start of each integration */
@@ -1334,7 +1414,8 @@ static uint64_t stix_det_nom_materialize(StixDetState *d, uint32_t nom_bank)
     uint64_t eacc_events;
     uint32_t grp;
 
-    eacc_events = stix_det_draw_acc(d, d->nom_expo, eacc, grp_events);
+    eacc_events = stix_det_draw_acc(d, d->nom_expo, d->inj_nom, eacc,
+                                    grp_events);
     memory_region_set_dirty(d->sram, stix_det_eacc_off[nom_bank],
                             STIXCTRL_EACC0_SIZE);
     for (grp = 0; grp < STIX_DET_N_GRP; grp++) {
@@ -1561,6 +1642,123 @@ static void *stix_det_cps_prop(size_t det_offset, size_t field_offset)
     return p;
 }
 
+/*
+ * det-inject (D-Db, D-6; write-only): "fpga_det=F,pix=P,ebin=B,count=N",
+ * a one-shot deposit of N counts at (pix P, fpga_det F, ebin B). The
+ * keys are mandatory, so the index spaces are explicit; an unknown or
+ * duplicate key, a missing key, a value that is not a number, count 0
+ * and an index outside its space (fpga_det 0..31, pix 0..11 — the guard
+ * ring is never accumulated —, ebin 0..31) are rejected and store
+ * nothing. The setter only stores the request and traces (D-Dj); the
+ * next 100 ms tick applies it through stix_det_add_counts, with the
+ * sky's per-tick gating: where the (pix, fpga_det) pair is gated off at
+ * that tick, the deposit is dropped, like a real event.
+ */
+static bool stix_det_inject_num(const char *key, char *val, uint32_t hi,
+                                uint32_t *out, Error **errp)
+{
+    unsigned long long v;
+    char *end;
+
+    /* strtoull would take "+250", " 5" and "-1": the first character
+     * must be a decimal digit */
+    if (*val < '0' || *val > '9') {
+        error_setg(errp, "det-inject: %s='%s' is not a number in 0..%u",
+                   key, val, hi);
+        return false;
+    }
+    errno = 0;
+    v = strtoull(val, &end, 10);
+    if (errno != 0 || end == val || *end != '\0' || v > hi) {
+        error_setg(errp, "det-inject: %s='%s' is not a number in 0..%u",
+                   key, val, hi);
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+static void stix_det_inject_set(Object *obj, Visitor *v, const char *name,
+                                void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    uint32_t fpga_det = 0, pix = 0, ebin = 0, n = 0;
+    bool got_fpga_det = false, got_pix = false, got_ebin = false,
+         got_n = false;
+    g_autofree char *value = NULL;
+    char *kv, *next;
+
+    if (!visit_type_str(v, name, &value, errp)) {
+        return;
+    }
+    for (kv = value; kv && *kv; kv = next) {
+        char *val = strchr(kv, '=');
+        const char *key;
+        uint32_t *dst, hi;
+        bool *got;
+
+        next = strchr(kv, ',');
+        if (next) {
+            *next++ = '\0';
+        }
+        if (!val) {
+            error_setg(errp, "det-inject: expected key=value, got '%s'",
+                       kv);
+            return;
+        }
+        *val++ = '\0';
+        key = kv;
+        if (!strcmp(key, "fpga_det")) {
+            dst = &fpga_det;
+            hi = STIX_DET_N_FPGA_DET - 1;
+            got = &got_fpga_det;
+        } else if (!strcmp(key, "pix")) {
+            dst = &pix;
+            hi = STIX_DET_N_PIX_ACC - 1;
+            got = &got_pix;
+        } else if (!strcmp(key, "ebin")) {
+            dst = &ebin;
+            hi = STIX_DET_N_EBIN - 1;
+            got = &got_ebin;
+        } else if (!strcmp(key, "count")) {
+            dst = &n;
+            hi = UINT32_MAX;
+            got = &got_n;
+        } else {
+            error_setg(errp, "det-inject: unknown key '%s' (the format "
+                       "is fpga_det=F,pix=P,ebin=B,count=N)", key);
+            return;
+        }
+        if (*got) {
+            error_setg(errp, "det-inject: duplicate key '%s'", key);
+            return;
+        }
+        if (!stix_det_inject_num(key, val, hi, dst, errp)) {
+            return;
+        }
+        *got = true;
+    }
+    if (!got_fpga_det || !got_pix || !got_ebin || !got_n) {
+        error_setg(errp, "det-inject: missing %s%s%s%s (the format is "
+                   "fpga_det=F,pix=P,ebin=B,count=N)",
+                   got_fpga_det ? "" : "fpga_det ",
+                   got_pix ? "" : "pix ",
+                   got_ebin ? "" : "ebin ",
+                   got_n ? "" : "count");
+        return;
+    }
+    if (n == 0) {
+        error_setg(errp, "det-inject: count=0 adds no counts");
+        return;
+    }
+    d->inject_pending = true;
+    d->inject_fpga_det = fpga_det;
+    d->inject_pix = pix;
+    d->inject_ebin = ebin;
+    d->inject_n = n;
+    trace_stixdet_inject(fpga_det, pix, ebin, n);
+}
+
 void stix_det_instance_init(StixDetState *d)
 {
     d->source = STIX_DET_SOURCE_SYNTHETIC;
@@ -1599,6 +1797,13 @@ void stix_det_class_init(ObjectClass *klass, size_t det_offset)
                                   offsetof(StixDetState, flare_cps)));
     object_class_property_set_description(klass, "det-flare-cps",
         "flare sky, counts/s per fpga_det, 0..1000000 (runtime)");
+    object_class_property_add(klass, "det-inject", "str", &str_type_info,
+                              NULL, stix_det_inject_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-inject",
+        "one-shot count deposit, write-only: fpga_det=F,pix=P,ebin=B,"
+        "count=N; lands in the LACC of the finished QL bank at the next "
+        "swap and in EACC (the next chunk) at the next nominal swap, "
+        "where the pair is gated on at the next tick (runtime)");
 }
 
 bool stix_det_owns(StixDetState *d, hwaddr addr)
@@ -1722,6 +1927,8 @@ void stix_det_reset(StixDetState *d)
     d->nom_int_time_min = 0;
     d->nom_int_time_max = 0;
     d->nom_int_events_max = 0;
+    /* a pending det-inject is in-flight model state, not a scene knob */
+    d->inject_pending = false;
     stix_det_nom_clear_expo(d);
     stix_det_reseed(d);
 }

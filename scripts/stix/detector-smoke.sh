@@ -102,6 +102,30 @@
 # >= 3 nominal swaps, no chunk at all).
 # --flare --negative must now fail exactly ql-contrast and chunk-flare
 # (no flip, so neither the LC contrast nor the 1 s integrations).
+# D-6 (the index-space end-to-end check), in the --flare modes only: the
+# D-3 modes keep their zero sky and their byte-for-byte checks (a
+# deposit would break the zero-flush contract), while the --flare flush
+# checks tolerate extra counts and the deposit lands in their quiet
+# phase (@85 < 135). At @85 -- T_nom is due within 10 s of the @70 TC,
+# so this is T_nom + 5..15 s, always inside the first 8 QL periods
+# (T_nom + 32 s) that SSID 32 sums -- the probe injects 250 counts at
+# fpga_det 5, pix 0, ebin 20 through the write-only det-inject property
+# (qom-set /machine/stixctrl det-inject "fpga_det=5,pix=0,ebin=20,
+# count=250"). In the TM the detector index is a subcol: the target
+# sample is the one whose detector byte is utils_subcolIdFromFpgaId[5]
+# = 10 (STIX-FSW 600a7a72, ASW/ASW/src/utils.c:113-119; the one
+# FSW-sourced index value in the scripts -- stix_det.c already carries
+# the full table, accepted-diffs §32). A third check, ql-inject,
+# runs ql-check.py --ssid32-inject 10 20 0x2F 0x10 on the dump: in the
+# one SSID 32 dump of the exit flush the target sample's byte 21
+# (= ebin 20 + 1) is >= 0x2F (the S0 byte of 250; the quiet background
+# there is a few counts), byte 21 of every other sample is < 0x10, and
+# the target's other bytes are only compared with its subcol 9/11
+# neighbours' range and logged (the plan's [L] item). The deposit also
+# shows as a one-sample spike in SSID 30 band 3 and SSID 33; the sky
+# checks see it, nothing asserts it. --flare --negative injects too
+# (the deposit does not depend on the flare switch), so its
+# expected-failure set stays ql-contrast chunk-flare.
 # --negative alone runs QEMU with -global grlib-stixctrl.det-idefx=off
 # (CmdReady 0, accepted-diffs §32). A read timeout is not a mismatch
 # (XrayDetFDIR.c:611-615), so no TM fault is expected: the probe must
@@ -122,6 +146,7 @@
 #
 # Usage: detector-smoke.sh <qemu-binary> [--flare] [--negative]
 #                           [--no-rotb] [--dry-run] [--check-guard]
+#   (--flare carries the D-6 det-inject deposit at @85; see above)
 #   --no-rotb combines with neither --flare nor --negative.
 #   STIX_ASW_ELF            as in tc-smoke.sh
 #   STIX_DETECTOR_RUN_DIR   run dir (default /tmp/stix-detector-run).
@@ -291,6 +316,9 @@ TC_CONF2="40 02 00 00 1D AC C0 05 00 07 19 EC 01 00 04 00 D6 2E"
 
 # D-4: the flare switch over QMP (--flare). The negative sends false at
 # @135, so nothing flips but the QMP path and the timing stay the same.
+# D-6: at @85 (T_nom + 5..15 s, inside the 8 QL periods SSID 32 sums)
+# the one-shot det-inject deposit of the index-space check; see the
+# header. It runs in both --flare modes.
 qom_set() {  # path property json-value
     printf '{"execute": "qom-set", "arguments": %s' \
         "{\"path\": \"$1\", \"property\": \"$2\", \"value\": $3}}"
@@ -301,6 +329,9 @@ FLARE_ARGS=()
 if [ "$FLARE" -eq 1 ]; then
     FLARE_ARGS=(
         --qmp "$QMP_SOCK"
+        --send-at 85
+        --qmp-cmd "$(qom_set /machine/stixctrl det-inject \
+            '"fpga_det=5,pix=0,ebin=20,count=250"')"
         --send-at 135
         --qmp-cmd "$(qom_set /machine/stixctrl det-flare "$FLARE_ON")"
         --send-at 195
@@ -421,8 +452,8 @@ touch .unfinished
 # appended to, so it must start empty.
 rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
-      ql.contrast.log trace.check.log chunk.check.log chunk-flare.check.log \
-      qmp.sock
+      ql.contrast.log ql.inject.log trace.check.log chunk.check.log \
+      chunk-flare.check.log qmp.sock
 truncate -s 17716740096 flash.bin
 # the trace events: the IDeF-X words, and the FSM strobes that mark the
 # NOMINAL window in the same file (one -trace option: a second one would
@@ -652,6 +683,39 @@ if [ "$FLARE" -eq 1 ]; then
                 "ql-check rc=$QLC_RC; see ql.contrast.log)"
             FAILED+=(ql-contrast)
             add_why ql-contrast "$(ql_why ql.contrast.log)"
+        fi
+    fi
+fi
+
+# 2c. --flare: the D-6 index-space deposit (see the header). In the TM
+# the detector index is a subcol; the target sample's detector byte is
+# utils_subcolIdFromFpgaId[5] = 10 (STIX-FSW 600a7a72,
+# ASW/ASW/src/utils.c:113-119; the one FSW-sourced index value in the
+# scripts -- stix_det.c already carries the full table, accepted-diffs
+# §32). The bytes: 0x2F is the S0 byte of the 250 deposited counts
+# (monotone, so more counts only raise it), 0x10 the quiet-sky bound.
+INJECT_SUBCOL=10
+if [ "$FLARE" -eq 1 ]; then
+    if [ ! -s ql.dump.hex ]; then
+        echo "CHECK ql-inject: FAIL (no 0x5DC packet dumped)"
+        FAILED+=(ql-inject)
+        add_why ql-inject "no 0x5DC packet dumped"
+    else
+        set +e
+        python3 "$QLCHECK" ql.dump.hex \
+            --ssid32-inject "$INJECT_SUBCOL" 20 0x2F 0x10 \
+            > ql.inject.log 2>&1
+        QLI_RC=$?
+        set -e
+        grep -E '^QL-CHECK' ql.inject.log || true
+        if [ "$QLI_RC" -eq 0 ]; then
+            echo "CHECK ql-inject: ok (250 counts at fpga_det 5, pix 0," \
+                "ebin 20 seen at subcol $INJECT_SUBCOL, byte 21)"
+        else
+            echo "CHECK ql-inject: FAIL ($(ql_why ql.inject.log);" \
+                "ql-check rc=$QLI_RC; see ql.inject.log)"
+            FAILED+=(ql-inject)
+            add_why ql-inject "$(ql_why ql.inject.log)"
         fi
     fi
 fi

@@ -175,6 +175,28 @@ typedef struct StixDetState {
     double nom_expo[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
                    [STIX_DET_N_PROFILE];
     double nom_trg_extra_grp[STIX_DET_N_GRP];
+    /*
+     * D-6 (D-Db det-inject): the pending one-shot deposit request, stored
+     * by the QMP setter (D-Dj: fields only) and applied by the next tick
+     * through stix_det_add_counts. A device reset drops it.
+     */
+    bool inject_pending;
+    uint32_t inject_fpga_det;
+    uint32_t inject_pix;
+    uint32_t inject_ebin;
+    uint32_t inject_n;
+    /*
+     * D-6 (D-Df event sink): the injected counts per cell, on top of the
+     * drawn sky, so a deposit lands at its own (pix, fpga_det, ebin) and
+     * not through the template shares. inj_ql materializes into the
+     * finished bank's LACC at the next QL swap, inj_nom into EACC (and so
+     * the next chunk) at the next nominal swap; both are consumed (and
+     * cleared with the exposure) at their swap.
+     */
+    uint32_t inj_ql[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
+                   [STIX_DET_N_EBIN];
+    uint32_t inj_nom[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
+                    [STIX_DET_N_EBIN];
     /* the chunk being built at a nominal swap */
     uint8_t chunk[STIX_DET_CHUNK_BLOCKS * STIXCTRL_BLOCK_SIZE];
     /* the template (D-Df), built at realize: pix share and ebin shares */
@@ -199,6 +221,14 @@ void stix_det_class_init(ObjectClass *klass, size_t det_offset);
 
 /* true when the model owns the APB offset (det-model on, 0x00-0x4C) */
 bool stix_det_owns(StixDetState *d, hwaddr addr);
+/*
+ * The D-Df event sink (D-6 det-inject; the D-7 replay will use it too):
+ * add @n integer counts at (pix @pix, fpga_det @fpga_det, ebin @ebin).
+ * Call it from tick context; the counts reach the LACC of the finished
+ * bank at the next QL swap and EACC at the next nominal swap.
+ */
+void stix_det_add_counts(StixDetState *d, uint32_t fpga_det, uint32_t pix,
+                         uint32_t ebin, uint32_t n);
 uint32_t stix_det_read(StixDetState *d, hwaddr addr);
 /* false when the write was dropped (a read-only register) */
 bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value);

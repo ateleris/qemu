@@ -1222,7 +1222,16 @@ binary at their first new assertion, and green after.
   - `det-inject-chunk`: the same counts appear at the matching payload
     offset of the next chunk;
   - `det-inject-props`: missing keys, unknown keys and out-of-range
-    values (`fpga_det` > 31, `pix` > 11, `ebin` > 31) are rejected.
+    values (`fpga_det` > 31, `pix` > 11, `ebin` > 31) are rejected;
+  - `det-inject-gated`: a deposit at a pair the gate has off (TH = 63
+    on asic_ch 1 = pix 3 of fpga_det 18, as det-chunk-format sets it)
+    is dropped whole — the finished LACC bank and the next chunk's EACC
+    (and ETRG) stay all zero — while the same deposit at the gated-on
+    18/2 in the same run lands at its own cell in both;
+  - `det-inject-reset`: a deposit set and then hit by a system reset
+    before any tick never lands: after re-arming the scene (the pair
+    gated on, so a surviving request would land) the LACC bank past the
+    QL swap is all zero.
 - detector-smoke: at T_nom + 8 s (inside the first 8 QL periods, which
   SSID 32 sums) inject 250 counts at `fpga_det` 5, `pix` 0, `ebin` 20.
   `ql-check.py` asserts, in the one SSID 32 dump of the exit flush:
@@ -1239,6 +1248,50 @@ binary at their first new assertion, and green after.
     asserted.
 - Gates: the full set.
 - accepted-diffs §36.
+- **As built (2026-11-11, accepted-diffs §36):**
+  - `det-inject` (write-only str on `/machine/stixctrl`):
+    `fpga_det=F,pix=P,ebin=B,count=N`; missing, unknown or duplicate
+    keys, non-numeric values, `count=0` and out-of-space indices are
+    rejected and store nothing (`pix` > 11 rejected: the guard ring is
+    never accumulated); the setter stores and traces
+    `stixdet_inject(fpga_det, pix, ebin, n)`, the next 100 ms tick
+    applies it through `stix_det_add_counts` (the D-Df event sink,
+    shared with the future replay);
+  - the sink keeps the counts per cell in `inj_ql`/`inj_nom`, on top of
+    the drawn sky (a deposit lands at its own cell, the template
+    shares stay out), consumed by `stix_det_draw_acc` at the next QL
+    swap (LACC) and nominal swap (EACC → the next chunk), wrapping at
+    16 bits with the draw; the SUMDMASK rule holds for EACC (a masked
+    `fpga_det` counts in ETRG only, via `nom_trg_extra_grp`); SUMCNT
+    takes the SUMDMASK × SUMEMASK share, LVAR the VARDMASK × VARPMASK
+    × VAREMASK share; the sky's per-tick gating applies at the
+    applying tick (a deposit while the pair is gated off is dropped,
+    like a real event); deposits clear with the exposure they belong
+    to, and a device reset drops a pending request; both rules are
+    qtest-pinned: `det-inject-gated` (a deposit at a gated-off pair —
+    TH 63 on fpga_det 18/pix 3 — leaves the finished LACC bank and the
+    next chunk's EACC and ETRG all zero, the same deposit at the
+    gated-on 18/2 lands at its own cell in both) and `det-inject-reset`
+    (a system reset before any tick, then a re-armed scene with the
+    pair gated on, leaves the LACC bank past the QL swap all zero and
+    SUMCNT 0);
+  - **deviation:** the deposit runs in the `--flare` modes only (the
+    D-3 zero-sky modes keep their byte-for-byte zero-flush checks; in
+    `--flare` the deposit lands in the quiet phase and the sky checks
+    tolerate it), at @85 — the probe has no send-after-expect group,
+    and T_nom + 5..15 s is inside the 8-period window for every T_nom
+    the probe accepts; `--flare --negative` injects too, so every
+    expected-failure set is unchanged;
+  - the gate check is `ql-check.py --ssid32-inject 10 20 0x2F 0x10`
+    (check `ql-inject`): 10 = `utils_subcolIdFromFpgaId[5]`
+    (STIX-FSW 600a7a72 `ASW/ASW/src/utils.c:113-119`, the one
+    FSW-sourced index value in the scripts — `stix_det.c` already
+    carries the full table, accepted-diffs §32), 0x2F the S0 byte of 250,
+    0x10 the quiet-sky bound; the target's other bytes are logged
+    against its `subcol` 9/11 neighbours' range (the [L] item), and
+    the `pix`/`ebin` neighbours are pinned by the qtests at the
+    LACC/EACC offsets (the TM sums all `pix`, so only the `subcol`
+    dimension is visible there).
 
 ### D-7: DSS `.dssevs` replay
 - D-Dk: the pre-scan at realize, the event table, the ELUT lookup with

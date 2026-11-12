@@ -72,9 +72,19 @@ samples (ending by ON - 6 s), with at least 5 samples on each side. The
 6 s margin covers the 1 s resolution of the probe's clock and one QL
 period of phase between NOMINAL entry and the first sample.
 
+--ssid32-inject SUBCOL EBIN MIN_SPIKE MAX_QUIET is the D-6 index-space
+check of a det-inject deposit: in the one SSID 32 dump, the sample
+whose detector byte (0-based subcol, ICD Table 105) is SUBCOL holds the
+deposit at byte EBIN, at least MIN_SPIKE (the S0 byte of the count
+floor; the raw byte is monotone in the count), and byte EBIN stays
+below MAX_QUIET in every other sample (the quiet sky there). The other
+bytes of the target sample are only compared with its subcol +- 1
+neighbours' range and logged (the plan's [L] item).
+
 Usage:
   ql-check.py DUMP [--samples] [--expect-zero-flush SECONDS]
               [--expect-sky-flush SECONDS] [--lc-contrast ON OFF]
+              [--ssid32-inject SUBCOL EBIN MIN_SPIKE MAX_QUIET]
   ql-check.py --self-test
 Exit codes: 0 decoded (and the check passed), 1 a decode error or a
 failed check, 2 bad usage or an unreadable file. stdlib only.
@@ -554,6 +564,46 @@ def check_lc_contrast(products, on_s, off_s, out=None):
     return []
 
 
+def check_ssid32_inject(products, subcol, ebin, min_spike, max_quiet,
+                        out=None):
+    """The D-6 det-inject check on the one SSID 32 dump (see the module
+    docstring). Returns a list of failures; prints the target sample's
+    bytes that fall outside its subcol +- 1 neighbours' range to @out."""
+    prods = products.get(32, [])
+    if len(prods) != 1:
+        return [f"SSID 32: {len(prods)} products, want 1"]
+    smp = prods[0]["samples"]
+    tgt = [s for s in smp if s["subcol"] == subcol]
+    if len(tgt) != 1:
+        return [f"SSID 32: {len(tgt)} samples with subcol {subcol}, "
+                f"want 1"]
+    tgt = tgt[0]
+    fails = []
+    if tgt["ebin"][ebin] < min_spike:
+        fails.append(f"SSID 32: subcol {subcol} ebin {ebin} byte "
+                     f"0x{tgt['ebin'][ebin]:02x} is below the deposit "
+                     f"floor 0x{min_spike:02x}")
+    hot = [(s["subcol"], s["ebin"][ebin]) for s in smp
+           if s["subcol"] != subcol and s["ebin"][ebin] >= max_quiet]
+    for sc, byte in hot:
+        fails.append(f"SSID 32: subcol {sc} ebin {ebin} byte 0x{byte:02x}"
+                     f" is at or above the quiet bound 0x{max_quiet:02x}")
+    if out is not None:
+        near = [s for s in smp if abs(s["subcol"] - subcol) == 1]
+        odd = []
+        for j in range(NUM_EBIN):
+            if j == ebin or not near:
+                continue
+            vals = [s["ebin"][j] for s in near]
+            if not min(vals) <= tgt["ebin"][j] <= max(vals):
+                odd.append((j, tgt["ebin"][j], min(vals), max(vals)))
+        print(f"QL-CHECK SSID 32 deposit: subcol {subcol} ebin {ebin} "
+              f"byte 0x{tgt['ebin'][ebin]:02x}; other bytes outside the "
+              f"subcol {subcol - 1}/{subcol + 1} range: "
+              f"{odd if odd else 'none'}", file=out)
+    return fails
+
+
 def check_zero_flush(products, seconds):
     """The detector-smoke flush check; returns a list of failures."""
     fails = []
@@ -789,6 +839,7 @@ def self_test():
     assert len(f) == 1 and "det_mask_subcol" in f[0], f
 
     self_test_sky(zero_lines, secs, n4, n8)
+    self_test_inject()
     print("QL-CHECK SELF-TEST: PASS")
     return 0
 
@@ -858,6 +909,49 @@ def self_test_sky(zero_lines, secs, n4, n8):
     assert len(f) == 1 and "subcol 3 has no counts" in f[0], f
 
 
+def self_test_inject():
+    """The D-6 SSID 32 deposit check: a deposit at subcol 10, ebin 20
+    (byte 21) passes; the same byte at the wrong subcol, a too-small
+    deposit, a byte above the quiet bound at another subcol and a
+    missing target sample each fail."""
+    def flush(sp_at):
+        spectra = [(sc, sp_at.get(sc, [0] * 32)) for sc in range(32)]
+        return [build_packet(ssid32_body(spectra)).hex()]
+
+    dep = [0x2F if e == 20 else 0 for e in range(32)]
+    prods = decode_lines(flush({10: dep}))
+    assert check_ssid32_inject(prods, 10, 20, 0x2F, 0x10) == []
+    # the deposit at the wrong subcol: the target byte stays quiet and
+    # subcol 9 carries the spike instead (two mismatches)
+    f = check_ssid32_inject(decode_lines(flush({9: dep})), 10, 20,
+                            0x2F, 0x10)
+    assert len(f) == 2 and "below the deposit floor" in f[0] and \
+        "subcol 9" in f[1] and "quiet bound" in f[1], f
+    # a too-small deposit
+    small = [0x05 if e == 20 else 0 for e in range(32)]
+    f = check_ssid32_inject(decode_lines(flush({10: small})), 10, 20,
+                            0x2F, 0x10)
+    assert len(f) == 1 and "below the deposit floor" in f[0], f
+    # the deposit leaks into another sample
+    leak = {10: dep, 11: [0x10 if e == 20 else 0 for e in range(32)]}
+    f = check_ssid32_inject(decode_lines(flush(leak)), 10, 20, 0x2F, 0x10)
+    assert len(f) == 1 and "subcol 11" in f[0] and "quiet bound" in f[0], f
+    # no sample with the target subcol
+    spectra = [(sc, [0] * 32) for sc in range(32) if sc != 10]
+    prods = decode_lines([build_packet(ssid32_body(spectra)).hex()])
+    f = check_ssid32_inject(prods, 10, 20, 0x2F, 0x10)
+    assert len(f) == 1 and "samples with subcol 10" in f[0], f
+    # a non-SSID-32 dump
+    prods = decode_lines([build_packet(ssid34_body(2)).hex()])
+    f = check_ssid32_inject(prods, 10, 20, 0x2F, 0x10)
+    assert f == ["SSID 32: 0 products, want 1"], f
+
+
+def int_arg(s):
+    """int() accepting 0x hex (the gate passes S0 bytes in hex)."""
+    return int(s, 0)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Decode/check STIX QL TM(21,6) SSID 30-34 dumps")
@@ -876,6 +970,12 @@ def main():
                     help="check the SSID 30 band-0 flare contrast; the "
                          "flare switch was on from ON to OFF seconds "
                          "after NOMINAL entry (D-4)")
+    ap.add_argument("--ssid32-inject", type=int_arg, nargs=4,
+                    metavar=("SUBCOL", "EBIN", "MIN_SPIKE", "MAX_QUIET"),
+                    help="check the D-6 det-inject deposit in the SSID "
+                         "32 dump: the sample with detector byte SUBCOL "
+                         "holds >= MIN_SPIKE at byte EBIN, every other "
+                         "sample stays < MAX_QUIET there")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -905,6 +1005,10 @@ def main():
         fails += check_lc_contrast(products, *args.lc_contrast,
                                    out=sys.stdout)
         passed.append("LC band-0 flare contrast")
+    if args.ssid32_inject is not None:
+        fails += check_ssid32_inject(products, *args.ssid32_inject,
+                                     out=sys.stdout)
+        passed.append("SSID 32 det-inject deposit (D-6)")
     if not passed:
         return 0
     for x in fails:
