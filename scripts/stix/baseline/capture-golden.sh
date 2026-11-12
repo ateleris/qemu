@@ -14,7 +14,7 @@
 #     Determinism is provided by content stability instead (verified: two
 #     90 s runs produce identical normalized content).
 #   - flash.bin (FLASH_TOTAL_STORAGE = 17,716,740,096 B apparent) lives in
-#     RUN_DIR (STIX_RUN_DIR, default /tmp/stix-uprev-run). Since D-I the
+#     RUN_DIR (STIX_RUN_DIR, default $STIX_UPREV_DIR, lib/paths.sh). Since D-I the
 #     model creates a missing file instantly as a sparse, inverted file (a
 #     hole is erased flash), so it costs only the pages the FSW writes. This
 #     script never deletes it. /tmp/stix-baseline-run holds the frozen v11.1
@@ -25,8 +25,9 @@ set -euo pipefail
 
 QEMU_BIN="${1:?usage: capture-golden.sh <qemu-binary> <out-dir>}"
 OUT_DIR="${2:?usage: capture-golden.sh <qemu-binary> <out-dir>}"
-ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
-RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/paths.sh"
+ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
+RUN_DIR="${STIX_RUN_DIR:-$STIX_UPREV_DIR}"
 DURATION=90
 
 # The one intended writer of the master flash: slot mode (STIX_PORT_BASE,
@@ -54,7 +55,7 @@ mkdir -p "$RUN_DIR" "$OUT_DIR"
 OUT_DIR="$(cd "$OUT_DIR" && pwd)"   # absolute: the script cd's to RUN_DIR next
 cd "$RUN_DIR"
 
-if [ "$RUN_DIR" = /tmp/stix-baseline-run ]; then
+if [ "$(realpath -m -- "$RUN_DIR")" = /tmp/stix-baseline-run ]; then
     echo "refusing to run in the frozen v11.1 reference dir $RUN_DIR"; exit 2
 fi
 # Exclusive against the slot-mode copies (stix_flash_private takes it

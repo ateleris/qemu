@@ -32,7 +32,8 @@ done
     exit 2
 }
 QEMU="$1"
-ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
+. "$(dirname "${BASH_SOURCE[0]}")/../lib/paths.sh"
+ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 RUN="${STIX_GS_RUN_DIR:-/tmp/stix-gs-run}"
 PORT="${STIX_GS_TM_PORT:-21500}"
 UDP_TM_PORT="${STIX_GS_UDP_TM_PORT:-21501}"

@@ -150,7 +150,8 @@ for a in "${@:2}"; do
     esac
 done
 
-ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
+ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_DETECTOR_RUN_DIR:-/tmp/stix-detector-run}"
 DURATION="${STIX_DETECTOR_SECONDS:-240}"
@@ -175,7 +176,8 @@ fi
 # them, any parent of them, and /. Checked on the given dir and on the
 # final one (with the mode and slot suffixes).
 RUN_DIR="$(realpath -m -- "$RUN_DIR")"
-SHARED_UPREV="$(realpath -m -- /tmp/stix-uprev-run)"
+SHARED_UPREV="$(realpath -m -- "$STIX_UPREV_DIR")"
+SHARED_OLD="$(realpath -m -- /tmp/stix-uprev-run)"
 SHARED_BASE="$(realpath -m -- /tmp/stix-baseline-run)"
 refuse_run_dir() {
     echo "refusing run dir $RUN_DIR ($1)"
@@ -185,7 +187,7 @@ refuse_run_dir() {
 }
 guard_shared() {
     local shared
-    for shared in "$SHARED_UPREV" "$SHARED_BASE"; do
+    for shared in "$SHARED_UPREV" "$SHARED_OLD" "$SHARED_BASE"; do
         case "$RUN_DIR" in
             "$shared" | "$shared"/*)
                 refuse_run_dir "it is $shared or inside it" ;;

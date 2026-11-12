@@ -37,13 +37,22 @@ REPAIRED old model.
 | `asm-head.golden.log` | first 200 translated guest blocks (`-d in_asm`) — bootloader/CPU-start tripwire |
 | `run-flags.txt` | the exact invocation |
 
+## Persistent state (since 2026-11-12)
+
+A WSL restart clears `/tmp`. On 2026-11-12 one took out the gate ELF and the master flash. Both now live outside `/tmp`, set by `scripts/stix/lib/paths.sh`:
+
+- **The gate ELF:** `~/dev/stix-elf/ASW_em_baseline.elf` (`STIX_ELF_DIR`), with its sha256 and `PROVENANCE.md`. It was restored from the Windows build history (`stix_asw_src/ASW/ASW/bin/History/ASW_laszl-1794253052.elf`, the same sha256 as `run-flags.txt`).
+- **The master flash and the legacy run dir:** `~/dev/stix-state/uprev-run/` (`STIX_STATE_DIR`). It was rebuilt by two 90 s boots on a fresh flash; boot-smoke matched the golden afterwards.
+- **The frozen v11.1 reference flash** (`/tmp/stix-baseline-run/flash.bin`) is gone and was not recreated. The scripts still refuse `/tmp/stix-baseline-run` and `/tmp/stix-uprev-run` as run dirs.
+- **Per-run scratch dirs** (`STIX_*_RUN_DIR`, default `/tmp/stix-*-run`) stay in `/tmp`, because every gate recreates them.
+
 ## Run rules (do not break these)
 
 - **No `-icount`.** Under icount the WDT path reaches the CTRL SCET-set
   registers (`0xC8`/`0xCC`) and hits `assert(0)` in `grlib_stixctrl.c`
   (QEMU SIGABRT, exit 134). Determinism is provided by content stability
   instead — verified: two 90 s runs produce identical normalized content.
-- **Run directory: `/tmp/stix-uprev-run/`** (`STIX_RUN_DIR`, the default of
+- **Run directory: `~/dev/stix-state/uprev-run/`** (`STIX_RUN_DIR`, the default of
   all three scripts). Its `flash.bin` is 17.7 GB apparent but sparse and
   inverted (D-I, `accepted-diffs.md` §9): the model creates it instantly if
   it is missing, and it costs only the pages the FSW writes (about 16 KB
@@ -56,7 +65,7 @@ REPAIRED old model.
   `-global grlib-stixflash.inverted-storage=off` for it.
 - **The ELF.** The gate scripts (`boot-smoke.sh`, `soak.sh`,
   `capture-golden.sh`) default to the normal ELF the golden was captured
-  from, `/tmp/stix-baseline-run/ASW_em_baseline.elf` (reading it is fine).
+  from, `~/dev/stix-elf/ASW_em_baseline.elf` (reading it is fine).
   - `STIX_ASW_ELF` overrides it.
   - Don't point it at `stix_asw_src/.../ASW_em.elf` for a gate. That file is
     whatever was built last on Windows. On 2026-11-10 that was a
@@ -88,7 +97,7 @@ REPAIRED old model.
     waiting up to `STIX_SLOT_WAIT` s (1800). A number k >= 1 takes exactly
     slot k or exits 2. The gate passes `-global
     grlib-stixspw.tmtc-port=B`, runs in `<run dir>-s<k>` (for example
-    `/tmp/stix-uprev-run-s1`; an explicit `STIX_*RUN_DIR` gets the suffix
+    `~/dev/stix-state/uprev-run-s1`; an explicit `STIX_*RUN_DIR` gets the suffix
     too) and appends `slot=k busy=<other held slots> load=<1 min>` to its
     verdict lines. The CPU cap is N slot runs plus one legacy run.
     `STIX_PORT_BASE` stays the selector; the slot's base port is exported
@@ -97,8 +106,8 @@ REPAIRED old model.
     21000-21499 (slots 0-4).
   - **Slot mode never opens the shared flash.** boot-smoke, soak and
     tc-smoke boot a private `cp --sparse=always` copy of
-    `/tmp/stix-uprev-run/flash.bin` (refreshed every run, under a shared
-    `flock` on `/tmp/stix-uprev-run/.flash.lock`; refused when the master
+    `~/dev/stix-state/uprev-run/flash.bin` (refreshed every run, under a shared
+    `flock` on `~/dev/stix-state/uprev-run/.flash.lock`; refused when the master
     is missing, when the copy allocates 64 MB or more, or when its size
     differs). Legacy mode still boots the master in place: today's SAFE
     gates do not write it. capture-golden.sh, the master's only writer,
@@ -173,7 +182,7 @@ python3 scripts/stix/idefx-trace-check.py --self-test # verification runs
 ```
 
 Notes:
-- `flash.bin` lives in `/tmp/stix-uprev-run/` (sparse, see the run rules).
+- `flash.bin` lives in `~/dev/stix-state/uprev-run/` (sparse, see the run rules).
   Legacy gate runs use it there and never delete it; slot-mode runs use a
   private copy in their `-s<k>` dir. The qtests use their own temp files.
 - Long gate: `STIX_ASW_ELF=... bash scripts/stix/soak.sh build/qemu-system-sparc 600`.
@@ -227,8 +236,8 @@ be watched live from a second terminal. The FSW pads with NUL bytes, so
 strip them:
 
 ```bash
-tail -f /tmp/stix-uprev-run/uart.soak.raw | tr -d '\000'   # FSW console
-tail -f /tmp/stix-uprev-run/tm.soak-probe.log              # TM chunks as they arrive
+tail -f ~/dev/stix-state/uprev-run/uart.soak.raw | tr -d '\000'   # FSW console
+tail -f ~/dev/stix-state/uprev-run/tm.soak-probe.log              # TM chunks as they arrive
 ```
 
 From Windows the same files are at `\\wsl$\<distro>\tmp\stix-uprev-run\`.
@@ -249,7 +258,7 @@ route, scripted or manual — makes the FSW write a flash context
 (`ContextMgmt_deinit`), and every later boot **on that `flash.bin`**
 starts from it (the TC20 reaction stays disabled; the other context
 parameters come from it too). Never point a NOMINAL session at
-`/tmp/stix-uprev-run` or `/tmp/stix-baseline-run`; use an empty
+`~/dev/stix-state/uprev-run` or `/tmp/stix-baseline-run`; use an empty
 directory of its own (`STIX_NOMINAL_RUN_DIR` for `nominal-smoke.sh`,
 which enforces this, or an empty dir with its own `flash.bin` for a
 manual run). Do not reuse another experiment's run dir either:
@@ -261,9 +270,9 @@ other QEMU is running, because the TM server binds port 21000. Ctrl-C ends
 the run:
 
 ```bash
-cd /tmp/stix-uprev-run && /path/to/build/qemu-system-sparc \
+cd ~/dev/stix-state/uprev-run && /path/to/build/qemu-system-sparc \
     -M leon3_generic -m 64M -no-reboot -display none -monitor none \
-    -serial stdio -kernel /tmp/stix-baseline-run/ASW_em_baseline.elf
+    -serial stdio -kernel ~/dev/stix-elf/ASW_em_baseline.elf
 ```
 
 - Since P2-2 the model prints **no device activity by default** (the only

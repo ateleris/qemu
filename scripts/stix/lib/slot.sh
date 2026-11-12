@@ -28,11 +28,13 @@
 # kernel frees it when the last of them exits, SIGKILL included).
 #
 # Test hooks: STIX_SLOT_LOCK_DIR (default /tmp), STIX_FLASH_MASTER
-# (default /tmp/stix-uprev-run/flash.bin), STIX_FLASH_MAX_ALLOC_KB
+# (default $STIX_UPREV_DIR/flash.bin, see lib/paths.sh), STIX_FLASH_MAX_ALLOC_KB
 # (65536), STIX_CP_CMD (default "cp --sparse=always"), STIX_DF_CMD (the
 # df command whose last line's last field is the free KiB),
-# STIX_SHARED_DIRS (default "/tmp/stix-uprev-run /tmp/stix-baseline-run":
-# the uprev master's dir first, then the frozen baseline's).
+# STIX_SHARED_DIRS (default "$STIX_UPREV_DIR $STIX_LEGACY_DIRS": the uprev
+# master's dir first, then the old /tmp master dir and the frozen baseline's).
+
+. "$(dirname "${BASH_SOURCE[0]}")/paths.sh"
 
 STIX_SLOT=0
 STIX_SLOT_MODE=0
@@ -240,7 +242,7 @@ stix_run_dir_guard() { # dir [strict]
         echo "slot: refusing run dir / ($1)"
         exit 2
     fi
-    for shared in ${STIX_SHARED_DIRS:-/tmp/stix-uprev-run /tmp/stix-baseline-run}; do
+    for shared in ${STIX_SHARED_DIRS:-$STIX_UPREV_DIR $STIX_LEGACY_DIRS}; do
         if [ "$first" -eq 1 ] && [ "$STIX_SLOT_MODE" -eq 0 ] &&
                 [ "${2:-}" != strict ]; then
             first=0
@@ -271,7 +273,7 @@ stix_run_dir_guard() { # dir [strict]
 # After the copy, the copy must be sparse (allocated below the cap) and
 # its apparent size the master's: a second line of defence.
 stix_flash_copy() {
-    local master="${STIX_FLASH_MASTER:-/tmp/stix-uprev-run/flash.bin}"
+    local master="${STIX_FLASH_MASTER:-$STIX_UPREV_DIR/flash.bin}"
     local max_kb="${STIX_FLASH_MAX_ALLOC_KB:-65536}" alloc size msize
     local here fstype malloc
     if [ ! -f "$master" ]; then

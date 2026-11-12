@@ -12,10 +12,11 @@
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: boot-smoke.sh <qemu-binary> [--with-tm]}"
-ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
+ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GOLDEN_DIR="$REPO_ROOT/docs/stix-port/baseline"
-RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
+RUN_DIR="${STIX_RUN_DIR:-$STIX_UPREV_DIR}"
 DURATION="${STIX_SMOKE_SECONDS:-90}"
 
 # Resolve the binary BEFORE cd-ing to the run directory: a relative path is

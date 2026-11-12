@@ -125,7 +125,8 @@ for a in "${@:2}"; do
     esac
 done
 
-ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
+ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_FAULT_RUN_DIR:-/tmp/stix-fault-run}"
 DURATION="${STIX_FAULT_SECONDS:-250}"
@@ -148,7 +149,8 @@ RUN_DIR="$(stix_slot_dir "$RUN_DIR")"
 # relative path), then refuse the two shared run dirs, anything inside
 # them, any parent of them, and /.
 RUN_DIR="$(realpath -m -- "$RUN_DIR")"
-SHARED_UPREV="$(realpath -m -- /tmp/stix-uprev-run)"
+SHARED_UPREV="$(realpath -m -- "$STIX_UPREV_DIR")"
+SHARED_OLD="$(realpath -m -- /tmp/stix-uprev-run)"
 SHARED_BASE="$(realpath -m -- /tmp/stix-baseline-run)"
 refuse_run_dir() {
     echo "refusing run dir $RUN_DIR ($1)"
@@ -159,7 +161,7 @@ refuse_run_dir() {
 if [ "$RUN_DIR" = "/" ]; then
     refuse_run_dir "it is the root directory"
 fi
-for shared in "$SHARED_UPREV" "$SHARED_BASE"; do
+for shared in "$SHARED_UPREV" "$SHARED_OLD" "$SHARED_BASE"; do
     case "$RUN_DIR" in
         "$shared" | "$shared"/*)
             refuse_run_dir "it is $shared or inside it" ;;

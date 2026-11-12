@@ -32,9 +32,10 @@ DRY_RUN="${2:-}"
 [ -z "$DRY_RUN" ] || [ "$DRY_RUN" = "--dry-run" ] || {
     echo "unknown argument: $DRY_RUN"; exit 2; }
 
-ASW_ELF="${STIX_ASW_ELF:-/tmp/stix-baseline-run/ASW_em_baseline.elf}"
+. "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
+ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-RUN_DIR="${STIX_RUN_DIR:-/tmp/stix-uprev-run}"
+RUN_DIR="${STIX_RUN_DIR:-$STIX_UPREV_DIR}"
 SEND_AT="${STIX_TC_SEND_AT:-20}"
 WINDOW="${STIX_TC_WINDOW:-10}"
 DURATION="${STIX_TC_SECONDS:-60}"

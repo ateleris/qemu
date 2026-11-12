@@ -90,10 +90,12 @@ legacy_dry() { # script args...: old vs new --dry-run output
     local sc="$1" o n
     shift
     o="$(bash "$OLD/scripts/stix/$sc" "$FAKE" "$@" 2>&1 | sed "s#$OLD#$REPO_ROOT#g")"
-    # detector-smoke's intended changes: the per-mode run dir (-neg) and
-    # the trace events file (the FSM strobes mark NOMINAL in the trace)
+    # Intended changes: the master/legacy run dir moved out of /tmp
+    # (lib/paths.sh); for detector-smoke also the per-mode run dir (-neg)
+    # and the trace events file (the FSM strobes mark NOMINAL in the trace)
     n="$(bash "$S/$sc" "$FAKE" "$@" 2>&1 |
-        sed -e 's#\(/tmp/stix-detector-run\)-neg\([/ ,]\)#\1\2#g' \
+        sed -e "s#$HOME/dev/stix-state/uprev-run#/tmp/stix-uprev-run#g" \
+            -e 's#\(/tmp/stix-detector-run\)-neg\([/ ,]\)#\1\2#g' \
             -e 's#events=[^ ]*/idefx\.events\\,#enable=stixdet_idefx_cmd\\,#')"
     [ "$o" = "$n" ] && [ -n "$n" ]
     check "legacy: $sc $* identical to $REF" $? \
@@ -315,6 +317,10 @@ out="$(slotenv STIX_NOMINAL_RUN_DIR=/tmp/stix-uprev-run/x \
     bash "$S/nominal-smoke.sh" "$FAKE" --check-guard 2>&1)"
 [ $? -eq 2 ]
 check "slot: nominal run-dir guard still refuses the shared dir" $? "$out"
+out="$(slotenv STIX_NOMINAL_RUN_DIR="$HOME/dev/stix-state/uprev-run/x" \
+    bash "$S/nominal-smoke.sh" "$FAKE" --check-guard 2>&1)"
+[ $? -eq 2 ]
+check "slot: nominal run-dir guard refuses the persistent master dir" $? "$out"
 
 # capture-golden refuses slot mode, before any QEMU
 : > "$W/cap.s.argv"
