@@ -1185,6 +1185,31 @@ binary at their first new assertion, and green after.
   flash block about every 7 s. Record host CPU and flash growth in
   `STIX_DETECTOR_RUN_DIR`.
 - accepted-diffs §35.
+- **As built (2026-11-11, accepted-diffs §35):**
+  - the swap rule, latching, materialization and chunk layout as
+    planned; ETRG per `grp` = 1.25 × (drawn EACC events + Poisson of the
+    SUMDMASK-masked `fpga_det`'s expected events), so **ETRG is not
+    masked by SUMDMASK** [I]; the finished `nom_bank` (EACC and ETRG) is
+    zeroed after every swap, also when the chunk was dropped [I]; the
+    chunk SCET keeps the UNSYNCED bit 31 as the 0xC8 read does [I];
+  - the tick engages `mem_reentrancy_guard` for its whole body; new
+    qtest `det-chunk-guard` (the release half is mutation-checked; the
+    engage half is not observable from a qtest);
+  - the qtest helpers now program the FSW NOMINAL-entry parameters
+    9/199/1800 (`OpModeMgmt.c:625`); with zeros every tick swaps;
+  - **deviation:** the gate negative for the chunk checks is a new
+    `--no-rotb` mode (zero sky, `det-rotb=off`, must fail exactly
+    `uart-chunk chunk`); the flare negative now must fail exactly
+    `ql-contrast chunk-flare`;
+  - **deviation:** the trace golden is "checked" from the detector-smoke
+    trace (no `stixdet_nominal_swap` before the first SetEnable strobe),
+    not by a slot-mode `capture-golden.sh` run, which needs the shared
+    run dir;
+  - the chunk cadence allows a tenth of a tick: the D-1 tick timer
+    re-arms from its callback, so 200 ticks took 20.000141 s live;
+  - [L] resolved: no archive, filesystem or chunk-path `*E` line on the
+    fresh flash; `uart-chunk` now forbids them (TRACE_TAGs Archive,
+    RotAccuComp, RotAccumulator, FS, FSapi, MemStream, MemCommon, FIFO).
 
 ### D-6: index-space end-to-end check
 - `det-inject` (D-Db) through `stix_det_add_counts`, with the trace
