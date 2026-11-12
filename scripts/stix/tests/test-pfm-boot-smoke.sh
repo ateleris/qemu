@@ -126,7 +126,9 @@ gen_log() { # file boot fs fdir tc20  (tc20 empty = never arrives; fs
         echo "TM +$((nom + 1)) s 0x5A1 (1,1) 1dacc003 [m=1000.000]" >> "$f"
         echo "TM +$((nom + 1)) s 0x5A7 (5,1) 00210405 [m=1000.000]" >> "$f"
         echo "TM +$((nom + 1)) s 0x5A1 (1,7) 1dacc003 [m=1000.000]" >> "$f"
-        echo "TM +$((nom + 1)) s 0x5A4 (3,25) 0215 [m=1000.000]" >> "$f"
+        # SID2 every 64 s: SID2_AFTER_NOM (default 1) places the first
+        # one after NOMINAL; empty = it never comes
+        [ -z "${SID2_AFTER_NOM-1}" ] || echo "TM +$((nom + ${SID2_AFTER_NOM:-1})) s 0x5A4 (3,25) 0215 [m=1000.000]" >> "$f"
     fi
     [ -z "$fs" ] && t=0 || t=$fs
     while [ "$t" -le 240 ]; do
@@ -145,6 +147,18 @@ grep_check "replay: release-like sends CONF at 75" \
 grep_check "replay: release-like prints the 0x0032 offset" \
     "^PFM 0x0032 at \+70\.0 s$" "$out"
 grep_check "replay: release-like DRIVE: PASS last" "^DRIVE: PASS$" "$out"
+
+# the measured PFM case: SID2 43 s after NOMINAL (64 s period) passes
+SID2_AFTER_NOM=43 gen_log "$W/sid2late.log" 1 70 16 32
+out="$(python3 "$DRIVE" --replay "$W/sid2late.log" --seconds 240 2>&1)"
+check "replay: SID2 43 s after NOMINAL passes" 0 $?
+grep_check "replay: SID2 43 s DRIVE: PASS last" "^DRIVE: PASS$" "$out"
+
+SID2_AFTER_NOM= gen_log "$W/nosid2.log" 1 70 16 32
+out="$(python3 "$DRIVE" --replay "$W/nosid2.log" --seconds 240 2>&1)"
+check "replay: no SID2 after NOMINAL fails" 1 $?
+grep_check "replay: no SID2 names the 70 s window" \
+    "NOMINAL: no SID2 mode 5 within 70 s" "$out"
 
 gen_log "$W/late26.log" 1 70 16 $((16 + 26))
 out="$(python3 "$DRIVE" --replay "$W/late26.log" --seconds 240 2>&1)"

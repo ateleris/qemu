@@ -27,8 +27,9 @@ phase would drop the connection between phases):
     CONF + 20 s
     CONF:  TM(1,1), TM(5,1) 0021 02 04, TM(1,7)    by CONF + 10 s
     S20:   TM(1,1), TM(1,7)                        by S20 + 10 s
-    NOM:   TM(1,1), TM(5,1) 0021 04 05, TM(1,7), SID2 0x5A4 with the
-           mode nibble 5                            by NOMINAL + 5 s
+    NOM:   TM(1,1), TM(5,1) 0021 04 05, TM(1,7)    by NOMINAL + 5 s;
+           SID2 0x5A4 with the mode nibble 5        by NOMINAL + 70 s
+           (SID2 comes every 64 s, see SID2_WINDOW)
     forbidden from CONF on: 0021 05 02, 0021 04 02, any TM(1,8)
   forbidden from the connect on: TM(5,3) 8021 (0x8021 Watchdog failure
     detected)
@@ -78,6 +79,12 @@ NOM_AFTER_CONF = 20.0
 CONF_WINDOW = 10.0
 S20_WINDOW = 10.0
 NOM_WINDOW = 5.0
+# SID2 HK comes every HK_TM_SID2_REPORTING_PERIOD = 512 cycles of 125 ms
+# = 64 s (ParamMgmtDef.h:204, HKReport.c:183; the PFM has no context
+# file, so the default holds): the first one after NOMINAL can be up to
+# 64 s away, so it gets its own window.
+SID2_WINDOW = 64.0 + 6.0
+EXP_WINDOW = {"SID2 mode 5": SID2_WINDOW}
 
 
 def spec(apid, ptype, sub, data=""):
@@ -203,11 +210,13 @@ class Checker:
                     self._fail(f"no 0x142E (Preparing for shutdown) by"
                                f" 0x14A3 + {TC20_AFTER_FDIR:.0f} s")
         for g, (_, window, exps) in GROUPS.items():
-            if g in self.sent and t > self.sent[g] + window:
-                missing = [n for n, _ in exps if n not in self.got[g]]
-                if missing:
-                    self._fail(f"{g}: no {', '.join(missing)} within"
-                               f" {window:.0f} s")
+            if g not in self.sent:
+                continue
+            for n, _ in exps:
+                w = EXP_WINDOW.get(n, window)
+                if n not in self.got[g] and t > self.sent[g] + w:
+                    self._fail(f"{g}: no {n} within {w:.0f} s")
+                    break
         due = []
         if self.fail is None:
             for g in ("CONF", "S20", "NOMINAL"):
@@ -221,6 +230,12 @@ class Checker:
         self.tick(t)
         if self.nominal and "NOMINAL" not in self.sent:
             self._fail("the run ended before NOMINAL was commanded")
+        for g, (_, _, exps) in GROUPS.items():
+            missing = [n for n, _ in exps
+                       if g in self.sent and n not in self.got[g]]
+            if missing:
+                self._fail(f"{g}: the run ended before"
+                           f" {', '.join(missing)}")
         if "fs" in self.seen:
             span = t - self.seen["fs"]
             need = int(span // 2)
