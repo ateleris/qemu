@@ -4285,3 +4285,102 @@ tree ASW/):**
 8. `WDT.c` `WDT_setWdgInterval` ends with DISABLE; whether RELOAD
    re-arms after DISABLE decides whether such a build has a live
    watchdog at all.
+
+## A. Attenuator mechanism and AttnCmdSta (baseline: plain storage)
+
+Attenuator plan A-1 (`docs/stix-port/2026-11-11-attenuator-plan.md`,
+D-Aa..Ae, Ah, Ai). The heading is non-numeric on purpose: it gets a
+number at the merge, like P-1 above.
+
+**Baseline:** AttnCmdSta (0x5C) was plain storage. A PFM ELF would read
+OPERATIONSTATUS = 0, "moving", forever, wait 3 s at every SAFE entry and
+end every move in the FSW's 3.3 s timeout (0x942B). The gate ELF never
+touches 0x5C (an AX build, the stub is pure software), so on AX the
+model is invisible; only ATT_C is real on both builds (A-2).
+
+**Model (hw/sparc/stix_att.c, the child object
+`/machine/stixctrl/attenuator`, type `stix-att`):**
+- **`att-model`** (qdev bool on stixctrl, default on): off keeps 0x5C
+  as plain storage, never reset, with `fsw-accesses` at 0. On is safe
+  because the gate ELF never accesses 0x5C [G, E]: the UART and trace
+  goldens are unchanged, and 0x60/0x64 stay plain storage either way.
+- **Timing knobs** (qdev on stixctrl, D-Ah): `att-initial` (out|in,
+  default out — the AX stub's `isAB`; anything else is a realize
+  error, like `timecode-source`), `att-travel-ms` (1000, the user's
+  "usually 1 second-ish", Q3), `att-ramp-ms` (1600, the drive window
+  from the PWM ramp), `att-debounce-ms` (10 [I]), `att-timeout-finishes`
+  (on [I], Q4). `att-travel-ms`/`att-ramp-ms` 0 is a realize error (a
+  zero travel would divide by zero).
+- **The mechanism (truth, D-Ad):** one shaft, `pos_ppm` 0 = OUT,
+  1 000 000 = IN, 1 ppm per travel-ms ns (end to end = travel time);
+  the position survives a device reset. AB actuates iff pos = 0, BC iff
+  pos = 1e6, both released in transit [I]. M1/M2 drive one shaft at
+  nominal speed; a motor is powered iff hkCmdSta LVEN was set at the
+  command (LV sampled at the command [A]).
+- **Lazy evaluation (D-Ac):** no timer, BH, DMA or IRQ. Every 0x5C
+  access and every state getter (`truth.position*`, `truth.last-end`,
+  the sensors, `presented.*`; not the counters `truth.moves` and
+  `fsw-accesses`) advances the pure state to QEMU_CLOCK_VIRTUAL;
+  `truth.position` reads `moving-*` only while the shaft really
+  travels (not for an LV-off or motorless command, nor in the debounce
+  at the end stop); with `att-model=off`, `presented.cmdsta` is the
+  plain storage the guest reads; the move's end (target switch + debounce, or the
+  ramp end) is solved analytically at the command. The advance is
+  idempotent, so an extra read changes nothing (the PL-1/PL-2 purity
+  note); getters advance but never trace (D-Ai), so a move end a
+  getter passes first leaves no `stixatt_end` line. With no
+  out-of-MMIO path, the a83fe9a3a5 re-entrancy guard rule does not
+  apply (D-Ai).
+- **The controller (D-Ae):** a write of 1/2/3 (open M1/M2/both) or
+  4/8/12 (close) starts — or restarts, from the current position — a
+  move: OPERATIONSTATUS 0, the commanded MOTORxUSED (the drive flag,
+  AttCtrl.c:387-388), the ramp window starts. The move ends
+  `att-debounce-ms` after the presented target switch actuates
+  (already-actuated included: a redundant move clears MOTORxUSED after
+  10 ms), or at the ramp end with TIMEOUT = 1 and, with
+  `att-timeout-finishes`, OPERATIONSTATUS = 1. ERRORMASK (bit 4)
+  ignores the switches and runs the full ramp without TIMEOUT. 6 stops
+  now (OPERATIONSTATUS 1, the flags clear, the position stays). Any
+  other value is stored for readback only; status bits 11:5 are
+  ignored on write. Idle reads: 0x500 at OUT, 0x300 at IN. A device
+  reset aborts a running move at the reset instant (the position is
+  kept, the registers go idle including the bits-4:0 readback, and
+  `truth.last-end` = reset — recorded only when a move was actually
+  running).
+- **QOM (D-Ah), all read-only:** `truth.position` (out|in|moving-in|
+  moving-out|between), `truth.position-ppm`, `truth.sensor-ab`/`-bc`,
+  `truth.motor1-driving`/`motor2-driving` (torque, not the flag),
+  `truth.moves` (restarts count), `truth.last-end`
+  (none|target|timeout|override|emergency|fail|reset; fail is A-3),
+  `truth.last-end-ns`, `presented.sensor-ab`/`-bc` (== truth until
+  A-3), `presented.cmdsta` (the 0x5C readback as a read returns it
+  now, no side effects) and `fsw-accesses` (guest 0x5C accesses since
+  realize, not cleared on reset; 0 on the AX gate ELF — the R5/Q9 AX
+  artefact label). `truth.att-c`/`presented.att-c` come with A-2.
+  There are no setters yet (A-3): qom-set is rejected ("is not
+  writable").
+- **Traces:** `stixatt_cmd(cmd, override, pos_ppm)` on every 0x5C
+  write; `stixatt_end(reason, at_ns, pos_ppm)` when an MMIO access
+  commits a move end, carrying the computed event time. The unit is
+  silent at realize, at reset and on 0x60/0x64, so the
+  `-trace 'stix*'` golden is unchanged.
+- **The [I]/[A] semantics recorded for A-later (Q2-Q5):** the
+  stop-on-presented-switch rule and the 10 ms debounce, the
+  timeout/finished relation, the override behaviour, the emergency
+  semantics, OPERATIONSTATUS reset value 1, "a command during a move
+  restarts it", the travel time (Q3) and the switch polarity (Q5:
+  `stuck_open` = the bit reads 0). Each is one knob or one constant.
+
+**Evidence:** qtests `/sparc/stix/att-*` in the `stix` binary
+(registered behind `stix_att_register()`, in one appended block before
+main()): `att-reset`, `att-close-open` (M1, M2, both), `att-redundant`,
+`att-override`, `att-lv-off`, `att-emergency`, `att-reset-midmove`,
+`att-initial-in`, `att-config1`, `att-model-off`, `att-qom-names`,
+`att-determinism` (identical reads with and without interleaved
+qom-gets; no `stixatt_*` line inside a getter), and the negatives
+`att-reject-status-bits`, `att-reject-cmd-values`,
+`att-reject-restart`, `att-reject-readonly`. RED before A-1: the
+attenuator object and its properties do not exist and 0x5C is plain
+storage (0, not 0x500). The move-timing tests set
+`att-travel-ms=500`: the plan's +250/+510 timelines predate its Q3
+answer (the default stays 1000).

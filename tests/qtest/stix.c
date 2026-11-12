@@ -9977,6 +9977,563 @@ static void test_flash_savevm(void)
     stix_qtest_cleanup();
 }
 
+
+/* ---- Attenuator A-1: mechanism and AttnCmdSta (no faults) ---- */
+
+/*
+ * The attenuator plan (docs/stix-port/2026-11-11-attenuator-plan.md)
+ * keeps its qtests in this one appended block behind
+ * stix_att_register(), so a merge with other tracks touches main() in
+ * one line. The tests drive the exact FSW words (PFM Attenuator.c:99-104):
+ * the command and the override in bits 4:0 of AttnCmdSta (CTRL 0x5C),
+ * LV on through hkCmdSta LVEN (0x88). The move timelines use
+ * att-travel-ms=500: the plan's +250/+510 expectations and att-override's
+ * "reaches IN at 500 ms" predate its Q3 answer, so the default (1000)
+ * stays and the property is set explicitly.
+ */
+
+#define ATT_PATH  "/machine/stixctrl/attenuator"
+#define CTRL_ATT  0x5cu
+#define ATT_MS_NS (1000 * 1000LL)
+
+/* AttnCmdSta status bits (StixIdpu.h:709-731) */
+#define ATT_TO    (1u << 5)     /* TIMEOUT */
+#define ATT_M1U   (1u << 6)     /* MOTOR1USED */
+#define ATT_M2U   (1u << 7)     /* MOTOR2USED */
+#define ATT_OP    (1u << 8)     /* OPERATIONSTATUS, 1 = finished/idle */
+#define ATT_BC    (1u << 9)
+#define ATT_AB    (1u << 10)
+
+/* 500 ms travel so the plan's qtest timelines hold (see the header) */
+static QTestState *att_qtest_new(const char *extra)
+{
+    g_autofree gchar *all = g_strdup_printf(
+        "-global grlib-stixctrl.att-travel-ms=500 %s", extra);
+
+    return stix_qtest_new_extra(all);
+}
+
+static void att_lv_on(QTestState *qts)
+{
+    ctrl_write(qts, CTRL_HKCMDSTA, 0x1u);   /* LVEN */
+}
+
+static uint64_t att_qom_u64(QTestState *qts, const char *prop)
+{
+    bool ok;
+    uint64_t v = stix_qom_get_u64(qts, ATT_PATH, prop, &ok);
+
+    g_assert(ok);
+    return v;
+}
+
+static bool att_qom_bool(QTestState *qts, const char *prop)
+{
+    bool ok, v = stix_qom_get_bool(qts, ATT_PATH, prop, &ok);
+
+    g_assert(ok);
+    return v;
+}
+
+/* a string property, or NULL when it is unknown */
+static char *att_qom_str(QTestState *qts, const char *prop)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-get',"
+                            " 'arguments': {'path': %s, 'property': %s}}",
+                            ATT_PATH, prop);
+    const char *s = qdict_get_try_str(resp, "return");
+    char *out;
+
+    g_assert_nonnull(s);
+    out = g_strdup(s);
+    qobject_unref(resp);
+    return out;
+}
+
+/* assert a string property reads exactly @want */
+static void att_qom_str_is(QTestState *qts, const char *prop,
+                           const char *want)
+{
+    g_autofree char *got = att_qom_str(qts, prop);
+
+    g_assert_cmpstr(got, ==, want);
+}
+
+/* qom-set of a string property; true when QEMU accepted it */
+static bool att_qom_set_str(QTestState *qts, const char *prop,
+                            const char *val)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %s}}",
+                            ATT_PATH, prop, val);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+/*
+ * att-reset (R5): idle at OUT reads 0x500 (OPERATIONSTATUS 1, AB 1),
+ * truth.position is out, and fsw-accesses counts the guest 0x5C reads
+ * without being cleared by a reset.
+ */
+static void test_att_reset(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_AB);
+    att_qom_str_is(qts, "truth.position", "out");
+    g_assert_cmpuint(att_qom_u64(qts, "fsw-accesses"), ==, 1);
+    ctrl_read(qts, CTRL_ATT);
+    g_assert_cmpuint(att_qom_u64(qts, "fsw-accesses"), ==, 2);
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_AB);
+    g_assert_cmpuint(att_qom_u64(qts, "fsw-accesses"), ==, 3);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-close-open: close M1 (4) moves OUT -> IN (AB 1, then both 0 at
+ * 250 ms, BC 1 and finished with M1USED 0 at 510 ms), open M1 (1) moves
+ * back; the same for M2 (8/2) and both motors (12/3).
+ */
+static void test_att_close_open(void)
+{
+    static const struct {
+        uint32_t open_cmd, close_cmd, used;
+    } cases[] = {
+        { 1,  4, ATT_M1U },             /* M1 */
+        { 2,  8, ATT_M2U },             /* M2 */
+        { 3, 12, ATT_M1U | ATT_M2U },   /* both */
+    };
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(cases); i++) {
+        QTestState *qts = att_qtest_new("");
+        uint32_t close_cmd = cases[i].close_cmd;
+        uint32_t open_cmd = cases[i].open_cmd;
+        uint32_t used = cases[i].used;
+
+        att_lv_on(qts);
+        ctrl_write(qts, CTRL_ATT, close_cmd);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                        close_cmd | used | ATT_AB);
+        qtest_clock_step(qts, 250 * ATT_MS_NS);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, close_cmd | used);
+        att_qom_str_is(qts, "truth.position", "moving-in");
+        g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+        qtest_clock_step(qts, 260 * ATT_MS_NS);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                        close_cmd | ATT_OP | ATT_BC);
+        att_qom_str_is(qts, "truth.position", "in");
+        att_qom_str_is(qts, "truth.last-end", "target");
+
+        ctrl_write(qts, CTRL_ATT, open_cmd);
+        qtest_clock_step(qts, 510 * ATT_MS_NS);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                        open_cmd | ATT_OP | ATT_AB);
+        att_qom_str_is(qts, "truth.position", "out");
+
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+    }
+}
+
+/*
+ * att-redundant: a command toward the end the mechanism already sits
+ * at ends after the debounce; MOTOR1USED reads 1 right after the write
+ * (the FSW samples it there) and 0 after 10 ms (D-Ae, why 10 ms).
+ */
+static void test_att_redundant(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 1);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U | ATT_AB);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_OP | ATT_AB);
+    att_qom_str_is(qts, "truth.last-end", "target");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-override: ERRORMASK ignores the switches; the shaft reaches IN
+ * at 500 ms but the drive runs the full window and ends at 1600 ms
+ * with no TIMEOUT (D-Ae).
+ */
+static void test_att_override(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4 | 0x10);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0x14u | ATT_M1U | ATT_AB);
+    qtest_clock_step(qts, 500 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0x14u | ATT_M1U | ATT_BC);
+    qtest_clock_step(qts, 1100 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0x14u | ATT_OP | ATT_BC);
+    att_qom_str_is(qts, "truth.last-end", "override");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-lv-off: without hkCmdSta LVEN the motors have no power; the
+ * shaft holds and the move ends at the ramp end with TIMEOUT and
+ * OPERATIONSTATUS (att-timeout-finishes on).
+ */
+static void test_att_lv_off(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    ctrl_write(qts, CTRL_ATT, 4);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    /* no motion; MOTOR1USED is the drive flag even without LV */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_AB);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+    /* nothing travels: the truth stays at the end stop */
+    att_qom_str_is(qts, "truth.position", "out");
+    g_assert(!att_qom_bool(qts, "truth.motor1-driving"));
+    qtest_clock_step(qts, 1350 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==,
+                    4u | ATT_TO | ATT_OP | ATT_AB);
+    att_qom_str_is(qts, "truth.last-end", "timeout");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-emergency: command 6 stops the move now; the position stays
+ * between the ends with both switches released and OPERATIONSTATUS 1.
+ */
+static void test_att_emergency(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    ctrl_write(qts, CTRL_ATT, 6);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 6u | ATT_OP);
+    att_qom_str_is(qts, "truth.position", "between");
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+    att_qom_str_is(qts, "truth.last-end", "emergency");
+    qtest_clock_step(qts, 1500 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 6u | ATT_OP);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-reset-midmove: a system_reset aborts the move at the reset
+ * instant; the position is kept, the registers go idle and
+ * truth.last-end is reset (D-Ae).
+ */
+static void test_att_reset_midmove(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP);
+    att_qom_str_is(qts, "truth.position", "between");
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 500000);
+    att_qom_str_is(qts, "truth.last-end", "reset");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* att-initial-in: the mechanism boots covered; idle at IN reads 0x300 */
+static void test_att_initial_in(void)
+{
+    QTestState *qts = att_qtest_new(
+        "-global grlib-stixctrl.att-initial=in");
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_BC);
+    att_qom_str_is(qts, "truth.position", "in");
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 1000000);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-config1: 0x60 and 0x64 stay plain storage (D-Aa): they round-trip
+ * and no stixatt_* trace fires for them, so the trace golden keeps its
+ * 12 identical 0x60 lines.
+ */
+static void test_att_config1(void)
+{
+    g_autofree gchar *log = NULL, *extra = NULL;
+    g_autofree gchar *text = NULL;
+    QTestState *qts;
+    int fd;
+
+    fd = g_file_open_tmp("stix-att-trace-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixctrl_io_write -trace stixatt_cmd "
+                            "-trace stixatt_end -D %s", log);
+    qts = stix_qtest_new_extra(extra);
+
+    ctrl_write(qts, 0x60, 0x1E0E4000u);     /* the FSW's AttnConfig1 [G] */
+    g_assert_cmphex(ctrl_read(qts, 0x60), ==, 0x1E0E4000u);
+    ctrl_write(qts, 0x64, 0x12345678u);
+    g_assert_cmphex(ctrl_read(qts, 0x64), ==, 0x12345678u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_AB);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_assert(g_file_get_contents(log, &text, NULL, NULL));
+    g_assert_null(strstr(text, "stixatt"));
+    g_assert_nonnull(strstr(text, "addr = 0x60"));
+    g_assert_nonnull(strstr(text, "0x1e0e4000"));
+    unlink(log);
+}
+
+/*
+ * att-model-off: 0x5C is plain storage, never reset, and the model
+ * never sees an access (D-Ab).
+ */
+static void test_att_model_off(void)
+{
+    QTestState *qts = att_qtest_new(
+        "-global grlib-stixctrl.att-model=off");
+
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0);
+    ctrl_write(qts, CTRL_ATT, 0xFFFF0004u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0xFFFF0004u);
+    qtest_clock_step(qts, 600 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 0xFFFF0004u);
+    /* the QOM face shows what the guest reads, not the model's idle */
+    g_assert_cmphex(att_qom_u64(qts, "presented.cmdsta"), ==, 0xFFFF0004u);
+    g_assert_cmpuint(att_qom_u64(qts, "fsw-accesses"), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* att-qom-names: the dotted property names work over QMP (D-Ah [L]) */
+static void test_att_qom_names(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_qom_str_is(qts, "truth.position", "out");
+    att_qom_str_is(qts, "truth.last-end", "none");
+    g_assert_cmpuint(att_qom_u64(qts, "presented.cmdsta"), ==,
+                     ATT_OP | ATT_AB);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.moves"), ==, 0);
+    g_assert_cmpuint(att_qom_u64(qts, "fsw-accesses"), ==, 0);
+    g_assert(att_qom_bool(qts, "truth.sensor-ab"));
+    g_assert(!att_qom_bool(qts, "truth.sensor-bc"));
+    g_assert(att_qom_bool(qts, "presented.sensor-ab"));
+    g_assert(!att_qom_bool(qts, "presented.sensor-bc"));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * att-determinism (D-Ai): the same clock_step script gives identical
+ * 0x5C and ATT_C reads with and without interleaved qom-gets, and no
+ * stixatt_* trace fires inside a getter: the getter that passes the
+ * move end first commits it silently, so run B keeps the cmd line but
+ * never gains an end line.
+ */
+static void test_att_determinism(void)
+{
+    g_autofree gchar *log_a = NULL, *log_b = NULL, *extra = NULL;
+    g_autofree gchar *text_a = NULL, *text_b = NULL;
+    QTestState *qts;
+    uint32_t r[2][4], c[2];
+    int fd, i;
+
+    for (i = 0; i < 2; i++) {
+        fd = g_file_open_tmp(i == 0 ? "stix-att-det-a-XXXXXX"
+                                    : "stix-att-det-b-XXXXXX",
+                             i == 0 ? &log_a : &log_b, NULL);
+        g_assert(fd >= 0);
+        close(fd);
+        extra = g_strdup_printf("-trace stixatt_cmd -trace stixatt_end "
+                                "-D %s", i == 0 ? log_a : log_b);
+        qts = att_qtest_new(extra);
+        att_lv_on(qts);
+        ctrl_write(qts, CTRL_ATT, 4);
+        r[i][0] = ctrl_read(qts, CTRL_ATT);
+        qtest_clock_step(qts, 250 * ATT_MS_NS);
+        if (i == 1) {
+            /* what a UI poll would read mid-move */
+            att_qom_str_is(qts, "truth.position", "moving-in");
+            att_qom_u64(qts, "truth.position-ppm");
+            att_qom_u64(qts, "presented.cmdsta");
+            att_qom_bool(qts, "truth.sensor-ab");
+            att_qom_bool(qts, "truth.sensor-bc");
+            att_qom_u64(qts, "fsw-accesses");
+        }
+        r[i][1] = ctrl_read(qts, CTRL_ATT);
+        /* the ATT_C conversion (ch 8): static 20 until A-2 wires it */
+        ctrl_write(qts, CTRL_HKADC, 8);
+        c[i] = (ctrl_read(qts, CTRL_HKADC) >> HKADC_VAL_SHIFT) &
+               HKADC_VAL_MASK;
+        qtest_clock_step(qts, 260 * ATT_MS_NS);   /* the move end, 510 ms */
+        if (i == 1) {
+            /* these cross the end: they must not trace (D-Ai) */
+            att_qom_str_is(qts, "truth.last-end", "target");
+            att_qom_str_is(qts, "truth.position", "in");
+            att_qom_u64(qts, "presented.cmdsta");
+        }
+        r[i][2] = ctrl_read(qts, CTRL_ATT);
+        qtest_clock_step(qts, 100 * ATT_MS_NS);
+        r[i][3] = ctrl_read(qts, CTRL_ATT);
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+    }
+
+    for (i = 0; i < 4; i++) {
+        g_assert_cmpuint(r[0][i], ==, r[1][i]);
+    }
+    g_assert_cmpuint(c[0], ==, c[1]);
+    g_assert(g_file_get_contents(log_a, &text_a, NULL, NULL));
+    g_assert(g_file_get_contents(log_b, &text_b, NULL, NULL));
+    g_assert_nonnull(strstr(text_a, "stixatt_cmd"));
+    g_assert_nonnull(strstr(text_a, "stixatt_end"));
+    g_assert_nonnull(strstr(text_b, "stixatt_cmd"));
+    g_assert_null(strstr(text_b, "stixatt_end"));
+    unlink(log_a);
+    unlink(log_b);
+}
+
+/* ---- att-reject-*: the negative qtests ---- */
+
+/* status bits 11:5 in a write are ignored (D-Ae) */
+static void test_att_reject_status_bits(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 0xFE0u | 4);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_M1U | ATT_AB);
+    qtest_clock_step(qts, 510 * ATT_MS_NS);
+    /* the move ran as command 4: no TIMEOUT, no FAILFLAG */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 4u | ATT_OP | ATT_BC);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* the unused command values are stored for readback, no motion (D-Ae) */
+static void test_att_reject_cmd_values(void)
+{
+    static const uint32_t cmds[] = { 0, 5, 7, 9, 10, 11, 13, 14, 15 };
+    QTestState *qts = att_qtest_new("");
+    size_t i;
+
+    att_lv_on(qts);
+    for (i = 0; i < G_N_ELEMENTS(cmds); i++) {
+        ctrl_write(qts, CTRL_ATT, cmds[i]);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_AB |
+                                                       cmds[i]);
+        qtest_clock_step(qts, 600 * ATT_MS_NS);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, ATT_OP | ATT_AB |
+                                                       cmds[i]);
+    }
+    g_assert_cmpuint(att_qom_u64(qts, "truth.moves"), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* a command during a move restarts it from the current position [I] */
+static void test_att_reject_restart(void)
+{
+    QTestState *qts = att_qtest_new("");
+
+    att_lv_on(qts);
+    ctrl_write(qts, CTRL_ATT, 4);
+    qtest_clock_step(qts, 250 * ATT_MS_NS);   /* half way, moving in */
+    ctrl_write(qts, CTRL_ATT, 1);             /* restart toward OUT */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U);
+    qtest_clock_step(qts, 255 * ATT_MS_NS);   /* 5 ms before the stop */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_M1U | ATT_AB);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.position-ppm"), ==, 0);
+    qtest_clock_step(qts, 10 * ATT_MS_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ATT), ==, 1u | ATT_OP | ATT_AB);
+    g_assert_cmpuint(att_qom_u64(qts, "truth.moves"), ==, 2);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* qom-set on the read-only truth/presented/fsw-accesses is rejected */
+static void test_att_reject_readonly(void)
+{
+    static const char *const ro_str[] = {
+        "truth.position", "truth.last-end",
+    };
+    static const char *const ro_bool[] = {
+        "truth.sensor-ab", "truth.sensor-bc",
+        "truth.motor1-driving", "truth.motor2-driving",
+        "presented.sensor-ab", "presented.sensor-bc",
+    };
+    static const char *const ro_num[] = {
+        "truth.position-ppm", "truth.moves", "truth.last-end-ns",
+        "presented.cmdsta", "fsw-accesses",
+    };
+    QTestState *qts = att_qtest_new("");
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(ro_str); i++) {
+        g_assert(!att_qom_set_str(qts, ro_str[i], "in"));
+    }
+    for (i = 0; i < G_N_ELEMENTS(ro_bool); i++) {
+        g_assert(!stix_qom_set_bool(qts, ATT_PATH, ro_bool[i], true));
+    }
+    for (i = 0; i < G_N_ELEMENTS(ro_num); i++) {
+        g_assert(!stix_qom_set_u64(qts, ATT_PATH, ro_num[i], 0));
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+static void stix_att_register(void)
+{
+    qtest_add_func("/sparc/stix/att-reset", test_att_reset);
+    qtest_add_func("/sparc/stix/att-close-open", test_att_close_open);
+    qtest_add_func("/sparc/stix/att-redundant", test_att_redundant);
+    qtest_add_func("/sparc/stix/att-override", test_att_override);
+    qtest_add_func("/sparc/stix/att-lv-off", test_att_lv_off);
+    qtest_add_func("/sparc/stix/att-emergency", test_att_emergency);
+    qtest_add_func("/sparc/stix/att-reset-midmove", test_att_reset_midmove);
+    qtest_add_func("/sparc/stix/att-initial-in", test_att_initial_in);
+    qtest_add_func("/sparc/stix/att-config1", test_att_config1);
+    qtest_add_func("/sparc/stix/att-model-off", test_att_model_off);
+    qtest_add_func("/sparc/stix/att-qom-names", test_att_qom_names);
+    qtest_add_func("/sparc/stix/att-determinism", test_att_determinism);
+    qtest_add_func("/sparc/stix/att-reject-status-bits",
+                   test_att_reject_status_bits);
+    qtest_add_func("/sparc/stix/att-reject-cmd-values",
+                   test_att_reject_cmd_values);
+    qtest_add_func("/sparc/stix/att-reject-restart",
+                   test_att_reject_restart);
+    qtest_add_func("/sparc/stix/att-reject-readonly",
+                   test_att_reject_readonly);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -10102,6 +10659,7 @@ int main(int argc, char **argv)
                        test_det_inject_reset);
         stix_det7_register();
         stix_platform_register();
+        stix_att_register();
     }
 
     return g_test_run();

@@ -101,6 +101,10 @@ stixspw_timecode_manual(const char *kind, uint32_t timecnt, bool emitted) "manua
 stixspw_timecode_once_drop(const char *why) "pending timecode-once dropped: %s"
 stixspw_obt_set(uint64_t old, uint64_t obt) "obt set: 0x%012"PRIx64" -> 0x%012"PRIx64
 
+# stix_att.c (STIX attenuator mechanism)
+stixatt_cmd(uint32_t cmd, int override, uint32_t pos_ppm) "ATT | cmd=%u override=%d pos_ppm=%u"
+stixatt_end(const char *reason, int64_t at_ns, uint32_t pos_ppm) "ATT | move end (%s) at_ns=%" PRId64 " pos_ppm=%u"
+
 # tmtc_io_server.c (STIX)
 stixtmtc_accept_failed(void) "accept failed"
 stixtmtc_client_connected(const char *addr, int port) "Client connected from: %s:%d"

@@ -740,6 +740,32 @@ construction):**
     - a command during a move restarts it [I];
     - qom-set on `truth.*`, `presented.*` and `fsw-accesses` is
       rejected.
+- **As built (A-1, 2026-11-12):** implemented in `stix_att.[ch]` per
+  D-Aa..Ae, Ah, Ai, with these choices where the plan left room:
+  - the tests live in `tests/qtest/stix.c` behind `stix_att_register()`
+    (one block directly before `main()`), not in the separate
+    `stix-att` binary D-Aj drafted: the temp-flash helper
+    `stix_qtest_new_extra` is reused directly and
+    `tests/qtest/meson.build` is untouched;
+  - the move-timing qtests set `-global grlib-stixctrl.att-travel-ms=500`:
+    the +250/+510 timelines here and att-override's "reaches IN at
+    500 ms" predate the Q3 answer, so the default stays 1000 and the
+    property is set explicitly;
+  - getters advance the lazy state (D-Ac) but never trace (D-Ai), so a
+    move end that a QOM getter passes first leaves no `stixatt_end`
+    line — `att-determinism` pins both halves of that contract;
+  - a device reset also clears the bits-4:0 command readback ("the
+    registers become idle", D-Ae), and `truth.last-end` = reset is
+    recorded only when a move was actually running (the power-on reset
+    keeps "none"); likewise emergency on an idle mechanism only clears
+    the flags;
+  - a restart mid-move counts in `truth.moves` and leaves the replaced
+    move without a last-end;
+  - realize rejects `att-travel-ms`/`att-ramp-ms` = 0 (a zero travel
+    would divide by zero) and an `att-initial` other than out|in, like
+    `timecode-source`;
+  - `truth.att-c`/`presented.att-c` are A-2, as is the ATT_C wiring;
+    `truth.last-end` = fail exists but never sets before A-3.
 - Gates: the per-commit set.
 - The accepted-diff section (a).
 

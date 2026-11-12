@@ -18,6 +18,7 @@
 #include "system/runstate.h"
 #include "StixIdpu.h"
 #include "stix_det.h"
+#include "stix_att.h"
 
 #include "trace.h"
 #include "qom/object.h"
@@ -142,6 +143,13 @@ struct STIXCTRL
      * QL tick and IRQ 3) lives in stix_det.c; its registers stay in reg
      */
     StixDetState det;
+    /*
+     * Attenuator plan A-1 (D-Aa): the mechanism and AttnCmdSta (0x5C)
+     * live in stix_att.c; the QOM face is the child object
+     * /machine/stixctrl/attenuator
+     */
+    StixAttState att;
+    StixAttConfig att_cfg;      /* the att-* qdev properties */
 };
 
 #define STIXCTRL_ADC_INJECT_NONE 0xFFFFFFFFu
@@ -823,6 +831,14 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 
         return regval;
     }
+    /* A-1: AttnCmdSta (0x5C), composed in stix_att.c */
+    if (stix_att_owns(&stixctrl->att, addr)) {
+        uint32_t regval = stix_att_read(&stixctrl->att, addr);
+
+        trace_stixctrl_io_read((uint32_t)addr, regval);
+
+        return regval;
+    }
     /* D-1: 0x00-0x4C (detector controller), composed in stix_det.c */
     if (stix_det_owns(&stixctrl->det, addr)) {
         uint32_t regval = stix_det_read(&stixctrl->det, addr);
@@ -879,6 +895,18 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
                                     stixctrl->reg.hkProtConfig[line]);
             return;
         }
+    }
+
+    /*
+     * A-1: the attenuator (0x5C), like the detector: after the hk-prot
+     * block, so this write spends an unlock token like any other
+     * (D-Aa); 0x60/0x64 stay plain storage below
+     */
+    if (stix_att_owns(&stixctrl->att, addr)) {
+        stix_att_write(&stixctrl->att, addr, (uint32_t)value);
+        trace_stixctrl_io_write((uint32_t)addr,
+                                stix_att_cmdsta(&stixctrl->att));
+        return;
     }
 
     /*
@@ -1084,6 +1112,16 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (!stix_att_realize(&STIXCTRL->att, &STIXCTRL->att_cfg,
+                          &STIXCTRL->reg, errp)) {
+        stix_det_unrealize(&STIXCTRL->det);
+        timer_free(STIXCTRL->wdg_timer);
+        STIXCTRL->wdg_timer = NULL;
+        g_free(STIXCTRL->rotb_ring);
+        STIXCTRL->rotb_ring = NULL;
+        return;
+    }
+
     //STIXCTRL->reference_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     //STIXCTRL->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, grlib_stixctrl_timer_tick, STIXCTRL);
     //timer_mod(STIXCTRL->timer, 1);
@@ -1141,6 +1179,13 @@ static void grlib_stixctrl_reset(DeviceState *d)
      * values and the QL tick stops; det-model=off leaves them alone
      */
     stix_det_reset(&stixctrl->det);
+
+    /*
+     * A-1 (D-Ae): a running attenuator move aborts at the reset
+     * instant, the registers go idle and the position is kept;
+     * att-model=off leaves 0x5C alone
+     */
+    stix_att_reset(&stixctrl->att);
 }
 
 static void grlib_stixctrl_unrealize(DeviceState *dev)
@@ -1150,6 +1195,7 @@ static void grlib_stixctrl_unrealize(DeviceState *dev)
     g_free(stixctrl->rotb_ring);
     stixctrl->rotb_ring = NULL;
     stix_det_unrealize(&stixctrl->det);
+    stix_att_unrealize(&stixctrl->att);
 }
 
 /*
@@ -1360,6 +1406,17 @@ static const Property grlib_stixctrl_properties[] = {
      * realize error naming the path
      */
     DEFINE_PROP_STRING("det-replay-file", STIXCTRL, det.replay_file),
+    /*
+     * A-1 (D-Ah): the attenuator mechanism. att-model=off keeps 0x5C
+     * plain storage, never reset (legacy, A/B comparison)
+     */
+    DEFINE_PROP_BOOL("att-model", STIXCTRL, att_cfg.model, true),
+    DEFINE_PROP_STRING("att-initial", STIXCTRL, att_cfg.initial),
+    DEFINE_PROP_UINT32("att-travel-ms", STIXCTRL, att_cfg.travel_ms, 1000),
+    DEFINE_PROP_UINT32("att-ramp-ms", STIXCTRL, att_cfg.ramp_ms, 1600),
+    DEFINE_PROP_UINT32("att-debounce-ms", STIXCTRL, att_cfg.debounce_ms, 10),
+    DEFINE_PROP_BOOL("att-timeout-finishes", STIXCTRL, att_cfg.timeout_finishes,
+                     true),
 };
 
 /*
@@ -1372,6 +1429,9 @@ static void grlib_stixctrl_instance_init(Object *obj)
     stixctrl_adc_inject_clear(GRLIB_STIXCTRL(obj));
     stix_det_instance_init(&GRLIB_STIXCTRL(obj)->det);
     stixctrl_hk_last_clear(GRLIB_STIXCTRL(obj));
+    /* A-1 (D-Aa): the QOM face, /machine/stixctrl/attenuator */
+    object_initialize_child(obj, "attenuator", &GRLIB_STIXCTRL(obj)->att,
+                            TYPE_STIX_ATT);
     /* PL-2 (D-PLo): read-only, no setter */
     object_property_add_str(obj, "hw-state", stixctrl_get_hw_state, NULL);
 }
