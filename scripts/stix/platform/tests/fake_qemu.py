@@ -24,7 +24,8 @@ import time
 
 PROPS_NEW = ["flash-file", "inverted-storage"]
 PROPS_OLD = ["flash-file"]
-SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject") + \
+SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject",
+            "upset-inject") + \
     tuple("adc-inject[%d]" % ch for ch in range(128))
 
 

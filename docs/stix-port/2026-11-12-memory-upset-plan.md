@@ -1167,6 +1167,106 @@ the merge.
   (the JSON section, two reads equal with no virtual time — D-PLo's
   purity rule).
 - **Gates: the full set**, plus edac-smoke ± if it exists.
+- **As built (M-6a)** (the live `edac-smoke.sh` stays M-6b):
+  - **The random bursts (D-Ug), exactly as pinned:** the draw is
+    **xorshift32, Marsaglia's 13/17/5 triple**
+    (`x ^= x << 13; x ^= x >> 17; x ^= x << 5`); `edac-random` pins
+    the generator to canonical outputs computed outside the test (seed
+    0x1234ABCD: 0x6EE4450B, 0x2EEF9309, 0x4D55748E; review fix: the
+    test's reference copy alone would pass a misreading shared with the
+    model). **Seed handling:**
+    `random-seed` (uint32, read/write, default **0 = off**) is plain
+    state that survives a reset like `edac-at-boot`; seed 0 refuses
+    `random-count` (D-Ug's "default 0 = off" — unlike the detector's
+    `det-seed`, where 0 is a valid seed via splitmix64). **The draw
+    order:** every `random-count` set restarts the state from the seed
+    and each upset costs three draws, in this order — the **memory**
+    (draw % the wired EDAC memories, in enum order sdram/cache/rotbuf;
+    the BRAM is never drawn: it has no EDAC and no record to observe,
+    D-Uh — the plan's burst note said "across sdram/cache"; the device
+    side covers the three EDAC memories and the catalogue/probe text
+    says so), the **word** (draw % extent, 4-aligned; the extent is the
+    backing region's size for sdram/cache, the ring bytes for rotbuf),
+    the **bit** (draw % 32 → mask 1u<<bit, so every drawn upset is a
+    one-bit SEU; `mode`/`persist` are not reachable — one-shot SEUs).
+    Every draw consumes the state, a skipped attempt included. A word
+    already poisoned is skipped (D-Ug) and the attempt's three draws
+    are spent; the burst gives up after 1024 attempts with the placed
+    count named in the error. The refusals (count 0, seed 0, a count
+    over the free table slots — all-or-nothing like `edac-enable`'s
+    masks, no memory wired) change nothing. `random-count` is
+    write-only like the upset verbs (the burst fires on the set);
+    **check bits:** the model stores only the 32-bit data word — the
+    EDAC check bits are implicit in the correction machinery, so every
+    drawn bit is a data bit by construction and there is no check-bit
+    storage to exclude. A drawn upset arms through
+    `stix_edac_poison_arm()`, the shared tail of `upset-inject` (no
+    second implementation): same overlays, same counters, same
+    `stix_edac_inject` traces, no new trace events (D-Ug's three-event
+    set). A repeat of the same seed skips the words it already poisoned
+    (the skip rule) and continues the draw sequence into fresh ones —
+    n repeats arm n×count upsets on an uncleaned table (the pinned
+    contract is the draw sequence; the placements are it minus the
+    already-poisoned words, in order); random sdram upsets may land in
+    code words and correct silently on the next fetch (a real EDAC
+    behaviour, SECDED corrects instruction fetches).
+  - **The `hw-state.edac` section (D-PLo):** one accessor
+    `stix_edac_hw_state(StixEdac *e, QDict *root)` builds the section —
+    the same JSON as `upsets-active` (the armed poisons plus the
+    per-memory counters); `upsets-active` itself is now a thin wrapper
+    over it. Pure like every section (reads the table and the counters,
+    touches nothing, never traces); the stixctrl getter appends it
+    after `det`. **The root `schema` is bumped 1 → 2** (the layout
+    changed; the SPW hw-state stays at 1) — the declared impact, and
+    `test_ctrl_hw_state`'s assert moved with it. Nothing else consumes
+    the value (the controller's `leaves_from_hw` walks named sections
+    and ignores the new one).
+  - **The catalogue:** the eight rows of the fault table are entries in
+    `faults-v1.json`, `class: memory`, `changes: truth`, with the qom
+    action on the real path `/machine/stixctrl/edac`, property
+    `upset-inject`. Three deviations from the plan's one-line sketch,
+    all forced by the loader's schema: the action key is **`path`**
+    (the loader's name; the plan wrote `target`, which is the entry's
+    own state-tree key); the fixed upset rides as a **string `value`**
+    (`"cache,0xE0180040,0x1"` — the qom action's params are
+    integer-only, so the word cannot be built from params), which
+    needed one line in `faults.py` widening the qom `value` to
+    `(int, str)` with self-test coverage and the fake QEMU's
+    `upset-inject` in its SETTABLE; and the entries are **one-shot
+    events** (`transient` for the sdram/cache/rotbuf rows, `permanent`
+    for the bram rows — the `obt.jump` precedent), `reversible: false`:
+    the generic qom action can undo only the property it set and
+    `upset-clear` is a different property, so the plan table's
+    "reversible" is the *device's* (upset-clear, a rewrite, the first
+    corrected read), not the platform's. Each entry carries a dead but
+    required `"clear": 0` (without an action `clear` the apply saves
+    the prior with a qom-get, and `upset-inject` is write-only; the
+    undo never runs for a one-shot fault). The fixed words: the
+    `memory.sdram.ded` catalogue row injects a **data word, never
+    code** (M-3's rule, carried in its preconditions). The
+    `memory.random.burst` convenience entry is **not added**: one qom
+    action sets one property and the burst needs seed+count; the plan's
+    "the platform track may fold it into a scenario step" stands, and
+    the probe recipes cover the manual flow. `platform.md`'s v1-entries
+    note gained the sentence.
+  - **Probe recipes** in `ground-station.md` under Fault injection
+    (short, the file's table style): the EDAC properties, the
+    reset/persistence semantics, a `qom_get` companion for the existing
+    `qom_set` helper, and five probes (cache DED → SID2, sdram DED →
+    trap/reboot/0x0022 with the `-no-reboot` caveat, SEU with the
+    0x542F-period caveat, the seeded burst, `-S` + qom-set + `cont` for
+    an upset present from boot). No gate claims: the rows stay [L]
+    until the M-6b probe run confirms them.
+  - qtests (in `stix_edac_register()`, one-line RED story each):
+    `edac-random` (red-by-construction on M-5: the properties do not
+    exist, the qom-set is refused and nothing arms — the test carries a
+    reference implementation of the pinned draw, including the skip
+    rule, and checks every record of three bursts through
+    upsets-active plus the three refusals), `edac-hw-state`
+    (red-by-construction on M-5: the section does not exist — the
+    section shape, the upsets-active equality, the purity equality).
+    Gate impact: none uninjected (the getter is pure, the properties
+    are inert until set, no new trace events).
 
 ### M-7: docs
 - `accepted-diffs.md`: heading **"Accepted diff: memory upsets and

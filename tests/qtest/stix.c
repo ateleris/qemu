@@ -9017,10 +9017,11 @@ static off_t plat_file_size(const char *path)
 
 /*
  * D-PLo: /machine/stixctrl hw-state is a read-only JSON string (schema
- * 1) that follows hkCmdSta (enables, POWERSTAT), idefxConfig (quarter
- * power), an injection (truth = the pre-injection value, presented =
- * the injected one), the last conversion, a protection trip, the
- * watchdog and the SCET with its UNSYNCED flag. Reading it is free of
+ * 2 since the M-6a edac section) that follows hkCmdSta (enables,
+ * POWERSTAT), idefxConfig (quarter power), an injection (truth = the
+ * pre-injection value, presented = the injected one), the last
+ * conversion, a protection trip, the watchdog and the SCET with its
+ * UNSYNCED flag. Reading it is free of
  * side effects: two reads with no clock_step in between are equal, and
  * no stixctrl_io_read or stixspw_io_read trace fires while the getters
  * run (the CTRL read handler stores into reg on every read). RED before
@@ -9044,10 +9045,10 @@ static void test_ctrl_hw_state(void)
                             "-D %s", log);
     qts = plat_qtest_new(extra);
 
-    /* a. JSON, schema 1, with the virtual time */
+    /* a. JSON, schema 2 (M-6a's edac section), with the virtual time */
     st = plat_hw_state(qts, ctrl);
     g_assert(st != NULL);
-    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 1);
+    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 2);
     g_assert(qdict_haskey(st, "vclock_ns"));
     sup = plat_dict(st, "supplies");
     g_assert_cmpint(qdict_get_int(sup, "enables"), ==, 0);
@@ -14106,6 +14107,311 @@ static void test_edac_bram_reject(void)
     stix_qtest_cleanup();
 }
 
+/* ---- seeded random upsets and the hw-state section (plan M-6a) ---- */
+
+/*
+ * The pinned xorshift32 (Marsaglia's 13/17/5) and the draw order of
+ * random-seed/random-count, mirrored from stix_edac.c: per upset one
+ * draw picks the memory uniformly among the wired EDAC memories (in
+ * this order; never bram), one the 4-aligned word uniformly in the
+ * memory's extent, one the bit. The state restarts from the seed at
+ * every burst.
+ */
+static uint32_t edac_rand_ref(uint32_t *state)
+{
+    uint32_t x = *state;
+
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static const struct {
+    const char *name;
+    uint32_t base, words;
+} edac_random_mems[] = {
+    { "sdram",  0x40000000u, 0x800000u },   /* -m 32M / 4 */
+    { "cache",  0xE0000000u, 0x80000u },    /* the 2 MB SRAM / 4 */
+    { "rotbuf", 0x00000000u, 0x4000u  },    /* 128 blocks * 512 B / 4 */
+};
+
+/* one attempt of the burst: three draws (memory, word, bit) */
+static void edac_random_draw(uint32_t *state, unsigned *mi, uint32_t *addr,
+                             uint32_t *mask)
+{
+    unsigned bit;
+
+    *mi = edac_rand_ref(state) % ARRAY_SIZE(edac_random_mems);
+    *addr = edac_random_mems[*mi].base +
+            (edac_rand_ref(state) % edac_random_mems[*mi].words) * 4u;
+    bit = edac_rand_ref(state) % 32;
+    *mask = 1u << bit;
+}
+
+/*
+ * The reference burst, mirroring stix_edac.c's skip rule: an attempt
+ * whose word is already placed — the @n_prior records before this
+ * burst's, or one of the burst's own — is skipped and its three draws
+ * are spent; the burst gives up after 1024 attempts.
+ */
+static void edac_random_burst(uint32_t seed, unsigned count,
+                              uint32_t addr[], uint32_t mask[],
+                              const char *mem[], unsigned n_prior)
+{
+    uint32_t state = seed;
+    unsigned placed = 0, draws = 0;
+
+    while (placed < count && draws < 1024) {
+        unsigned mi, i, n = n_prior + placed;
+        uint32_t a, m;
+
+        edac_random_draw(&state, &mi, &a, &m);
+        draws++;
+        for (i = 0; i < n; i++) {
+            if (mem[i] == edac_random_mems[mi].name && addr[i] == a) {
+                break;
+            }
+        }
+        if (i < n) {
+            continue;
+        }
+        mem[n] = edac_random_mems[mi].name;
+        addr[n] = a;
+        mask[n] = m;
+        placed++;
+    }
+    /* the test's extents and counts never exhaust the attempts */
+    g_assert_cmpuint(placed, ==, count);
+}
+
+/*
+ * /sparc/stix/edac-random (M-6a, D-Ug): random-seed + random-count draw
+ * exactly the pinned sequence — the reference burst above recomputes it
+ * and every record is checked through upsets-active. A second burst of
+ * the same seed skips the words it already poisoned and continues the
+ * sequence into fresh ones; after an upset-clear the same seed draws
+ * the first burst again. The refusals (seed 0, count 0, a count that
+ * does not fit the table) change nothing. Red-by-construction on M-5:
+ * the properties do not exist, the qom-set is refused and nothing arms.
+ */
+static void test_edac_random(void)
+{
+    const uint32_t seed = 0x1234ABCDu;
+    const unsigned count = 5;
+    QTestState *qts = stix_qtest_new_extra(
+        "-m 32M -global grlib-stixctrl.rotb-blocks=128");
+    static const char *const names[] = { "sdram", "cache", "rotbuf" };
+    uint32_t addr[16], mask[16];
+    const char *mem[16];
+    g_autofree char *json = NULL;
+    QDict *act, *counters;
+    QList *poisons;
+    bool ok;
+    unsigned i, injected = 0;
+
+    /*
+     * The reference generator itself is pinned to canonical xorshift32
+     * (13/17/5) outputs computed independently (outside this file), so a
+     * misreading shared by the model and edac_rand_ref cannot pass.
+     */
+    {
+        uint32_t st = seed;
+
+        g_assert_cmphex(edac_rand_ref(&st), ==, 0x6EE4450Bu);
+        g_assert_cmphex(edac_rand_ref(&st), ==, 0x2EEF9309u);
+        g_assert_cmphex(edac_rand_ref(&st), ==, 0x4D55748Eu);
+    }
+
+    /* seed 0 (the default) is off */
+    g_assert_false(stix_qom_set_u64(qts, EDAC_EDAC_PATH, "random-count",
+                                    count));
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_null(strstr(json, "\"memory\""));
+
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH, "random-seed",
+                                   seed));
+    g_assert_cmpuint(stix_qom_get_u64(qts, EDAC_EDAC_PATH, "random-seed",
+                                      &ok), ==, seed);
+    g_assert_true(ok);
+
+    /* count 0 and a count that does not fit the table are refused */
+    g_assert_false(stix_qom_set_u64(qts, EDAC_EDAC_PATH, "random-count",
+                                    0));
+    g_assert_false(stix_qom_set_u64(qts, EDAC_EDAC_PATH, "random-count",
+                                    300));      /* the table holds 256 */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    g_assert_null(strstr(json, "\"memory\""));
+
+    /* the burst: exactly the reference records, all one-bit SEUs */
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH, "random-count",
+                                   count));
+    edac_random_burst(seed, count, addr, mask, mem, 0);
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    act = qobject_to(QDict, qobject_from_json(json, &error_abort));
+    poisons = qdict_get_qlist(act, "poisons");
+    for (i = 0; i < count; i++) {
+        QDict *rec = qobject_to(QDict, plat_list_nth(poisons, i));
+
+        g_assert_nonnull(rec);
+        g_assert_cmpstr(qdict_get_str(rec, "memory"), ==, mem[i]);
+        g_assert_cmpuint(qdict_get_int(rec, "address"), ==, addr[i]);
+        g_assert_cmpuint(qdict_get_int(rec, "mask"), ==, mask[i]);
+        g_assert_cmpstr(qdict_get_str(rec, "mode"), ==, "seu");
+        g_assert(!qdict_get_bool(rec, "persist"));
+    }
+    g_assert(plat_list_nth(poisons, count) == NULL);
+
+    /* the counters moved by five, the BRAM has none */
+    counters = qdict_get_qdict(act, "counters");
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        QDict *c = qdict_get_qdict(counters, names[i]);
+
+        g_assert_nonnull(c);
+        injected += qdict_get_int(c, "injected");
+        g_assert_cmpuint(qdict_get_int(c, "corrected"), ==, 0);
+        g_assert_cmpuint(qdict_get_int(c, "detected"), ==, 0);
+    }
+    g_assert_cmpuint(injected, ==, count);
+    g_assert_null(qdict_get_qdict(counters, "bram"));
+    qobject_unref(act);
+
+    /*
+     * the same seed draws the same sequence again: the five words it
+     * poisoned are skipped (D-Ug) and the burst continues into fresh
+     * ones, records count..2*count - 1 of the draw sequence
+     */
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH, "random-count",
+                                   count));
+    edac_random_burst(seed, count, addr, mask, mem, count);
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    act = qobject_to(QDict, qobject_from_json(json, &error_abort));
+    poisons = qdict_get_qlist(act, "poisons");
+    for (i = 0; i < 2 * count; i++) {
+        QDict *rec = qobject_to(QDict, plat_list_nth(poisons, i));
+
+        g_assert_nonnull(rec);
+        g_assert_cmpstr(qdict_get_str(rec, "memory"), ==, mem[i]);
+        g_assert_cmpuint(qdict_get_int(rec, "address"), ==, addr[i]);
+        g_assert_cmpuint(qdict_get_int(rec, "mask"), ==, mask[i]);
+    }
+    g_assert(plat_list_nth(poisons, 2 * count) == NULL);
+    counters = qdict_get_qdict(act, "counters");
+    injected = 0;
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        injected += qdict_get_int(qdict_get_qdict(counters, names[i]),
+                                  "injected");
+    }
+    g_assert_cmpuint(injected, ==, 2 * count);
+    qobject_unref(act);
+
+    /* after an upset-clear the same seed draws the first burst again */
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-clear",
+                                   "all"));
+    g_assert_true(stix_qom_set_u64(qts, EDAC_EDAC_PATH, "random-count",
+                                   count));
+    edac_random_burst(seed, count, addr, mask, mem, 0);
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    act = qobject_to(QDict, qobject_from_json(json, &error_abort));
+    poisons = qdict_get_qlist(act, "poisons");
+    for (i = 0; i < count; i++) {
+        QDict *rec = qobject_to(QDict, plat_list_nth(poisons, i));
+
+        g_assert_nonnull(rec);
+        g_assert_cmpstr(qdict_get_str(rec, "memory"), ==, mem[i]);
+        g_assert_cmpuint(qdict_get_int(rec, "address"), ==, addr[i]);
+        g_assert_cmpuint(qdict_get_int(rec, "mask"), ==, mask[i]);
+    }
+    g_assert(plat_list_nth(poisons, count) == NULL);
+    qobject_unref(act);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * /sparc/stix/edac-hw-state (M-6a, D-Ug/D-PLo): the stixctrl hw-state
+ * carries the edac section — the same JSON as upsets-active, through
+ * the one accessor. Pure like every section: two reads with no
+ * clock_step in between are byte-equal, and an armed upset shows the
+ * same record and counters in both faces. Red-by-construction on M-5:
+ * the section does not exist.
+ */
+static void test_edac_hw_state(void)
+{
+    static const char *const names[] = { "sdram", "cache", "rotbuf" };
+    static const char *const ck[] = { "injected", "corrected", "detected" };
+    QTestState *qts = stix_qtest_new();
+    g_autofree char *a = NULL, *b = NULL, *json = NULL;
+    QDict *st, *edac, *counters, *act, *rec;
+    QList *poisons;
+    unsigned i, k;
+
+    /* empty at reset, with the three counters and no bram */
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    edac = plat_dict(st, "edac");
+    poisons = qdict_get_qlist(edac, "poisons");
+    g_assert_nonnull(poisons);
+    g_assert(plat_list_nth(poisons, 0) == NULL);
+    counters = plat_dict(edac, "counters");
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        QDict *c = plat_dict(counters, names[i]);
+
+        g_assert_cmpuint(qdict_get_int(c, ck[0]), ==, 0);
+        g_assert_cmpuint(qdict_get_int(c, ck[1]), ==, 0);
+        g_assert_cmpuint(qdict_get_int(c, ck[2]), ==, 0);
+    }
+    g_assert_null(qdict_get_qdict(counters, "bram"));
+    qobject_unref(st);
+
+    /* an armed upset shows in the section ... */
+    qtest_writel(qts, 0xE0180040u, 0x12345678u);
+    g_assert_true(stix_qom_set_str(qts, EDAC_EDAC_PATH, "upset-inject",
+                                   "cache,0xE0180040,0x1"));
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    edac = plat_dict(st, "edac");
+    poisons = qdict_get_qlist(edac, "poisons");
+    rec = qobject_to(QDict, plat_list_nth(poisons, 0));
+    g_assert_nonnull(rec);
+    g_assert_cmpstr(qdict_get_str(rec, "memory"), ==, "cache");
+    g_assert_cmpuint(qdict_get_int(rec, "address"), ==, 0xE0180040u);
+    g_assert_cmpuint(qdict_get_int(rec, "mask"), ==, 1);
+    g_assert_cmpstr(qdict_get_str(rec, "mode"), ==, "seu");
+    g_assert_cmpuint(qdict_get_int(plat_dict(plat_dict(edac, "counters"),
+                                             "cache"), ck[0]), ==, 1);
+    qobject_unref(st);
+
+    /* ... exactly as in upsets-active (the same JSON, D-Ug) */
+    json = stix_qom_get_str(qts, EDAC_EDAC_PATH, "upsets-active");
+    act = qobject_to(QDict, qobject_from_json(json, &error_abort));
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    edac = plat_dict(st, "edac");
+    g_assert(plat_list_nth(qdict_get_qlist(act, "poisons"), 0) != NULL);
+    g_assert(plat_list_nth(qdict_get_qlist(edac, "poisons"), 0) != NULL);
+    g_assert(plat_list_nth(qdict_get_qlist(act, "poisons"), 1) == NULL);
+    g_assert(plat_list_nth(qdict_get_qlist(edac, "poisons"), 1) == NULL);
+    for (i = 0; i < ARRAY_SIZE(names); i++) {
+        QDict *c = plat_dict(plat_dict(act, "counters"), names[i]);
+        QDict *h = plat_dict(plat_dict(edac, "counters"), names[i]);
+
+        for (k = 0; k < 3; k++) {
+            g_assert_cmpuint(qdict_get_int(c, ck[k]), ==,
+                             qdict_get_int(h, ck[k]));
+        }
+    }
+    qobject_unref(st);
+    qobject_unref(act);
+
+    /* pure: two reads with no clock_step in between are byte-equal */
+    a = plat_hw_state_str(qts, "/machine/stixctrl");
+    b = plat_hw_state_str(qts, "/machine/stixctrl");
+    g_assert_cmpstr(a, ==, b);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_edac_register(void)
 {
     qtest_add_func("/sparc/stix/edac-reg-reset", test_edac_reg_reset);
@@ -14148,6 +14454,8 @@ static void stix_edac_register(void)
     qtest_add_func("/sparc/stix/edac-bram-wdt", test_edac_bram_wdt);
     qtest_add_func("/sparc/stix/edac-bram-flip", test_edac_bram_flip);
     qtest_add_func("/sparc/stix/edac-bram-reject", test_edac_bram_reject);
+    qtest_add_func("/sparc/stix/edac-random", test_edac_random);
+    qtest_add_func("/sparc/stix/edac-hw-state", test_edac_hw_state);
 }
 
 int main(int argc, char **argv)

@@ -2343,13 +2343,30 @@ def t_fault_model(env):
                              0xFFFFFFFF]], "qom fault sets %r" % sets[-2:])
     finally:
         ctl.shutdown()
+    # the memory-upset entries (M-6a) ride the qom action as strings:
+    # a one-shot event (no undo: upset-clear is a different property),
+    # and fault.clear refuses
+    ctl = env.controller()
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        ctl.command("fault.inject", {"id": "memory.cache.seu"})
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-1] == ["/machine/stixctrl/edac", "upset-inject",
+                           "cache,0xE0180040,0x1"],
+              "memory.cache.seu applies %r" % sets[-1])
+        e = raises(VerbError, ctl.command, "fault.clear",
+                   {"id": "memory.cache.seu"})
+        check(e.status == 409, "a transient memory fault clears to 409")
+    finally:
+        ctl.shutdown()
 
 
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
     cat = faults_mod.load()
-    check(len(cat["faults"]) >= 8, "v1 catalogue")
+    check(len(cat["faults"]) >= 16, "v1 catalogue + the memory upsets")
     for broken in ({"api": 1, "faults": {}},
                    {"api": 1, "faults": ["x"]},
                    {"api": 1, "faults": [dict(cat["faults"][0],

@@ -875,6 +875,86 @@ Notes:
   `damage-add` needs the `allow-reserved` qdev property to lift the
   rule, the sidecar has none.
 
+### Memory upsets (EDAC)
+
+Since M-6a the EDAC unit at `/machine/stixctrl/edac` injects bit upsets
+into the instrument's memories (plan
+`docs/stix-port/2026-11-12-memory-upset-plan.md`). One upset is one
+qom-set; the state is the unit's read-only `upsets-active` JSON and,
+since the same commit, the `edac` section of the `/machine/stixctrl`
+`hw-state` (the same JSON: the armed poisons plus the per-memory
+injected/corrected/detected counters).
+
+| QOM path | Property | Values | Effect |
+|---|---|---|---|
+| `/machine/stixctrl/edac` | `upset-inject` | `"memory,address,bitmask[,mode][,persist]"`; memory ∈ sdram, cache, rotbuf, bram | Arms one upset. rotbuf takes `"block:offset"` as the address; bram takes an absolute address in 0xE0200000+0x400 and flips the four bytes at once. A rejected set is a QMP error and changes nothing. |
+| `/machine/stixctrl/edac` | `upset-clear` | `"all"`, or an index into upsets-active | Disarms poisons (a BRAM flip has nothing to clear: a rewrite cures the cell). |
+| `/machine/stixctrl/edac` | `upsets-active` | read-only JSON | The armed poisons and the counters. |
+| `/machine/stixctrl/edac` | `random-seed`, `random-count` | uint32 | Setting `random-count` fires one burst of count one-bit upsets drawn from the seed (xorshift32; the same seed always draws the same words; 0 = off). |
+| `/machine/stixctrl/edac` | `edac-enable` | `"all-on"`, or a mask (1 sdram, 2 cache, 4 rotb) | Sets the Edacon bits a software write could set — the ASW never does it, so sdram/rotbuf probes need this (or `edac-at-boot=all-on` as a `-global` at boot). |
+| `/machine/stixctrl` | `hw-state` | read-only JSON | The `edac` section (upsets-active's JSON) since M-6a. |
+
+**Reset:** unlike `adc-inject[N]`, upsets survive a system reset (a
+reboot does not heal a cell) and die only at a power cycle. String
+values are one JSON string each:
+`qom_set $RUN/qmp.sock /machine/stixctrl/edac upset-inject '"cache,0xE0180040,0x3"'`.
+To read, use the same function with `qom-get`:
+
+```bash
+qom_get() {  # qom_get <socket> <QOM path> <property>
+    python3 - "$@" <<'EOF'
+import json, socket, sys
+sock, path, prop = sys.argv[1:]
+s = socket.socket(socket.AF_UNIX)
+s.connect(sock)
+f = s.makefile("rw")
+f.readline()
+for cmd in ({"execute": "qmp_capabilities"},
+            {"execute": "qom-get", "arguments": {"path": path,
+                                                 "property": prop}}):
+    f.write(json.dumps(cmd) + "\n")
+    f.flush()
+    while "event" in (reply := json.loads(f.readline())):
+        pass
+print(json.dumps(reply))
+EOF
+}
+
+qom_get $RUN/qmp.sock /machine/stixctrl/edac upsets-active
+qom_get $RUN/qmp.sock /machine/stixctrl hw-state
+```
+
+**Probes** (the fault-injection QMP setup above; start the probes in
+SAFE or CONFIGURATION, never in NOMINAL — an SDRAM trap reboots):
+
+- **CACHE double error** — works from boot (Edacon resets on):
+  `upset-inject` = `"cache,0xE0180044,0x3"`. Expected: SID2 (0x5A4,
+  TM(3,25)) status1 bits 2:0 = 1 on the next HK cycle (64 s cadence),
+  then reset every cycle; `hw-state.edac` counters.cache.detected = 1
+  and the poison retired (one-shot).
+- **SDRAM double error → trap and reboot** — `edac-enable` = `"all-on"`
+  first, then `upset-inject` = `"sdram,0x40002000,0x3"` (a data word,
+  never code). Expected: the UART prints `Unexpected trap (0x09)` and
+  forces the watchdog. `run-qemu-gs.sh` passes `-no-reboot`, so QEMU
+  stops at that reset; under the platform controller (warm resets) the
+  FSW reboots and the boot event 0x0022 follows, with the failing
+  address in the WDT's BRAM boot record.
+- **Single-bit (SEU)** — `upset-inject` = `"cache,0xE0180040,0x1"`: the
+  next read of that word returns the corrected value and
+  `hw-state.edac` counters.cache.corrected moves. TM(5,2) 0x542F comes
+  only after the report period (default 1000 s,
+  `E_EDAC_SEU_REPORT_PERIOD_S`; [L], Q4).
+- **Seeded burst** — `random-seed` = 305419896, then `random-count` =
+  10: ten one-bit upsets across sdram/cache/rotbuf, the same draw
+  sequence for every run of the same seed; watch `hw-state.edac`.
+  Repeating `random-count` skips the words it already poisoned and
+  continues into fresh ones (clear first with `upset-clear` all for a
+  replay of the same words).
+- **An upset present from boot** — start QEMU paused (`-S`, added by
+  hand to the QEMU command line), qom-set the upset, `cont`. CACHE
+  needs nothing (Edacon's reset value is on); for sdram/rotbuf also
+  pass `-global stix-edac.edac-at-boot=all-on` before QEMU starts.
+
 ## Notes and limits
 
 - **Order doesn't matter.** The bridge retries the QEMU connection. QEMU

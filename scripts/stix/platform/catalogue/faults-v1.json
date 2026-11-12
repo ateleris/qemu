@@ -202,6 +202,108 @@
                 "param": "offset"},
      "preconditions": [
        "visible on AX too; 800 with the ATT_C line armed trips 0x9434"],
+     "expected_detection": []},
+    # The memory upsets (the 2026-11-12 memory-upset plan, M-6a): one
+    # qom-set of /machine/stixctrl/edac "upset-inject" per inject, the
+    # fixed word riding as the string value. They are one-shot events
+    # (the obt.jump precedent): the generic qom action can undo only the
+    # property it set, and the poison's clear is the device's own
+    # upset-clear verb — the table's "reversible" is the device's, not
+    # the platform's. "clear" is dead but required: without it the apply
+    # would save the prior with a qom-get, and upset-inject is
+    # write-only. A seeded burst across the memories is the device's
+    # random-seed/random-count (one action sets one property, so there
+    # is no entry for it; see the plan's ground-station recipes).
+    {"id": "memory.cache.seu", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.cache", "mode": "seu", "params": {},
+     "persistence": "transient", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "cache,0xE0180040,0x1", "clear": 0},
+     "preconditions": [],
+     "expected_detection": [
+       {"tm": "0x5A7:5:2:542f", "within_s": 1100,
+        "note": "corrected on read (cacheCmdSta SECCOUNT++); the periodic SEU report after E_EDAC_SEU_REPORT_PERIOD_S (default 1000 s, Q4)"}]},
+    {"id": "memory.cache.ded", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.cache", "mode": "ded", "params": {},
+     "persistence": "transient", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "cache,0xE0180044,0x3", "clear": 0},
+     "preconditions": [],
+     "expected_detection": [
+       {"tm": "0x5A4:3:25", "within_s": 130,
+        "note": "SID2 status1 bits 2:0 = 1 on the next HK cycle (64 s cadence), then reset every cycle; DEDETECTED is cleared by the ISR's EDAC_reset"}]},
+    {"id": "memory.sdram.seu", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.sdram", "mode": "seu", "params": {},
+     "persistence": "transient", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "sdram,0x40001000,0x1", "clear": 0},
+     "preconditions": [
+       "Edacon on: edac-enable all-on over QMP, or -global stix-edac.edac-at-boot=all-on (the reset default is off)"],
+     "expected_detection": [
+       {"tm": "0x5A7:5:2:542f", "within_s": 1100,
+        "note": "corrected on read (edac SECCOUNT++); the periodic SEU report, the SDRAM slot only with Edacon on"}]},
+    {"id": "memory.sdram.ded", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.sdram", "mode": "ded", "params": {},
+     "persistence": "transient", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "sdram,0x40002000,0x3", "clear": 0},
+     "preconditions": [
+       "Edacon on (as memory.sdram.seu); with Edacon off the flipped word is returned raw",
+       "the address is a data word, never code (an instruction fetch with Edacon on does not trap in the model)"],
+     "expected_detection": [
+       {"tm": "0x5A7:5:1:0022", "within_s": 150,
+        "note": "trap 0x09 (the UART prints Unexpected trap) forces the watchdog; the next boot reports 0x0022 (with -no-reboot QEMU stops at the reset instead)"}]},
+    {"id": "memory.rotbuf.seu", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.rotbuf", "mode": "seu", "params": {},
+     "persistence": "transient", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "rotbuf,0:0,0x1", "clear": 0},
+     "preconditions": [
+       "Edacon on (as memory.sdram.seu)"],
+     "expected_detection": [
+       {"tm": "0x5A7:5:2:542f", "within_s": 1100,
+        "note": "corrected on read (rotbCmdSta SECCOUNT++); the periodic SEU report, the ROTBUF slot only with Edacon on"}]},
+    {"id": "memory.rotbuf.ded", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.rotbuf", "mode": "ded", "params": {},
+     "persistence": "transient", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "rotbuf,1:0,0x3", "clear": 0},
+     "preconditions": [
+       "Edacon on (as memory.sdram.seu)"],
+     "expected_detection": [
+       {"tm": "0x5A4:3:25", "within_s": 130,
+        "note": "SID2 status1 bits 5:3 = 1 on the next HK cycle; the accumulator task skips exactly the block"}]},
+    {"id": "memory.bram.flip", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.bram", "mode": "flip", "params": {},
+     "persistence": "permanent", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "bram,0xE02003C3,0xFF000000", "clear": 0},
+     "preconditions": [
+       "silent: no EDAC, the flip is the bytes; the MemBram record (EDAC_reboot_module at 0xE02003C3) has no ASW reader (SuSW-only) - mechanism regression only"],
+     "expected_detection": []},
+    {"id": "memory.bram.wdt", "class": "memory",
+     "changes": "truth",
+     "target": "instrument.memory.bram", "mode": "flip", "params": {},
+     "persistence": "permanent", "reversible": false,
+     "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
+                "property": "upset-inject",
+                "value": "bram,0xE02000A8,0x1", "clear": 0},
+     "preconditions": [
+       "silent until the next boot: the WDT UNCHANGED_STORAGE record is read every boot (garbage sramTestResult or a spurious WDT_RESET_TRAP; [L], nothing formats it into TM yet), and the FSW clears the record after reading, so one boot only"],
      "expected_detection": []}
   ]
 }

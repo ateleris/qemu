@@ -48,6 +48,9 @@ CHANGES = ("truth", "presented")
 # sub-models such as the attenuator, and stixspw)
 QOM_PATH = re.compile(r"^/machine/(stixctrl[A-Za-z0-9_-]*"
                       r"(/[A-Za-z0-9_-]+)*|stixspw)$")
+# the qom value rides verbatim: an integer for the forcing-style
+# properties, a string for the EDAC upset verbs (upset-inject, M-6a of
+# the memory-upset plan)
 TRIGGERS = ("now", "at_sim")
 REQUIRED = ("id", "class", "changes", "target", "mode", "params",
             "persistence", "reversible", "action", "preconditions",
@@ -114,7 +117,7 @@ def validate(cat):
             _need(isinstance(act.get("property"), str) and
                   act["property"], "%s: qom property is not a string" % fid)
             _need(act.get("param") in f["params"] or
-                  (isinstance(act.get("value"), int) and
+                  (isinstance(act.get("value"), (int, str)) and
                    "param" not in act),
                   "%s: qom needs a param of the entry or a value" % fid)
             _need(isinstance(act.get("clear", 0), int), "%s: qom clear "

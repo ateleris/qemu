@@ -1413,7 +1413,8 @@ static void stixctrl_hw_state_line(QDict *lines, const char *name,
  * register, timer or IRQ is touched, so two reads with no virtual time
  * in between are equal. "schema" versions the layout; every index
  * names its space (ch = HK ADC channel, line = hkProtConfig selector,
- * quarter = idefxConfig bit).
+ * quarter = idefxConfig bit). Since M-6a the edac section carries the
+ * memory-upset state (D-Ug), which bumped the schema to 2.
  */
 static char *stixctrl_get_hw_state(Object *obj, Error **errp)
 {
@@ -1422,13 +1423,14 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     QDict *sup = qdict_new(), *lines = qdict_new();
     QDict *adc = qdict_new(), *prot = qdict_new(), *wdg = qdict_new();
     QDict *scet = qdict_new(), *det = qdict_new(), *model = qdict_new();
+    QDict *edac = qdict_new();
     QList *plines = qlist_new(), *qon = qlist_new();
     uint32_t cmdsta = stixctrl_hkcmdsta(s);
     uint32_t enables, good, sta, ch, line, q, coarse;
     uint16_t fine;
     GString *json;
 
-    qdict_put_int(root, "schema", 1);
+    qdict_put_int(root, "schema", 2);   /* M-6a: the edac section */
     qdict_put_int(root, "vclock_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     qdict_put_bool(model, "hk_adc", s->hk_adc);
@@ -1529,6 +1531,10 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
 
     /* A-3 (D-Ah): the attenuator's truth/presented/faults summary */
     qdict_put(root, "attenuator", stix_att_hw_state(&s->att));
+
+    /* M-6a (D-Ug): the EDAC upsets, the same JSON as upsets-active */
+    stix_edac_hw_state(&s->edac, edac);
+    qdict_put(root, "edac", edac);
 
     json = qobject_to_json(QOBJECT(root));
     return g_string_free(json, false);

@@ -21,6 +21,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev.h"
 #include "qom/object.h"
+#include "qobject/qdict.h"
 #include "system/memory.h"
 
 #define TYPE_STIX_EDAC "stix-edac"
@@ -136,6 +137,13 @@ struct StixEdac {
      */
     uint32_t ahbstat;
     MemoryRegion ahbstat_mr;
+
+    /*
+     * M-6a (D-Ug): the seed of the random bursts (xorshift32), 0 = off.
+     * The draw state is local to each burst, so a given seed always
+     * draws the same sequence; the qtest edac-random pins it.
+     */
+    uint32_t random_seed;
 };
 
 /*
@@ -253,5 +261,14 @@ MemoryRegion *stix_edac_ahbstat_mr(StixEdac *e);
  */
 void stix_edac_host_write(StixEdac *e, StixEdacModule m, hwaddr off,
                           hwaddr len);
+
+/*
+ * M-6a (D-Ug): the edac section of the stixctrl hw-state (D-PLo) — the
+ * same JSON as upsets-active (the armed poisons plus the per-memory
+ * injected/corrected/detected counters), built into @root. Pure: it
+ * reads the table and the counters and touches nothing, so two hw-state
+ * reads with no accesses in between are equal.
+ */
+void stix_edac_hw_state(StixEdac *e, QDict *root);
 
 #endif /* HW_SPARC_STIX_EDAC_H */

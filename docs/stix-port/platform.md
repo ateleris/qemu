@@ -343,7 +343,11 @@ The v1 entries (all on existing model hooks): `spw.link.disconnect`,
 `timecode.missing`, `timecode.wrong_value`, `obt.jump`,
 `keepalive.missing`, `power.dpu_1v5.undervoltage`,
 `thermal.psu.overtemp` and `hk_prot.det_c.overcurrent`. The
-attenuator's fault IDs are reserved in the catalogue's comments.
+attenuator's fault IDs are reserved in the catalogue's comments. The
+memory-upset track's `memory.*` entries (M-6a of
+`2026-11-12-memory-upset-plan.md`) ride the qom action on
+`/machine/stixctrl/edac` with string values (one-shot events; the
+device's own `upset-clear` is the undo).
 
 ## Timing
 

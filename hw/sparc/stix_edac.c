@@ -11,7 +11,9 @@
  * region: stix_edac_rotb_check runs where the CPU reads the 512 B block
  * window). Since M-5 the BRAM flips ride the inject verb but nothing
  * else: no EDAC, so the host bytes flip at inject time — no poison, no
- * counters, no status (D-Uh).
+ * counters, no status (D-Uh). Since M-6a the seeded random bursts
+ * (random-seed/random-count, D-Ug) ride the same arm path, and the
+ * hw-state accessor feeds the stixctrl's edac section (D-PLo).
  *
  * Traces only fire from the QOM verbs and actual intercepted accesses,
  * never at realize, reset or in a getter (D-Ug, D-Ai).
@@ -39,6 +41,13 @@
 /* D-Uk, ICD reset values (STIX-ICD-0026 txt:2119, txt:2202, txt:3249) */
 #define STIX_EDAC_BOOT_HW_RESET (1u << STIX_EDAC_CACHE)
 #define STIX_EDAC_BOOT_ALL_ON 0x7u
+/*
+ * M-6a (D-Ug): the burst give-up bound, counted in attempts (three
+ * draws each): 1024 attempts are far more than any placeable count
+ * (the table holds 256); exhaustion is only reachable when the drawn
+ * space is mostly poisoned already.
+ */
+#define STIX_EDAC_RANDOM_MAX_DRAWS 1024u
 
 bool stix_edac_boot_edacon(StixEdac *e, StixEdacModule m)
 {
@@ -697,57 +706,69 @@ void stix_edac_host_write(StixEdac *e, StixEdacModule m, hwaddr off,
 }
 
 /*
- * upsets-active (D-Ug): the armed poisons as records plus the per-memory
- * injected/corrected/detected counters. Pure: no state is touched, so
- * two reads with no accesses in between are equal.
+ * M-6a (D-Ug): the edac section of the stixctrl hw-state (D-PLo) — the
+ * same JSON as upsets-active, through this one accessor. Pure: no state
+ * is touched, so two hw-state reads with no accesses in between are
+ * equal, and nothing traces (a getter never traces, D-Ai).
  */
-static char *stix_edac_upsets_json(StixEdac *e)
+void stix_edac_hw_state(StixEdac *e, QDict *root)
 {
-    g_autoptr(QDict) root = qdict_new();
     QDict *counters = qdict_new();
     QList *poisons = qlist_new();
     StixEdacPoison *p;
     uint32_t i, id = 0;
-    GString *json;
     StixEdacModule m;
 
-    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
-        p = &e->poison[i];
-        if (!p->armed) {
-            continue;
-        }
-        QDict *rec = qdict_new();
+    if (e != NULL) {
+        for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+            p = &e->poison[i];
+            if (!p->armed) {
+                continue;
+            }
+            QDict *rec = qdict_new();
 
-        qdict_put_int(rec, "id", id++);
-        qdict_put_str(rec, "memory", stix_edac_mem_name[p->mem]);
-        qdict_put_int(rec, "address", p->addr);
-        if (p->mem == STIX_EDAC_ROTBUF) {
-            /* the rotbuf address in its grammar's terms (M-4) */
-            qdict_put_int(rec, "block", p->addr / STIXCTRL_BLOCK_SIZE);
-            qdict_put_int(rec, "offset", p->addr % STIXCTRL_BLOCK_SIZE);
+            qdict_put_int(rec, "id", id++);
+            qdict_put_str(rec, "memory", stix_edac_mem_name[p->mem]);
+            qdict_put_int(rec, "address", p->addr);
+            if (p->mem == STIX_EDAC_ROTBUF) {
+                /* the rotbuf address in its grammar's terms (M-4) */
+                qdict_put_int(rec, "block", p->addr / STIXCTRL_BLOCK_SIZE);
+                qdict_put_int(rec, "offset", p->addr % STIXCTRL_BLOCK_SIZE);
+            }
+            qdict_put_int(rec, "mask", p->mask);
+            qdict_put_str(rec, "mode", p->de ? "de" : "seu");
+            qdict_put_bool(rec, "persist", p->persist);
+            qlist_append(poisons, rec);
         }
-        qdict_put_int(rec, "mask", p->mask);
-        qdict_put_str(rec, "mode", p->de ? "de" : "seu");
-        qdict_put_bool(rec, "persist", p->persist);
-        qlist_append(poisons, rec);
+
+        for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
+            QDict *c;
+
+            /* the BRAM has no EDAC and no counters (M-5) */
+            if (m == STIX_EDAC_BRAM) {
+                continue;
+            }
+            c = qdict_new();
+            qdict_put_int(c, "injected", e->mems[m].injected);
+            qdict_put_int(c, "corrected", e->mems[m].corrected);
+            qdict_put_int(c, "detected", e->mems[m].detected);
+            qdict_put(counters, stix_edac_mem_name[m], c);
+        }
     }
     qdict_put(root, "poisons", poisons);
-
-    for (m = 0; m < STIX_EDAC_N_MODULE; m++) {
-        QDict *c;
-
-        /* the BRAM has no EDAC and no counters (M-5): nothing to report */
-        if (m == STIX_EDAC_BRAM) {
-            continue;
-        }
-        c = qdict_new();
-        qdict_put_int(c, "injected", e->mems[m].injected);
-        qdict_put_int(c, "corrected", e->mems[m].corrected);
-        qdict_put_int(c, "detected", e->mems[m].detected);
-        qdict_put(counters, stix_edac_mem_name[m], c);
-    }
     qdict_put(root, "counters", counters);
+}
 
+/*
+ * upsets-active (D-Ug): the armed poisons as records plus the per-memory
+ * injected/corrected/detected counters.
+ */
+static char *stix_edac_upsets_json(StixEdac *e)
+{
+    g_autoptr(QDict) root = qdict_new();
+    GString *json;
+
+    stix_edac_hw_state(e, root);
     json = qobject_to_json(QOBJECT(root));
     return g_string_free(json, false);
 }
@@ -779,6 +800,62 @@ static void stix_edac_bram_flip(StixEdac *e, hwaddr addr, uint32_t mask)
 }
 
 /*
+ * Arm one poison — the shared tail of upset-inject and random-count, so
+ * a drawn upset rides the exact inject path (D-Ug, no second
+ * implementation). A fresh event on an already poisoned word replaces
+ * its record (mask/mode/persist, counted as a fresh injected, allowed
+ * with a full table); otherwise the first free slot.
+ */
+static bool stix_edac_poison_arm(StixEdac *e, const char *name,
+                                 StixEdacModule m, hwaddr addr,
+                                 uint32_t mask, bool de, bool persist,
+                                 Error **errp)
+{
+    uint32_t slot = STIX_EDAC_N_POISON;
+    bool replace = false;
+    uint32_t i;
+
+    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
+        StixEdacPoison *p = &e->poison[i];
+
+        if (p->armed && p->mem == m && p->addr == addr) {
+            slot = i;
+            replace = true;
+            break;
+        }
+        if (slot == STIX_EDAC_N_POISON && !p->armed) {
+            slot = i;
+        }
+    }
+    if (slot == STIX_EDAC_N_POISON) {
+        error_setg(errp, "%s: poison table full (%u upsets)", name,
+                   STIX_EDAC_N_POISON);
+        return false;
+    }
+    e->poison[slot] = (StixEdacPoison) {
+        .mem = m,
+        .addr = addr,
+        .mask = mask,
+        .de = de,
+        .persist = persist,
+        .armed = true,
+    };
+    if (e->mems[m].backing != NULL &&
+        !stix_edac_overlay_find(&e->mems[m],
+                                addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1))) {
+        stix_edac_overlay_add(e, m,
+                              addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1));
+    }
+    if (!replace) {
+        e->n_armed++;
+    }
+    e->mems[m].injected++;
+    trace_stix_edac_inject(stix_edac_mem_name[m], (uint32_t)addr, mask,
+                           de ? "de" : "seu");
+    return true;
+}
+
+/*
  * upset-inject (D-Ug): "memory,address,bitmask[,mode][,persist]" with
  * memory in {sdram,cache,rotbuf,bram}. rotbuf (M-4) takes
  * "<block>:<offset>" as its address — the block index into the ring
@@ -791,7 +868,8 @@ static void stix_edac_bram_flip(StixEdac *e, hwaddr addr, uint32_t mask)
  * record, no counters, no status, no mode and no persist (silent, D-Uh
  * — it survives a system reset and dies at power cycle). Unsupported or
  * unwired memories are rejected so a caller is never left with a
- * silently unarmed upset. A rejected set changes nothing.
+ * silently unarmed upset. A rejected set changes nothing. The arming
+ * itself is stix_edac_poison_arm, shared with random-count (M-6a).
  */
 static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
                                  void *opaque, Error **errp)
@@ -800,8 +878,8 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
     StixEdacModule m = STIX_EDAC_N_MODULE;
     char *str, **fields;
     uint64_t addr, mask;
-    bool de, persist = false, replace = false;
-    uint32_t i, slot = STIX_EDAC_N_POISON;
+    bool de, persist = false;
+    uint32_t i;
 
     if (!visit_type_str(v, name, &str, errp)) {
         return;
@@ -949,48 +1027,10 @@ static void stix_edac_inject_set(Object *obj, Visitor *v, const char *name,
         stix_edac_bram_flip(e, (hwaddr)addr, (uint32_t)mask);
         goto out;
     }
-    /*
-     * a fresh event on an already poisoned word replaces its record
-     * (allowed even with a full table, and not counted as a new armed
-     * poison); otherwise the first free slot
-     */
-    for (i = 0; i < STIX_EDAC_N_POISON; i++) {
-        StixEdacPoison *p = &e->poison[i];
-
-        if (p->armed && p->mem == m && p->addr == addr) {
-            slot = i;
-            replace = true;
-            break;
-        }
-        if (slot == STIX_EDAC_N_POISON && !p->armed) {
-            slot = i;
-        }
-    }
-    if (slot == STIX_EDAC_N_POISON) {
-        error_setg(errp, "%s: poison table full (%u upsets)", name,
-                   STIX_EDAC_N_POISON);
+    if (!stix_edac_poison_arm(e, name, m, addr, (uint32_t)mask, de, persist,
+                              errp)) {
         goto out;
     }
-    e->poison[slot] = (StixEdacPoison) {
-        .mem = m,
-        .addr = addr,
-        .mask = mask,
-        .de = de,
-        .persist = persist,
-        .armed = true,
-    };
-    if (e->mems[m].backing != NULL &&
-        !stix_edac_overlay_find(&e->mems[m],
-                                addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1))) {
-        stix_edac_overlay_add(e, m,
-                              addr & ~(hwaddr)(STIX_EDAC_PAGE_SIZE - 1));
-    }
-    if (!replace) {
-        e->n_armed++;
-    }
-    e->mems[m].injected++;
-    trace_stix_edac_inject(stix_edac_mem_name[m], addr, mask,
-                           de ? "de" : "seu");
 
 out:
     g_strfreev(fields);
@@ -1058,6 +1098,104 @@ static void stix_edac_upsets_get(Object *obj, Visitor *v, const char *name,
 
     visit_type_str(v, name, &str, errp);
     g_free(str);
+}
+
+/*
+ * M-6a (D-Ug): the seeded random bursts. The draw is xorshift32,
+ * Marsaglia's 13/17/5 triple
+ *     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+ * and the state restarts from random-seed at every random-count set, so
+ * a given seed always draws the same sequence (the qtest edac-random
+ * pins it; no host randomness, no timer — D-Ai). Seed 0 is off (D-Ug).
+ *
+ * Each upset costs three draws, in this order: the memory (uniform
+ * among the wired EDAC memories, in enum order sdram/cache/rotbuf —
+ * never the BRAM: it has no EDAC and no record to observe, D-Uh), the
+ * 4-aligned word (uniform in the memory's extent: the backing region's
+ * size, the ring bytes for ROTBUF), the bit (uniform 0..31, so every
+ * drawn upset is a one-bit SEU; the model stores only the 32-bit data
+ * word, the EDAC check bits are implicit in the correction machinery
+ * and cannot be drawn). A word already poisoned is skipped (D-Ug) and
+ * the attempt's three draws are spent. The burst places the upsets
+ * through stix_edac_poison_arm — the exact inject path.
+ */
+static uint32_t stix_edac_rand(uint32_t *state)
+{
+    uint32_t x = *state;
+
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static void stix_edac_random_set(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    static const StixEdacModule order[] = {
+        STIX_EDAC_SDRAM, STIX_EDAC_CACHE, STIX_EDAC_ROTBUF,
+    };
+    StixEdac *e = STIX_EDAC(obj);
+    StixEdacModule wired[ARRAY_SIZE(order)];
+    uint32_t count, placed = 0, draws = 0, state;
+    unsigned n_wired = 0, w;
+
+    if (!visit_type_uint32(v, name, &count, errp)) {
+        return;
+    }
+    if (count == 0) {
+        error_setg(errp, "%s: 0 injects nothing", name);
+        return;
+    }
+    if (e->random_seed == 0) {
+        error_setg(errp, "%s: random-seed is 0 (off): set a nonzero "
+                   "seed first", name);
+        return;
+    }
+    if (count > STIX_EDAC_N_POISON - e->n_armed) {
+        error_setg(errp, "%s: %u upsets do not fit the poison table "
+                   "(%u free of %u)", name, count,
+                   STIX_EDAC_N_POISON - e->n_armed, STIX_EDAC_N_POISON);
+        return;
+    }
+    for (w = 0; w < ARRAY_SIZE(order); w++) {
+        if (stix_edac_wired(e, order[w])) {
+            wired[n_wired++] = order[w];
+        }
+    }
+    if (n_wired == 0) {
+        error_setg(errp, "%s: no EDAC memory is wired in this machine",
+                   name);
+        return;
+    }
+    state = e->random_seed;
+    while (placed < count && draws < STIX_EDAC_RANDOM_MAX_DRAWS) {
+        StixEdacModule m = wired[stix_edac_rand(&state) % n_wired];
+        StixEdacMem *mem = &e->mems[m];
+        uint64_t size = m == STIX_EDAC_ROTBUF ? mem->ring_bytes
+                        : memory_region_size(mem->backing);
+        hwaddr wa = mem->base +
+            (hwaddr)(stix_edac_rand(&state) %
+                     (uint32_t)(size / STIX_EDAC_WORD_SIZE)) *
+            STIX_EDAC_WORD_SIZE;
+        uint32_t mask = 1u << (stix_edac_rand(&state) % 32);
+
+        draws++;
+        if (stix_edac_poison_get(e, m, wa) != NULL) {
+            continue;               /* already poisoned: skipped (D-Ug) */
+        }
+        /* the capacity was checked up front; a full table cannot happen */
+        if (!stix_edac_poison_arm(e, name, m, wa, mask, false, false, errp)) {
+            return;
+        }
+        placed++;
+    }
+    if (placed < count) {
+        error_setg(errp, "%s: placed %u of %u upsets in %u attempts "
+                   "(three draws each, all poisoned); upset-clear or "
+                   "reseed first", name, placed, count, draws);
+    }
 }
 
 /*
@@ -1312,6 +1450,27 @@ static void stix_edac_instance_init(Object *obj)
     object_property_set_description(obj, "upsets-active",
         "read-only JSON: the armed poisons and the per-memory "
         "injected/corrected/detected counters");
+
+    /*
+     * M-6a (D-Ug): the seeded random bursts. The seed is plain state
+     * (0 = off, D-Ug) and survives a reset like edac-at-boot; the count
+     * is a verb like the upset verbs (write-only: the burst fires on
+     * the set and leaves no count to read back).
+     */
+    object_property_add_uint32_ptr(obj, "random-seed", &e->random_seed,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "random-seed",
+        "the seed of the random upset bursts (xorshift32); "
+        "0 (the default) = off");
+    object_property_add(obj, "random-count", "uint32", &uint32_type_info,
+                        NULL, stix_edac_random_set, NULL, NULL);
+    object_property_set_description(obj, "random-count",
+        "inject count one-bit upsets drawn from random-seed (the "
+        "sequence restarts at every set; the qtest edac-random pins "
+        "it): per upset one draw picks the memory uniformly among the "
+        "wired EDAC memories (sdram, cache, rotbuf - never bram), one "
+        "the 4-aligned word uniform in its extent, one the bit; words "
+        "already poisoned are skipped");
 }
 
 static void stix_edac_class_init(ObjectClass *klass, const void *data)
