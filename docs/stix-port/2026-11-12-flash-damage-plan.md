@@ -1,6 +1,6 @@
 # Flash damage plan: bad blocks, broken cells and corrupted files as the FSW filesystem sees them
 
-Status: X-1, X-2 and X-3 implemented 2026-11-12 (see their "As built"
+Status: X-1 to X-4 implemented 2026-11-12 (see their "As built"
 notes); the rest is
 draft, 2026-11-12, revised the same day after the independent
 review (`.review-flashdmg.txt`, all 8 findings resolved — see "Review
@@ -886,6 +886,60 @@ detector/att smokes) at X-4/X-4b and before the merge.
 - Every [L] payload is confirmed by a probe run before it becomes an
   expectation (the Phases 3/4 pattern).
 - Gates: the full set plus flash-damage-smoke ±.
+- **As built (2026-11-12, commit X-4).** The live probe runs changed
+  the design in seven places; all of them are pinned live:
+  1. **File types and the spare byte.** The tool's type codes were the
+     header comments (context0 8, ...); the enum is sequential, so
+     context0 = 6, context1 = 7, lut = 8, flare = 4, user-requests = 5
+     (FSW finding F18). Context names carry the build's CONTEXT_VERSION
+     in the spare byte (0x22 on the AX gate ELF, 35 in the source), so
+     `show`/`corrupt-file` take `--spare any`.
+  2. **Flight BCH (FSW finding F19).** `encode_bch` byte-swaps every
+     32-bit word unconditionally (`BCH.c:300-310`), so on the LEON the
+     stored ECC is the standard BCH of the word-swapped sub-block, and
+     `BCH_decode` applies its fixes at swapped-stream indices: a real
+     error in byte b is "corrected" in byte b^3 (ok, fixes = 1, two
+     wrong bytes). Pinned by the master flash's stored header ECC and a
+     LEON-faithful build of `BCH.c` (`tests/bch13t7-leon-vector.txt`).
+     The tool's `bch_encode`/`bch_decode` are the flight forms; the
+     standard core stays pinned by the x86 vector. Consequence for the
+     outcome rows: a "correctable" flip is NOT corrected on flight — the
+     page reads back with the original error plus the mirrored one, and
+     the >= 4-corrections rewrite path stores the miscorrected data with
+     a fresh, valid ECC. The X-4b correctable flavour's expectations
+     need re-deriving from this before it graduates.
+  3. **Seed wait.** The NOMINAL-entry re-store frees the old blocks and
+     the model's erase deallocates them, so the file's allocation (du)
+     stays put; the seed waits on CONTEXT1's logicalWriteTime instead
+     (2 -> 4 live).
+  4. **Boot-time context damage is fatal (FSW finding F20)**, so the
+     boot part carries only the bad-block and the LUT legs (0x0032
+     bad=1), and the address and uncorrectable damage are two parts of
+     their own, `addr` and `stuck`. INIT waits for the FILE task's
+     context reads (`MemFilesystem.c:542-544`, `:1038-1051`) before
+     `TMBuffer_init` (`main.c:136-140`); the read error's 0x543B report
+     hits the uncreated TMBuffer semaphores -> ASSERT (`TMBuffer.c:276`)
+     -> Halting -> trap -> reset, every boot while the file is damaged.
+     Pinned: QEMU exits by itself under -no-reboot, the UART has the
+     read-error line ("address corrupt" / "Unrecoverable error in
+     file"), the TMBuffer ASSERT and no "init: TM buffer"; the ASSERT's
+     backtrace (0x543B in some frame) is printed only sometimes and is
+     reported, not pinned. The plan's "0x543B on the CONTEXT1 read" is
+     therefore unobservable as TM on any boot.
+  5. **Check page.** A context file is one page, so the store programs
+     page 0 only: the injection is page 0 of the first free CB0 block
+     (block 67 live), not page 2 (which never fired). The FSW marks the
+     failed block in pages 0 and 1 and the scan reads both.
+  6. **TC(238,6) is MAINTENANCE-only** (`TCVerifDynamic.c:97`; TM(1,8)
+     48301 "wrong operation mode" live in NOMINAL), and MAINTENANCE is
+     entered only from SAFE (`OpModeMgmt.c:86-95`): the check part goes
+     NOMINAL -> SAFE -> MAINTENANCE first.
+  7. **badBlockHandling = 0.** With 1 the check erases the grown-bad
+     block; a program-fail-only block erases fine, so it healed before
+     the reset (live: bad_after=1, then 0x0032 bad=0, block 67 all
+     0xFF). With 0: bad_after=1 and the second boot's 0x0032 bad 0 -> 1.
+  The QMP `damage-list` read-back is now actually requested (qom-get at
+  +36 s; the first version grepped for a read-back it never asked for).
 
 ### X-4b: framework-derived scenarios
 

@@ -95,10 +95,14 @@ RESERVED_BLOCKS = 64
 # sparse allocation cap, STIX_FLASH_MAX_ALLOC_KB (slot.sh:277,305-310)
 CAP_KB_DEFAULT = 65536
 
-# file types (FilesystemDefinition.h:80-92)
+# file types: the enum values of MemFilesystem_filetype_e
+# (FilesystemDefinition.h:81-92), which are sequential from FIRST = 0.
+# The header's per-line comments ("6 for FLARE", "8 for CONTEXT", ...)
+# do not match the enum; the master's stored context names (type bytes
+# 0x06 / 0x07) confirm the enum values.
 FILE_TYPES = {
-    "aspect": 1, "raw-counts": 2, "tmmgmt": 3, "flare": 6,
-    "user-requests": 7, "context0": 8, "context1": 9, "lut": 10,
+    "aspect": 1, "raw-counts": 2, "tmmgmt": 3, "flare": 4,
+    "user-requests": 5, "context0": 6, "context1": 7, "lut": 8,
 }
 
 
@@ -270,7 +274,7 @@ def _poly_eval(coefs, x):
     return acc
 
 
-def bch_encode(data):
+def _bch_encode_std(data):
     """The 12 parity bytes of one sub-block: parity = data(X) * X^ecc_bits
     mod g(X). Bit-serial division, MSB-first; the ecc_bits zero bits fed
     after the data are the X^ecc_bits shift of the systematic code, the
@@ -297,6 +301,36 @@ def bch_encode(data):
     return bytes(out)
 
 
+def word_swap(data):
+    """Reverse the bytes of every 32-bit word (len(data) % 4 == 0)."""
+    return b"".join(bytes(data[i:i + 4])[::-1] for i in range(0, len(data), 4))
+
+
+def bch_encode(data):
+    """The 12 ECC bytes the FLIGHT FSW stores for one sub-block. encode_bch
+    byte-swaps every aligned 32-bit word unconditionally (BCH.c:300-310, the
+    Linux cpu_to_be32 hard-coded for a little-endian host); on the
+    big-endian LEON that swap reverses each word, so the flight code word
+    is the standard BCH of word_swap(data), not of data (FSW finding F19).
+    Pinned by the master flash's stored header ECC and by a LEON-faithful
+    build of BCH.c (tests/bch13t7-leon-vector.txt). A sub-block is 528 B
+    and 4-aligned in the page buffer, so encode_bch always takes the
+    aligned path."""
+    return _bch_encode_std(word_swap(data))
+
+
+def bch_decode(data, recv_ecc):
+    """What the FLIGHT BCH_decode does with one sub-block: (ok, fixes,
+    data_fixes). ok/fixes are those of the swapped stream (the error count
+    does not depend on the byte order). data_fixes are the (byte, mask)
+    flips the FSW APPLIES to the unswapped buffer: BCH_decode uses errloc
+    as _data[errloc / 8] (BCH.c:1480-1486), a swapped-stream index, so a
+    real error in byte b is "corrected" in byte b ^ 3, same bit (F19). The
+    flips are therefore NOT the fix: apply them to model the flight result,
+    which keeps the original error and adds a mirrored one."""
+    return _bch_decode_std(word_swap(data), recv_ecc)
+
+
 def _parity_by_division(data):
     """The same parity by plain big-int carry-less division of
     data(X) * X^ecc_bits by g(X) - an implementation independent of the
@@ -315,7 +349,7 @@ def _parity_by_division(data):
     return reg.to_bytes(FILE_ECC_BCH_SIZE, "big")
 
 
-def bch_decode(data, recv_ecc):
+def _bch_decode_std(data, recv_ecc):
     """Mirror of BCH_decode (BCH.c:1464-1488) + decode_bch
     (BCH.c:1089-1148): re-encode the data, XOR with the stored ECC and
     locate the error positions. Returns (ok, fixes, data_fixes) where ok is
@@ -324,7 +358,7 @@ def bch_decode(data, recv_ecc):
     the data region (errors in the ECC region itself are counted but not
     applied, BCH.c:1481-1486)."""
     _bch_init()
-    calc = int.from_bytes(bch_encode(data), "big")
+    calc = int.from_bytes(_bch_encode_std(data), "big")
     recv = int.from_bytes(recv_ecc, "big")
     # the parity bits are MSB-aligned in the ECC bytes: drop the trailing
     # pad bits (not code bits, BCH.c:455-458); bit s of the result is
@@ -575,7 +609,13 @@ def block_page0_offset(lin_block):
     return file_offset(mcm, chip, bic * PAGES_PER_BLOCK)
 
 
-def scan_for_name(img, name):
+def _name_matches(stored, name, any_spare):
+    if any_spare:
+        return stored[0] == name[0] and stored[2:] == name[2:]
+    return stored == name
+
+
+def scan_for_name(img, name, any_spare=False):
     """Locate a stored file by its 10-byte name: a chunked spare-area scan
     of the FS regions, page 0 of every block (the FSW catalogs one file per
     block from the first page, File.c:318-404). Past-EOF blocks read as
@@ -595,7 +635,10 @@ def scan_for_name(img, name):
             continue                       # not a stored file's first page
         if aux[AUX_BAD_BLOCK_MARKER] != 0xFF:
             continue                       # the boot scan marks it BAD
-        if bytes(aux[AUX_FILE_NAME:AUX_FILE_NAME + FN_LENGTH]) == name:
+        stored = bytes(aux[AUX_FILE_NAME:AUX_FILE_NAME + FN_LENGTH])
+        if _name_matches(stored, name, any_spare):
+            if any_spare:
+                print("flash-damage: block %d holds %s" % (b, name_hex(stored)))
             hits.append(b)
     return hits
 
@@ -684,8 +727,8 @@ def op_bad_block(img, blocks, allow_reserved, fs_range=False):
 
 # ---- corrupt-file (D-X2/D-X4, review finding 5) --------------------------------
 
-def locate_file(img, name):
-    hits = scan_for_name(img, name)
+def locate_file(img, name, any_spare=False):
+    hits = scan_for_name(img, name, any_spare)
     if not hits:
         raise ToolError("file %s not found in the FS ranges (blocks "
                         "%d-%d and %d-%d)" % (name_hex(name),
@@ -865,8 +908,8 @@ def in_use_pages(img, lin_block):
     return pages
 
 
-def op_show(img, name):
-    lin_block = locate_file(img, name)
+def op_show(img, name, any_spare=False):
+    lin_block = locate_file(img, name, any_spare)
     mcm, chip, bic = block_split(lin_block)
     lin0 = linear_page0(lin_block)
     print("file %s: block %d (mcm %d chip %d block %d), pages:"
@@ -1121,20 +1164,24 @@ def _st_bch_section():
                 bytes((i * 7 + 3) & 0xFF
                       for i in range(FILE_ECC_SUBBLOCK_SIZE))]
     for p in patterns:
-        _st(bch_encode(p) == _parity_by_division(p),
+        _st(_bch_encode_std(p) == _parity_by_division(p),
             "encoder matches the independent polynomial division")
-    # decode: 1..7 flips are corrected at exactly the flipped bits (BCH
-    # bound, d_min >= 2t+1); a single flipped ECC byte is located too
+    # decode (the standard core): 1..7 flips are corrected at exactly the
+    # flipped bits (BCH bound, d_min >= 2t+1); a single flipped ECC byte is
+    # located too. The flight wrapper's mirrored fixes: _st_leon_vectors.
     data = patterns[4]
-    ecc = bch_encode(data)
+    ecc = _bch_encode_std(data)
     for k in (1, 2, 5, 7):
         flips = bit_flips(0, k)
-        ok, fixes, data_fixes = bch_decode(apply_flips(data, flips), ecc)
+        ok, fixes, data_fixes = _bch_decode_std(apply_flips(data, flips), ecc)
         _st(ok and fixes == k, "%d data flips decode with %d fixes" % (k, k))
         _st(sorted(data_fixes) == sorted(flips),
             "%d fixes land on the flipped bits" % k)
+        ok, fixes, _ = bch_decode(apply_flips(data, flips), bch_encode(data))
+        _st(ok and fixes == k,
+            "flight: %d data flips are counted as %d fixes" % (k, k))
     bad_ecc = bytes([ecc[0] ^ 0x80]) + ecc[1:]
-    ok, fixes, data_fixes = bch_decode(data, bad_ecc)
+    ok, fixes, data_fixes = _bch_decode_std(data, bad_ecc)
     _st(ok and fixes == 1 and data_fixes == [],
         "one flipped ECC bit is located and counted, the data untouched")
     # reference vector (D-X4): pinned when the fixture is committed;
@@ -1153,14 +1200,39 @@ def _st_bch_section():
         _st(len(data_v) == FILE_ECC_SUBBLOCK_SIZE
             and len(ecc_v) == FILE_ECC_BCH_SIZE,
             "vector '%s' has 528 data and 12 ecc bytes" % name)
-        _st(bch_encode(data_v) == ecc_v,
+        _st(_bch_encode_std(data_v) == ecc_v,
             "vector '%s' pins the encoder" % name)
-        ok, fixes, _ = bch_decode(data_v, ecc_v)
+        ok, fixes, _ = _bch_decode_std(data_v, ecc_v)
         _st(ok and fixes == 0, "vector '%s' decodes clean" % name)
         bad = bytes([ecc_v[0] ^ 0x01]) + ecc_v[1:]
-        ok, fixes, _ = bch_decode(data_v, bad)
+        ok, fixes, _ = _bch_decode_std(data_v, bad)
         _st(ok and fixes == 1,
             "vector '%s': a wrong ECC byte is caught, not ignored" % name)
+
+
+def _st_leon_vectors():
+    """F19: the flight encoder (word-swapped) against a LEON-faithful build
+    of BCH.c and a header sub-block the AX gate ELF wrote, and the flight
+    decoder's mirrored miscorrection."""
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "tests", "bch13t7-leon-vector.txt")
+    vecs = _parse_vectors(fixture)
+    _st(len(vecs) >= 2, "LEON vector file has the emulated and live vectors")
+    for name, data_v, ecc_v in vecs:
+        _st(bch_encode(data_v) == ecc_v,
+            "LEON vector '%s' pins the flight encoder" % name)
+        ok, fixes, _ = bch_decode(data_v, ecc_v)
+        _st(ok and fixes == 0, "LEON vector '%s' decodes clean" % name)
+    name, data_v, ecc_v = vecs[0]
+    _st(_bch_encode_std(data_v) != ecc_v,
+        "LEON vector '%s' differs from the standard (x86) ECC" % name)
+    for b, bit in ((0, 0), (1, 5), (4, 7), (523, 2)):
+        flipped = bytearray(data_v)
+        flipped[b] ^= 1 << bit
+        ok, fixes, dfx = bch_decode(bytes(flipped), ecc_v)
+        _st(ok and fixes == 1 and dfx == [(b ^ 3, 1 << bit)],
+            "flight decode of a flip at %d.%d returns ok with the mirrored "
+            "fix %d.%d (F19)" % (b, bit, b ^ 3, bit))
 
 
 def _parse_vectors(path):
@@ -1235,8 +1307,10 @@ def _st_image_checks(img, mode_name):
     ok, fixes, data_fixes = bch_decode(subblock_with_ecc_zeroed(page_b2, 0),
                                        stored_ecc(page_b2, 0))
     _st(ok and fixes == 3
-        and sorted(data_fixes) == sorted(bit_flips(0, 3)),
-        "the FSW decode corrects the 3 flips (BCH corrected 3 SEUs)")
+        and sorted(data_fixes) == sorted((b ^ 3, m)
+                                         for b, m in bit_flips(0, 3)),
+        "the flight decode counts 3 fixes (BCH corrected 3 SEUs) but "
+        "applies them to the mirrored byte 3 (F19)")
     # 8 flips in sub-block 1: uncorrectable, the 0x543B path
     corrupt_data(img, 71, 0, 1, 8)
     page_b3 = img.read_guest(off_b, PAGE_SIZE)
@@ -1288,6 +1362,7 @@ def self_test():
     t0 = time.time()
     _ST_CHECKS[0] = 0
     _st_bch_section()
+    _st_leon_vectors()
 
     tmp = tempfile.mkdtemp(prefix="stix-flashdmg-selftest-")
     try:
@@ -1482,6 +1557,15 @@ def _hex_int(text):
     return int(text, 0)
 
 
+def _spare_arg(text):
+    """--spare: a byte, or "any" (match the name ignoring the spare byte;
+    the FSW's context names carry CONTEXT_VERSION there, which differs
+    between builds: the gate ELF stores 0x22, the source says 35)."""
+    if text == "any":
+        return None
+    return int(text, 0)
+
+
 def _file_type(text):
     if text in FILE_TYPES:
         return FILE_TYPES[text]
@@ -1540,7 +1624,7 @@ def build_parser():
     cf.add_argument("--type", dest="ftype", type=_file_type, required=True,
                     help="file type: %s or the number"
                          % "|".join(FILE_TYPES))
-    cf.add_argument("--spare", type=_hex_int, default=0,
+    cf.add_argument("--spare", type=_spare_arg, default=0,
                     help="name byte 1 (context files: CONTEXT_VERSION=35, "
                          "ContextMgmt.h:11)")
     cf.add_argument("--coarse", type=_hex_int, default=0,
@@ -1573,7 +1657,8 @@ def build_parser():
     sh = sub.add_parser("show", help="print the file's block and pages "
                                      "(truth read-back)")
     sh.add_argument("--type", dest="ftype", type=_file_type, required=True)
-    sh.add_argument("--spare", type=_hex_int, default=0)
+    sh.add_argument("--spare", type=_spare_arg, default=0,
+                    help='a byte, or "any" to ignore the spare byte')
     sh.add_argument("--coarse", type=_hex_int, default=0)
     sh.add_argument("--fine", type=_hex_int, default=0)
     sh.add_argument("--duration", type=_hex_int, default=0)
@@ -1637,8 +1722,9 @@ def cmd_bad_block(args):
 
 
 def cmd_corrupt_file(args):
-    name = build_name(args.ftype, args.spare, args.coarse, args.fine,
-                      args.duration)
+    any_spare = args.spare is None
+    name = build_name(args.ftype, 0 if any_spare else args.spare,
+                      args.coarse, args.fine, args.duration)
     if args.mode == "header":
         if (args.page is not None or args.all_pages
                 or args.sub_block is not None or args.to is not None):
@@ -1654,7 +1740,7 @@ def cmd_corrupt_file(args):
             raise ToolError("--all-pages and --page are mutually exclusive")
     img = open_image(args)
     try:
-        lin_block = locate_file(img, name)
+        lin_block = locate_file(img, name, any_spare)
         if args.mode == "header":
             corrupt_header(img, lin_block,
                            8 if args.bits is None else args.bits)
@@ -1684,11 +1770,12 @@ def cmd_corrupt_file(args):
 
 
 def cmd_show(args):
-    name = build_name(args.ftype, args.spare, args.coarse, args.fine,
-                      args.duration)
+    any_spare = args.spare is None
+    name = build_name(args.ftype, 0 if any_spare else args.spare,
+                      args.coarse, args.fine, args.duration)
     img = open_image(args)
     try:
-        op_show(img, name)
+        op_show(img, name, any_spare)
     finally:
         img.close()
     return 0
