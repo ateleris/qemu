@@ -3449,7 +3449,12 @@ marks):
   before the first SetEnable strobe), not by a slot-mode
   `capture-golden.sh` run, which needs the shared run dir.
 
-**Gate record:** pending; no run from this worktree is recorded yet.
+**Gate record** (2026-11-12, `stix-uprev-det5` rebased on 451d4d399e, slot 2):
+- suite (qt.sh all): 68 of 68 ok, including `det-chunk-guard`;
+- boot-smoke PASS (golden unchanged); tc-smoke PASS;
+- nominal-smoke PASS, and `--negative` PASS;
+- fault-smoke PASS, and `--negative` PASS;
+- detector-smoke: positive PASS; `--negative` PASS (failed as planned); `--flare` PASS; `--flare --negative` PASS (failed as planned); `--no-rotb` PASS (failed exactly `uart-chunk chunk`).
 
 ## 40. Flight ELUT load (baseline: none)
 
