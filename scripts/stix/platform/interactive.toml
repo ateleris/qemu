@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Sample config: interactive mode in the PL-7 container. Every key here
+# is one stixplat/config.py accepts (an unknown key is an error); the
+# defaults of the rest are fine. Run it with:
+#
+#   scripts/stix/platform/run-container.sh --config interactive.toml
+#
+# The config dir is mounted read-only at /config (default: the platform
+# dir itself), the ELF dir at /elf, the scenario dir at /scenarios, and
+# the flash lives on the named volume stix-run at /var/lib/stix.
+
+mode = "interactive"
+
+[api]
+# Inside the container the API binds 0.0.0.0 so the 127.0.0.1-only
+# publishing of run-container.sh reaches it (D-PLj). container = true
+# is what allows the non-loopback bind and the GS destination below;
+# never set it outside a container published on 127.0.0.1.
+bind = "0.0.0.0"
+container = true
+
+[qemu]
+# The image's binary; the ELF comes from the /elf read-only mount.
+binary = "/opt/qemu/bin/qemu-system-sparc"
+elf = "/elf/ASW_em_baseline.elf"
+# The platform OBT drives the time codes (D-PLb); "scet" restores the
+# pre-PL-1 behaviour. The default epoch has coarse & 63 = 0, so the
+# boot codes match the FSW's SCET LSBs.
+timecode_source = "obt"
+
+[run_dir]
+# The volume: the flash, the log and the reports survive a container
+# restart. The controller refuses a filesystem without sparse files or
+# hole punching (never /mnt/c); a fresh start is fresh = true, or a new
+# volume (docker volume rm stix-run).
+path = "/var/lib/stix"
+fresh = false
+
+[gs]
+# The GS on the host: run-container.sh adds host.docker.internal (the
+# host gateway) and publishes 21502/udp on 127.0.0.1 for its TCs, so
+# the GS satellite entry is unchanged (in 21501, out 127.0.0.1:21502).
+# On a Linux engine with --network host, use 127.0.0.1:21501 and
+# [api] bind = "127.0.0.1" with container = false instead.
+tm_dests = ["host.docker.internal:21501"]
+bind = "0.0.0.0"

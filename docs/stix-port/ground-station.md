@@ -13,6 +13,14 @@ Status 2026-11-11 (the Phase 2 end-to-end run, plus Phase 4 fault injection):
 The findings, with file:line references on both sides, are in
 `drafts/2026-11-10-gs-attach-report.md`.
 
+The **platform controller** (`docs/stix-port/platform.md`, PL-7) is a
+second way to attach the ground station: it relays TM to 21501 and
+proxies the GS's TCs from 21502, replacing QEMU on these ports, so the
+satellite entry below is unchanged (in the container it sends TM to
+`host.docker.internal:21501`). Do not run `run-qemu-gs.sh --udp` or
+`stix_gs_bridge.py` alongside it — both bind 21502; see platform.md's
+"Troubleshooting".
+
 ## How it fits together
 
 ```

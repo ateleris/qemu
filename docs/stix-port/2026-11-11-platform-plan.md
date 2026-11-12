@@ -2094,3 +2094,73 @@ defaults that the user can override.
   slots 1/2. The platform gates boot a fresh flash in their own run dir
   (QEMU makes it sparse after the binary guard), never the shared
   master, so they need no private flash copy.
+- **PL-7** is on `stix-uprev-platform` (no C change; the image was
+  built 2026-11-12, approved). As built:
+  - `Dockerfile` and `Dockerfile.dockerignore` as specified: two
+    stages, one `ARG UBUNTU_DIGEST` pinning both FROM lines to
+    ubuntu:24.04 `sha256:2198e4c6…caf5` (pinned at the first build);
+    the build stage has the
+    plan's packages plus `ca-certificates` (the wrap download is
+    https, and git only Recommends it, which `--no-install-recommends`
+    drops); no `make install`, `strip`, `--disable-install-blobs`; the
+    run stage copies `build/qemu-system-sparc` alone, `tmtc-probe.py`
+    to `/opt/stix/tmtc-probe.py` (probe_lib resolves
+    `<stixplat>/../../tmtc-probe.py`; the first build put it at
+    `/opt/tmtc-probe.py`, one level too high, and run mode failed to
+    load it — `test-run-container.sh` now derives the probe path from
+    the platform COPY and checks it) and `platform/` to
+    `/opt/stix/platform`; non-root `stix` user, `/var/lib/stix` owned
+    by it, tini entrypoint, `CMD --config /config/platform.toml`; the
+    dockerignore excludes `build*/`, `.git`, `**/flash.bin` and run-dir
+    artifacts, **not** `*.bin`.
+  - `run-container.sh` (bash, `set -euo pipefail`, repo style) with the
+    plan's argv, `--dry-run`, the `build` subcommand that prints the
+    D-PLu prune/VHDX hygiene and runs none of it, `--volume DIR` for a
+    bind mount, and the `/mnt/*` volume refusal before docker runs;
+    `--network host` stays a documented alternative in platform.md (a
+    loopback config is required there), not a flag. Review additions:
+    the `paths.sh` source path (`../lib`, not `../../lib`); without
+    `--config` it runs `interactive.toml` (the image CMD's
+    `/config/platform.toml` is not shipped, so the documented default
+    failed); `--volume-name NAME` and `--detach` (for the smoke).
+  - `tests/test-run-container.sh`: the `docker` stub records the argv;
+    asserts the 127.0.0.1 publishing, `--add-host`, the named volume,
+    the `:ro` mounts, the optional `/idb`, `--config`, the image last,
+    the `/mnt/c` refusal (exit 2, no docker call), the build argv plus
+    hygiene-only, the static Dockerfile checks (two digest-pinned FROM
+    lines, only `qemu-system-sparc` copied, no `make install`, no
+    `*.bin` in the dockerignore), `bash -n`, and hadolint when
+    available.
+  - `interactive.toml` and `run-gates.toml`: container paths and
+    `host.docker.internal:21501`, both with `[api] container = true`;
+    both pass `stixplat/config.py` as written (the container key is
+    what allows the 0.0.0.0 binds and the non-loopback TM destination;
+    verified against the loader by hand — no run here).
+  - `platform.md` is now the usage (native and container), ownership
+    table, API reference (**API v1 is declared stable**, D-PLn), fault
+    catalogue and timing references, security and troubleshooting
+    (including the GS hookup, the TM-view quirk, the liboqs/cmake note
+    and the 21502 clashes); `ground-station.md` points to it.
+  - **Docker gate record (2026-11-12, Docker 29.8.0 on WSL):**
+    - `docker build` rc 0: 2870 s cold (QEMU compiled in the build
+      stage), 132 s with the build stage cached; **final image
+      185 MB** (budget 250 MB); the build cache grew ~1.1 GB, pruned
+      after the gates with `docker builder prune -f`; C: free 65 GB
+      before and after.
+    - In the image: `ldd` resolves all 13 libraries, `qemu-system-sparc
+      --version` 11.1.50, python 3.12.3 with every module the
+      controller imports, user `stix` (uid 999).
+    - Run mode over `run-gates.toml` (gate-spw-link, gate-keepalive,
+      gate-timesync, every variant): rc 0, all PASS. With
+      `--scenario gate-negative.json`: rc 1, failed exactly on the
+      planned `await_event 142d` (as natively). flash.bin 16 KiB, the
+      whole volume 4.1 MB.
+    - `tests/container-smoke.sh` (new; core-smoke starts its own
+      native controller, so it cannot target a container — this runs
+      the same API checks against the interactive container): `docker
+      port` only 127.0.0.1 (8080/tcp, 21502/udp); `--check-ui` 19
+      verbs, CSP matches; the UART banner on boot; a 10 s pause moved
+      sim_time 0.15 s; a cycle: boot_id 1 → 2, sim_time continuous,
+      banner in both boots; `docker stop` → a clean QEMU quit record
+      (rc 0) through tini; flash.bin 16 KiB. PASS.
+    - Offline: `test-run-container.sh` PASS, the self-test PASS.

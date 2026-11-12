@@ -1,0 +1,20 @@
+# BuildKit's per-Dockerfile ignore: it applies when the build names this
+# Dockerfile (-f scripts/stix/platform/Dockerfile), and its patterns are
+# relative to the context root, the repo root.
+#
+# The build tree and the VCS never enter the context.
+.git
+build*/
+#
+# The controller's run dirs, should one ever sit in the tree: never ship
+# a flash or run data (D-PLl). NOT *.bin: that would drop pc-bios/*.bin,
+# and the meson setup lists them even with --disable-install-blobs
+# (pc-bios/meson.build:95-97), so configure fails on the missing files.
+**/flash.bin
+**/uart.raw
+**/qemu.log
+**/log.jsonl*
+**/tm.jsonl
+**/qmp.sock
+**/.stixplat-*
+**/__pycache__/

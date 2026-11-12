@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Sample config: run mode over the gate scenarios in the PL-7 container.
+# Run it with:
+#
+#   scripts/stix/platform/run-container.sh --config run-gates.toml
+#
+# Each scenario variant runs in its own controller, QEMU process and
+# fresh flash under <run_root>/runs/; reports land in
+# <run_root>/reports/<stamp>/ (exit 0 all pass, 1 a fail, 2 an error,
+# 3 infrastructure). gate-negative.json must FAIL, so it is not listed
+# here; add gate-timecode-loss.json for the long run (~150 s).
+
+mode = "run"
+
+[api]
+# As in interactive.toml: the container is published on 127.0.0.1 only
+# (D-PLj). Run mode does not serve the API unless [run] serve_api is
+# true; the bind is still validated, hence this table.
+bind = "0.0.0.0"
+container = true
+
+[qemu]
+binary = "/opt/qemu/bin/qemu-system-sparc"
+elf = "/elf/ASW_em_baseline.elf"
+
+[run]
+# The scenario dir is mounted read-only from --scen-dir (default: the
+# shipped gate scenarios, so the shipped files are seen at the same
+# names). scenario.run reads only from here.
+scenario_dir = "/scenarios"
+scenarios = [
+    "gate-spw-link.json",
+    "gate-keepalive.json",
+    "gate-timesync.json",
+    # "gate-timecode-loss.json",
+]
+# variants = ["aligned"]     # only these variants, or a glob
+
+[retention]
+# On the volume (stix-run). Runs and reports are cleaned by the
+# retention policy (keep_runs 10, keep_failed_days 7, keep_flash
+# "failed": a passed run's flash is dropped, a failed one kept).
+run_root = "/var/lib/stix/runs"
+
+[gs]
+# The GS on the host sees the gates' TM as well (the relay fans out);
+# with no GS running the datagrams are simply not received. The TC
+# proxy still takes the GS's TCs on the published 21502/udp.
+tm_dests = ["host.docker.internal:21501"]
+bind = "0.0.0.0"
