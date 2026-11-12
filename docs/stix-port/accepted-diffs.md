@@ -3229,6 +3229,228 @@ Re-run, each under the 21000 flock in fresh `/tmp/stix-d4r-*` dirs:
 - checkpatch: 0/0 apart from the missing Signed-off-by
 - suite (qt.sh all): 62 of 62 ok, exit 0
 
+## 35. Nominal integration and ROTB science chunks (baseline: no integration, empty ring)
+
+**Baseline:** the nominal side of the detector model did nothing. The
+QL switch and the synthetic sky (§31, §34) filled LACC/LTRG and SUMCNT,
+but `fsmIntTime` and `fsmIntEvents` were plain storage,
+`fsmSta.ActiveNominal` read 0, the EACC/ETRG banks were never written,
+and only PUTBLOCK in TESTMODE filled the ROTB ring (§12). No detector
+chunk ever reached the archive, so the FSW's science path downstream of
+the ROTB was untested.
+
+Detector plan D-5 (`docs/stix-port/2026-11-11-detector-plan.md`,
+"### D-5", decision D-Dg; the "As built" note there).
+
+**FSW tree:** every FSW `file:line` in this section is STIX-FSW
+600a7a72, as in §34 (`Detectors.c` is
+`BSW_ASW/src/BSW/Detectors/Detectors.c`).
+
+**The integration and the swap (D-Dg).** The nominal integration runs
+on the same 100 ms tick as the QL sky, so only while FSM Enable = 1.
+It ends at the first tick t (ticks since its start) with
+`((t >= IntTimeMax + 1) || (SUMCNT >= IntEventsMax)) &&
+t >= IntTimeMin + 1` [D, TN Table 5-8; RP-0067]. The parameters are
+latched at the start of each integration, from `fsmIntTime` (min 15:0 /
+max 31:16, in ticks − 1) and `fsmIntEvents` (`Detectors.c:1140-1149`),
+and re-latch at every swap and at the Reset strobe. The FSW programs
+9 / 199 / 1800 (1 s min, 20 s max, 1800 events) at NOMINAL entry
+(`OpModeMgmt.c:625`, `ParamMgmtDef.h:382-384`); the register reset
+values are 0/0/0, with which every tick would swap — the reason the
+qtest helpers now program the FSW's parameters. At the swap
+(`stix_det_nominal_swap`):
+1. the finished bank's EACC is materialized from the integration's own
+   exposure (`nom_expo`): the same Poisson draw per cell as the QL
+   LACC (`stix_det_draw_acc`, factored out of §34's materializer, the
+   same `[pix][fpga_det][ebin]` u16 big-endian layout), but it only
+   accumulates the ticks in which the `fpga_det` was in SUMDMASK (EACC
+   is SUMDMASK-gated [D, RP-0067]; QLACC is not);
+2. ETRG per `grp` (`grp` = `fpga_det`/2, u32 big-endian) = 1.25 × (the
+   drawn EACC events of its two `fpga_det` + one Poisson draw of the
+   expected events of the read-out `fpga_det` **outside** SUMDMASK),
+   rounded, clamped at 24 bits: **the triggers are not masked by
+   SUMDMASK** [I];
+3. `ActiveNominal` (fsmSta bit 4) toggles, SUMCNT restarts at 0, the
+   parameters re-latch;
+4. with `det-rotb` on, the bank goes into the ROTB ring as one chunk
+   (below);
+5. the finished bank's EACC and ETRG are zeroed after every swap, also
+   when no chunk was taken (read-and-clear [D]), so every integration
+   starts from zero.
+
+A fresh enable (SetEnable at tick 0) also latches the parameters and
+zeroes the active EACC/ETRG bank (no stale RAM: the banks survive a
+reset, §13). A device reset restarts the integration in bank 0 and
+re-latches; `ActiveNominal` and the banks stay. The banks: EACC0/1 at
+0xE01A0000 + n·0x8000 (0x6000 used per bank) in the SRAM region,
+ETRG0/1 at 0xE0600000 + n·0x40 in their own region. The FSW never
+reads the banks in NOMINAL; it consumes the chunk
+(`RotAccumulator.c:64-140`). `stix_det_realize` now takes the owning
+`STIXCTRL` and the ETRG region; `stix_det.h` declares the two new
+controller helpers (`stixctrl_scet_reg`, `stixctrl_rotb_append`).
+
+**The chunk layout.** One chunk = 49 blocks of 512 B (block numbers
+0..48; `RotAccumulator.h`'s `LAST_DETECTOR_BLOCK_NUMBER` 48), built
+into a scratch buffer and handed over whole; `RotAccuCompactor.c:76-270`
+is the FSW's builder. Block n (0..48): u16 big-endian descriptor
+`0x8000 | n` (type 0x8000 = detector data, `RotAccumulator.h:16-22`;
+block number 5:0), u32 big-endian SCET coarse at +2 and u16 fine at +6
+— exactly what the 0xC8/0xCC reads compose at the swap, with the
+UNSYNCED status flag in bit 31 of the coarse (`stixctrl_scet_reg`;
+`ArchiveManager.c:131` masks it) — then 504 data bytes from +8 in
+every block. The stream is the EACC bank first (0x6000 B = 12 `pix` ×
+32 `fpga_det` × 32 `ebin` u16), then ETRG (0x40 B = one u32 per `grp`,
+on the wire hw/lw u16 pairs, `RotAccuCompactor.c:174-245`), then a
+56 B zero pad in block 48 (24640 + 56 = 49 × 504). Everything
+big-endian, as the banks are. Layout trap for a later TM gate (plan
+D-5): the chunk carries `[pix][fpga_det][ebin]`; the compactor
+converts `fpga_det` → `subcol` (`RotAccuCompactor.c:298-300`).
+
+**The append and `det-rotb`.** `stixctrl_rotb_append`
+(`grlib_stixctrl.c`) is called once per swap from timer context (BQL
+held) and shares the ring push with PUTBLOCK (factored into
+`stixctrl_rotb_push`). It appends only with rotbConfig ENABLE = 1
+(bit 31) and TESTMODE = 0 (bit 13; in TESTMODE the window and PUTBLOCK
+own the ring, §12), and only whole: with fewer free blocks than 49 the
+chunk is dropped and IRQ 7 (`IRQ_STIXCTRL_ROTB`, IRQMP line 7) pulses
+once. The docs say the hardware overwrites the oldest block; dropping
+keeps §12's drop-new rule and never leaves a partial chunk (plan Doc
+vs code 7). Reaching capacity exactly still sets FULL, as for
+PUTBLOCK. The qdev property `det-rotb` (default on) keeps the swaps
+and makes no chunk when off, for the gate negative.
+
+**Re-entrancy (D-Dj).** The tick writes guest RAM outside any MMIO
+dispatch (the banks through `memory_region_get_ram_ptr`, the ring
+through the controller's host buffer), so it now engages the
+controller's `mem_reentrancy_guard` for its whole body and restores it
+afterwards, as the SpW DMA paths do (the a83fe9a3a5 rule); should a
+future tick path reach the controller's own MMIO, the access is
+refused ("Blocked re-entrant IO"). The QMP setters still only store
+fields.
+
+**Traces.** Three new events, every line stamped with the virtual
+clock (`vclock_ns`): `stixdet_nominal_swap` (done and active
+`nom_bank`, `int_ticks`, `sumcnt`, `eacc_events`), `stixdet_chunk`
+(49 blocks, SCET `coarse_reg:fine`, `int_ticks`, `eacc_events`,
+`rotb_count`) and `stixdet_chunk_drop` (`rotb-disabled` |
+`rotb-testmode` | `ring-full` | `det-rotb-off`).
+
+**qtests** (`tests/qtest/stix.c`; all six RED on the D-4 binary):
+- `det-chunk-format`: a 5 s integration (max time 50 ticks) gives one
+  49-block chunk, decoded the way `RotAccumulator`/`RotAccuCompactor`
+  decode it: descriptors, whole block numbers 0..48
+  (`RotAccuCompactor.c:88-96`), every block's SCET equal to the
+  0xC8/0xCC read now, the counts from +8 of every block in
+  rot-counter order (`pix << 10 | fpga_det << 5 | ebin`), ETRG as
+  hw/lw pairs, the pad zero. Every ETRG word is exactly 1.25 ×
+  (rounded) the decoded EACC events of its `grp` (no SUMDMASK bit
+  clear); the `pix` the R3 switched off (`fpga_det` 18, `asic_ch` 1 =
+  `pix` 3) is zero at its own offsets only; nothing lands in `ebin`
+  0/31; the total matches the rate; the EACC/ETRG banks read zero
+  afterwards. The next integration uses bank 1 and makes the next
+  chunk 5 s later, with a later SCET.
+- `det-nominal-rule`: the quiet sky ends at the max time (200 ticks;
+  SUMCNT stays below 1800), the flare (about 4600 events per tick) at
+  the min time (10 ticks); a new min or max applies from the next
+  integration on (latched); a Reset strobe restarts the count and
+  re-latches; an event limit of 100 with no min time ends on the
+  events (8..30 ticks), with SUMCNT zeroed after.
+- `det-chunk-gating`: in TESTMODE and with ENABLE = 0 the swap still
+  happens (`ActiveNominal` toggles) and the ring stays as it is; with
+  the FSM disabled nothing swaps; `det-rotb=off` swaps without
+  chunks.
+- `det-chunk-full`: with `rotb-blocks=60` the first chunk fits; the
+  second finds 11 free blocks, is dropped whole with one IRQ 7 pulse,
+  and BLOCKCOUNT stays 49 with FULL still 0; every further dropped
+  chunk pulses again; draining returns the first chunk intact and the
+  next chunk fits again.
+- `det-chunk-sumdmask`: with `fpga_det` 5 masked, its chunk counts are
+  0 while its QL LACC counts are not (QLACC is not masked); ETRG
+  `grp` 2 (`fpga_det` 4 and 5) is not masked — it exceeds 1.25 ×
+  `fpga_det` 4's EACC by about 1.25 × 5000, the unmasked `fpga_det` 5's
+  expected events — while every other `grp` is exactly 1.25 × its EACC
+  events.
+- `det-chunk-guard`: after timer-driven swaps and chunks every CTRL
+  MMIO path still answers (the detector registers, the composed
+  `rotbCmdSta`, GETBLOCK and the block window, and IRQ 3 still
+  pulses); a guard left engaged would refuse all of them. Per the
+  plan's as-built note: the release half is mutation-checked; the
+  engage half is not observable from a qtest.
+- helpers: `nom_set_params`, `det_start_nom` and `sky_start_nom`
+  program the nominal parameters, and the older `det_start` /
+  `sky_start` now default to the FSW's 9/199/1800, so the D-1..D-4
+  tests keep their behaviour (with zeros every tick would swap and
+  reset SUMCNT); the gap sentinels move from "past LACC3" — that is
+  EACC0, 0xE01A0000, which D-5 now writes — to the unused 0x2000 of
+  each EACC stride.
+
+**Gates.**
+- `detector-smoke.sh` runs the D-5 checks in every mode (positive,
+  `--negative`, `--flare`, `--flare --negative` and the new
+  `--no-rotb`); the timeline is unchanged. QEMU also traces
+  `stixdet_scene`, `stixdet_nominal_swap`, `stixdet_chunk`,
+  `stixdet_chunk_drop` and `stixctrl_rotb_cmd` into the same trace
+  file, and `chunk-trace-check.py` (new, stdlib only) checks it — all
+  on the virtual clock and tick counts the model writes into the
+  lines, never the wall `<time>` stamps (§41):
+  - check `chunk`: every nominal swap made a 49-block chunk and none
+    was dropped; every quiet integration took exactly 200 ticks (the
+    FSW's 20 s max; SUMCNT stays below 1800), at least 5 of them (1
+    with `--flare`); consecutive chunks are the later one's
+    `int_ticks` apart within a tenth of a tick (the D-1 tick timer
+    re-arms from its late callback, so a tick is 100 ms + the
+    callback's lateness — the plan's as-built note measured 200 ticks
+    in 20.000141 s live; a lost or extra tick is 100 ms off and still
+    fails); and GETBLOCK ≥ 49 × (chunks − 1), i.e. the FSW drained
+    the ring (the newest chunk stays).
+  - check `chunk-flare` (`--flare` only): at least 40 integrations
+    inside the flare windows (from the `stixdet_scene` lines), each
+    exactly 10 ticks (the min time; the 1800 events come within a
+    tick at 2000 cps). A `--flare` run uses `--min-quiet 1`.
+  - check `uart-chunk` (every mode): "Skipped first Det data chunk"
+    (`ArchiveManager.c:140`; the archive drops the first chunk, later
+    ones are archived silently) exactly once, and no `*E` line from
+    the chunk path, the archive or the filesystem on the fresh flash
+    (the FSW TRACE_TAGs Archive, RotAccuComp, RotAccumulator, FS,
+    FSapi, MemStream, MemCommon, FIFO). This resolves the plan's [L]
+    item. The tag list is split over two assignments for checkpatch
+    (f88b160d55).
+  - the run prints the flash.bin KiB allocated, for the D-5 NAND cost
+    record (plan D-5 Performance).
+- `--no-rotb` (new): the zero sky plus
+  `-global grlib-stixctrl.det-rotb=off` (run dir suffix `-norotb`);
+  refused together with `--flare` or `--negative` (exit 2). It passes
+  only when exactly the two chunk checks fail as planned: `uart-chunk`
+  (no "Skipped first Det data chunk") and `chunk`
+  (`chunk-trace-check.py --expect-none`: at least 3 nominal swaps, no
+  chunk at all, drop reasons only `det-rotb-off`).
+- `--flare --negative` must now fail exactly `ql-contrast` **and**
+  `chunk-flare` (no flip: no LC contrast, no 1 s integrations).
+- `chunk-trace-check.py --self-test` builds synthetic traces: the
+  positive rules and each of their failures (a short quiet
+  integration, too few chunks, a dropped chunk, a 48-block chunk, an
+  undrained ring, a swap without a chunk line, a cadence break), the
+  late-timer tolerance (141 µs over 200 ticks passes), the flare
+  classification (quiet/flare/mixed across a switch), the flare
+  negative, and `--expect-none`.
+- nominal-smoke needs no change: "Skipped first Det data chunk" now
+  appears there too and was never in its forbids (plan Gate impact).
+- `test-gate-slots.sh` covers the `-norotb` run dir in slot mode, the
+  refused flag combinations and the `-global` flags in the dry run.
+
+**Deviations from the plan's D-5 section** (the two its As-built note
+marks):
+- the gate negative for the chunk checks is the new `--no-rotb` mode
+  (the plan had only the flare negative), and the flare negative's
+  expected failure set grows from `ql-contrast` to
+  `ql-contrast chunk-flare`;
+- the trace golden ("qemu-stdout.golden.log unchanged, checked") is
+  checked from the detector-smoke trace (no `stixdet_nominal_swap`
+  before the first SetEnable strobe), not by a slot-mode
+  `capture-golden.sh` run, which needs the shared run dir.
+
+**Gate record:** pending; no run from this worktree is recorded yet.
+
 ## 41. Gate ports: slots for parallel gate runs (baseline: one global lock)
 
 Plan: `2026-11-11-gateports-plan.md`. Four tracks (tc, platform, elut,
