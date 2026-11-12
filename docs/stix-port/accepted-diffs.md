@@ -3527,7 +3527,9 @@ has the index-space table, the recipe and the template flash.
   SRAM and flash are much faster than the flight FPGA path, so no
   timing conclusion carries over.
   - [L] re-run elut-smoke once flash-latency F-3 makes latency the
-    default.
+    default. **Done 2026-11-12** on the integration tip ad5472dfb1
+    (latency on by default), slot 4: elut-smoke PASS and `--negative`
+    PASS.
 - **SpW RX:** the 226-B units are the largest TCs ever sent; the
   `stixspw_rx_truncated` trace stayed silent (QEMU runs with it on).
 - **Disk:** the seeded flash allocates 148 KiB (apparent 16.5 GiB); the
@@ -3695,7 +3697,22 @@ deposit, a leak into another sample, a dump without the target
   pinned by the qtests at the LACC/EACC offsets, as the plan's
   "End-to-end check" paragraph already assigns.
 
-**Gate record:** pending; no run from this worktree is recorded yet.
+**Gate record** (2026-11-12, `stix-uprev-det6` rebased on ad5472dfb1 =
+platform + flash latency on, slot 2):
+- suite (qt.sh all): 92 of 92 ok, including the five `det-inject-*`;
+  `det-inject-gated` and `det-inject-reset` go red when the pix-gate
+  check is moved below the `inj_ql` add or the reset line is removed;
+- boot-smoke PASS (golden unchanged); tc-smoke PASS;
+- nominal-smoke PASS, and `--negative` PASS;
+- fault-smoke PASS, and `--negative` PASS;
+- detector-smoke: positive PASS; `--negative` PASS (failed as planned);
+  `--flare` PASS (`ql-inject`: 250 counts at fpga_det 5, pix 0, ebin 20
+  seen at subcol 10, byte 21 = 0x2F); `--flare --negative` PASS (failed
+  as planned); `--no-rotb` PASS (failed exactly `uart-chunk chunk`).
+- The first `--flare` run on the pre-rebase build failed `trace-verif`
+  only: a QlClear strobe inside a ~30 ms verification run split it
+  (136 + 248). Fixed in idefx-trace-check.py (bbd794466b: a QlClear ends
+  only a complete run); the failed trace re-judges to 4 x 384.
 
 ## 41. Gate ports: slots for parallel gate runs (baseline: one global lock)
 
