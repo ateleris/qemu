@@ -1268,6 +1268,148 @@ the merge.
     Gate impact: none uninjected (the getter is pure, the properties
     are inert until set, no new trace events).
 
+- **As built (M-6b):** `scripts/stix/edac-smoke.sh`, the fault-smoke
+  skeleton (slot library, canonical run-dir guard + QMP socket length,
+  `--dry-run`/`--check-guard`, the probe first with QMP connected at the
+  first due `--qmp-cmd`, log tails before every verdict) plus the
+  detector-smoke check-list verdict (every check records its name in
+  `FAILED`, so the negative can compare the set).
+  - **Live results (2026-11-12) — these override the pre-live notes
+    below:** (1) the SDRAM part passes live: the trap line, one
+    reboot, and the second boot's 0x0022 + 0x14A3. (2) The inject word
+    is **0x4008337C**: `hkLineLimits` is at 0x40083344 (nm on the AX
+    gate ELF) and `HKMonitor_limits_s` is `{u16 min, u16 max, u32
+    count}`, 8 bytes, so entry 7 starts at 0x4008337C; 0x40083378 is
+    entry 6's count word. The live `xp` reads `0x00000fff 0x00000003`
+    (min 0, max 0x0FFF, count 3 — the 1V5 min 0x079F belongs to the
+    TC(236,10) scenario, not to this run), and the layout check pins
+    exactly that; the HMP dump prints the address in lowercase. (3) The
+    cache part **resolved its [L] negatively, as the code review
+    predicted**: no SID2 shows status1 bits 2:0 = 1, because nothing
+    reads the CACHE SRAM in SAFE. The cache step is dropped from the v1
+    gate; the mechanism stays pinned by the M-2 qtests and a
+    NOMINAL-window cache leg is a later item. (4) The catalogue and the
+    ground-station recipes now use data words: `memory.sdram.ded`
+    `sdram,0x4008337C,0x3` (entry 7) and `memory.sdram.seu`
+    `sdram,0x40083374,0x1` (entry 6, also read every second; M-6a's
+    0x40001000 and 0x40002000 are both inside `.text`, 0x40000000..
+    0x4007F100), and `memory.cache.ded` gains the NOMINAL precondition.
+  One run (the pre-live design, kept for the record):
+  - **Schedule:** connect group expects the boot report **0x0022
+    00000008 00000000** and **0x14A3** within 60 s (the master-flash
+    boot: boot-smoke's TM golden shows 0x14A3 at +30 s) and forbids
+    TM(1,2)/TM(1,8)/0x9434/0x9449 for the run; `@45` the CACHE inject,
+    `@110` an HMP `xp` layout check, `@112` the SDRAM inject, `--hold`
+    to 260 s (the minimum: the second post-inject SID2 under the reboot
+    shift — boot-1 SID2s at ~64/~128 s, boot-2's at ~180/~244 s).
+  - **Cache part ([L]):** inject `cache,0xE0180044,0x3` (the M-6a
+    catalogue's fixed LACC0 word) in SAFE; expect exactly one SID2
+    (0x5A4, TM(3,25)) packet with `status1` bits 2:0 = 1 in the
+    `--dump-apid 0x5A4` dump and a later one back at 0. **The byte
+    offset, from the code:** TM(3,25) SID2 serializes `status1` as the
+    BE u32 at application-data bytes 50..53 (`TM_3.c:31-137`: SID, the
+    mode byte, 16 12-bit analog triples = 50 bytes, then status1; app
+    data starts at SP[16], `TMData_DATA_FIELD`), so the low byte is
+    SP[69]; bits 2:0 are the SRAM DE count, 5:3 rotbuf, 6 watchdog
+    enabled, 7 active link (`HKAcquire.c:94-110`, `:286-293`) — the
+    check masks 0x07 so the flag bits stay free. **The [L], stated:**
+    the code review found **no FSW reader of the CACHE SRAM in SAFE** —
+    the QL LACC reads are gated to NOMINAL by
+    `Detectors_callbackQuickLook` (`QLAccuDblBuffs.c:135`, the task
+    waits on `QL_READ_EVENT`, `:219`), the TLUT re-trim is gated to
+    NOMINAL by the FDIR task (`FDIR.c:443-451`, the only path that
+    reads the TLUT temp words, `LUTMgmt.c:169` via
+    `LUTMgmt_updateTLUT`/`LUTMgmt_setTempCompensationLUT`), and the HK
+    path reads only ADC lines and SDRAM-resident state
+    (`HKAcquire.c:185-309`). The model never rewrites the word in SAFE
+    either (the QL materialization that retires LACC poisons via the
+    host-write rule runs only with the FSM enabled,
+    `stix_det.c` `stix_det_draw_acc` rewrites every cell at each swap),
+    so the poison just stays armed and the expectation FAILS — that
+    failure is the [L] resolving negatively, and the cache step then
+    needs a NOMINAL window (or the TLUT temp word, whose reader chain
+    is code-determined but NOMINAL-gated) in a follow-up. The plan's
+    "unconditional" in the M-6 bullet meant the EdacOn gate (no enable
+    step), not the reader.
+  - **SDRAM part:** QEMU runs **without `-no-reboot`** (the only STIX
+    gate that omits it) and with **`-global
+    stix-edac.edac-at-boot=all-on`** (D-Uk; the exact global name,
+    `TYPE_STIX_EDAC` = `stix-edac`, `stix_edac.h:27`, the property at
+    `stix_edac.c:1399`; applied at every device reset, so the reboot
+    keeps SDRAM EDACON on). The inject word is **`sdram,0x40083378,
+    0x3`** = `hkLineLimits[7].min` (`E_HK_DPU_1V5_V`, `HKData.h:163`),
+    read every 1 s by `HKMonitor_regularCheck` (`HKMonitor.c:446-447`)
+    once 0x14A3 has armed the line checks — fault-smoke's @40 0x9449
+    chain proves the 1V5 line check runs every second in SAFE on this
+    ELF, and the address is data (BSS), never code (M-3's rule). The
+    array base **0x40083344** was seen live (accepted-diffs, the
+    TC(236,10) record: "every `hkLineLimits[].count` (0x40083344) is
+    0xFF", the 1V5 entry `079F 0FFF 000000FF`) but the citation pins
+    the counts only to ±4 bytes, so `@110` runs HMP
+    `human-monitor-command "xp /4wx 0x40083378"` over QMP (the probe
+    prints the return; the format is exact,
+    `monitor/hmp-cmds.c` `memory_dump`: 8-digit address then
+    ` 0x%08x` per word) and the gate requires `079f0fff 000000ff` as
+    the FIRST two words; if `079f0fff` appears as the second word, the
+    base is 0x40083344 and the inject address must become 0x4008337C —
+    the check fails loudly with that instruction. **This corrects the
+    M-6a catalogue/ground-station fixed word `sdram,0x40002000,0x3`**:
+    0x40002000 is 128 KiB into the image, almost surely inside `.text`,
+    which contradicts that row's own "a data word, never code"
+    precondition; with a code-word DE the model executes the flipped
+    instruction (the M-3 known limit) instead of trapping
+    deterministically. The platform track should update the catalogue
+    value and the ground-station recipe when adopting this (M-7).
+  - **The trap/reboot expectations:** within ~1 s of the inject the
+    UART prints `Unexpected trap (0x09) at address ...`
+    (`WDT.c:135`, cited from **stix_asw_src** = the gate ELF's tree,
+    line-identical in STIX-FSW) and `data_access_exception (0x09,13)
+    ...` (`WDT.c:151`); `storeBadTrapInfo` writes the BRAM record with
+    the AHBSTAT address (`WDT.c:86-126`) and forces the watchdog
+    (`WDT.c:182` → `grlib_stixctrl.c:281-287` reset). The TMTC
+    transport survives the guest reset (`grlib_stixspw.c:1429-1434`,
+    "the TMTC transport (P2-1) is kept"), so the probe's connection
+    pauses and resumes — no reconnect logic needed. The gate expects
+    the **second** 0x0022 (within 90 s of the inject) and the second
+    0x14A3 (within 60 s), matching the first-boot copies only before
+    the group arms (the probe's unarmed-group rule); the UART checks
+    require exactly one `Unexpected trap (0x09)` and one
+    `data_access_exception` (one-shot, no boot loop) and **two** `init:
+    SAFE mode` banners (boot 1 + boot 2).
+  - **The 0x0022 payload, decoded:** TM(5,1) EID 0x0022 +
+    selfTestDone u32 + selfTestResult u32 + FSW_VERSION u8 —
+    `HKReport.c:249-254` (`(done & result) == 0` →
+    `TMForm_sendBootSuccess`) → `TMForm.c:162-170`; the probe prefix
+    `002200000008000000` (= 0x00000008 = `FSW_SUBSYSTEM_MASK`, result
+    0) is nominal-smoke's proven one, cut before the FSW_VERSION byte.
+  - **Negative:** the same schedule with no upset-inject at all (the
+    xp layout check stays — it is not an injected-fault expectation and
+    must pass in both modes). The probe must fail with exactly the two
+    second-boot strings unmatched (the WANT list, fault-smoke's
+    discipline) and exactly the `sid2-ded` and `uart-trap` checks must
+    fail (detector-smoke's discipline); the connect group, the layout
+    and the UART base must still pass. Run dir `-neg` suffix
+    (detector-smoke's evidence rule).
+  - **Deviations from the other gates, all deliberate:** no
+    `-no-reboot`; `-global stix-edac.edac-at-boot=all-on` (the boot
+    print reads `E_EDAC_MODULE_SDRAM = 1` and `E_EDAC_MODULE_ROTBUF =
+    1`, `main.c:122-125` — grep-only UART checks, no golden diff);
+    private master-flash copy (`stix_flash_private`, the tc-smoke
+    pattern, since SAFE never writes a context and the reboot's flash
+    state must be the frozen master's); SKIP = 77 (detector-smoke's
+    convention, per the task's exit-code list); gawk required (the
+    `strtonum` in the dump check, like nominal-smoke). No SEU/0x542F
+    step (Q4 open, the 1000 s period).
+  - **For the live run to resolve ([L] list):** (1) the SAFE CACHE
+    reader (the sid2-ded check above); (2) the hkLineLimits base ±4
+    (the layout check decides at run time); (3) the HMP xp output
+    format as seen in the probe log (the check fails loudly if the
+    parse misses); (4) the boot-1 boot report/0x14A3 timing on the
+    master flash (windows @60, the golden's +30 s 0x14A3); (5) the
+    reboot gap (boot-2 0x0022 within 90 s of the inject). Not built,
+    not run — the reviewer runs it (STIX_PORT_BASE=auto recommended;
+    the run takes ~260 s + boot).
+
 ### M-7: docs
 - `accepted-diffs.md`: heading **"Accepted diff: memory upsets and
   EDAC"**, no § number (numbered at the merge), covering: the overlay
@@ -1283,6 +1425,30 @@ the merge.
 - `baseline/README.md`: the suite recipe is unchanged (same binary);
   a note that `edac-smoke.sh` exists if M-6 shipped it.
 - This plan's "As built" notes per commit.
+- **M-6b hand-over (2026-11-12, before any live run):** `edac-smoke.sh`
+  exists (see "As built (M-6b)"). M-7 must pick up:
+  1. **done in M-6b (live):** the SDRAM words are data now
+     (`0x4008337C` ded, `0x40083374` seu; see "Live results"). The
+     pre-live note follows: M-6b replaced the M-6a
+     catalogue/ground-station word `sdram,0x40002000,0x3` (likely
+     `.text`, contradicting the row's own "data word, never code"
+     precondition) with `sdram,0x40083378,0x3`
+     (`hkLineLimits[7].min`, read every 1 s, layout checked live by the
+     gate's `xp` step); `faults-v1.json`'s `memory.sdram.ded` value and
+     the ground-station SDRAM probe recipe need the same number (the
+     catalogue row is platform-track scope);
+  2. the **[L] graduation** — the M-6b live run decides the SAFE CACHE
+     reader (the `sid2-ded` check), the hkLineLimits base ±4 (the
+     `layout` check), and the boot-2 timing windows; the ground-station
+     CACHE probe recipe's "works from boot" sentence and the catalogue's
+     `memory.cache.ded` `within_s: 130` stay [L] until that run, and a
+     negative outcome means the cache step moves into a NOMINAL window
+     (the gate then needs the nominal-smoke TC sequence, ~+70 s);
+  3. the **docs notes** — `baseline/README.md` gains the edac-smoke
+     line (260 s, private master-flash copy, slot mode), and
+     `accepted-diffs.md` records that edac-smoke's run is deliberately
+     non-default (`edac-at-boot=all-on` boot print: SDRAM and ROTBUF
+     lines read 1) — not a golden change (grep-only UART checks).
 
 ## Goldens and gate impact
 

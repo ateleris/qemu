@@ -232,7 +232,8 @@
      "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
                 "property": "upset-inject",
                 "value": "cache,0xE0180044,0x3", "clear": 0},
-     "preconditions": [],
+     "preconditions": [
+       "NOMINAL: the quick-look path reads the LACC; nothing reads the cache SRAM in SAFE, so there the DE is never latched (seen live)"],
      "expected_detection": [
        {"tm": "0x5A4:3:25", "within_s": 130,
         "note": "SID2 status1 bits 2:0 = 1 on the next HK cycle (64 s cadence), then reset every cycle; DEDETECTED is cleared by the ISR's EDAC_reset"}]},
@@ -242,7 +243,7 @@
      "persistence": "transient", "reversible": false,
      "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
                 "property": "upset-inject",
-                "value": "sdram,0x40001000,0x1", "clear": 0},
+                "value": "sdram,0x40083374,0x1", "clear": 0},
      "preconditions": [
        "Edacon on: edac-enable all-on over QMP, or -global stix-edac.edac-at-boot=all-on (the reset default is off)"],
      "expected_detection": [
@@ -254,7 +255,7 @@
      "persistence": "transient", "reversible": false,
      "action": {"kind": "qom", "path": "/machine/stixctrl/edac",
                 "property": "upset-inject",
-                "value": "sdram,0x40002000,0x3", "clear": 0},
+                "value": "sdram,0x4008337C,0x3", "clear": 0},
      "preconditions": [
        "Edacon on (as memory.sdram.seu); with Edacon off the flipped word is returned raw",
        "the address is a data word, never code (an instruction fetch with Edacon on does not trap in the model)"],

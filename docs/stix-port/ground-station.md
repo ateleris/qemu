@@ -928,13 +928,15 @@ qom_get $RUN/qmp.sock /machine/stixctrl hw-state
 SAFE or CONFIGURATION, never in NOMINAL — an SDRAM trap reboots):
 
 - **CACHE double error** — works from boot (Edacon resets on):
-  `upset-inject` = `"cache,0xE0180044,0x3"`. Expected: SID2 (0x5A4,
-  TM(3,25)) status1 bits 2:0 = 1 on the next HK cycle (64 s cadence),
-  then reset every cycle; `hw-state.edac` counters.cache.detected = 1
+  `upset-inject` = `"cache,0xE0180044,0x3"`. Expected **in NOMINAL
+  only** (the LACC is read by the quick-look path; nothing reads the
+  cache SRAM in SAFE, so there the DE is never latched — seen live):
+  SID2 (0x5A4, TM(3,25)) status1 bits 2:0 = 1 on the next HK cycle (64
+  s cadence), then reset every cycle; `hw-state.edac` counters.cache.detected = 1
   and the poison retired (one-shot).
 - **SDRAM double error → trap and reboot** — `edac-enable` = `"all-on"`
-  first, then `upset-inject` = `"sdram,0x40002000,0x3"` (a data word,
-  never code). Expected: the UART prints `Unexpected trap (0x09)` and
+  first, then `upset-inject` = `"sdram,0x4008337C,0x3"` (a data word,
+  never code: `hkLineLimits[7]`, read every second by the HK monitor). Expected: the UART prints `Unexpected trap (0x09)` and
   forces the watchdog. `run-qemu-gs.sh` passes `-no-reboot`, so QEMU
   stops at that reset; under the platform controller (warm resets) the
   FSW reboots and the boot event 0x0022 follows, with the failing
