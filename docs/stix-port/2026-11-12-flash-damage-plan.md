@@ -1,6 +1,7 @@
 # Flash damage plan: bad blocks, broken cells and corrupted files as the FSW filesystem sees them
 
-Status: X-1 implemented 2026-11-12 (see its "As built"); the rest is
+Status: X-1 and X-2 implemented 2026-11-12 (see their "As built"
+notes); the rest is
 draft, 2026-11-12, revised the same day after the independent
 review (`.review-flashdmg.txt`, all 8 findings resolved — see "Review
 resolutions") and the unit-test framework cross-check; unreviewed.
@@ -446,7 +447,8 @@ These change what the track can deliver. Read them first.
   - Runtime QOM on `/machine/stixflash`: `damage-add` (write str: a
     spec as in D-X2), `damage-remove` (write str: the exact spec or
     `all`), `damage-list` (read-only str: the active specs, sidecar
-    entries included, `src=file|runtime`). Dashed names, one property
+    entries included, `src=map|runtime` — X-2 renamed the X-1
+    `src=file` to `src=map`). Dashed names, one property
     per verb — no dotted-ID property zoo, because flash faults carry
     block parameters that an ID cannot hold (the attenuator's one-
     property-per-ID needs no params; here the spec is the ID).
@@ -725,6 +727,84 @@ detector/att smokes) at X-4/X-4b and before the merge.
   still hold), `flash-dmg-reject` (unknown kind, block < 64, bad spec,
   remove of an unknown spec, remove `all`).
 - Gates: the per-commit set; the probe self-test only otherwise.
+
+- **As built (2026-11-12, commit X-2).** Built as specified, with these
+  details the plan left open:
+  - One parser: X-1's per-entry parse `stixflash_dmg_entry` gained an
+    `allow_reserved` argument and is the only entry grammar — the
+    sidecar passes `allow_reserved=false` always (D-X3, no override),
+    `damage-add` passes the qdev `allow-reserved` property.
+    `damage-remove` parses its spec with the rule lifted (removing
+    injects nothing, so a removal must never be blocked by it). The
+    string→JSON-object step is generic `qobject_from_json`; there is
+    no second grammar.
+  - `damage-add` value = one sidecar `"damage"` entry as a JSON object
+    string. A spec that is already active (map or runtime) is rejected
+    like an invalid one ("the spec is already active"), so the list
+    keeps one row per active spec and the exact-spec remove is
+    unambiguous. Runtime entries append after the sidecar's, in add
+    order.
+  - `damage-remove` value = `all` or the exact spec. Matching is by
+    the canonical record (kind, scope, mcm/chip/page, byte/bit/value),
+    so any written form of the same spec (linear or mcm/chip,
+    `stuck` or the `stuck0` alias) removes it. Only `src=runtime` rows
+    are removable: `all` = every runtime row, the sidecar rows stay
+    (boot configuration, D-X3; they only go away by rebooting QEMU
+    without the sidecar). Removing a spec that is not there errors and
+    changes nothing (D-Ag); `all` is idempotent (with no runtime rows
+    it succeeds and changes nothing). The list is capped at 65536
+    entries (map + runtime); a damage-add beyond errors.
+  - damage-list rows are `src=map|runtime ...`; the X-1 `src=file` was
+    renamed to `src=map` (X-2 brief, D-X3 updated) and the five X-1
+    damage-list assertions were updated with it. Row order: map rows first
+    (sidecar load order), then runtime rows in add order.
+  - An entry added or removed while an op is pending takes effect at
+    that op's completion (the hit points run there, D-X3): an add can
+    fail the op in flight, a remove cannot recall a hit that already
+    ran. Both verbs run in the main loop like the completion timer, so
+    the parse-and-append needs no locking. Stated at the verbs.
+  - Runtime entries survive `system_reset` (D-X1: they model broken
+    cells); the reset handler is untouched. D-F4 interaction, stated
+    at the reset handler and pinned in `flash-dmg-reset`: the reset
+    drops a pending op before completion, so an aborted op can never
+    take a damage hit (no IRQ, no status, nothing committed); the
+    guest re-issues the op after the reset and the damage applies to
+    that one.
+  - `faults-v1.json`: the reservation is whole-line `#` comments next
+    to the attenuator's. The loader has no "reserved/disabled row"
+    form — `validate` requires every real row to be complete and every
+    real row is injectable and listed by `catalogue()` — so comments
+    are the only non-injectable form, which is how the attenuator IDs
+    are reserved. The three device rows name the qom action on
+    `/machine/stixflash`, which the platform's `QOM_PATH` pattern
+    (`stixplat/faults.py`, stixctrl*/stixspw only) does not reach yet:
+    adopting them needs a platform amendment, hence comment-only
+    (D-X5). The three offline rows are noted as setup-only with no
+    action.
+  - No new traces: `stixflash_damage_hit` fires for runtime hits like
+    for sidecar hits (one line per hit), add/remove are silent.
+    `flash-dmg-runtime-add` pins exactly one hit line for the failed
+    runtime erase and none after the remove.
+  - qtests: `flash-dmg-runtime-add` (inject → full-latency erase
+    fails, nothing erased, one hit → remove the identical spec →
+    erase succeeds), `flash-dmg-reset` (system_reset during a pending
+    erase of the undamaged block 71 drops it per D-F4; the entry
+    survives and still fails block 70 with the full latency and one
+    IRQ), `flash-dmg-reject` (unknown kind, reserved block with
+    `allow-reserved` off, no scope, non-JSON, unknown key, duplicate
+    add, remove of an unknown spec, remove of the sidecar's own spec,
+    each leaving damage-list unchanged;
+    then `all` removing only the runtime row, and a second `all`
+    succeeding with nothing to remove (idempotent); then the
+    `allow-reserved=on` positive with the same instance pattern).
+    Each is RED on a pre-X-2 binary: the verbs are unknown properties,
+    the first `qom-set` errors and the leading assert aborts. O4's
+    both polarities work at runtime for free through the shared
+    parser (pinned for the sidecar in X-1's stuck0/stuck1).
+  - Not implemented (the plan's "Later"): per-entry persistence
+    (O2 — the controller re-applies after a cold power cycle, no
+    device-side per-entry flag) and wear/presets (O3 — the explicit
+    per-entry list only).
 
 ### X-3: the offline tool
 

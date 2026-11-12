@@ -11650,7 +11650,8 @@ static void stix_att_register(void)
 }
 
 /*
- * ---- Flash damage: device model + sidecar (flash-damage plan X-1) ----
+ * ---- Flash damage: device model, sidecar, runtime injection
+ * (flash-damage plan X-1, X-2) ----
  *
  * Kept in this one appended block behind stix_flashdmg_register(), like
  * the platform's stix_platform_register() and the attenuator's
@@ -11772,7 +11773,7 @@ static void test_flash_dmg_erase_fail(void)
     }
 
     list = flash_dmg_list(qts);
-    g_assert_cmpstr(list, ==, "src=file kind=erase-fail block=70");
+    g_assert_cmpstr(list, ==, "src=map kind=erase-fail block=70");
     g_free(list);
 
     /* a program into the damaged block lands (the FSW's marker nuance) */
@@ -11848,7 +11849,7 @@ static void test_flash_dmg_program_fail(void)
     }
 
     list = flash_dmg_list(qts);
-    g_assert_cmpstr(list, ==, "src=file kind=program-fail page=5000");
+    g_assert_cmpstr(list, ==, "src=map kind=program-fail page=5000");
     g_free(list);
 
     /* the program takes its full latency, then fails once */
@@ -11920,8 +11921,8 @@ static void test_flash_dmg_stuck0(void)
     }
 
     list = flash_dmg_list(qts);
-    g_assert_cmpstr(list, ==, "src=file kind=stuck value=0 page=4490 "
-                              "bit=12.3\nsrc=file kind=stuck value=0 "
+    g_assert_cmpstr(list, ==, "src=map kind=stuck value=0 page=4490 "
+                              "bit=12.3\nsrc=map kind=stuck value=0 "
                               "block=71");
     g_free(list);
 
@@ -12027,8 +12028,8 @@ static void test_flash_dmg_stuck1(void)
     }
 
     list = flash_dmg_list(qts);
-    g_assert_cmpstr(list, ==, "src=file kind=stuck value=1 page=4490 "
-                              "bit=12.3\nsrc=file kind=stuck value=1 "
+    g_assert_cmpstr(list, ==, "src=map kind=stuck value=1 page=4490 "
+                              "bit=12.3\nsrc=map kind=stuck value=1 "
                               "block=71");
     g_free(list);
 
@@ -12151,8 +12152,8 @@ static void test_flash_dmg_stuck_multi(void)
     }
 
     list = flash_dmg_list(qts);
-    g_assert_cmpstr(list, ==, "src=file kind=stuck value=1 page=4490 "
-                              "bit=12.3\nsrc=file kind=stuck value=1 "
+    g_assert_cmpstr(list, ==, "src=map kind=stuck value=1 page=4490 "
+                              "bit=12.3\nsrc=map kind=stuck value=1 "
                               "page=4490 bit=12.4");
     g_free(list);
 
@@ -12420,6 +12421,286 @@ static void test_flash_dmg_map_parse(void)
     }
 }
 
+/*
+ * qom-set one of the X-2 verbs ("damage-add"/"damage-remove"); false
+ * when QEMU refused it (D-Ag: a rejected set changed nothing). %s
+ * inserts the value as a JSON string, so the spec's quotes are escaped
+ * by libqtest.
+ */
+static bool flash_dmg_set(QTestState *qts, const char *prop,
+                          const char *value)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %s}}",
+                            FLASH_QOM_PATH, prop, value);
+    bool ok = qdict_haskey(resp, "return");
+
+    if (!ok) {
+        QDict *err = qdict_get_qdict(resp, "error");
+
+        g_test_message("%s refused: %s", prop,
+                       err != NULL ? qdict_get_try_str(err, "desc") : "?");
+    }
+    qobject_unref(resp);
+    return ok;
+}
+
+/*
+ * /sparc/stix/flash-dmg-runtime-add (X-2): damage-add injects one
+ * runtime entry with the sidecar entry grammar (the same parser); the
+ * erase of the injected block takes its full tbers-us and fails
+ * FAILED | READY with one IRQ, erasing nothing, and one
+ * stixflash_damage_hit trace line (the same hit points as the
+ * sidecar); damage-remove of the identical spec drops the entry and
+ * the next erase succeeds. These verbs are platform fault verbs, not
+ * qtest-only state.
+ * RED before X-2: damage-add/damage-remove are unknown properties, the
+ * first qom-set errors and the assert aborts.
+ */
+static void test_flash_dmg_runtime_add(void)
+{
+    static const char json[] = "{\"v\":1,\"damage\":[]}";
+    static const char spec[] = "{\"kind\":\"erase-fail\",\"block\":70}";
+    g_autofree uint8_t *p = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree uint8_t *host = g_malloc(FLASH_PAGE_BYTES);
+    g_autofree gchar *log = NULL;
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *text = NULL;
+    QTestState *qts;
+    gchar *list, *cur;
+    size_t i;
+    int fd, hits;
+
+    for (i = 0; i < FLASH_PAGE_BYTES; i++) {
+        p[i] = (uint8_t)(i ^ 0x3Cu);
+    }
+    fd = g_file_open_tmp("stix-flash-dmgrun-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("%s -trace stixflash_damage_hit "
+                            "-trace stixflash_op_done -D %s",
+                            FLASH_LATENCY_ON, log);
+
+    qts = flash_dmg_qtest_new(json, extra);
+
+    /* inject: the row appears with src=runtime */
+    g_assert_true(flash_dmg_set(qts, "damage-add", spec));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=runtime kind=erase-fail block=70");
+    g_free(list);
+
+    /* the erase takes its full latency, then fails once */
+    qtest_memwrite(qts, FLASH_RAM_A, p, FLASH_PAGE_BYTES);
+    flash_issue(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_PAGE_WRITE);
+    flash_assert_done_ok(qts);
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_BLOCK_ERASE);
+    flash_assert_busy(qts);
+    flash_step_us(qts, FLASH_TBERS_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    flash_step_us(qts, 2);
+    g_assert_cmpuint(qtest_readl(qts, FLASH_CMDSTA)
+                     & (FTNAND_BUSY | FTNAND_FAILED | FTNAND_READY),
+                     ==, FTNAND_FAILED | FTNAND_READY);
+    g_assert_true(flash_irq_pending(qts));
+    flash_assert_no_more_irq(qts);
+
+    /* nothing was erased: the file still holds the pattern */
+    flash_pread_page(stix_dmg_flash_path,
+                     (uint64_t)FLASH_DMG_PAGE * FLASH_PAGE_BYTES, host);
+    flash_invert(host, FLASH_PAGE_BYTES);
+    g_assert_cmpint(memcmp(host, p, FLASH_PAGE_BYTES), ==, 0);
+
+    /* remove the identical spec: the row goes, the erase lands */
+    g_assert_true(flash_dmg_set(qts, "damage-remove", spec));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "");
+    g_free(list);
+    flash_irq_clear(qts);
+    flash_issue(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_BLOCK_ERASE);
+    flash_assert_done_ok(qts);
+    g_assert_cmpint(stix_qom_counter(qts, FLASH_QOM_PATH, "ops-erase"),
+                    ==, 2);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+
+    /*
+     * exactly one damage hit (the failed runtime erase), none after
+     * the remove; positive control: the ops are in the log at all
+     */
+    g_assert(g_file_get_contents(log, &text, NULL, NULL));
+    g_assert_nonnull(strstr(text, "stixflash_op_done"));
+    hits = 0;
+    for (cur = text; (cur = strstr(cur, "stixflash_damage_hit")) != NULL;
+         cur++) {
+        hits++;
+    }
+    g_assert_cmpint(hits, ==, 1);
+    unlink(log);
+}
+
+/*
+ * /sparc/stix/flash-dmg-reset (X-2, D-X1/D-F4): a system_reset keeps
+ * the runtime entries (they model broken cells), and the pending-op
+ * rules of D-F4 still hold: a reset during an erase of the undamaged
+ * block 71 drops the op (cmdSta 0, no completion, no IRQ -- an aborted
+ * op can never take a damage hit), and after the reset the entry still
+ * fails block 70 with the full latency and one IRQ.
+ * RED before X-2: damage-add is an unknown property, the qom-set
+ * errors and the assert aborts.
+ */
+static void test_flash_dmg_reset(void)
+{
+    static const char json[] = "{\"v\":1,\"damage\":[]}";
+    static const char spec[] = "{\"kind\":\"erase-fail\",\"block\":70}";
+    QTestState *qts;
+    gchar *list;
+
+    qts = flash_dmg_qtest_new(json, FLASH_LATENCY_ON);
+
+    g_assert_true(flash_dmg_set(qts, "damage-add", spec));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=runtime kind=erase-fail block=70");
+    g_free(list);
+
+    /* a system_reset while an erase of block 71 is in flight: D-F4 */
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, 71 * FLASH_PAGENUM_IN_BLOCK,
+                       CMD_BLOCK_ERASE);
+    flash_assert_busy(qts);
+    qtest_system_reset(qts);
+    g_assert_cmphex(qtest_readl(qts, FLASH_CMDSTA), ==, 0);
+    flash_step_us(qts, 10 * 1000);
+    g_assert_false(flash_irq_pending(qts));
+
+    /* the entry survived the reset ... */
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, "src=runtime kind=erase-fail block=70");
+    g_free(list);
+
+    /* ... and still fails the block, with the full latency, one IRQ */
+    flash_irq_clear(qts);
+    flash_issue_nowait(qts, FLASH_RAM_A, FLASH_DMG_PAGE, CMD_BLOCK_ERASE);
+    flash_assert_busy(qts);
+    flash_step_us(qts, FLASH_TBERS_US - 1);
+    flash_assert_busy(qts);
+    g_assert_false(flash_irq_pending(qts));
+    flash_step_us(qts, 2);
+    g_assert_cmpuint(qtest_readl(qts, FLASH_CMDSTA)
+                     & (FTNAND_BUSY | FTNAND_FAILED | FTNAND_READY),
+                     ==, FTNAND_FAILED | FTNAND_READY);
+    g_assert_true(flash_irq_pending(qts));
+    flash_assert_no_more_irq(qts);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+}
+
+/*
+ * /sparc/stix/flash-dmg-reject (X-2, D-Ag): a rejected set errors and
+ * changes nothing. Rejected: an unknown kind, a block in the reserved
+ * ASW image area (allow-reserved off, the default), a spec that does
+ * not parse, an unknown key, a duplicate of an active spec, a remove
+ * of a spec no runtime entry has (including the sidecar's own spec:
+ * the map is boot configuration, not removable). damage-list is
+ * unchanged after every rejection. "all" removes the runtime rows,
+ * leaves the sidecar's, and is idempotent. With
+ * allow-reserved=on the reserved block is accepted, and removable.
+ * RED before X-2: the verbs are unknown properties; the first add
+ * errors and the assert aborts.
+ */
+static void test_flash_dmg_reject(void)
+{
+    static const char json[] =
+        "{\"v\":1,\"damage\":[{\"kind\":\"stuck\",\"value\":0,"
+        "\"page\":4490,\"bit\":\"12.3\"}]}";
+    static const char spec[] = "{\"kind\":\"erase-fail\",\"block\":70}";
+    static const char *const rejects[] = {
+        "{\"kind\":\"warp\",\"block\":70}",         /* unknown kind */
+        "{\"kind\":\"erase-fail\",\"block\":10}",   /* reserved, < 64 */
+        "{\"kind\":\"erase-fail\"}",                /* no block/page */
+        "not json at all",                          /* does not parse */
+        "{\"kind\":\"erase-fail\",\"pages\":70}",   /* unknown key */
+        "{\"kind\":\"erase-fail\",\"block\":70}",   /* duplicate */
+    };
+    const char *after_all = "src=map kind=stuck value=0 page=4490 bit=12.3";
+    g_autofree gchar *extra = NULL;
+    QTestState *qts;
+    gchar *list, *snapshot;
+    size_t i;
+
+    qts = flash_dmg_qtest_new(json, FLASH_LATENCY_ON);
+
+    g_assert_true(flash_dmg_set(qts, "damage-add", spec));
+    snapshot = flash_dmg_list(qts);
+    g_assert_cmpstr(snapshot, ==,
+                    "src=map kind=stuck value=0 page=4490 bit=12.3\n"
+                    "src=runtime kind=erase-fail block=70");
+
+    /* every rejected damage-add leaves the list exactly as it was */
+    for (i = 0; i < G_N_ELEMENTS(rejects); i++) {
+        g_assert_false(flash_dmg_set(qts, "damage-add", rejects[i]));
+        list = flash_dmg_list(qts);
+        g_assert_cmpstr(list, ==, snapshot);
+        g_free(list);
+    }
+
+    /*
+     * remove of a spec no runtime entry has: the sidecar's own spec
+     * counts as unknown (remove only reaches runtime entries)
+     */
+    g_assert_false(flash_dmg_set(qts, "damage-remove",
+                                 "{\"kind\":\"erase-fail\",\"block\":71}"));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, snapshot);
+    g_free(list);
+    g_assert_false(flash_dmg_set(qts, "damage-remove",
+                                 "{\"kind\":\"stuck\",\"value\":0,"
+                                 "\"page\":4490,\"bit\":\"12.3\"}"));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, snapshot);
+    g_free(list);
+
+    /*
+     * "all": the runtime row goes, the sidecar row stays, and a
+     * second "all" is idempotent (succeeds, changes nothing)
+     */
+    g_assert_true(flash_dmg_set(qts, "damage-remove", "all"));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, after_all);
+    g_free(list);
+    g_assert_true(flash_dmg_set(qts, "damage-remove", "all"));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, after_all);
+    g_free(list);
+    g_free(snapshot);
+
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+
+    /* allow-reserved=on lifts the reserved rule for damage-add only */
+    extra = g_strdup_printf("%s -global grlib-stixflash.allow-reserved=on",
+                            FLASH_LATENCY_ON);
+    qts = flash_dmg_qtest_new(json, extra);
+    g_assert_true(flash_dmg_set(qts, "damage-add",
+                                "{\"kind\":\"erase-fail\",\"block\":10}"));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==,
+                    "src=map kind=stuck value=0 page=4490 bit=12.3\n"
+                    "src=runtime kind=erase-fail block=10");
+    g_free(list);
+    g_assert_true(flash_dmg_set(qts, "damage-remove", "all"));
+    list = flash_dmg_list(qts);
+    g_assert_cmpstr(list, ==, after_all);
+    g_free(list);
+    qtest_quit(qts);
+    flash_dmg_cleanup();
+}
+
 /* X-1: one registration call from main(), the track's merge surface. */
 static void stix_flashdmg_register(void)
 {
@@ -12438,6 +12719,10 @@ static void stix_flashdmg_register(void)
                    test_flash_dmg_map_error_subprocess);
     qtest_add_func("/sparc/stix/flash-dmg-map-parse",
                    test_flash_dmg_map_parse);
+    qtest_add_func("/sparc/stix/flash-dmg-runtime-add",
+                   test_flash_dmg_runtime_add);
+    qtest_add_func("/sparc/stix/flash-dmg-reset", test_flash_dmg_reset);
+    qtest_add_func("/sparc/stix/flash-dmg-reject", test_flash_dmg_reject);
 }
 
 int main(int argc, char **argv)

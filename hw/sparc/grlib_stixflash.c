@@ -107,11 +107,13 @@ typedef struct StixFlashOp {
 } StixFlashOp;
 
 /*
- * Flash damage plan D-X2/D-X3: device-side damage, one list, loaded
- * from the sidecar at realize (the runtime QOM surface is X-2).
- * Addresses are canonical: mcm/chip plus the page inside the chip.
- * erase-fail covers the 64-page block from its base page; program-fail
- * and stuck hit one page, stuck also in the block-scope form.
+ * Flash damage plan D-X2/D-X3: device-side damage, one list. The
+ * sidecar loads it at realize (src=map); X-2's damage-add appends
+ * runtime entries (src=runtime) and damage-remove drops the runtime
+ * ones. Addresses are canonical: mcm/chip plus the page inside the
+ * chip. erase-fail covers the 64-page block from its base page;
+ * program-fail and stuck hit one page, stuck also in the block-scope
+ * form.
  */
 typedef enum {
     STIXFLASH_DMG_ERASE_FAIL,
@@ -119,8 +121,14 @@ typedef enum {
     STIXFLASH_DMG_STUCK,
 } StixFlashDmgKind;
 
+typedef enum {
+    STIXFLASH_DMG_SRC_MAP,      /* from the sidecar, loaded at realize */
+    STIXFLASH_DMG_SRC_RUNTIME,  /* injected at run time via damage-add */
+} StixFlashDmgSrc;
+
 typedef struct StixFlashDamage {
     StixFlashDmgKind kind;
+    StixFlashDmgSrc src;
     uint32_t mcm;
     uint32_t chip;
     uint32_t page;   /* page in the chip; block scope: the base page */
@@ -130,10 +138,15 @@ typedef struct StixFlashDamage {
     uint8_t value;   /* stuck: the value the bit reads, 0 or 1 (O4) */
 } StixFlashDamage;
 
-/* blocks < 64 are the ASW image area: no sidecar entry, no override */
+/*
+ * blocks < 64 are the ASW image area: no sidecar entry ever (D-X3);
+ * damage-add only with allow-reserved (X-2)
+ */
 #define STIXFLASH_DMG_RESERVED_BLOCKS 64uLL
 /* the sidecar is a small file; refuse anything larger at realize */
 #define STIXFLASH_DMG_FILE_MAX (1024uLL * 1024)
+/* the whole list (map + runtime) is capped; a runaway add errors */
+#define STIXFLASH_DMG_RUNTIME_MAX 65536u
 
 struct STIXFLASH
 {
@@ -186,8 +199,17 @@ struct STIXFLASH
     uint64_t ops_erase;
     uint64_t ops_abort;
 
-    /* D-X3: the sidecar qdev property and the damage list it loaded */
+    /*
+     * D-X3: the sidecar qdev property and the damage list it loaded.
+     * X-2: damage-add appends runtime entries (src), damage-remove
+     * drops them; both survive a system_reset.
+     */
     char *flash_damage_map;
+    /*
+     * X-2: damage-add may inject into the reserved ASW image area
+     * (blocks < 64); the sidecar never may (D-X3, no override)
+     */
+    bool allow_reserved;
     StixFlashDamage *damage;
     size_t damage_len;
 };
@@ -1065,9 +1087,12 @@ static bool stixflash_dmg_int(const QDict *e, const char *key, int64_t lo,
  * "page" (the framework's form). "bit" ("byte.bit" inside the page)
  * and "value" (0 or 1) are stuck-only; the framework's offset=<o> has
  * no key here (the tool resolves it to a bit before writing the
- * sidecar).
+ * sidecar). This is the one parser for both sources (D-X3 sidecar and
+ * X-2 damage-add/damage-remove): @allow_reserved lifts the reserved
+ * block rule for the runtime verbs only, the sidecar never passes it.
  */
-static bool stixflash_dmg_entry(QDict *e, StixFlashDamage *d, Error **errp)
+static bool stixflash_dmg_entry(QDict *e, StixFlashDamage *d,
+                                bool allow_reserved, Error **errp)
 {
     const uint32_t blocks_per_mcm = (uint32_t)(FLASH_DEVICES_PER_MCM *
                                                FLASH_BLOCKS_PER_DEVICE);
@@ -1213,13 +1238,17 @@ static bool stixflash_dmg_entry(QDict *e, StixFlashDamage *d, Error **errp)
         return false;
     }
 
-    /* the reserved ASW image area, by the containing block (D-X3) */
+    /*
+     * the reserved ASW image area, by the containing block (D-X3);
+     * allow-reserved lifts it for damage-add only (X-2)
+     */
     {
         uint32_t lin_block = mcm * blocks_per_mcm
                              + chip * FLASH_BLOCKS_PER_DEVICE
                              + page / FLASH_PAGENUM_IN_BLOCK;
 
-        if (lin_block < STIXFLASH_DMG_RESERVED_BLOCKS) {
+        if (!allow_reserved &&
+            lin_block < STIXFLASH_DMG_RESERVED_BLOCKS) {
             error_setg(errp, "block %" PRIu32 " is in the reserved ASW "
                        "image area (blocks < %llu)", lin_block,
                        (unsigned long long)STIXFLASH_DMG_RESERVED_BLOCKS);
@@ -1364,12 +1393,13 @@ static bool stixflash_damage_load(STIXFLASH *stixflash, Error **errp)
                        "is not a JSON object", path, idx);
             goto fail_obj;
         }
-        if (!stixflash_dmg_entry(e, &stixflash->damage[idx], &err)) {
+        if (!stixflash_dmg_entry(e, &stixflash->damage[idx], false, &err)) {
             error_prepend(&err, "stixflash: flash-damage-map %s: entry "
                           "%zu: ", path, idx);
             error_propagate(errp, err);
             goto fail_obj;
         }
+        stixflash->damage[idx].src = STIXFLASH_DMG_SRC_MAP;
         stixflash->damage_len++;
     }
     trace_stixflash_damage_load(stixflash->damage_len, path);
@@ -1387,7 +1417,15 @@ fail_text:
     return false;
 }
 
-/* D-X3: the active specs, one row per entry (X-2 adds src=runtime). */
+/*
+ * D-X3/X-2: the active specs, one row per entry, src=map (sidecar) or
+ * src=runtime (damage-add).
+ */
+static const char *stixflash_dmg_src_str(const StixFlashDamage *d)
+{
+    return d->src == STIXFLASH_DMG_SRC_RUNTIME ? "runtime" : "map";
+}
+
 static char *stixflash_damage_list_get(Object *obj, Error **errp)
 {
     STIXFLASH *s = GRLIB_STIXFLASH(obj);
@@ -1411,28 +1449,175 @@ static char *stixflash_damage_list_get(Object *obj, Error **errp)
         }
         switch (d->kind) {
         case STIXFLASH_DMG_ERASE_FAIL:
-            g_string_append_printf(out, "src=file kind=erase-fail block=%u",
-                                   block);
+            g_string_append_printf(out,
+                                   "src=%s kind=erase-fail block=%u",
+                                   stixflash_dmg_src_str(d), block);
             break;
         case STIXFLASH_DMG_PROGRAM_FAIL:
-            g_string_append_printf(out, "src=file kind=program-fail page=%u",
-                                   page);
+            g_string_append_printf(out,
+                                   "src=%s kind=program-fail page=%u",
+                                   stixflash_dmg_src_str(d), page);
             break;
         case STIXFLASH_DMG_STUCK:
             if (d->block_scope) {
                 g_string_append_printf(out,
-                                       "src=file kind=stuck value=%u block=%u",
+                                       "src=%s kind=stuck value=%u block=%u",
+                                       stixflash_dmg_src_str(d),
                                        (uint32_t)d->value, block);
             } else {
                 g_string_append_printf(out,
-                                       "src=file kind=stuck value=%u page=%u"
-                                       " bit=%u.%u", (uint32_t)d->value, page,
+                                       "src=%s kind=stuck value=%u page=%u"
+                                       " bit=%u.%u", stixflash_dmg_src_str(d),
+                                       (uint32_t)d->value, page,
                                        d->byte, (uint32_t)d->bit);
             }
             break;
         }
     }
     return g_string_free(out, FALSE);
+}
+
+/*
+ * ---- X-2: the runtime injection verbs (platform fault verbs, not
+ * qtest-only) ----
+ *
+ * Both take one sidecar "damage" entry as a JSON object string, parsed
+ * by the same stixflash_dmg_entry as the sidecar. Like every damage
+ * application (D-X3) the hit points run at stixflash_complete(), so an
+ * entry added or removed while an op is pending takes effect at that
+ * op's completion: an add can fail the op in flight, a remove before
+ * the completion cancels that op's hit, and nothing recalls a hit that
+ * already ran. Both verbs are silent (no new
+ * traces); a rejected set errors and changes nothing (D-Ag's rule).
+ */
+
+/*
+ * Do @a and @b name the same damage? The parse canonicalises the
+ * addressing, so equal records are equal specs whatever form they were
+ * written in (linear or mcm/chip, "stuck" or the "stuck0" alias).
+ */
+static bool stixflash_dmg_equal(const StixFlashDamage *a,
+                                const StixFlashDamage *b)
+{
+    return a->kind == b->kind && a->block_scope == b->block_scope &&
+           a->mcm == b->mcm && a->chip == b->chip && a->page == b->page &&
+           a->byte == b->byte && a->bit == b->bit && a->value == b->value;
+}
+
+/*
+ * One spec string into @d: a JSON object with the sidecar entry
+ * grammar, through the same stixflash_dmg_entry. @allow_reserved
+ * lifts the reserved-block rule (damage-add with the property set,
+ * damage-remove always).
+ */
+static bool stixflash_dmg_parse_value(const char *value, bool allow_reserved,
+                                      StixFlashDamage *d, Error **errp)
+{
+    Error *err = NULL;
+    QObject *obj = qobject_from_json(value, &err);
+    QDict *e;
+    bool ok;
+
+    if (obj == NULL) {
+        error_prepend(&err, "not JSON: ");
+        error_propagate(errp, err);
+        return false;
+    }
+    e = qobject_to(QDict, obj);
+    if (e == NULL) {
+        error_setg(errp, "the spec is not a JSON object");
+        qobject_unref(obj);
+        return false;
+    }
+    ok = stixflash_dmg_entry(e, d, allow_reserved, &err);
+    qobject_unref(obj);
+    if (!ok) {
+        error_propagate(errp, err);
+    }
+    return ok;
+}
+
+/*
+ * damage-add (write-only): inject one runtime entry. The value is one
+ * sidecar entry as a JSON object string; allow-reserved lifts the
+ * reserved-block rule. A spec that is already active (map or runtime)
+ * is rejected like an invalid one, so the list keeps one row per
+ * active spec and the exact-spec remove is unambiguous.
+ */
+static void stixflash_damage_add_set(Object *obj, const char *value,
+                                     Error **errp)
+{
+    STIXFLASH *s = GRLIB_STIXFLASH(obj);
+    StixFlashDamage d = { 0 };
+    Error *err = NULL;
+    size_t i;
+
+    if (!stixflash_dmg_parse_value(value, s->allow_reserved, &d, &err)) {
+        error_prepend(&err, "stixflash: damage-add: ");
+        error_propagate(errp, err);
+        return;
+    }
+    for (i = 0; i < s->damage_len; i++) {
+        if (stixflash_dmg_equal(&s->damage[i], &d)) {
+            error_setg(errp, "stixflash: damage-add: the spec is already "
+                       "active");
+            return;
+        }
+    }
+    if (s->damage_len >= STIXFLASH_DMG_RUNTIME_MAX) {
+        error_setg(errp, "stixflash: damage-add: at most %u damage "
+                   "entries", STIXFLASH_DMG_RUNTIME_MAX);
+        return;
+    }
+    d.src = STIXFLASH_DMG_SRC_RUNTIME;
+    s->damage = g_renew(StixFlashDamage, s->damage, s->damage_len + 1);
+    s->damage[s->damage_len++] = d;
+}
+
+/*
+ * damage-remove (write-only): "all" or the exact spec of an active
+ * runtime entry. Only src=runtime rows are removable: the sidecar rows
+ * are boot configuration (D-X3) and survive until QEMU exits. The
+ * reserved rule does not apply here (removing injects nothing). A
+ * spec that names nothing errors and changes nothing (D-Ag); "all" is
+ * idempotent.
+ */
+static void stixflash_damage_remove_set(Object *obj, const char *value,
+                                        Error **errp)
+{
+    STIXFLASH *s = GRLIB_STIXFLASH(obj);
+    StixFlashDamage d = { 0 };
+    Error *err = NULL;
+    size_t i, w;
+
+    /* "all" is idempotent: a clear-all with nothing armed succeeds */
+    if (strcmp(value, "all") == 0) {
+        for (i = 0, w = 0; i < s->damage_len; i++) {
+            if (s->damage[i].src != STIXFLASH_DMG_SRC_RUNTIME) {
+                s->damage[w++] = s->damage[i];
+            }
+        }
+        s->damage_len = w;
+        return;
+    }
+
+    /* a removal must never be blocked by the reserved rule */
+    if (!stixflash_dmg_parse_value(value, true, &d, &err)) {
+        error_prepend(&err, "stixflash: damage-remove: ");
+        error_propagate(errp, err);
+        return;
+    }
+    for (i = 0; i < s->damage_len; i++) {
+        if (s->damage[i].src == STIXFLASH_DMG_SRC_RUNTIME &&
+            stixflash_dmg_equal(&s->damage[i], &d)) {
+            memmove(&s->damage[i], &s->damage[i + 1],
+                    (s->damage_len - i - 1) * sizeof(StixFlashDamage));
+            s->damage_len--;
+            return;
+        }
+    }
+    error_setg(errp, "stixflash: damage-remove: no such runtime damage "
+               "entry");
 }
 
 static void grlib_stixflash_realize(DeviceState *dev, Error **errp)
@@ -1499,7 +1684,14 @@ static void grlib_stixflash_unrealize(DeviceState *dev)
 
 /*
  * D-F4: drop any pending op and return the command sequence to the
- * power-on state of the zeroed instance
+ * power-on state of the zeroed instance.
+ *
+ * X-2: the damage list (map and runtime entries) is deliberately
+ * untouched -- runtime entries model broken cells and survive a
+ * system_reset (D-X1). The pending op dropped here never completes, so
+ * it can never take a damage hit either (the only hit points run at
+ * completion): no IRQ, no status, nothing committed; the guest
+ * re-issues the op after the reset and the damage applies to that one.
  */
 static void grlib_stixflash_reset(DeviceState *d)
 {
@@ -1518,6 +1710,11 @@ static const Property grlib_stixflash_properties[] = {
     DEFINE_PROP_STRING("flash-file", STIXFLASH, flash_file),
     /* D-X3: the damage sidecar, parsed at realize; unset or "" = none */
     DEFINE_PROP_STRING("flash-damage-map", STIXFLASH, flash_damage_map),
+    /*
+     * X-2: damage-add may inject into blocks < 64 (the sidecar may
+     * not, D-X3)
+     */
+    DEFINE_PROP_BOOL("allow-reserved", STIXFLASH, allow_reserved, false),
     DEFINE_PROP_BOOL("inverted-storage", STIXFLASH, inverted_storage, true),
     /*
      * D-F6/D-F7: on by default (F-3), so the PFM build's FS-init task
@@ -1557,9 +1754,20 @@ static void grlib_stixflash_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READ);
     object_property_add_uint64_ptr(obj, "ops-abort", &stixflash->ops_abort,
                                    OBJ_PROP_FLAG_READ);
-    /* D-X3: the active damage specs, read-only (X-2 adds src=runtime) */
+    /*
+     * D-X3: the active damage specs, read-only (rows carry src=map or
+     * src=runtime, X-2)
+     */
     object_property_add_str(obj, "damage-list", stixflash_damage_list_get,
                             NULL);
+    /*
+     * X-2: the runtime injection verbs (write-only), the platform's
+     * qom fault actions on /machine/stixflash (D-X5)
+     */
+    object_property_add_str(obj, "damage-add", NULL,
+                            stixflash_damage_add_set);
+    object_property_add_str(obj, "damage-remove", NULL,
+                            stixflash_damage_remove_set);
 }
 
 static void grlib_stixflash_class_init(ObjectClass *klass, const void *data)

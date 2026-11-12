@@ -13,6 +13,22 @@
 #   attenuator.move.slow, attenuator.mechanism.partial,
 #   attenuator.motor1.flag_lost, attenuator.motor2.flag_lost,
 #   attenuator.controller.fail_flag, attenuator.current.scale.
+#
+# Reserved for the flash-damage track (docs/stix-port/
+# 2026-11-12-flash-damage-plan.md, D-X5), comment-only until the
+# platform track adopts the IDs: every real row is validated into an
+# injectable fault, so a reservation can only live here, as with the
+# attenuator IDs above.
+#   flash.block.erase_fail, flash.page.program_fail, flash.cell.stuck
+#     -- device faults: class memory, changes truth, persistence
+#     until_cleared, reversible; params block|page (+bit, value) in the
+#     FSW-linear index space; action qom with property damage-add and
+#     clear damage-remove on /machine/stixflash (needs the platform's
+#     qom-path pattern to reach that device first).
+#   flash.block.bad_factory, flash.file.corrupt, flash.file.wrong_address
+#     -- offline setup rows, no action: expressed as pre-boot scenario
+#     steps (the planned hooks.* verb flash.damage running
+#     scripts/stix/flash-damage.py), never injectable faults (D-X5).
 {
   "api": 1,
   "faults": [
