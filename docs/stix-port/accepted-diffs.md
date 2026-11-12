@@ -4802,18 +4802,41 @@ the sidecar's own spec — each leaving `damage-list` unchanged; then
 offline side. The gate pins the FSW-visible outcomes; its [L] payloads
 came from the live probe runs recorded in the plan's X-4 "As built".
 
-## Accepted diff: memory upsets and EDAC (baseline: no EDAC register semantics)
+## Accepted diff: memory upsets and EDAC (baseline: memories never fail)
 
-Plan: `2026-11-12-memory-upset-plan.md` (commits M-1..M-7; this section
-is unnumbered until the merge). M-1 lands the register semantics; the
-upset commits extend it in place.
+Plan: `2026-11-12-memory-upset-plan.md` (commits M-1..M-7). Unnumbered
+on purpose: it takes the next free § at the merge, like P-1.
+
+**Baseline:** memories never fail. The EDAC registers were plain
+storage (only §5's 0x54 write masking existed), nothing could be
+injected, and nothing counted, latched, interrupted or trapped; the
+boot print read the reset zeros. EEPROM/PROM stays out of scope (the
+boot image is immutable) and keeps its plain-storage register
+behaviour.
 
 - **The EDAC unit** (`hw/sparc/stix_edac.[ch]`, TYPE_STIX_EDAC at
   `/machine/stixctrl/edac`, a QOM child of the stixctrl device): owns
-  the SEC counters and DeDetected latches of the three EDAC memories
-  (SDRAM, CACHE, ROTBUF; EEPROM is out of scope and stays plain
-  storage) and the `edac-at-boot` property (D-Uk). M-1 has no upsets:
-  nothing counts up, the unit traces nothing.
+  the poison table and the sparse overlays, the SEC counters and
+  DeDetected latches of the three EDAC memories (SDRAM, CACHE, ROTBUF;
+  EEPROM is out of scope and stays plain storage), the injection
+  interface and the `edac-at-boot` property (D-Uk). With nothing armed
+  the unit is byte-invisible: no overlay exists, the register and
+  window hooks early-return on an empty table, nothing counts up,
+  nothing traces.
+- **The injection interface (D-Ug).** All on `/machine/stixctrl/edac`:
+  `upset-inject` (write-only string), `upset-clear` (`"all"` or the
+  record id — the 0-based position in the armed list, the same order
+  `upsets-active` lists them), `upsets-active` (read-only JSON: one
+  record per armed poison — id, memory, address, mask, mode, persist;
+  rotbuf records additionally carry `block` and `offset` — plus
+  per-memory `injected`/`corrected`/`detected` counters) and
+  `edac-enable` (M-3, below). A rejected set (unknown memory, unaligned
+  address, bitmask 0 or wider than the word, a rotbuf block or offset
+  out of range) is an error that names the offending field and changes
+  nothing; a re-inject of an already-armed word replaces its record and
+  counts a fresh `injected`. The counters are host-side statistics that
+  survive a reset, like the poisons (the M-1 reset hook clears only the
+  SEC/DE latches).
 - **Register semantics (M-1).** The composed fields are read-only and
   read 0 until a commit counts an upset; the write-1 strobes self-clear
   and reset counter and latch:
@@ -4872,13 +4895,67 @@ upset commits extend it in place.
   clobber the bits; the unit's hook clears its counters, where the
   order does not matter. Live SDRAM/ROTB DE gates run `all-on` until
   Q1 is answered.
-- **Tests:** the `stix_edac_register()` block in `tests/qtest/stix.c`:
-  `edac-reg-reset` and `edac-reg-readonly` are RED on the pre-M-1
-  binary (cacheCmdSta read 0; the composed fields and the 0x54 strobe
-  bit came back from plain storage); `edac-boot-state`, `edac-strobe`
-  and `edac-rotb-strobe-quirk` are red-by-construction (the property
-  and the strobe semantics are new). The strobes are exercised with
-  forced latches via the unit's test-only `test-latch-*` properties.
+- **The overlay design (M-2, D-Uc).** Truth is the host RAM bytes; the
+  flip lives in the poison table, not the backing bytes — an overlay
+  read fetches the clean word from the backing RAM and XORs the mask.
+  On the first poison in an aligned 4 KB page a priority subregion with
+  `read_with_attrs`/`write_with_attrs` handlers covers that page (a
+  plain `.read` would have won the dispatch); it is removed when the
+  page empties, and a removed struct is parked on a freelist and
+  reused, never freed inside its own read dispatch. All 1/2/4-byte
+  accesses are forwarded (`valid.max_access_size` 8, the M-3 review
+  fix: with 4 every guest ldd/std on an overlaid page was a silent
+  decode error — the load returned 0, the store was dropped). A write
+  touching any byte of a poisoned word is a read-modify-write of the
+  EDAC word: the untouched bytes keep the flip (EDACON = 0, or a DE
+  re-encoded as the cell's content), except an EDACON = 1 SEU, which
+  the RMW's read half corrects without counting. Host-side writers go
+  through the same rule: stix_det's LACC/EACC materialization calls
+  `stixctrl_edac_sram_write` (`stix_edac_host_write`), so a QL swap
+  retires every poison it overwrites, and the ROTB FPGA append (M-4)
+  clears every block it writes. Traces: `stix_edac_inject`,
+  `stix_edac_effect` (kinds `sec`, `ded`, `raw`, `write-clear`,
+  `host-clear`), `stix_edac_clear`, `stix_edac_enable` — from the QOM
+  verbs and real intercepted accesses only, never from a getter. Known
+  bounded window: after an inject over QMP a running vCPU can still hit
+  a stale RAM TLB entry for a few TBs (the flush is async), so a first
+  read may be clean while the poison stays armed; the campaigns poll
+  (the ROTB block window is MMIO and never cached in a RAM TLB entry).
+- **One-shot and persist (D-Uh).** SEU poisons self-retire on the first
+  read with EDACON = 1 (corrected + counted); a one-shot DE retires on
+  the first *detected* read (with EDACON = 0, or — CACHE — OPMODE = 1,
+  the flip is returned raw and the poison stays armed: nothing
+  corrected the cell); `persist=1` keeps a poison armed through
+  everything and models a stuck cell (boot-loop risk documented in the
+  catalogue; no gate uses it). Upsets survive a system reset — a reboot
+  does not heal a memory cell — and die at a power cycle. This differs
+  from Phase-4's "injections clear with the device" rule (D-P4b) and
+  follows the attenuator's physical-fault persistence (D-Ag).
+- **The OPMODE gate (M-2).** For CACHE the DEDETECTED latch and the
+  IRQ 6 pulse gate on OPMODE = 0 (cache mode) as well as EDACON = 1,
+  per the IRQ-table comment (`StixIdpu.h:1547`); the DE *data* flip is
+  returned regardless of OPMODE — the register comment gates the IRQ,
+  not the data. The SEU path gates on EDACON only [I — the qtests never
+  read an SEU with OPMODE = 1; one constant to change if the FSW side
+  says otherwise]. cacheCmdSta resets with OPMODE = 0 (the accepted
+  divergence below), so the CACHE DE → IRQ path is live with no FSW
+  setup.
+- **SDRAM: the AHBSTAT window and the trap (M-3).** The DE overlay read
+  (EDACON = 1) latches DEDETECTED/SECCOUNT, latches the failing word
+  address into a new 4-byte AHBSTAT window at 0x80000F00 (`StixIdpu.h`
+  `SDRAM_AHBSTAT_BASE`; owned by the unit, mapped by leon3.c via
+  `stix_edac_ahbstat_mr()`; reset value 0, the latch survives a system
+  reset — the post-reboot record is the BRAM copy the FSW's
+  `storeBadTrapInfo` made — and writes drop) and returns MEMTX_ERROR;
+  the *data* under the error response is the flipped word (undefined on
+  real hardware; the trap path never sees it). `edac-enable` on the
+  unit (`"all-on"` or a 3-bit mask: 1 sdram, 2 cache, 4 rotb) ORs the
+  EdacOn bits a software write could set into the register owners'
+  stored words and never clears a bit; a module whose owner is not
+  wired refuses the whole set (all-or-nothing, so a caller is never
+  left with a silently missed module) and an empty mask is refused;
+  write-only, traced (`stix_edac_enable`), not qtest-gated — it is a
+  platform fault verb.
 - **Behaviour change in `target/sparc` (M-3): a MEMTX_ERROR on a LEON3
   data access now raises trap 0x09.** `sparc_cpu_do_transaction_failed`
   (`target/sparc/ldst_helper.c`) raises `TT_DFAULT` (0x09) when the
@@ -4895,7 +4972,150 @@ upset commits extend it in place.
   gptimer, apbuart, ahb/apb pnp) uses plain `.read`/`.write` handlers,
   which always dispatch as MEMTX_OK, and no machine sets
   `ignore_memory_transaction_failures`. The first (and only) producer
-  is the EDAC unit's SDRAM DE overlay read. `edac-sdram-ded-trap-runtime`
-  is the assertion for the trap, with guest code (the trap is expected
-  to land in the guest's tt 0x09 slot at TBR+0x90 — this emulator
-  routes trap tt to base + tt*16, `int32_helper.c:163`).
+  is the EDAC unit's SDRAM DE overlay read.
+- **Known limit, and the data-words-only rule (M-3).** An instruction
+  fetch from a DE word with EDACON = 1 does **not** trap (the raise
+  excludes `is_exec`): the flipped word is executed, the poison retires
+  and AHBSTAT/DEDETECTED latch a code address — hardware would take an
+  instruction-access error. SDRAM DE injections are therefore data
+  words only; the catalogue's `memory.sdram.ded` row carries the rule
+  in its preconditions.
+- **ROTB upsets and the block:offset grammar (M-4).** The ring is host
+  RAM the CPU sees only through the 512 B block window at 0xE0800000
+  (the block at the read pointer), so there is no overlay:
+  `stix_edac_rotb_check()` runs in the window read handler with the
+  overlay read's semantics — SEU with EDACON = 1 returns the corrected
+  word (nothing to write back: the ring already holds it) and counts
+  SECCOUNT (rotbCmdSta 31:24); DE returns the flip, latches DEDETECTED
+  (bit 4) and pulses the shared IRQ 6; ROTBUF never errors the bus (no
+  trap path). Grammar: `rotbuf,<block>:<offset>,<bitmask>[,mode]
+  [,persist]` — block 0..rotb-blocks-1 (bounds from the ring size, the
+  error names the bound), offset 0..511, 4-aligned; the poison carries
+  the ring byte offset `block * 512 + offset` as its address and the
+  traces log that offset. The FPGA append (`stixctrl_rotb_append`)
+  clears the poisons of every block it memcpy's (the D-Uc write rule), a
+  CPU store through the window (the TESTMODE fill path, where the store
+  is not ignored) clears the words it touches, and the EDACRESET strobe
+  needed no new code (M-1's 0x54 filter already treats bit 2 as the
+  strobe) — poisons survive the strobe and the FIFO commands (clearing
+  the status is not curing the cell).
+- **BRAM silent flips (M-5).** `bram,<address>,<bitmask>` — an absolute
+  guest address in the 0x400 lvar window 0xE0200000..0xE02003FF (LVAR0-3
+  included), any alignment (there is no EDAC word), the mask XORs the
+  four bytes at the address big-endian; `mode`/`persist` are refused
+  (a flip is silent by construction) and each accepted inject flips
+  once (a repeat flips again). No poison record, no counters, no
+  status, no IRQ: the flip is applied at inject time to the host bytes
+  (`memory_region_get_ram_ptr` + `memory_region_set_dirty`, the
+  stix_det pattern) and `upsets-active` stays byte-identical (its
+  counters remain sdram/cache/rotbuf); the only trace is the inject's.
+  The flip survives a system reset and dies at a power cycle (the lvar
+  window is plain RAM, zeroed at power-on only). The FSW-visible
+  outcome is the WDT `UNCHANGED_STORAGE` record at 0xE02000A8, read at
+  every boot (`WDT_callAfterReset`): garbage `sramTestResult` or a
+  spurious `WDT_RESET_TRAP` [L — nothing in ASW formats the record
+  into TM yet; the FSW clears the record after reading, so exactly one
+  boot is affected]. The MemBram record at 0xE02003C0 has no ASW reader
+  at all (setters only) — mechanism regression only.
+- **Seeded random bursts (M-6a).** `random-seed` (uint32, default
+  0 = off — seed 0 refuses `random-count` — plain state that survives a
+  reset) and `random-count` (write-only; the burst fires on the set)
+  draw deterministic one-bit upsets: xorshift32, Marsaglia's 13/17/5
+  triple, the state restarts from the seed at every set, and each upset
+  costs three draws in a fixed order — the memory (draw % the wired
+  EDAC memories, in enum order sdram/cache/rotbuf; BRAM is never drawn:
+  no EDAC, no record to observe), the word (draw % the extent,
+  4-aligned; the backing region's size for sdram/cache, the ring bytes
+  for rotbuf), the bit (draw % 32 → mask 1u<<bit, so every drawn upset
+  is a one-bit SEU; `mode`/`persist` are not reachable). A word already
+  poisoned is skipped and the attempt's three draws are spent; the
+  burst gives up after 1024 attempts with the placed count named.
+  Refusals (count 0, seed 0, a count over the free table slots —
+  all-or-nothing, no memory wired) change nothing. The model stores
+  only the 32-bit data word (the EDAC check bits are implicit in the
+  correction machinery), so every drawn bit is a data bit — a random
+  SDRAM upset may land in a code word and correct silently on the next
+  fetch (SECDED corrects instruction fetches). A drawn upset arms
+  through the same `stix_edac_poison_arm()` tail as `upset-inject`:
+  same overlays, counters and traces. Repeating the same seed skips
+  the words it already poisoned and continues the draw sequence into
+  fresh ones.
+- **The `hw-state.edac` section (M-6a).** One accessor
+  (`stix_edac_hw_state`) appends the section after `det` — the same
+  JSON as `upsets-active`, which became a thin wrapper over it. Pure
+  like every hw-state section (reads the table and the counters,
+  touches nothing, never traces). The `/machine/stixctrl` root `schema`
+  is bumped 1 → 2 (the layout changed; the SPW hw-state stays at 1) —
+  the declared impact.
+- **The catalogue (M-6a).** The eight rows of the plan's fault table
+  are entries in `scripts/stix/platform/catalogue/faults-v1.json`
+  (`class: memory`, `changes: truth`), the qom action on
+  `/machine/stixctrl/edac`, property `upset-inject`, the fixed upset
+  riding as a string `value` (one line in `faults.py` widened the qom
+  `value` to `(int, str)`; the loader's action key is `path`). They are
+  one-shot events (`transient` for the sdram/cache/rotbuf rows,
+  `permanent` for the bram rows — the obt.jump precedent),
+  `reversible: false` — the generic qom action can undo only the
+  property it set and `upset-clear` is a different property, so the
+  plan table's "reversible" is the device's (`upset-clear`, a rewrite,
+  the first corrected read), not the platform's — and each carries a
+  dead but required `"clear": 0` (without an action `clear` the apply
+  would qom-get the write-only property). `memory.random.burst` is not
+  an entry: one qom action sets one property and the burst needs seed +
+  count; the ground-station recipes cover the manual flow.
+- **The live gate and its results (M-6b).** `scripts/stix/edac-smoke.sh`
+  (the fault-smoke skeleton: slot library, the canonical run-dir guard
+  and the QMP socket length check, `--dry-run`/`--check-guard`, the
+  probe started first with QMP connected at the first due
+  `--qmp-cmd`, log tails before every verdict, every check recorded so
+  the negative can compare the set). The run is deliberately non-default
+  and **not a golden change**: `-global stix-edac.edac-at-boot=all-on`
+  makes the boot print read `E_EDAC_MODULE_SDRAM = 1` and
+  `E_EDAC_MODULE_ROTBUF = 1` (`main.c:122-125`) under grep-only UART
+  checks, and it is the only STIX gate without `-no-reboot` (the
+  injected DE must reboot the guest). **Live record (2026-11-12): the
+  SDRAM part passes** — the inject word `sdram,0x4008337C,0x3` is a
+  data word, the `hkLineLimits[7]` entry (symbol at 0x40083344, nm on
+  the AX gate ELF; entry 7 starts at 0x4008337C), read every second by
+  `HKMonitor_regularCheck`; the gate checks the layout live with HMP
+  `xp /4wx 0x4008337C` and requires `4008337c: 0x00000fff 0x00000003`
+  (entry 7 = {min 0, max 0x0fff, count 3}; the live run pinned exactly
+  that). Within ~1 s of the inject the UART prints `Unexpected trap
+  (0x09)` and `data_access_exception`, the FSW forces the watchdog, the
+  model resets the guest, and the second boot reports 0x0022 and 0x14A3
+  (exactly one trap print and one reboot — the one-shot default, no
+  boot loop). **No SAFE cache reader — the cache step is dropped from
+  the v1 gate:** the M-6a pre-live design expected SID2 status1 bits
+  2:0 = 1 in SAFE; the live run resolved that [L] negatively, as the
+  code review predicted — nothing reads the CACHE SRAM in SAFE (the QL
+  LACC reads and the TLUT re-trim are NOMINAL-gated; the HK path reads
+  only ADC lines and SDRAM-resident state), so a CACHE DE is never
+  latched there. The mechanism stays pinned by the M-2 qtests; a
+  NOMINAL-window cache leg is a later item (it needs the nominal-smoke
+  TC sequence, ~+70 s). The catalogue's SDRAM rows moved from the M-6a
+  words 0x40001000/0x40002000 (both inside `.text`,
+  0x40000000..0x4007F100) to the `hkLineLimits` data words
+  (`0x4008337C` ded, `0x40083374` seu — entry 6, also read every
+  second), and `memory.cache.ded` gained the NOMINAL precondition. No
+  0x542F SEU step (Q4, the 1000 s report period).
+- **Tests.** The `stix_edac_register()` block in `tests/qtest/stix.c`:
+  `edac-reg-reset` and `edac-reg-readonly` are RED on the pre-M-1
+  binary (cacheCmdSta read 0; the composed fields and the 0x54 strobe
+  bit came back from plain storage); `edac-boot-state`, `edac-strobe`
+  and `edac-rotb-strobe-quirk` are red-by-construction (the property
+  and the strobe semantics are new). The strobes are exercised with
+  forced latches via the unit's test-only `test-latch-*` properties.
+  All later tests are red-by-construction on their predecessors (no
+  verbs, no overlay, no properties before their commit): the nine M-2
+  cache tests (`edac-cache-seu`, `-seu-raw`, `-ded`, `-opmode`,
+  `-tlut`, `-persist`, `edac-inject-reject`, `-subword`,
+  `-swap-poison`), the M-3 SDRAM tests (`edac-sdram-seu`, `-seu-raw`,
+  `-ded-ahbstat`, `-ded-trap-runtime` (the trap must land in the
+  guest's tt 0x09 slot at TBR+0x90, `int32_helper.c:163`, with AHBSTAT
+  holding the failing address), `-persist`, and the review's
+  `-dword` for the 8-byte overlay accesses), the M-4 ROTB tests
+  (`edac-rotb-seu`, `-ded`, `-fpga-block`, `edac-enable-all`), the
+  M-5 BRAM tests (`edac-bram-wdt`, `-flip`, `-reject`) and the M-6a
+  tests (`edac-random` — it carries a reference implementation of the
+  pinned draw, checked against canonical xorshift32 outputs computed
+  outside the test — and `edac-hw-state`).

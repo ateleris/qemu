@@ -924,28 +924,55 @@ qom_get $RUN/qmp.sock /machine/stixctrl/edac upsets-active
 qom_get $RUN/qmp.sock /machine/stixctrl hw-state
 ```
 
-**Probes** (the fault-injection QMP setup above; start the probes in
-SAFE or CONFIGURATION, never in NOMINAL — an SDRAM trap reboots):
+**Probes** (the fault-injection QMP setup above; run them in SAFE or
+CONFIGURATION — an SDRAM trap reboots. The two probes marked NOMINAL
+below need a NOMINAL window instead: their only reader chain is
+NOMINAL-gated. Enter NOMINAL with the recipe above and keep the SDRAM
+probe out of it):
 
-- **CACHE double error** — works from boot (Edacon resets on):
-  `upset-inject` = `"cache,0xE0180044,0x3"`. Expected **in NOMINAL
-  only** (the LACC is read by the quick-look path; nothing reads the
-  cache SRAM in SAFE, so there the DE is never latched — seen live):
-  SID2 (0x5A4, TM(3,25)) status1 bits 2:0 = 1 on the next HK cycle (64
-  s cadence), then reset every cycle; `hw-state.edac` counters.cache.detected = 1
-  and the poison retired (one-shot).
+- **CACHE double error** — arms from boot (Edacon resets on), but the
+  expectation needs a **NOMINAL window** (the LACC is read by the
+  quick-look path; nothing reads the cache SRAM in SAFE, so there the
+  DE is never latched — seen live): `upset-inject` =
+  `"cache,0xE0180044,0x3"`. Expected: SID2 (0x5A4, TM(3,25)) status1
+  bits 2:0 = 1 on the next HK cycle (64 s cadence), then reset every
+  cycle; `hw-state.edac` counters.cache.detected = 1 and the poison
+  retired (one-shot).
 - **SDRAM double error → trap and reboot** — `edac-enable` = `"all-on"`
   first, then `upset-inject` = `"sdram,0x4008337C,0x3"` (a data word,
-  never code: `hkLineLimits[7]`, read every second by the HK monitor). Expected: the UART prints `Unexpected trap (0x09)` and
-  forces the watchdog. `run-qemu-gs.sh` passes `-no-reboot`, so QEMU
-  stops at that reset; under the platform controller (warm resets) the
-  FSW reboots and the boot event 0x0022 follows, with the failing
-  address in the WDT's BRAM boot record.
+  never code: the `hkLineLimits[7]` entry, read every second by the HK
+  monitor). Expected — pinned live by `edac-smoke.sh` (2026-11-12):
+  within ~1 s the UART prints `Unexpected trap (0x09)` and
+  `data_access_exception (0x09,13)`; the FSW records the failing
+  address in the WDT's BRAM boot record and forces the watchdog, and
+  the model resets the guest. The TMTC transport survives the reset
+  (the probe's connection pauses and resumes — no reconnect), and the
+  second boot sends 0x0022 and 0x14A3 again (both within ~90 s). One-shot:
+  the poison retires on the detected read, so there is no boot loop.
+  `run-qemu-gs.sh` passes `-no-reboot`, so under it QEMU stops at that
+  reset instead of rebooting.
 - **Single-bit (SEU)** — `upset-inject` = `"cache,0xE0180040,0x1"`: the
   next read of that word returns the corrected value and
-  `hw-state.edac` counters.cache.corrected moves. TM(5,2) 0x542F comes
-  only after the report period (default 1000 s,
-  `E_EDAC_SEU_REPORT_PERIOD_S`; [L], Q4).
+  `hw-state.edac` counters.cache.corrected moves. In SDRAM (Edacon on
+  first, as above) `"sdram,0x40083374,0x1"` — the `hkLineLimits[6]`
+  entry, also read every second. TM(5,2) 0x542F comes only after the
+  report period (default 1000 s, `E_EDAC_SEU_REPORT_PERIOD_S`; [L],
+  Q4).
+- **ROTB double error** — `edac-enable` = `"4"` (or `"all-on"`) first,
+  then `upset-inject` = `"rotbuf,1:0,0x3"`: the block data comes back
+  flipped and the accumulator task skips exactly that block [I]. Expected
+  in a **NOMINAL window** (the accumulator runs there): SID2 status1
+  bits 5:3 = 1 on the next HK cycle; DEDETECTED is cleared by the
+  ISR's EDAC_reset. A rotbuf SEU (`"rotbuf,0:0,0x1"`) behaves like the
+  SEU probe above.
+- **BRAM flip** — `upset-inject` = `"bram,0xE02000A8,0x1"` (a byte in
+  the WDT's `UNCHANGED_STORAGE` boot record): silent — no status, no
+  counter, no event. The corruption shows on the next boot, when the
+  FSW reads the record (`WDT_callAfterReset` reads it at every boot;
+  garbage `sramTestResult` or a spurious `WDT_RESET_TRAP`; [L] —
+  nothing formats the record into TM yet), and the FSW clears it after
+  reading, so one boot only. The flip survives a system reset and dies
+  at a power cycle.
 - **Seeded burst** — `random-seed` = 305419896, then `random-count` =
   10: ten one-bit upsets across sdram/cache/rotbuf, the same draw
   sequence for every run of the same seed; watch `hw-state.edac`.
@@ -953,9 +980,10 @@ SAFE or CONFIGURATION, never in NOMINAL — an SDRAM trap reboots):
   continues into fresh ones (clear first with `upset-clear` all for a
   replay of the same words).
 - **An upset present from boot** — start QEMU paused (`-S`, added by
-  hand to the QEMU command line), qom-set the upset, `cont`. CACHE
-  needs nothing (Edacon's reset value is on); for sdram/rotbuf also
-  pass `-global stix-edac.edac-at-boot=all-on` before QEMU starts.
+  hand to the QEMU command line), qom-set the upset, `cont`. CACHE and
+  bram need nothing (Edacon's reset value is on; bram has no EDAC);
+  for sdram/rotbuf also pass `-global stix-edac.edac-at-boot=all-on`
+  before QEMU starts.
 
 ## Notes and limits
 

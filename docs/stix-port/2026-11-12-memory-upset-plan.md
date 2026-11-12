@@ -1,6 +1,8 @@
 # Memory upsets (SEU/DEU/MBU) in the STIX memories, with EDAC: plan
 
-Status: draft 2026-11-12, revised the same day after the independent
+Status: implemented — M-1..M-7 on `stix-uprev-mem`, 2026-11-12 (M-6b =
+`1efd4a3c6c`; M-7 is the docs commit). Draft 2026-11-12, revised the
+same day after the independent
 plan review (`.review-mem.txt`, resolutions at the end). Base: track
 worktree `~/dev/qemu-stix-mem`
 (branch `stix-uprev-mem`, from `083d3d4365`, the same tip as
@@ -1449,6 +1451,32 @@ the merge.
      `accepted-diffs.md` records that edac-smoke's run is deliberately
      non-default (`edac-at-boot=all-on` boot print: SDRAM and ROTBUF
      lines read 1) — not a golden change (grep-only UART checks).
+- **As built (M-7):** the three docs — `accepted-diffs.md`'s final
+  unnumbered section (the M-1/M-3 stub replaced by the full record,
+  heading "Accepted diff: memory upsets and EDAC (baseline: memories
+  never fail)"), the `ground-station.md` EDAC probes checked against
+  the live results (the SDRAM SEU word 0x40083374, the SDRAM DE event
+  chain as pinned live, the NOMINAL-window wording, ROTB/BRAM
+  expectations) and `baseline/README.md`'s edac-smoke step (positive +
+  `--negative`).
+- **M-6b hand-over closure (2026-11-12):**
+  1. done in M-6b (live): the SDRAM words are data words (`0x4008337C`
+     ded, `0x40083374` seu); the catalogue and the ground-station
+     recipe carry them.
+  2. decided by the live run: the SAFE CACHE reader resolved
+     **negatively** (nothing reads the cache SRAM in SAFE) — the cache
+     step is out of the v1 gate, the ground-station CACHE probe is
+     NOMINAL-only and the catalogue row carries the precondition; the
+     hkLineLimits base is pinned (0x40083344, inject 0x4008337C, the
+     gate's `layout` check) and the boot-2 timing windows are pinned
+     by the gate (0x0022 + 0x14A3 in one shared @90 window).
+  3. done in M-7: the README edac-smoke line and the accepted-diffs
+     non-default note (edac-at-boot=all-on boot print: SDRAM and
+     ROTBUF lines read 1 — grep-only UART checks, not a golden
+     change).
+  **Later, not in this track's gate:** the NOMINAL-window cache leg
+  (it needs the nominal-smoke TC sequence, ~+70 s) and the 0x542F SEU
+  step (Q4 — the 1000 s report period).
 
 ## Goldens and gate impact
 

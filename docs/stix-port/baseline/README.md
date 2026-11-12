@@ -195,6 +195,14 @@ STIX_PORT_BASE=auto bash scripts/stix/pfm-boot-smoke.sh \
 #    copy of the master flash; the seeded parts are two QEMU runs each):
 STIX_PORT_BASE=auto bash scripts/stix/flash-damage-smoke.sh \
     build/qemu-system-sparc          # add --negative, --dry-run
+
+# 9. EDAC gate (memory-upset plan M-6b; needs the ASW ELF; a private
+#    master-flash copy, own slot or the 21000 flock; ~260 s positive +
+#    ~260 s negative; deliberately non-default: -global
+#    stix-edac.edac-at-boot=all-on and NO -no-reboot, because the
+#    injected SDRAM double error must reboot the guest):
+STIX_PORT_BASE=auto bash scripts/stix/edac-smoke.sh \
+    build/qemu-system-sparc          # add --negative, --dry-run
 ```
 
 Notes:
@@ -256,6 +264,22 @@ Notes:
   only when the boot part's damage expectations are exactly the
   unmatched set. Needs the master flash and slot mode; SKIP 77 without
   the ELF.
+- EDAC gate: `edac-smoke.sh` (step 9). **PASS** means the AX ELF boots
+  with SDRAM/ROTB EDAC on (`-global stix-edac.edac-at-boot=all-on`;
+  grep-only UART checks — the boot print reads SDRAM and ROTBUF = 1,
+  a deliberately non-default run, no golden diff), the boot report
+  0x0022 + 0x14A3 within 60 s of connect, the live layout check at
+  0x4008337C (HMP `xp /4wx`; `hkLineLimits[7]` must read
+  `0x00000fff 0x00000003`), the SDRAM double-bit inject at @112 and
+  within ~1 s the UART's `Unexpected trap (0x09)` and
+  `data_access_exception` lines — exactly one of each and two `init:
+  SAFE mode` banners (one trap, one reboot, no boot loop) — then the
+  second boot's 0x0022 + 0x14A3, both within 90 s of the inject. No cache
+  step: nothing reads the cache SRAM in SAFE (seen live), so a cache
+  leg needs a NOMINAL window — a later item. Run dir
+  `/tmp/stix-edac-run` (`-neg`), a private master-flash copy, SKIP 77
+  without the ELF. `--negative` (no inject) passes only when exactly
+  the two second-boot expectations and the trap check fail.
 - **Gate exit codes:**
 
   | Code | Meaning |
