@@ -4802,10 +4802,10 @@ the sidecar's own spec — each leaving `damage-list` unchanged; then
 offline side. The gate pins the FSW-visible outcomes; its [L] payloads
 came from the live probe runs recorded in the plan's X-4 "As built".
 
-## Accepted diff: memory upsets and EDAC (baseline: memories never fail)
+## 45. Memory upsets and EDAC (baseline: memories never fail)
 
-Plan: `2026-11-12-memory-upset-plan.md` (commits M-1..M-7). Unnumbered
-on purpose: it takes the next free § at the merge, like P-1.
+Plan: `2026-11-12-memory-upset-plan.md` (commits M-1..M-7; numbered
+§45 at the merge, after the flash damage §44).
 
 **Baseline:** memories never fail. The EDAC registers were plain
 storage (only §5's 0x54 write masking existed), nothing could be
