@@ -357,3 +357,16 @@ sparse-copy the flash.bin as `aged-flash.bin` (archived, read-only); every
 "full" run starts from a sparse copy of it. Recon 2 (param indices) uses
 the AX block: 312/313 hold for the AX gate ELF, still gated by the
 TC(237,19) read-back.
+
+**RF-2 early shakedown (2026-11-13, AX gate ELF ASW_em_baseline.elf,
+fresh flash, 90 s wall, no probe).** `-icount shift=6` and `shift=7` both
+boot to `init: SAFE mode` and `delete init` with the usual fresh-flash LUT
+errors only; no abort. Guest time of `delete init`: shift 6 = 2.645 s,
+shift 7 = 3.095 s, **no icount = 3.368 s** (a gate run, uprev-run-s1).
+So without icount the guest is not "infinitely fast": the virtual clock
+follows the host and TCG speed + host load set the work per guest second.
+**Design change:** every cell runs under icount; the CPU axis becomes the
+shift: **3 (~125 M insn/s, ~6-8x LEON: "fast CPU")** vs **6 / 7 (~LEON
+bracket)**. M1..M4 keep their meaning with "no icount" read as "shift 3".
+All runs are then deterministic in guest time once the drive is
+event-driven (RF-3).
