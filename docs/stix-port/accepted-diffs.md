@@ -3980,8 +3980,9 @@ missing or surprising behaviour is not mistaken for a bug (plan D-8,
   cannot run to completion. The IDeF-X ADC answers are canned (§32):
   readTemp gives A − B = 0x200, adcRead and the on-demand reads give
   1850.
-- **No aspect ROTB blocks** (plan D-Dg; §35 builds only the 0x8000
-  detector descriptor): the ring carries only detector chunks.
+- **No aspect ROTB blocks** (plan D-Dg): superseded by §48 — the
+  aspect generator appends 0x4000 blocks between the detector chunks
+  (§48 records what remains not modelled).
 - **No SEU injection** (§31): QuarterSeu always reads 0. The IDeF-X
   registers are also outside the memory-upset track (§45).
 - **The RCR → attenuator-motion path is untested** (§22, §34, §43):
@@ -5578,4 +5579,114 @@ aspect archive stayed empty and every aspect-burst request answered
   test `scripts/stix/tests/test-aspect-check.sh` builds the synthetic
   dumps (good + one per failure signature) with the checker's own
   packet builders and pins the CLI exit codes and verdict lines.
+- **The experiment legs (AS-5).** Each leg is one `aspect-smoke.sh`
+  run: the D-ASi timeline (CONF @50, NOMINAL @70, CONF @320, the
+  request pair @340/@350, TC(238,10) @400, hold +480) with the leg's
+  knob set over QMP at a fixed stamp, the leg's D-ASh signature
+  asserted by `aspect-check.py` on the dumped SSID 42 packets and the
+  failure/success events expected by the probe. All nine legs PASS
+  live (main-line QEMU `3b69e02366` + this branch); the first live
+  NOTE numbers ([L] in the plan) are pinned below:
+  - `--ideal` (row 1, control): no knob, the default timeline. PASS:
+    both request paths answer the ideal signature — 510-sample packets
+    (TMData.h:595-596), summingFpga 16 (the once-per-request estimate,
+    AspectCtrl.c:219-233), averagingTc 16.
+  - `--negative`: `-global grlib-stixctrl.as-enable=false` at boot. No
+    blocks, no aspect file, no SSID 42 packet at all; the request
+    answers TM(5,2) EID 0x543F "no BSD data found"
+    (SciReport.c:535-544) and TM(1,8) FID_48435 (AspectCtrl.c:531,
+    TMData.h:214). PASS.
+  - `--jitter` (row 2): `as-jitter-next-ms 6` @150 (mid-NOMINAL), the
+    default budget 1, requests @340/@400. One archived record is
+    +6 ms → two gap events, entry +6 and exit −6 (the > 5 ms check,
+    AspectCtrl.c:279-291); the first spends the budget, the second
+    hits the no-budget branch → forced final packet + FSW_ERROR
+    (AspectCtrl.c:297-315) → EID 0x5440 (SciReport.c:467-474) and
+    TM(1,8) FID_48435 on the TC(238,10) path (AspectCtrl.c:531). PASS,
+    forced-abort (`--expect-forced-abort 1 0`): packets [295, 4],
+    span 75606 ms — the product ends at the knob stamp, not at the
+    archive end.
+  - `--step-gap` (row 3): `as-step-next-ms 6` @150, budget 1. One gap
+    event at the step's entry boundary only (the offset persists,
+    there is no exit), forced packet, the request completes
+    (AspectCtrl.c:317-342). PASS, forced-complete
+    (`--expect-forced-complete 1 0`): [299, 510, 151].
+  - `--drop` (row 5, corrected by Amendment B1): `as-drop-next 2`
+    @150, budget 1. The archive stores each block with the previous
+    block's end (ArchiveManager.c:243-245, :265-266), so the two
+    missing blocks show one record later as a gap (never "no time gap
+    at all" as D-ASd/D-ASh row 5 first said): one gap event, forced
+    packet, the request completes. PASS, forced-complete: [303, 510,
+    143] — the forced start ≈ 2 blocks later than `--step-gap`'s.
+  - `--drift` (row 4): `as-rate-ppm -2000` @55 (pre-NOMINAL, so the
+    whole archived stream and the estimate pair are drifted), budget
+    100 by TC(237,18) `01 DD 00 00 00 00 64` with the TC(237,19)
+    read-back @330/@331 (NUMBER_ASPECT_GAPS_ALLOWED 477 = 0x01DD,
+    ParamMgmtDef.h:547, TcService237.c:66-94), averaging-64 requests
+    (the level-5 path, SciReport.c:586-602, plus TC(238,10)). The
+    truncated pair delta 1005..1006 (Timing.c:395-399) → inc = 15
+    (AspectCtrl.c:219-233) → a > 5 ms gap at every block → forced
+    packets of the samples accumulated since the last send (63 < 64;
+    the averaging counter is not reset at a forced send,
+    AspectCtrl.c:317-342) → budget exhausted → FSW_ERROR. PASS, tiny
+    (`--expect-tiny 1 0`): 101 packets — 2 x 0-sample (the leading
+    one, plan MINOR 3), 99 x 1-sample — then 0x5440 + TM(1,8)
+    FID_48435.
+  - `--avg` (row 6, redesigned by Amendment B2): two epochs, because
+    TC(236,6) is applicable only in CONFIGURATION/MAINTENANCE
+    (TCVerifDynamic.c:66) — an AvgSize change cannot happen inside
+    NOMINAL. Avg16 in epoch 1; @332 TC(236,6) `03 01 00 01` (Avg2) in
+    CONF (12 s after the @320 CONF: the mode commits only after the
+    archive flush, OpModeMgmt.c:287-302, :702); @334/@335 budget 100 +
+    read-back; @340 NOMINAL (epoch 2, 126 ms blocks); @400 CONF (file
+    2); @410/@412 one averaging-64 level-5 request over both files
+    (urn 1; no TC(238,10) path). The estimate is taken once per
+    request from file 1's first pair (inc 16, AspectCtrl.c:196-237)
+    and every Avg2 record shows an 882 ms residual → a gap per record
+    → forced 0/1-sample packets → 0x5440. PASS, stale
+    (`--expect-stale 1`): packet 0 = epoch 1's open packet, 239
+    samples starting 76135 ms; then 100 forced packets from 344949 ms
+    (all in epoch 2), summing 16 / averaging 64 throughout — the
+    stale-estimate evidence.
+  - `--step-1031` (row 7): a −1 ms step armed by a trace watcher at
+    the FIRST archived block's own block_seq (the estimate pair
+    straddles the step → truncated delta 1007 → inc 15,
+    AspectCtrl.c:219-233), budget 100 + averaging 64, the request
+    answered in CONF @340/@342 (Amendment B3); then the second epoch
+    (@400 NOMINAL, @460 CONF, file 2) and the urn-2 request @470 with
+    the window start 405 s. PASS, tiny + epoch 2
+    (`--expect-tiny 1 --expect-epoch2 2`): 101 forced packets →
+    0x5440, and the epoch-2 request returns 1 packet of 53 samples at
+    inc 16 — the neighbouring epoch succeeds, the row-7
+    discriminator.
+  - `--step-1031-control` (row 7's control): the same −1 ms step
+    @150, mid-window. The estimate pair stays clean (inc 16) and 1 ms
+    is below the 5 ms gap threshold (AspectCtrl.c:279-291), so the
+    request completes control-like. PASS: the ideal signature, silent.
+  **Caveat, verbatim from the plan's Goal 4, for every leg above that
+  reproduces an issue's signature (#1058: `--jitter`, `--step-gap`;
+  #1026: `--drop`; #1031: `--drift`, `--avg`, `--step-1031`): emulator
+  shows FSW behaviour for our input; supports a mechanism, does not
+  prove the flight cause.**
+- **The harness bugs the live runs found (fixed in AS-5/Amendment B).**
+  (i) The TC(238,1) builder filled the number-of-boxes byte with 0
+  (the length stays right): the FSW rejects the TC with FID_48022
+  "invalid length of dynamic packet" (TCVerifDynamic.c:296); the
+  builder now sends exactly one box (`tc238_1` in aspect-smoke.sh).
+  (ii) The `--step-1031` placement watcher keyed on "the first
+  appended push": live, the ROTB still accepts pushes at boot, before
+  the self-test switches it into test mode (RotBuf_setTestMode(TRUE),
+  HWSelftest.c:495) — blocks 0-49 were appended in SAFE and are never
+  archived (the FSW drains only in NOMINAL, RotAccumulator.c:69-72).
+  The watcher and the post-run placement check now take the first
+  appended push that FOLLOWS a not-appended (rotb-testmode /
+  rotb-disabled) push.
+- **Open item O-B1.** The Amendment-B3 first attempt sent the epoch-1
+  request at +340 into epoch-2 NOMINAL; it was not served for 41 s
+  (more than one Background slot, background.c:63). Candidates: the
+  flare skip (SciReport.c:354-358) or the slot phase plus Background
+  load in NOMINAL (SciReport.c:361-392 at Background priority 150).
+  The legs now answer every request in CONF (B3/B4); a discriminating
+  run (the TC(238,10) event path bypasses the 30 s tick) is noted for
+  later, not a gate item.
 

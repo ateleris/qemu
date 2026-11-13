@@ -1,10 +1,14 @@
 # Aspect system emulation: photodiode ROTB blocks, archives and aspect-burst reports: plan
 
-Status: draft 2026-11-13, revised the same day after the independent plan
-review (`~/dev/stix-state/tools/glm/asp-plan-review.md`; resolutions at
+Status: built 2026-11-13 — AS-1..AS-6 done (Amendment B and its review
+resolutions below record what the first live AS-5 runs changed;
+"As-built" at the end holds the live table). Draft 2026-11-13, revised
+the same day after the independent plan review
+(`~/dev/stix-state/tools/glm/asp-plan-review.md`; resolutions at
 the end, "Review resolutions"). Base: track worktree
 `~/dev/qemu-stix-aspect` (branch `stix-uprev-asp`, at the main-line tip
-`49d36da19d`). The user wants a new emulator track "aspect system"
+`3b69e02366`; drafted at `49d36da19d`, rebased onto the moved main).
+The user wants a new emulator track "aspect system"
 (prefix AS-): the model generates the Aspect System photodiode data so
 the real flight ASW archives it and answers aspect-burst requests, with
 timing knobs to test hypotheses about three open FSW GitHub issues
@@ -917,3 +921,23 @@ A dedicated run would tell; not a gate item.
   forced TM sends, easily exceeds 41 s; the flare gate is the only
   documented *skip*. A discriminating run (TC(238,10) bypasses the tick)
   is noted for later, not a gate item.
+
+## As-built (2026-11-13)
+
+All nine legs PASS live (main-line QEMU `3b69e02366` + this branch).
+The full record — mechanisms with FSW file:line, the two harness bugs
+the live runs found (the TC(238,1) builder's 0-box byte → FID_48022;
+the step watcher's boot-time ROTB pushes) and open O-B1 — is
+accepted-diffs §48, "Experiment legs (AS-5)".
+
+| leg | knob, timeline essentials | check mode | live result |
+|---|---|---|---|
+| ideal | no knob, the default timeline | `--expect-ideal 1 0` | PASS: 510-sample packets on both request paths, summing 16, averaging 16 |
+| negative | `-global as-enable=false` | `--expect-none` | PASS: no aspect file, 0x543F + TM(1,8) FID_48435, no SSID 42 |
+| jitter | `as-jitter-next-ms 6` @150, budget 1 | `--expect-forced-abort 1 0` | PASS: packets [295, 4], span 75606 ms, 0x5440 + TM(1,8) |
+| step-gap | `as-step-next-ms 6` @150, budget 1 | `--expect-forced-complete 1 0` | PASS: [299, 510, 151] |
+| drop | `as-drop-next 2` @150 (B1) | `--expect-forced-complete 1 0` | PASS: [303, 510, 143] — the gap one record later (the archive stores each block with the previous block's end) |
+| drift | `as-rate-ppm -2000` @55, budget 100, averaging 64 | `--expect-tiny 1 0` | PASS: inc 15, 101 packets (2 x 0-sample, 99 x 1-sample), 0x5440 + TM(1,8) |
+| avg | two epochs; Avg2 by TC(236,6) in CONF @332 (B2, the TC is CONF/MAINTENANCE-only, TCVerifDynamic.c:66); request @410 over both files | `--expect-stale 1` | PASS: packet 0 = 239 samples at 76135 ms, then 100 forced packets from 344949 ms, 0x5440 |
+| step-1031 | -1 ms at the first archived block (trace watcher); second epoch, urn-2 from 405 s (B3) | `--expect-tiny 1 --expect-epoch2 2` | PASS: inc 15, 101 forced packets, 0x5440; the epoch-2 request returns 1 packet of 53 samples at inc 16 |
+| step-1031-control | the same -1 ms step @150, mid-window | `--expect-ideal 1 0` | PASS: silent (the ideal signature) |

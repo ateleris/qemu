@@ -603,6 +603,125 @@ realize).
   masks (e.g. the SSID 30 pixel mask) use bit i = `pix` i; the RCR
   masks are reversed (bit 11−i = `pix` i, bit 12 = attenuator).
 
+## Aspect scene
+
+Since the aspect track (`accepted-diffs.md` §48; plan
+`2026-11-13-aspect-plan.md`) the controller `/machine/stixctrl` also
+models the Aspect System photodiode readout. A fixed 1 ms tick samples
+each enabled channel (`asCmdSta` bits 0/1; the FSW powers both at
+boot and at every SAFE/NOMINAL entry, `OpModeMgmt.c:1066-1068`,
+`:229-230`, `:680`, and re-applies AVGSIZE 4 = N 16 at NOMINAL entry,
+`OpModeMgmt.c:641`), N = 1, 2, 4, 8, 16 consecutive samples are
+summed per row (AVGSIZE bits 10:8, latched at the row start), and
+every 63rd row flips the double buffer into ONE 512-byte ROTB block —
+descriptor 0x4000, 63 rows x 4 u16 big-endian (A0, A1, B0, B1),
+timestamp = the LongTimer at the flip — so one block every 63·N ms
+(63 ms .. 1008 ms). The FSW routes the block into its flash archive
+and answers aspect-burst requests (TC(238,1) processing level 5,
+`SciReport.c:586-602`, and TC(238,10), `AspectCtrl.c:495-510`) with
+TM(21,6) SSID 42 on APID 0x5DC. The default `ramp` pattern encodes
+block_seq, row and diode in every 12-bit sample (per-diode bases
+0x000/0x100/0x200/0x300, the row value = N x (sample + sun)), so a
+decoder can verify sample order and loss from two consecutive rows.
+The controller hw-state JSON gained an `as` section
+(`qom_get $RUN/qmp.sock /machine/stixctrl hw-state`): channels,
+AVGSIZE and latched N, pattern, sun, rate_ppm, enable, tick,
+block_seq, rows in the open page, the push/drop counters, the knob
+values, last flip SCET and the four QL words.
+
+### The knobs
+
+Runtime properties on `/machine/stixctrl`, set with `qom_set` (the
+function in "Fault injection") exactly like the detector knobs. The
+scene knobs (`as-pattern`, `as-sun`, `as-rate-ppm`, `as-enable`)
+survive a device reset; the experiment knobs are state, not scene,
+and clear:
+
+| Property | Values | Effect |
+|---|---|---|
+| `as-enable` | bool, default true | The generation switch: false = no samples, no rows, no blocks at all (the negative leg). Setting false also clears an armed one-shot. |
+| `as-sun` | uint32 0..65535, default 0 | Added to every diode sample, clamped into 12 bits before the N-sum (a saturating ADC). |
+| `as-pattern` | `"zero"` \| `"ramp"` (default) | The sample pattern; the ramp encodes block_seq, row and diode (above). |
+| `as-rate-ppm` | int32 -5000..5000, default 0 | The tick period becomes (1 + ppm·1e-6) ms, so the block period in LongTimer time is 63·N·(1+ppm·1e-6) ms; positive = the blocks come too late. |
+| `as-jitter-next-ms` | write-only int32 -32..32 | One-shot: the NEXT flipped block's timestamp shifts by d ms, then the knob is back to 0 (a one-block error; the FSW sees two gap events, entry +d and exit -d). Refused while `as-enable=false`. |
+| `as-step-next-ms` | write-only int32 -32..32 | Persistent: every flip from the armed one on shifts its timestamp by d ms; 0 clears. |
+| `as-step-at-block` | write-only uint32, default 0 | Where the step starts: 0 = the next flip, otherwise the block_seq (in the hw-state and the `stixasp_flip` trace) whose flip begins it; resolved when the step is armed. |
+| `as-drop-next` | write-only uint32 | The next k flipped blocks are not appended (the pages keep flipping). Refused while `as-enable=false`. |
+
+**The validator:** every knob is checked N-aware against the latched
+AVGSIZE (`stix_aspect_pair_ok`, `hw/sparc/stix_aspect.c`) so the
+FSW's increment estimate — floor(pair delta / 63), asserted 1..16
+(`AspectCtrl.c:219-230`) — cannot leave that range: a (rate, step,
+jitter) combination is accepted only if P - |step| - |jitter| >= 63 ms
+and P + |step| + |jitter| < 1070 ms at P = 63·N·(1+ppm·1e-6) ms. At
+startup N = 1 is latched, so a nonzero jitter/step or a negative ppm
+on the command line (`-global`) is refused and QEMU exits — set the
+experiment knobs at runtime over QMP, as the legs below do. The
+timestamp shifts are exact to the whole ms (the corrected-SCET ns
+domain), so a ±d ms knob moves the FSW's whole-ms view
+(`Timing_ToMs`, `Timing.c:395-399`) by exactly d ms.
+
+### Running the legs
+
+`scripts/stix/aspect-smoke.sh` (gate record: `accepted-diffs.md` §48,
+"Experiment legs (AS-5)") boots a fresh-flash run dir, drives
+SAFE -> CONF -> NOMINAL -> CONF, fires both aspect-burst request
+paths and asserts the leg's signature with `aspect-check.py`:
+
+```bash
+STIX_PORT_BASE=auto bash scripts/stix/aspect-smoke.sh \
+    build/qemu-system-sparc --drift
+```
+
+- Legs (each a separate run): `--ideal` (the default, control),
+  `--negative`, `--jitter`, `--step-gap`, `--drift`, `--drop`,
+  `--avg`, `--step-1031`, `--step-1031-control`.
+- `--dry-run` prints the QEMU and probe command lines and boots
+  nothing; `--check-guard` runs only the run-dir guard (exit 0/2).
+- `STIX_ASPECT_SECONDS` overrides the probe duration; the per-leg
+  defaults are 480, and 550/560 for the two-epoch legs `--avg` and
+  `--step-1031` (floors 450/520/540).
+- The run dir is `STIX_ASPECT_RUN_DIR` (default
+  `/tmp/stix-aspect-run`, suffixed per leg and slot). A NOMINAL entry
+  writes a flash context, so the shared uprev/baseline/GS dirs are
+  refused, as everywhere. Without the ASW ELF (`STIX_ASW_ELF`,
+  default `STIX_DEFAULT_ELF`) the gate prints `SKIP:` and exits 77.
+- QEMU traces the `stixasp_*` events into `asp.trace` in the run
+  dir; the flips' block_seq/SCET are the knob legs' placement
+  evidence (the `--step-1031` watcher arms from them).
+
+### Decoding SSID 42
+
+The probe appends every 0x5DC packet to `asp.dump.hex` in the run dir
+(`--dump-apid`; whole CCSDS packets, the SSID at byte 16);
+`scripts/stix/aspect-check.py` decodes it (TM(21,6) SSID 42, one
+product per request path, at most 510 samples per packet,
+`TMData.h:595-596`, SGF FIRST -> CONT -> ... -> LAST,
+`TM_21.c:647-687`):
+
+```bash
+python3 scripts/stix/aspect-check.py <run-dir>/asp.dump.hex \
+    --expect-ideal 1 0 --samples
+python3 scripts/stix/aspect-check.py --self-test
+```
+
+- `--samples` prints every sample's diode values (A0, A1, B0, B1) —
+  the ramp is checkable by eye (block_seq in the high bits, row in
+  the low 6).
+- The `--expect-*` modes are the leg signatures: `--expect-ideal URN
+  ...` (row 1), `--expect-forced-abort` (row 2, the series ends early
+  with a forced packet), `--expect-forced-complete` (row 3, one
+  forced packet, the archive fully delivered), `--expect-tiny` (rows
+  4/7: summing 15, averaging 64, tens of 0/1-sample packets),
+  `--expect-epoch2` (row 7's second epoch), `--expect-stale`
+  (Amendment B2's two-epoch `--avg`), `--expect-collapse` (the ~8x
+  value step-down at an AvgSize change), `--expect-content-jump`
+  (with `--expect-ideal`: the ramp's A0 values jump once, times
+  continuous) and `--expect-none` (the negative). `--summing` /
+  `--averaging` set the expected header values (default 16/16). Every
+  SSID 42 product must be claimed by exactly one mode; the verdict is
+  one `ASPECT-CHECK: PASS/FAIL` line.
+
 ## Energy LUT (ELUT)
 
 The FSW bins each event's raw ADC value into one of 32 science energy
