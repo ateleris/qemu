@@ -423,7 +423,28 @@ from TM:
   first chunk of each flush epoch (count asserted against the UART's
   "Skipped first Det data chunk" lines, which do print);
 - the truth file format for l4-decode.py stays as it is.
-Open questions for the review: (Q-A1) how the FSW locates a file's pages
+**Review resolutions (GLM, 2026-11-13; glm-l4-amendA).** Q-A1: a file is
+one 256-KiB block; the catalog comes from the page-0 spares (File.c:328,
+:342, :387); CB initial blocks MemFilesystem.c:495-500; pages are read
+sequentially (File.c:621-651); the spare pageAddress is a redundant check
+(:691-699). Q-A2: contiguous, last page zero-padded (File.c:478-484); the
+valid length is fileSizeInBytes in the spare (File.c:490) and the first
+4 data bytes (ArchiveManager.c:47-48). Q-A3: the chunk header's timestamp
+is coarse u32 BE + fine u16 BE, but the FSW **overwrites** it with the
+previous chunk's end (ArchiveManager.c:133,168,182-185): archived chunk k
+carries trace chunk k's SCET, archived = model - 1, the last model SCET
+never appears; a file's name SCET is its first chunk's timestamp
+(:158-159). The size field at 62 counts the whole chunk incl. its 64-B
+header (RotAccuCompactor.c:169-173). Q-A4: data bytes are stored
+verbatim; no BCH correction on an undamaged image.
+Edits adopted: (1) the truth prints SCETs ms-exact (3 decimals, Timing_ToMs
+truncation), not 0.1 s; (2) the cross-check is the exact mapping
+archived[k] == trace[k] (ms), archived == model - 1, one "Skipped first Det
+data chunk"; (3) l4-replay.sh's phase-2 comment is rewritten. The reader is
+`scripts/stix/l4-flash-truth.py`, importing flash-damage.py's layout code;
+the snapshot it reads is the collect run's flash image.
+
+Open questions for the review (answered above): (Q-A1) how the FSW locates a file's pages
 (block header vs spare `pageAddress`, File.c/MemFilesystem.c — cite);
 (Q-A2) whether a file's data is contiguous in the 256-KiB block and where
 its valid length is recorded (the last chunk may be partial or padded);
