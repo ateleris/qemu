@@ -8,7 +8,7 @@ Status 2026-11-11 (the Phase 2 end-to-end run, plus Phase 4 fault injection):
 | **TC (ground station → FSW)** | Works end to end over direct UDP (`run-qemu-gs.sh --udp`, no bridge), verified 2026-11-10 with QEMU `866ee37709` and ground station `0dcb1af`. TC(17,1) gave TM(1,1), TM(17,2) and TM(1,7). TC(9,129) coarse 0x10000000 gave TM(1,1) and TM(1,7), and the heartbeat CUC then counted from 0x10000000. The transcript is in the Phase 2 acceptance checklist. Over TCP the bridge with `--forward-tc` reaches the same RX path (P2-6; shown in the 2026-11-10 bridge demo). |
 | **Modes (SAFE → CONFIGURATION → NOMINAL)** | Works: the three TCs of the NOMINAL recipe below move the FSW through the modes. The gate `nominal-smoke.sh` passes in both modes (positive and `--negative`; gate record in `accepted-diffs.md` §23), including SID2 with the NOMINAL mode nibble. **A NOMINAL entry writes a flash context — use a scratch run dir** (see the recipe). |
 | **Fault injection** | Works from the outside over QMP (Phase 4): HK ADC values, the HK hardware protection, time-code loss and SpW link-down. The gate `fault-smoke.sh` passes (positive and `--negative`; `accepted-diffs.md` §27-29). See "Fault injection" below. |
-| **Detector (tiers 0+1)** | The FSW drives the modelled detector interface (FSM, QL banks, IRQ 3, IDeF-X registers; `accepted-diffs.md` §31-32) without errors. The gate `detector-smoke.sh` passes (positive and `--negative`; §33): the ASIC verification runs silently, and the NOMINAL-exit flush carries QL TM(21,6) SSID 30-34 on APID 0x5DC, all zero (no synthetic sky yet). `ql-check.py` decodes such packets. |
+| **Detector (tiers 0-3, replay)** | The FSW drives the modelled detector (FSM, QL banks, IRQ 3, IDeF-X registers, synthetic sky, ROTB chunks, `.dssevs` replay; `accepted-diffs.md` §31-37) without errors. The gate `detector-smoke.sh` passes in all its modes (positive, `--negative`, `--flare`, `--flare --negative`, `--no-rotb`; §33-§36). The knobs (flare switch, count deposit, DSS replay) are QOM properties on `/machine/stixctrl`; see "Detector scene" below. |
 
 The findings, with file:line references on both sides, are in
 `drafts/2026-11-10-gs-attach-report.md`.
@@ -359,15 +359,249 @@ Never use `/tmp/stix-uprev-run` (the golden run dir) or
 **What NOMINAL looks like here:**
 - heartbeats (0x5E5) continue, and SID2 (0x5A4, TM(3,25)) arrives every
   64 s with mode 0x15;
-- **no quick-look or science TM** — there is no detector/IDeF-X model
-  and no ROTB data path;
-- at NOMINAL entry the UART shows 384 `*E writing register … failed`
-  lines (`XrayDetFDIR.c:731`): the ASIC register writes time out and
-  the NOMINAL path carries on. Expected, not a failure;
+- quick-look TM(21,6) SSID 30-34 on APID 0x5DC leaves at the NOMINAL
+  exit flush, and the science path writes ROTB chunks that the FSW
+  archives into the flash (see "Detector scene" below);
+- the UART shows no IDeF-X errors at NOMINAL entry: the model answers
+  the ASIC register interface (`accepted-diffs.md` §32), so the 384
+  write timeouts the older trees showed are gone;
 - since P4-1, SID2 shows the commanded supplies as powered: POWERSTAT
   (hkCmdSta bits 9:5) follows the enables (`accepted-diffs.md` §25).
   Before P4-1 it read 0, so LV/HV/SpW showed off in every mode;
 - one TM(5,2) 0x542C (no LUTs in flash) is also expected at entry.
+
+## Detector scene
+
+Since the detector phase (`accepted-diffs.md` §31-§37) the controller
+`/machine/stixctrl` carries a detector scene: a synthetic count sky, a
+flare switch, a one-shot count deposit and a replay of a DSS `.dssevs`
+file. The FSW drives it in NOMINAL only (the detector FSM is enabled at
+NOMINAL entry and cleared on leaving), and the quick-look TM leaves
+only at the NOMINAL exit:
+
+- **QL TM.** TM(21,6), SSID 30-34, APID 0x5DC. Each product is sent
+  only when its packet fills (about 39 min for the light curves) or at
+  the NOMINAL exit, whose flush is unconditional. A NOMINAL stay of a
+  few tens of seconds shows all five products in the exit flush; the
+  spectra (SSID 32) need 32 s of NOMINAL for their first dump, and the
+  next one comes only 1024 s later.
+- **Science chunks.** The model writes 49-block detector chunks into
+  the ROTB at every nominal integration (1-20 s); the FSW compacts and
+  archives them into the flash. No TM comes from them.
+- **Leaving NOMINAL** is the flush trigger: ZIX36001 with "Operation
+  mode" = 4 (CONFIGURATION), the first step of the mode recipe in
+  reverse. The gate `scripts/stix/detector-smoke.sh` runs this
+  timeline; `scripts/stix/ql-check.py` decodes a probe dump
+  (`tmtc-probe.py --port 21500 --dump-apid 0x5DC:ql.hex` appends one
+  whole CCSDS packet per line, hex).
+
+### The knobs
+
+Init-time properties (`-global grlib-stixctrl.PROPERTY=...`, before
+QEMU starts; they cannot be changed later):
+
+| Property | Values | Effect |
+|---|---|---|
+| `det-model` | bool, default true | false keeps the detector registers 0x00-0x4C as plain storage that a reset never clears. |
+| `det-idefx` | bool, default true | false keeps the IDeF-X interface raw with CmdReady 0: the 384 NOMINAL-entry ASIC-register timeouts come back (the `--negative` modes). |
+| `det-seed` | uint32, default 1 | The synthetic sky's PRNG seed, re-applied at every reset. `-global` only (seeded at realize). |
+| `det-rotb` | bool, default true | false stops the ROTB chunk generation; the nominal integration continues. |
+| `det-replay-file` | string, default empty | The `.dssevs` file, pre-scanned once at startup into an event table. A missing, unreadable or malformed file (size not a multiple of 4, an undefined type-0xC word, over 2^32 ticks of replay time, over the event cap) is a startup error naming the path. |
+
+Runtime properties (the `qom_set` function from "Fault injection"; a
+set is stored and takes effect at the next 100 ms tick):
+
+| Property | Values | Effect |
+|---|---|---|
+| `det-source` | `"zero"` \| `"synthetic"` (default) \| `"replay-dss"` | Where the counts come from. `zero`: no counts. `synthetic`: the synthetic sky. `replay-dss`: the pre-scanned `.dssevs` table replaces the sky; accepted only with a table, so it must be set over QMP once QEMU is up (a `-global` at startup is applied before the file is scanned and rejected). |
+| `det-flare` | bool, default false | The flare switch: the synthetic sky uses `det-flare-cps` and the flare spectrum instead of `det-quiet-cps` and the quiet one. Synthetic only; `zero` counts nothing and `replay-dss` ignores it. |
+| `det-quiet-cps` | uint32 0..1000000, default 20 | Quiet sky, counts/s per `fpga_det`. Above 1000000 the set is rejected, not clamped. |
+| `det-flare-cps` | uint32 0..1000000, default 2000 | Flare sky, counts/s per `fpga_det`. |
+| `det-inject` | write-only string `fpga_det=F,pix=P,ebin=B,count=N` | One-shot deposit of N counts at that accumulator cell. Lands in the quick-look accumulators at the next bank swap (4 s with the FSW default) and in the next ROTB chunk at the next nominal integration; the SSID 32 spectra show it only in the sample whose detector index is the `subcol` of F (see the index-space table below — not the identity). The keys are mandatory; unknown or duplicate keys, non-numeric values, `count=0`, `fpga_det` > 31, `pix` > 11 (the guard ring is never accumulated) and `ebin` > 31 are rejected and nothing is stored. Where the (pix, fpga_det) pair is gated off at the applying tick the deposit is dropped, like a real event — with the current gate ELF only `pix` 0, 3, 6, 8 (usually also 7) are gated on at NOMINAL entry, the FSW's double-mirrored R3 (STIX-FSW issue #1069, §34). A device reset drops a pending deposit. |
+| `det-replay-trigger` | `"nominal"` (default) \| `"qmp"` | When a loaded replay starts: `nominal` at the first FSM Enable edge after a reset (i.e. NOMINAL entry), `qmp` only on `det-replay-start=true`. |
+| `det-replay-offset-ms` | uint64 ms, default 0 | The file time the replay starts at. Sub-tick parts round down to the 100 ms tick; an event exactly at the offset arrives in the first tick. A value past 2^32 ticks is rejected. |
+| `det-replay-start` | bool | true starts a loaded replay now (needs `det-source=replay-dss`; acts at the next 100 ms tick), false stops it at once. Reading it gives the running state. |
+| `det-replay-status` | read-only string | `state=idle|armed|running|ended|stopped,pos_ns=...,events=...,dropped=...,unsupported=...,table=...,count=...,duration_ns=...`. `armed` = loaded, waiting for its trigger; `ended` = end of file (no loop); `stopped` = a `det-replay-start=false` stop; a device reset re-arms. `dropped` counts events the pixel gating dropped, `unsupported` the 0xD setup words the model does not implement. |
+
+**Reset:** the scene knobs (`det-source`, `det-flare`, the two rates,
+`det-replay-trigger`, `det-replay-offset-ms`) survive a device reset;
+a running replay stops and re-arms on its trigger; a pending
+`det-inject` is dropped. (`run-qemu-gs.sh` passes `-no-reboot`, so a
+reset stops QEMU anyway.)
+
+### Flare recipe
+
+Start QEMU with a QMP socket and a fresh run dir (a NOMINAL entry
+writes a flash context), as in "Fault injection":
+
+```bash
+RUN=/tmp/stix-gs-detector-$(date +%Y%m%d-%H%M%S)
+STIX_GS_RUN_DIR=$RUN STIX_GS_QMP=$RUN/qmp.sock \
+    scripts/stix/gs/run-qemu-gs.sh --udp build/qemu-system-sparc
+```
+
+1. **Watch and enter NOMINAL.** In a second terminal run the probe
+   with a dump, then enter NOMINAL with the recipe above:
+
+   ```bash
+   tmtc-probe.py --port 21500 --seconds 300 --dump-apid 0x5DC:ql.hex
+   ```
+
+2. **Flare on.** `qom_set $RUN/qmp.sock /machine/stixctrl det-flare
+   true` — the switch acts at the next 100 ms tick; the quick-look
+   bank that is open still carries the counts gathered before it.
+3. **Flare off** (`det-flare` false, optional), then **leave NOMINAL**
+   (ZIX36001, mode 4). The exit flush carries every QL product with
+   all its samples since NOMINAL entry.
+4. **Decode:** `python3 scripts/stix/ql-check.py ql.hex`.
+
+What the defaults show (20 and 2000 counts/s per `fpga_det`; observed
+2026-11-11, `accepted-diffs.md` §34):
+
+- SSID 30 light curves: the band-0 compressed byte rises from about
+  0x1F quiet to about 0x70 in the flare; the RCR bytes stay 0. The
+  flare keeps the group triggers far below the RCR's threshold (about
+  17.5 k counts/s per `fpga_det`); above it the FSW's RCR would insert
+  the attenuator. The model animates 0x5C-commanded moves and the ATT_C
+  current ("The attenuator" below; `accepted-diffs.md` §43), but the
+  gate ELF (AX) never writes 0x5C, so that path is untested — keep the
+  rates low.
+- SSID 34: the flare flag fires in the flare periods.
+- SSID 32: counts in all 32 `subcol` samples, dominated by the
+  Ba-133-like bins (`ebin` 18, 19, 27).
+- The nominal integration shrinks from its 20 s maximum to its 1 s
+  minimum, so the FSW archives about one 49-block science chunk per
+  second: the UART shows "Skipped first Det data chunk" once (the
+  first chunk is dropped, later ones are archived) and the flash grows
+  by a 256 KB NAND block about every 7 s. Another reason for the fresh
+  run dir.
+- The gate form of this recipe is `detector-smoke.sh --flare` (and
+  `--flare --negative`, which must fail exactly the light-curve
+  contrast and flare-chunk checks).
+
+**A one-shot deposit instead of the switch.** `det-inject` places N
+counts in one (pix, fpga_det, ebin) cell; in the SSID 32 flush it
+shows only in the `subcol` sample of its `fpga_det` — the end-to-end
+proof of the index mapping below (`accepted-diffs.md` §36). A detector
+kept above about 300 counts per 8 s for about 2 min (15 consecutive
+checks; the others near zero) trips the noisy-detector FDIR (TM(5,3)
+0x942E), so a single large deposit does not; the sky itself is uniform
+across `fpga_det`.
+
+### DSS replay recipe
+
+A `.dssevs` file is a raw stream of big-endian u32 words, no header:
+`[31:20] adc | [19:16] type | [15:11] dss_det | [10:0] wait` (20 ns
+units; types 0x0-0xB are events with type = `pix`, 0xE carries the
+per-detector baseline, 0xD is setup the model counts but does not
+implement, 0xF is wait-only padding). The file stays **outside the
+repo**: pass its path at startup and never commit the file or anything
+derived from it.
+
+1. **Start QEMU by hand.** The file is read once at startup, and
+   `run-qemu-gs.sh` has no hook for extra `-global` flags, so use its
+   flags plus the replay file:
+
+   ```bash
+   DSSEVS=/path/to/file.dssevs     # stays local, never in the repo
+   ELF=$HOME/dev/stix-elf/ASW_em_baseline.elf   # the normal ELF
+   RUN=/tmp/stix-gs-replay-$(date +%Y%m%d-%H%M%S)
+   mkdir -p "$RUN" && cd "$RUN"
+   qemu-system-sparc -M leon3_generic -m 64M -no-reboot -display none \
+       -monitor none -serial file:"$RUN/uart.raw" -kernel "$ELF" \
+       -global grlib-stixspw.tmtc-port=21500 \
+       -global grlib-stixspw.udp-tm-port=21501 \
+       -global grlib-stixspw.udp-tc-port=21502 \
+       -global grlib-stixctrl.det-replay-file="$DSSEVS" \
+       -qmp unix:"$RUN/qmp.sock",server=on,wait=off \
+       -trace 'stixtmtc*' -trace stixspw_tx_send \
+       -trace stixspw_recv_packet_callback \
+       -trace stixdet_replay_scan -trace stixdet_elut_fallback &
+   ```
+
+   The pre-scan trace (`stixdet_replay_scan`) prints words, events,
+   duration and scan time; `stixdet_elut_fallback` fires once per
+   degenerate ELUT row while the replay runs. The UDP ports match the
+   satellite entry of "One-time setup", so the ground station needs no
+   change.
+
+2. **Switch the source over QMP** once QEMU is up (values are JSON:
+   strings quoted, numbers bare; the `qom_get` helper is the one
+   defined in "Memory upsets (EDAC)" below):
+
+   ```bash
+   qom_set $RUN/qmp.sock /machine/stixctrl det-source '"replay-dss"'
+   qom_set $RUN/qmp.sock /machine/stixctrl det-replay-offset-ms 860000
+   qom_get $RUN/qmp.sock /machine/stixctrl det-replay-status
+   ```
+
+   The default trigger is already `nominal`. The status line now reads
+   `state=armed`.
+
+3. **Enter NOMINAL**: the replay starts at the NOMINAL entry's FSM
+   Enable edge, from the offset. To start it at another moment set
+   `det-replay-trigger '"qmp"'` instead and fire `det-replay-start`
+   true; `det-replay-start` false stops it. The status line moves to
+   `state=running` with `events=` counting, `state=ended` at the end
+   of the file (no loop), `state=stopped` after a stop.
+
+4. **What the known file shows** (about 60 k events on `dss_det` 9-15
+   = `fpga_det` 9-15, quiet for 0-900 s, a step to about 62 events/s
+   for 900-1800 s): the SSID 32 flush shows count bytes only in the
+   samples whose detector index (`subcol`) is 14, 9, 15, 7, 8, 2 or 3,
+   and only in `ebin` 2-28. The `ebin` comes from the linear fallback:
+   a fresh flash has no ELUT, and a constant ELUT row means "no ELUT",
+   so the model bins linearly above the file's baseline (trace
+   `stixdet_elut_fallback`; non-physical, recorded in §37/§38).
+   **On an ELUT-loaded flash a replay lands almost entirely in bins
+   30/31** — see "DSS replay caveat" in the ELUT section below.
+
+Notes:
+
+- The replay gain is fixed at 1×; there is no rate knob. At 1× the lit
+  detectors stay below the noisy-detector thresholds.
+- A `detector-smoke.sh --replay` gate is planned (D-7) and **not built
+  yet** on this tree; the replay model is covered by the `det-replay-*`
+  qtests (`accepted-diffs.md` §37).
+
+### Index spaces (TM detector and pixel indices)
+
+Detector and pixel numbers are renamed several times between the ASIC
+and the TM, and not every step is 1:1. Every property, variable and
+trace argument in the model names its space; a TM or TC consumer needs
+the same care. This table is the single reference (copied from the
+detector plan, `2026-11-11-detector-plan.md` "Index spaces"; the
+conversion tables live in `hw/sparc/stix_det.c`, self-checked at
+realize).
+
+| Name | Space | Range | Defined in (FSW) | Used for |
+|---|---|---|---|---|
+| `asic_ch` | IDeF-X channel | 0-31 | `commonFSW.h:149`; R3 6-bit fields `utils.c:521-555`; SW↔wire order `utils_reorderThreshold3` `utils.c:663-677` (self-inverse) | R3 thresholds, R12 ALIMON, R4 |
+| `pix` | Caliste pixel J | 0-11 (12 = guard ring, never accumulated) | `utils_pixelId2channelId` `utils.c:50-53`, inverse `utils.c:56-62` | LACC/EACC dimension 0 |
+| `fpga_det` | FPGA detector | 0-31 = 2·`grp` + `asic` | `dete_data` `utils.c:74-107` | LACC/EACC dimension 1, ROTB chunk payload order, all FPGA register detector masks (SUMDMASK, VARDMASK, fsmCalMask) |
+| `grp` | IDeF-X group | 0-15 = `fpga_det`/2 | `StixIdpu.h` IDEFXCONFIG_ENABLE_V_QxGy | GrpAddr, WriteMask, ReadMode, Enable bits, LTRG/ETRG index |
+| `quarter` | power quarter | 0-3 = `grp`/4 | `dete_data` quarterId | idefxConfig Q1..Q4ON |
+| `asic` | ASIC in a group | 0/1 (2 = both) | `Detectors.c:747, 806, 868` | slow-control addressing |
+| `subcol` | ASW sub-collimator = ICD "detector index" (number − 1); `subcol` 8 = CFL, 9 = BKG | 0-31 (ICD detector number 1-32) | `utils_subcolIdFromFpgaId` / `utils_fpgaIdFromSubcolId` `utils.c:113-127` | every ASW parameter mask, the QL TM detector index, the archive control word |
+| `fe_sc` | front-end ("old") sub-collimator | 1-32 | `Detectors_fpgaFromFrontendMinusOne` `Detectors.c:536-540` | calibration report; the DSS app's "sc" |
+| `dss_det` | DSS event detector field | 0-31 | DSS app table | `.dssevs` bits 15:11 |
+| `ebin` | science energy bin | 0-31 | LACC dimension 2 (ELUT output); LC bands mask 0x10821082 = `ebin` 1-6, 7-11, 12-16, 17-22, 23-27 (`ParamMgmtDef.h:254`) | QL TM, SUMEMASK/VAREMASK bits |
+| `adc` | raw 12-bit ADC value | 0-4095 | ICD §7.2.11.2 | `.dssevs` events, IDeF-X ADC answers, ELUT input |
+
+- **The one non-1:1 step a TM user sees is `subcol` ↔ `fpga_det`**:
+  e.g. `subcol` 2 = `fpga_det` 14, 5 = 2, 8 = 13, 9 = 10; only 0, 1
+  and 4 map to themselves (the ELUT section's table below shows the
+  same mapping from the CSV side). In TM and TC, every detector mask,
+  the SSID 32 sample detector index, the L0/L1 sample detector field
+  and the event-ID detector parameters are `subcol`.
+- **`dss_det` = `fpga_det` (identity).** A `.dssevs` event's detector
+  field is already the FPGA detector index; the DSS app's "sc" is
+  `fe_sc`.
+- **`pix` → `asic_ch`:** `pix` 0..11 = `asic_ch` 26, 15, 8, 1, 29, 18,
+  5, 0, 30, 21, 11, 3; guard ring `pix` 12 = `asic_ch` 31.
+- **Pixel-mask bit orders differ between FSW users:** the QL software
+  masks (e.g. the SSID 30 pixel mask) use bit i = `pix` i; the RCR
+  masks are reversed (bit 11−i = `pix` i, bit 12 = attenuator).
 
 ## Energy LUT (ELUT)
 
@@ -381,7 +615,9 @@ record: `accepted-diffs.md` §40.
 ### Index spaces
 
 Detector and pixel numbers differ between the CSV, the TC and the FPGA.
-The tool and gate name the space in every variable and option.
+The tool and gate name the space in every variable and option. This is
+the ELUT-specific subset; the master table for every TM detector and
+pixel index is in "Detector scene" above.
 
 | Name | Space | Range | Where |
 |---|---|---|---|

@@ -103,6 +103,10 @@ variable, trace argument and table in this plan and in the code carries
 its index space in its name**, using the names below. A bare "det",
 "pixel" or "channel" is not allowed.
 
+D-8: the single reference for TM detector and pixel indices is the copy
+of this table in `ground-station.md`, section "Detector scene"; this
+section stays the planning source.
+
 | Name | Space | Range | Defined in (FSW) [C] | Used for |
 |---|---|---|---|---|
 | `asic_ch` | IDeF-X channel | 0-31 | `commonFSW.h:149`; R3 6-bit fields in SW order `utils.c:521-555`; SW↔wire order `utils_reorderThreshold3` `utils.c:663-677` (self-inverse) | R3 thresholds, R12 ALIMON, R4 |
@@ -378,7 +382,11 @@ forward/inverse pair composes to the identity.
   L1 = 140000, i.e. 35 k/s per `grp`, about 17.5 k counts/s per
   `fpga_det`.
   - A rise moves the attenuator (`RateCtrl.c:495-515`), which the model
-    does not animate (ATT_C is a static 20, §22).
+    did not animate when this was written (ATT_C a static 20, §22).
+    Superseded 2026-11-12: the attenuator track (accepted-diffs §43,
+    A-2/A-3) animates 0x5C-commanded moves and the ATT_C current; the
+    RCR → motion path itself is still untested (the AX gate ELF never
+    writes 0x5C).
   - **Synthetic rates must stay well below L1 by default.**
 - **QLDetPerf** (`QLDetPerf.c:115-180`; Kbad 5, Cbad 300, Nrep 15,
   `ParamMgmtDef.h:336-341`) flags a detector "noisy" when it has more than
@@ -1422,6 +1430,99 @@ binary at their first new assertion, and green after.
   doc, as the single reference for TM detector and pixel indices.
 - accepted-diffs §38: the known limits after the detector phase.
 - The detector checklist (this file's "As built"), and the GS-repo line.
+- **As built (2026-11-12, accepted-diffs §38):** the docs commit of the
+  series whose commits are D-1..D-7. It writes:
+  - `ground-station.md`: the new "Detector scene" section after
+    "NOMINAL mode" — the QL TM/chunk output paths, the init-time
+    (`det-model`, `det-idefx`, `det-seed`, `det-rotb`,
+    `det-replay-file`) and runtime knobs exactly as the code defines
+    them (`det-source`, `det-flare`, `det-quiet-cps`, `det-flare-cps`,
+    `det-inject`, `det-replay-trigger`, `det-replay-offset-ms`,
+    `det-replay-start`, `det-replay-status`), the reset rule, the flare
+    recipe (QMP + probe dump + `ql-check.py`, the observed 0x1F → 0x70
+    band-0 bytes, the chunk cadence) and the DSS replay recipe (by-hand
+    QEMU with `-global grlib-stixctrl.det-replay-file`, the QMP source
+    switch, the status line, the known file's `subcol`/`ebin` map; the
+    file stays outside the repo);
+  - `ground-station.md` "Detector scene" also carries the copied
+    "Index spaces" table as the single reference for TM detector and
+    pixel indices; the ELUT section's smaller table points at it, and
+    this section keeps the pointer added above;
+  - `accepted-diffs.md` §38, the known limits after the detector phase
+    (calibration, aspect blocks, SEU, the RCR/attenuator, the ELUT
+    bypass, the non-physical fallback, the 1× gain, the pending
+    `--replay` gate, the LVAR slot rule, the chunk-drop rule, the
+    ClearEnable/Reset choices, the unlock token, the disabled-`grp`
+    and THS traps, FSW bug #1069, `det-seed`, vmstate, determinism,
+    BRAM widths);
+  - the stale ground-station lines the scene invalidates: the status
+    table's detector row (tiers 0+1, "no synthetic sky yet") and the
+    NOMINAL section's "no quick-look or science TM" and 384-timeout
+    bullets;
+  - the GS-repo line is proposed in the commit report only: the GS
+    repo (`ATS-GroundStation-stix`, `docs/stix-qemu.md` "Limits") is
+    not this worktree's to edit; its stale "NOMINAL has no detector
+    model" bullet needs the replacement line from the report.
+  - review fixes (2026-11-12, `d8-review.md`): the §38 RCR bullet and
+    the flare recipe now state the §43 attenuator model (0x5C moves and
+    ATT_C animated; the AX gate ELF never writes 0x5C, so the RCR →
+    motion path is untested) instead of "no motion is modelled", and
+    the plan's RCR fact carries the same superseded note; the §38
+    disabled-`grp` cite is §32 (first stated §24), the aspect-block
+    cite the plan's D-Dg; SSID 32's second dump is 1024 s after the
+    first; the replay recipe points at the `qom_get` definition; the
+    det-inject FDIR note carries the Nrep 15 (~2 min) persistence.
+
+## As built: detector phase
+
+Branch `stix-uprev-d8` on the integration tip. Commit subjects and
+hashes are not re-verified here (the docs commit reads docs and code,
+not git history); the evidence is the accepted-diffs section each
+commit recorded and the code and scripts in the tree.
+
+- [x] D-1 FSM strobes, live fsmSta, QL swap and IRQ 3, register reset
+  (accepted-diffs §31): `stix_det.[ch]`, the `det-fsm-*`, `det-ql-*`,
+  `det-testpulse`, `det-reg-reset`, `det-model-off`,
+  `det-token-spend` qtests.
+- [x] D-2 IDeF-X interface, register store and index tables (§32):
+  the `det-idefx-*` qtests; nominal-smoke expects 0 IDeF-X timeouts.
+- [x] D-3 detector-smoke gate, probe `--dump-apid`, `ql-check.py` (§33).
+- [x] D-4 synthetic sky and the flare switch (§34): `det-source`,
+  `det-flare`, `det-quiet-cps`, `det-flare-cps`, `det-seed`; the
+  `det-counts-*`, `det-lvar-ltrg`, `det-props` qtests; FSW bug #1069
+  recorded.
+- [x] D-5 nominal integration and ROTB chunks (§35): `det-rotb`; the
+  `det-chunk-*` and `det-nominal-rule` qtests;
+  `chunk-trace-check.py`; the `--no-rotb` gate mode.
+- [x] D-6 `det-inject` index-space end-to-end check (§36): the
+  `det-inject-*` qtests, the `ql-check.py --ssid32-inject` gate check.
+- [x] D-7 DSS `.dssevs` replay (§37): `det-replay-file`,
+  `det-replay-trigger`, `det-replay-offset-ms`, `det-replay-start`,
+  `det-replay-status`, `det-source=replay-dss`; the `det-replay-*`
+  qtests.
+- [x] D-8 docs (this commit): ground-station.md "Detector scene", the
+  index-space copy, accepted-diffs §38, this checklist.
+- [ ] D-7 remainder: the optional `detector-smoke.sh --replay` gate
+  (SKIP-77 with `STIX_DSSEVS_FILE`) is **not built**; §37's gate
+  record stays pending.
+- [ ] GS-repo line: **proposed, not applied** — the GS repo's
+  `docs/stix-qemu.md` "Limits" bullet ("NOMINAL has no detector
+  model") is not this worktree's to edit.
+
+Gates (evidence: the gate records in accepted-diffs §33-§37; this
+docs commit runs none):
+- [x] suite (qt.sh all): 96 of 96 ok at D-7 (§37), including all
+  `det-*` qtests.
+- [x] at D-7 (§37): boot-smoke PASS (the UART golden unchanged),
+  tc-smoke PASS, nominal-smoke PASS and `--negative` PASS, fault-smoke
+  PASS and `--negative` PASS, detector-smoke PASS in all five modes
+  (positive, `--negative`, `--flare`, `--flare --negative`,
+  `--no-rotb`).
+- [ ] soak 300 s per commit: **unconfirmed** — the D-5/D-6/D-7 gate
+  records do not list it, though the plan's Gate impact expects it.
+- [ ] probe / ql-check / idefx-trace-check / chunk-trace-check
+  self-tests: PASS recorded at D-4 and D-5; per-commit runs
+  **unconfirmed**.
 
 ## Goldens: what changes, when, and why
 

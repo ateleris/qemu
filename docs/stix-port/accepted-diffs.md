@@ -3945,6 +3945,88 @@ the review fixes and the D-PLm req 3/4 pass, slot 2):
 - The optional `detector-smoke --replay` gate is not built (deferred,
   see above); the replay is covered by the qtests only.
 
+## 38. Known limits after the detector phase
+
+What the detector model (§31-§37) deliberately does **not** do, so a
+missing or surprising behaviour is not mistaken for a bug (plan D-8,
+"Out of scope"). The GS-side recipes are in `ground-station.md`,
+"Detector scene".
+
+- **Calibration never completes.** SetCalEnable only sets CalEnable:
+  CalReady never sets and CalCount/CalRes stay 0 (§31), so the
+  TC-driven calibration, test-pulse and threshold-scan procedures
+  cannot run to completion. The IDeF-X ADC answers are canned (§32):
+  readTemp gives A − B = 0x200, adcRead and the on-demand reads give
+  1850.
+- **No aspect ROTB blocks** (plan D-Dg; §35 builds only the 0x8000
+  detector descriptor): the ring carries only detector chunks.
+- **No SEU injection** (§31): QuarterSeu always reads 0. The IDeF-X
+  registers are also outside the memory-upset track (§45).
+- **The RCR → attenuator-motion path is untested** (§22, §34, §43):
+  above about 17.5 k counts/s per `fpga_det` the FSW's RCR inserts the
+  attenuator. The model animates 0x5C-commanded moves and the ATT_C
+  current since §43 (A-2/A-3: 20 idle, +100 per moving driven motor,
+  +300 stalled), but the gate ELF (AX) never writes 0x5C, so there
+  ATT_C stays 20 and the RCR's insertion command is never exercised —
+  keep the rates low. The `det-*-cps` properties allow up to 1 000 000
+  for experiments, at the user's risk.
+- **The synthetic sky and `det-inject` bypass the ELUT** (deliberate
+  deviation, D-Df/Doc vs code 20): they generate counts directly in
+  `ebin` space, while hardware with an empty flash would bin every
+  event into `ebin` 31. A comparison against real hardware with an
+  empty flash must not use the synthetic sky.
+- **The replay's linear fallback is non-physical** (§37): on a
+  degenerate (constant) ELUT row the model bins linearly above the
+  file's baseline, which differs from what the FPGA would do with this
+  ELUT (bin everything into `ebin` 31). `stixdet_elut_fallback` traces
+  it once per newly degenerate row per classification.
+- **The replay gain is fixed at 1×**, and about 25 of 32 `fpga_det`
+  stay dark with the known file. Only QLDetPerf is known to react to
+  dark detectors; the live `--replay` gate run that would confirm
+  nothing else reacts is still pending (no `--replay` gate yet, §37).
+- **The optional `detector-smoke.sh --replay` gate is not built**
+  (§37): the SSID 32/SSID 30 replay checks and the SKIP-77
+  `STIX_DSSEVS_FILE` mode are pending, and §37's gate record stays
+  open until it runs.
+- **The LVAR slot rule is a model choice** (§31): the documents do not
+  say what the FPGA does with the ticks of a QL period beyond slot 39;
+  the model drops them, so it never writes past the bank's 0xA0 bytes
+  (the WDT storage at +0xA8 and MemBram stay intact, qtest-pinned).
+- **ROTB overflow drops the whole new chunk** instead of overwriting
+  the oldest block (§35, Doc vs code 7). Unreachable while the FSW
+  drains the ring.
+- **ClearEnable freezes and Reset partially clears** (§31): both are
+  model choices ([I] in the plan); the FSW's SetEnable-then-Reset
+  order makes the difference invisible.
+- **The ISR can spend the hk-prot unlock token** (§31): a QlClear
+  landing between HK.c's token write and its protected store drops
+  that store. Hardware-faithful, nearly unreachable under TCG,
+  accepted; `det-token-spend` pins the rule.
+- **A disabled `grp` in a powered `quarter` reads zeros** and so trips
+  the ASIC-verification FDIR (0x542E → 0x9438; §32, first stated §24)
+  — plausibly hardware-faithful. No gate disables a `grp`; a later TC
+  gate must expect it.
+- **THS/TPG can stall the QL task for about 1.8 h** (§31): a latched
+  QlIntTime of 0xFFFF outlives THS_cleanup until the next period end.
+  Later gates that run THS or TPG must expect it.
+- **The NOMINAL-entry R3 is mirrored twice in the FSW** (STIX-FSW
+  issue #1069, §34): only `pix` 0, 3, 6, 8 (and usually 7, via an
+  out-of-bounds read) are gated on, so the observed sky is 0.475 of
+  the template estimate. `det-counts-r3-fsw` shows all 12 `pix`
+  counting with a corrected build; recalibrate the flare thresholds
+  then.
+- **`det-seed` is `-global`-only** (§34, an explicit exception to the
+  runtime-knob rule), and **no run is bit-for-bit reproducible** (no
+  icount; the same seed gives statistically equal, not identical,
+  banks).
+- **No vmstate** (§31): the detector scene, counters and IDeF-X store
+  are not migrated or snapshotted.
+- **BRAM width truncation is not modelled** (the §13 gap): the FSW's
+  over-wide BRAM writes are stored whole. Out-of-scope candidates for
+  a next phase (plan): a science-TM gate (TC(238,x) L0), the RP-0119
+  QL dump replay, an ADC-domain synthetic sky through the ELUT,
+  ALIMON-based pixel gating, FIFO overflow.
+
 ## 41. Gate ports: slots for parallel gate runs (baseline: one global lock)
 
 Plan: `2026-11-11-gateports-plan.md`. Four tracks (tc, platform, elut,
