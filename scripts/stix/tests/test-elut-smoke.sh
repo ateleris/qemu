@@ -386,6 +386,7 @@ check "fake slot: PASS with the slot tag, rc 0" $? \
     "rc=$rc $(tail -2 <<< "$out")"
 grep -qx "cwd: $W/fl-s1" "$W/qargv.slot" &&
     grep -qx -- "grlib-stixspw.tmtc-port=$B1" "$W/qargv.slot" &&
+    grep -qx -- "grlib-stixspw.tm-hold=on" "$W/qargv.slot" &&
     grep -qx -- "$B1" "$W/pargv.slot" &&
     [ "$(sed -n 's/^flash-inode: //p' "$W/qargv.slot" | head -1)" != none ] &&
     [ "$(sed -n 's/^flash-inode: //p' "$W/qargv.slot" | head -1)" != "$MINO" ]

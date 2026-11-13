@@ -226,9 +226,10 @@ flash_ok() { # argv-file dir
         ! grep -q "^flash-inode: none\$" "$1" &&
         ! grep -q "^flash-inode: $MINO\$" "$1"
 }
-has_global() { # argv-file count
+has_global() { # argv-file qemu-starts: each start has tmtc-port AND tm-hold
     [ "$(grep -cx "grlib-stixspw.tmtc-port=$B1" "$1")" -eq "$2" ] &&
-        [ "$(grep -cx -- "-global" "$1")" -eq "$2" ]
+        [ "$(grep -cx "grlib-stixspw.tm-hold=on" "$1")" -eq "$2" ] &&
+        [ "$(grep -cx -- "-global" "$1")" -eq "$((2 * $2))" ]
 }
 
 # boot-smoke --with-tm

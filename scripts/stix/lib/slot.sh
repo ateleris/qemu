@@ -22,8 +22,10 @@
 #
 # In slot mode the helper exports STIX_SLOT, TMTC_PORT (= B_k) and
 # STIX_QTEST_PORT_BASE (= B_k, read by tests/qtest/stix.c for its port
-# band); STIX_PORT_BASE keeps the caller's selector (auto or k). It
-# prints one "slot: k base B" line, and keeps the lock fd open
+# band); STIX_PORT_BASE keeps the caller's selector (auto or k). It also
+# sets STIX_SLOT_QEMU_ARGS (the slot's -global tmtc-port plus the P0b
+# tm-hold) for the caller's QEMU command line, and prints one
+# "slot: k base B" line, and keeps the lock fd open
 # for the caller's lifetime (inherited by QEMU and the probe, so the
 # kernel frees it when the last of them exits, SIGKILL included).
 #
@@ -205,7 +207,11 @@ stix_slot_setup() { # [peek]
     TMTC_PORT="$(stix_slot_base "$k")"
     STIX_QTEST_PORT_BASE="$TMTC_PORT"
     export STIX_SLOT TMTC_PORT STIX_QTEST_PORT_BASE
-    STIX_SLOT_QEMU_ARGS=(-global "grlib-stixspw.tmtc-port=$TMTC_PORT")
+    # P0b (gate speed-up plan): every slot-mode boot holds TM until the
+    # first probe connect, so the boot TM can never race the probe.
+    # Legacy mode boots nothing gated; the array stays empty there.
+    STIX_SLOT_QEMU_ARGS=(-global "grlib-stixspw.tmtc-port=$TMTC_PORT" \
+                         -global "grlib-stixspw.tm-hold=on")
     # D-G6: appended to every verdict line in slot mode
     STIX_SLOT_TAG=" slot=$k busy=$(stix_slot_busy)"
     STIX_SLOT_TAG="$STIX_SLOT_TAG load=$(cut -d' ' -f1 /proc/loadavg)"

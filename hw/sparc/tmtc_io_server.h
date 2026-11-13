@@ -49,6 +49,17 @@ struct StixTmtc {
     size_t out_sent;  /* bytes of the queue already on the wire */
 
     /*
+     * tm-hold (P0b, gate-only): while tm_hold is set and no client has
+     * EVER connected, TM packets are appended whole to out_buf instead
+     * of dropped, and the first accept flushes them. tm_first_seen is
+     * that latch: once set, the behaviour is the plain no-client drop
+     * again. Both survive a machine reset (the transport is kept, see
+     * grlib_stixspw_reset). Only meaningful while the TCP server runs.
+     */
+    bool tm_hold;
+    bool tm_first_seen;
+
+    /*
      * per-sink drops (P2-8 review m5): the TCP queue-full drop and a
      * UDP sendto failure both count here, so one TX can count once per
      * failing sink — or once when only one sink failed (see
@@ -85,7 +96,10 @@ bool init_tmtc_server(StixTmtc *tmtc, StixTmtcRecvFn tc_received, void *opaque,
  * packet, back to back, so a packet that does not fit the out-queue is
  * dropped whole (tm-dropped), and a partial write keeps its remainder
  * at the queue head. With no client the packet is dropped silently
- * (not counted in tm-dropped). Never blocks.
+ * (not counted in tm-dropped) — unless tm-hold is on and no client has
+ * ever connected, in which case the packet is appended whole to the
+ * out-queue (overflow: dropped whole and counted) until the first
+ * accept flushes it (see accepted-diffs §46). Never blocks.
  */
 void stix_tmtc_send(StixTmtc *tmtc, const uint8_t *data, int len);
 

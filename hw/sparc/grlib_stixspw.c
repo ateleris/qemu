@@ -116,6 +116,14 @@ struct STIXSPW
     uint32_t tmtc_port; /* 0 = dynamic: IO_TCP_SERVER_BASE_PORT + getuid() */
 
     /*
+     * tm-hold (P0b, gate-only): hold TM packets in the out-queue while
+     * no client has EVER connected, flushing them on the first accept.
+     * Default off = the plain no-client drop. Copied into the transport
+     * (tmtc.tm_hold) at realize, only when the TCP server starts.
+     */
+    bool tm_hold;
+
+    /*
      * D-B direct UDP for the ground station (P2-8); the ports are 0 =
      * off and the sockets live in tmtc (StixTmtc)
      */
@@ -972,6 +980,12 @@ static void grlib_stixspw_realize(DeviceState *dev, Error **errp)
     if (STIXSPW->tmtc_server == ON_OFF_AUTO_ON ||
         (STIXSPW->tmtc_server == ON_OFF_AUTO_AUTO && !qtest_driver()))
     {
+        /*
+         * P0b: the hold belongs to the TCP transport — with the server
+         * off there is no out-queue to hold anything in, so tm-hold is
+         * not copied and the sends keep dropping silently.
+         */
+        STIXSPW->tmtc.tm_hold = STIXSPW->tm_hold;
         if (!init_tmtc_server(&STIXSPW->tmtc, recv_packet_callback, STIXSPW,
                               STIXSPW->tmtc_port, errp))
         {
@@ -1427,8 +1441,10 @@ static void grlib_stixspw_reset(DeviceState *d)
     STIXSPW *STIXSPW = GRLIB_STIXSPW(d);
 
     /*
-     * power-on register values; the TMTC transport (P2-1) is kept. The
-     * RX queue and the descriptor selector (P2-5) clear here too; the
+     * power-on register values; the TMTC transport (P2-1) is kept —
+     * tm-hold's queue and first-client latch too (P0b), so a reset
+     * before the first connect delivers both boots' TM. The RX queue
+     * and the descriptor selector (P2-5) clear here too; the
      * register readback shows both gone (base and DESCSEL are 0).
      */
     memset(&STIXSPW->reg, 0, sizeof(STIXSPW->reg));
@@ -1462,6 +1478,8 @@ static void grlib_stixspw_reset(DeviceState *d)
 static const Property grlib_stixspw_properties[] = {
     DEFINE_PROP_ON_OFF_AUTO("tmtc-server", STIXSPW, tmtc_server, ON_OFF_AUTO_AUTO),
     DEFINE_PROP_UINT32("tmtc-port", STIXSPW, tmtc_port, 0),
+    /* P0b (gate-only): hold TM until the first client connects */
+    DEFINE_PROP_BOOL("tm-hold", STIXSPW, tm_hold, false),
     DEFINE_PROP_STRING("udp-tm-host", STIXSPW, udp_tm_host),
     DEFINE_PROP_UINT32("udp-tm-port", STIXSPW, udp_tm_port, 0),
     DEFINE_PROP_UINT32("udp-tc-port", STIXSPW, udp_tc_port, 0),

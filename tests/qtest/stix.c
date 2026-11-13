@@ -2687,6 +2687,278 @@ static void test_tm_reconnect(void)
     stix_qtest_cleanup();
 }
 
+/* ---- P0b: tm-hold, TM kept whole until the first client ---- */
+
+/*
+ * tm-hold (gate-only, accepted-diffs §46): with tm-hold=on and no
+ * client EVER connected, a TM send is appended whole to the 256 KiB
+ * out-queue (TMTC_OUT_QUEUE_SIZE, tmtc_io_server.h) instead of being
+ * dropped, and the first accept arms the handlers, sets the latch and
+ * flushes (an EAGAIN remainder is finished by the armed write handler).
+ * A 4 KiB packet fills the queue in exactly 64 packets.
+ */
+#define TM_HOLD_PKT 4096
+#define TM_HOLD_QUEUE_PKTS (256 * 1024 / TM_HOLD_PKT)
+
+/* The guest TX payload: the fill, rewritten with the seq per TX (the
+ * stalled-client pattern: the wire carries the DMA'd bytes verbatim). */
+static void tm_hold_write_fill(QTestState *qts)
+{
+    uint8_t payload[TM_HOLD_PKT];
+    int i;
+
+    for (i = 0; i < TM_HOLD_PKT; i++) {
+        payload[i] = (uint8_t)(i ^ 0xa5);
+    }
+    qtest_memwrite(qts, TXDATA_ADDR, payload, sizeof(payload));
+}
+
+static void tm_hold_tx(QTestState *qts, uint32_t seq)
+{
+    qtest_writel(qts, TXDATA_ADDR, seq);
+    qtest_writel(qts, IRQMP_CLEAR, SPW_IRQ_BIT);
+    qtest_writel(qts, SPW_CONTROL, SPW_CTRL_IE);
+    stix_drive_tx(qts, TM_HOLD_PKT);
+}
+
+/* One held packet on the wire: the big-endian @seq, then the fill. */
+static void tm_hold_check_pkt(const uint8_t *u, uint32_t seq)
+{
+    uint32_t got = ((uint32_t)u[0] << 24) | ((uint32_t)u[1] << 16) |
+                   ((uint32_t)u[2] << 8) | u[3];
+    int i;
+
+    g_assert_cmpuint(got, ==, seq);
+    for (i = 4; i < TM_HOLD_PKT; i++) {
+        g_assert_cmpuint(u[i], ==, (uint8_t)(i ^ 0xa5));
+    }
+}
+
+/*
+ * hold off (the default, byte-identical behaviour): a no-client send is
+ * dropped silently — not held, not counted in tm-dropped, and the
+ * client that connects later sees an empty stream.
+ */
+static void tm_hold_case_off(void)
+{
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[TM_HOLD_PKT];
+    QTestState *qts;
+    int fd, port, i;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+    g_assert(stix_wait_tmtc_state(qts, path, false, 10 * G_TIME_SPAN_SECOND));
+
+    tm_hold_write_fill(qts);
+    for (i = 0; i < 3; i++) {
+        tm_hold_tx(qts, i);
+    }
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0);
+
+    fd = stix_tm_connect(port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+    stix_tm_read_eagain(fd, buf, sizeof(buf)); /* nothing was held */
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * hold on: three sends before any connect are held, then delivered
+ * whole and in order at the first accept; after the first client has
+ * gone, the next no-client send is dropped silently again (the latch).
+ */
+static void tm_hold_case_basic(void)
+{
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[TM_HOLD_PKT];
+    QTestState *qts;
+    int fd, port, i;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d "
+                            "-global grlib-stixspw.tm-hold=on", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+    g_assert(stix_wait_tmtc_state(qts, path, false, 10 * G_TIME_SPAN_SECOND));
+
+    tm_hold_write_fill(qts);
+    for (i = 0; i < 3; i++) {
+        tm_hold_tx(qts, i);
+    }
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0);
+
+    fd = stix_tm_connect(port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+    for (i = 0; i < 3; i++) {
+        stix_tm_read_exact(fd, buf, sizeof(buf));
+        tm_hold_check_pkt(buf, i);
+    }
+    stix_tm_read_eagain(fd, buf, sizeof(buf));
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0);
+
+    close(fd);
+    g_assert(stix_wait_tmtc_state(qts, path, false, 10 * G_TIME_SPAN_SECOND));
+    tm_hold_tx(qts, 99); /* latch set: dropped, not counted */
+    fd = stix_tm_connect(port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+    stix_tm_read_eagain(fd, buf, sizeof(buf));
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0);
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * The flush hitting EAGAIN: the whole queue (64 x 4 KiB) is held while
+ * the client keeps a 1024-byte SO_RCVBUF and does not read until after
+ * the connect, so the synchronous flush stops with a remainder (the
+ * armed write handler finishes it; tm-stalled-client pins that path
+ * under load too) and everything still arrives, whole and in order.
+ */
+static void tm_hold_case_eagain(void)
+{
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[TM_HOLD_PKT];
+    QTestState *qts;
+    int fd, port, i;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d "
+                            "-global grlib-stixspw.tm-hold=on", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    tm_hold_write_fill(qts);
+    for (i = 0; i < TM_HOLD_QUEUE_PKTS; i++) {
+        tm_hold_tx(qts, i);
+    }
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0); /* exactly full */
+
+    fd = stix_tm_connect(port, true);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+    for (i = 0; i < TM_HOLD_QUEUE_PKTS; i++) {
+        stix_tm_read_exact(fd, buf, TM_HOLD_PKT);
+        tm_hold_check_pkt(buf, i);
+    }
+    stix_tm_read_eagain(fd, buf, sizeof(buf));
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0);
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * Overflow: 66 held packets — the 256 KiB queue takes exactly 64, and
+ * packets 64 and 65 are dropped WHOLE and counted (tm-dropped = 2). The
+ * stream after the connect carries the 64 held packets only: whole, in
+ * order, packet-aligned (no split, no partial prefix), nothing else.
+ */
+static void tm_hold_case_overflow(void)
+{
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[TM_HOLD_PKT];
+    QTestState *qts;
+    int fd, port, i;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d "
+                            "-global grlib-stixspw.tm-hold=on", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    tm_hold_write_fill(qts);
+    for (i = 0; i < TM_HOLD_QUEUE_PKTS + 2; i++) {
+        tm_hold_tx(qts, i);
+    }
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 2);
+
+    fd = stix_tm_connect(port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+    for (i = 0; i < TM_HOLD_QUEUE_PKTS; i++) {
+        stix_tm_read_exact(fd, buf, TM_HOLD_PKT);
+        tm_hold_check_pkt(buf, i); /* 0..63: the drops are the last two */
+    }
+    stix_tm_read_eagain(fd, buf, sizeof(buf));
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * The hold survives a machine reset (the transport is kept, see
+ * grlib_stixspw_reset): the first boot's TM, a reset, then the second
+ * boot's TM — all with no client yet — are delivered at the first
+ * connect, in order, so a reset before the probe connect delivers both
+ * boots' boot TM.
+ */
+static void tm_hold_case_reset(void)
+{
+    g_autofree gchar *extra = NULL;
+    g_autofree gchar *path = NULL;
+    uint8_t buf[TM_HOLD_PKT];
+    QTestState *qts;
+    int fd, port, i;
+
+    port = stix_free_tcp_port();
+    extra = g_strdup_printf("-global grlib-stixspw.tmtc-server=on "
+                            "-global grlib-stixspw.tmtc-port=%d "
+                            "-global grlib-stixspw.tm-hold=on", port);
+    qts = stix_qtest_new_extra(extra);
+    path = stix_spw_path(qts);
+
+    tm_hold_write_fill(qts);
+    tm_hold_tx(qts, 0);
+    tm_hold_tx(qts, 1);
+    qtest_system_reset(qts);
+    /* the latch is not set: the second boot's TM is held too */
+    tm_hold_tx(qts, 2);
+    tm_hold_tx(qts, 3);
+    g_assert_cmpint(stix_qom_tm_dropped(qts, path), ==, 0);
+
+    fd = stix_tm_connect(port, false);
+    g_assert(stix_wait_tmtc_state(qts, path, true, 10 * G_TIME_SPAN_SECOND));
+    for (i = 0; i < 4; i++) {
+        stix_tm_read_exact(fd, buf, TM_HOLD_PKT);
+        tm_hold_check_pkt(buf, i);
+    }
+    stix_tm_read_eagain(fd, buf, sizeof(buf));
+
+    close(fd);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * tm-hold (P0b): one QEMU instance per case (the hold is stateful), the
+ * spw-udp pattern. RED on the pre-P0b binary: tm-hold is an unknown
+ * -global property, so QEMU dies at start (case off pins the unchanged
+ * default on both).
+ */
+static void test_tm_hold(void)
+{
+    tm_hold_case_off();
+    tm_hold_case_basic();
+    tm_hold_case_eagain();
+    tm_hold_case_overflow();
+    tm_hold_case_reset();
+}
+
 /* ---- P2-5: SPW RX descriptor DMA with a no-spill queue (spw-rx) ---- */
 
 #define SPW_DMARxDesc (SPW_BASE + 0x2cu)
@@ -14647,6 +14919,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/tm-stalled-client",
                        test_tm_stalled_client);
         qtest_add_func("/sparc/stix/tm-reconnect", test_tm_reconnect);
+        qtest_add_func("/sparc/stix/tm-hold", test_tm_hold);
         qtest_add_func("/sparc/stix/spw-rx", test_spw_rx);
         qtest_add_func("/sparc/stix/tc-tcp", test_tc_tcp);
         qtest_add_func("/sparc/stix/spw-timecode", test_spw_timecode);

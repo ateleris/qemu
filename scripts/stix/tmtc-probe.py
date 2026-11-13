@@ -1541,13 +1541,15 @@ def main():
         qmp = QmpClient(args.qmp)
 
     deadline = time.monotonic() + args.seconds
-    # Retry connect for a few seconds in case QEMU is still binding.
+    # Retry connect for a few seconds in case QEMU is still binding;
+    # 20 ms keeps the connect well inside the ~0.3 s boot-TM margin
+    # (P0a of the gate speed-up plan; tm-hold closes the rest).
     sock = None
     while time.monotonic() < deadline and sock is None:
         try:
             sock = socket.create_connection(("127.0.0.1", args.port), timeout=2)
         except OSError:
-            time.sleep(0.5)
+            time.sleep(0.02)
     if sock is None:
         print(f"NO TM OBSERVED: could not connect to 127.0.0.1:{args.port}")
         return 1

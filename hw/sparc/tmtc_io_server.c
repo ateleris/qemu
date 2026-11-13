@@ -232,10 +232,23 @@ static void stix_tmtc_accept(void *opaque)
     t->token_done = false;
     t->unit_len = 0;
     t->unit_need = 0;
+    /*
+     * tm-hold (P0b) order: arm the client handlers FIRST, then set the
+     * first-client latch, then flush — a flush remainder on EAGAIN is
+     * finished by the armed writable handler, so arming after the flush
+     * could strand held TM. The latch is set even if the flush fails
+     * and closes the client: after the first client, behaviour is the
+     * plain no-client drop again.
+     */
     qemu_set_fd_handler(t->client_fd, stix_tmtc_client_read,
                         stix_tmtc_client_write, t);
+    t->tm_first_seen = true;
     trace_stixtmtc_client_connected(inet_ntoa(sin.sin_addr),
                                     ntohs(sin.sin_port));
+    if (t->tm_hold && t->out_len > 0) {
+        trace_stixtmtc_tm_hold_flush((uint32_t)t->out_len);
+        stix_tmtc_flush(t);
+    }
 }
 
 void stix_tmtc_send(StixTmtc *t, const uint8_t *data, int len)
@@ -243,6 +256,25 @@ void stix_tmtc_send(StixTmtc *t, const uint8_t *data, int len)
     trace_stixtmtc_tm_send();
 
     if (t->client_fd < 0) {
+        /*
+         * tm-hold (P0b): no client has EVER connected yet — keep the
+         * packet whole in the out-queue for the first accept, instead
+         * of dropping it. No client ever connected also means nothing
+         * was ever flushed, so out_sent == 0 and out_len is the append
+         * point. After the first client has gone, today's drop returns.
+         */
+        if (t->tm_hold && !t->tm_first_seen) {
+            if ((size_t)len > TMTC_OUT_QUEUE_SIZE - t->out_len) {
+                /* all-or-nothing: drop the packet whole, never split it */
+                t->tm_dropped++;
+                trace_stixtmtc_tm_dropped((uint32_t)len);
+                return;
+            }
+            memcpy(t->out_buf + t->out_len, data, len);
+            t->out_len += len;
+            trace_stixtmtc_tm_held((uint32_t)t->out_len);
+            return;
+        }
         /* no client: drop silently, not counted in tm-dropped */
         trace_stixtmtc_socket_closed();
         return;

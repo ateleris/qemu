@@ -96,7 +96,9 @@ A WSL restart clears `/tmp`. On 2026-11-12 one took out the gate ELF and the mas
     65535 are refused),
     waiting up to `STIX_SLOT_WAIT` s (1800). A number k >= 1 takes exactly
     slot k or exits 2. The gate passes `-global
-    grlib-stixspw.tmtc-port=B`, runs in `<run dir>-s<k>` (for example
+    grlib-stixspw.tmtc-port=B` (and, since accepted-diffs §46, the
+    gate-only `-global grlib-stixspw.tm-hold=on`: TM is held until the
+    first probe connect), runs in `<run dir>-s<k>` (for example
     `~/dev/stix-state/uprev-run-s1`; an explicit `STIX_*RUN_DIR` gets the suffix
     too) and appends `slot=k busy=<other held slots> load=<1 min>` to its
     verdict lines. The CPU cap is N slot runs plus one legacy run.

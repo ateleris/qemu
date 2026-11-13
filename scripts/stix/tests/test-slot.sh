@@ -97,8 +97,8 @@ out="$(helper 'stix_slot_setup
     STIX_PORT_BASE=auto)"
 B2=$((UIDB + 200))
 [ "$(echo "$out" | tail -1)" = \
-    "2 $B2 -global grlib-stixspw.tmtc-port=$B2" ]
-check "auto, slot 1 held: slot 2 and its -global" $? "$out"
+    "2 $B2 -global grlib-stixspw.tmtc-port=$B2 -global grlib-stixspw.tm-hold=on" ]
+check "auto, slot 1 held: slot 2 and its -globals" $? "$out"
 
 # --- all auto slots held -> bounded wait, then exit 2 ---
 hold 2

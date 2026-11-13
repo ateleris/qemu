@@ -5260,6 +5260,77 @@ behaviour.
   pinned draw, checked against canonical xorshift32 outputs computed
   outside the test — and `edac-hw-state`).
 
+## 46. tm-hold: TM kept whole until the first client (baseline: dropped silently)
+
+Plan: the gate speed-up plan §3 (P0b + P0a), kept with the gate tooling
+outside this repo (`~/dev/stix-state/tools/gates-speedup-plan.md`).
+Measured evidence (V2 of that plan): two parallel gate legs failed with
+"0x0022 not matched" because the TM probe connected after the boot TM
+was gone — APID 0x5A7 sequence 0 (0x0022 Application SW boot success)
+and 1 (0x0021 Mode transition success) are emitted ~0.3 s after QEMU
+start, the probe retried the connect every 0.5 s, and `stix_tmtc_send`
+dropped TM with no client connected. A pre-existing race in every
+probe-based smoke; parallelism only made it likely enough to see.
+
+- **The property** (`-global grlib-stixspw.tm-hold=on`, default **off**,
+  gate-only): with `tm-hold=on` and **no client ever connected yet**,
+  `stix_tmtc_send` appends each TM packet **whole** to the existing
+  out-queue (`TMTC_OUT_QUEUE_SIZE`, 256 KiB) instead of dropping it.
+  All-or-nothing: a packet that does not fit whole is dropped whole and
+  counted in the existing `tm-dropped` counter (the same rule the
+  connected path applies). On the **first accept** the device arms the
+  client read+write handlers, then sets a "first client seen" latch,
+  then flushes the queue; a flush remainder on EAGAIN is finished by
+  the armed writable handler (flushing before arming can strand held
+  TM). The latch is set even if the flush fails and closes the client:
+  after the first client has gone, the behaviour is the baseline
+  no-client silent drop again (not counted).
+- **Scope.** The hold belongs to the TCP transport: it is copied into
+  `StixTmtc.tm_hold` at realize only when the TMTC TCP server starts
+  (`tmtc-server=on`, or auto outside qtest — the smokes' case). With
+  the server off there is no out-queue to hold anything in, so
+  `tm-hold=on` alone changes nothing; the UDP transport (§21) is
+  untouched. The platform controller's live sessions
+  (`scripts/stix/platform/stixplat`) run `tmtc-server=off` and never
+  pass the property: default off leaves the platform and every live
+  session byte-identical.
+- **Reset behaviour.** The hold and the latch survive a machine reset:
+  `grlib_stixspw_reset` keeps the whole TMTC transport (P2-1, §14), and
+  the queue and latch live in it. A reset before the first connect
+  therefore delivers both boots' TM at the first connect (pinned by
+  the `tm-hold` qtest's reset case).
+- **Why gate-only.** The smokes pass the property in one shared place:
+  slot mode's `STIX_SLOT_QEMU_ARGS` (`scripts/stix/lib/slot.sh`,
+  stix_slot_setup) carries `-global grlib-stixspw.tm-hold=on` next to
+  the slot's `tmtc-port`, so every smoke that boots a probe — and only
+  slot-mode boots (the gates all run in slot mode) — holds the boot TM
+  until the probe connects. Legacy mode (`STIX_PORT_BASE` unset) keeps
+  today's behaviour.
+- **P0a** (`scripts/stix/tmtc-probe.py`): the connect retry interval is
+  20 ms instead of 500 ms (only the TM connect loop; the QMP client's
+  own retry is untouched). Alone not a proof — with the hold it only
+  shortens the wait for the listen.
+- **Connect-time forbids.** Checked per smoke (`file:line`, the group
+  each forbid arms with): no connect-time `--forbid` matches the boot
+  TM the hold now delivers — 0x0022 and 0x0021 (TM(5,1) 0x5A7),
+  0x0032, 0x8030 (only on a fresh flash), 0x14A3, 0x142E and HK seq 0.
+  elut-smoke run 2's connect-time `--forbid 0x5A7:5:3:8030` gets
+  stronger (it now actually sees boot TM), as intended: run 2 boots
+  with the stored context, so a boot 0x8030 there is the failure the
+  forbid exists for. The `--forbid 0x5A7:5:1:0021` in att-smoke and
+  every mode-transition forbid attach to later send groups and ignore
+  what arrived before their arm instant.
+- **Tests.** `tests/qtest/stix.c` `/sparc/stix/tm-hold` (one QEMU per
+  case, `tmtc-server=on` explicit): off = silent drop, no count;
+  on = three pre-connect sends delivered whole and in order at the
+  connect, nothing after the first client; the full queue with a
+  1024-byte-rcvbuf client (the flush's EAGAIN remainder still arrives
+  in order); 66 held packets — the queue takes exactly 64, two dropped
+  whole, `tm-dropped` = 2, the stream packet-aligned; the hold across
+  `system_reset` delivers both boots' TM. RED on the pre-P0b binary:
+  `tm-hold` is an unknown `-global` property, so QEMU dies at start
+  (the off case pins the unchanged default on both).
+
 ## 47. gdb-legacy: stop reply for old GDB (baseline/upstream: "T05core:NN;")
 
 **Baseline and upstream:** the system-mode gdbstub answers GDB's initial
