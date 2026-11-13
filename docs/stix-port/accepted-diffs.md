@@ -5386,7 +5386,11 @@ aspect archive stayed empty and every aspect-burst request answered
   QlIntTime rule, D-Dd). After every 63rd row the double buffer flips:
   the full page becomes ONE 512 B block — u16 descriptor 0x4000 (block
   number 0), the SCET as the 0xC8/0xCC read at the flip (the
-  integration end, UNSYNCED in bit 31 like the detector chunks), 63
+  integration end, UNSYNCED in bit 31 like the detector chunks) — taken
+  at the tick's scheduled time, not when the callback runs: without
+  icount the callback is late by host jitter (live: 1007.72..1008.36 ms
+  intervals), enough to turn the FSW's increment estimate 1008/63 into
+  1007/63 = 15 and fail a default request with EID 0x5440; 63
   rows x 4 u16 BE (A0, A1, B0, B1) — pushed with
   `stixctrl_rotb_append(…, 1, …)`, so the rotbConfig
   ENABLE /\ !TESTMODE gating and the drop-new ring rule apply unchanged
