@@ -43,6 +43,18 @@ typedef struct
 	return toMs(_scet.coarse, _scet.fine);
 }*/
 
+/*
+ * RF-0 (Amendment B, plan 2026-11-14-rotb-fill-plan.md): what a block
+ * written into a full ring does. drop-new is today's rule (§12/D-F: the
+ * block is dropped, IRQ 7 pulses); overwrite-oldest is the FSW's
+ * assumption (RotAccuCompactor.c:81-85 expects the read pointer to
+ * advance over an overwritten block, HW unconfirmed).
+ */
+typedef enum StixctrlRotbOverflow {
+    STIXCTRL_ROTB_OVERFLOW_DROP_NEW,
+    STIXCTRL_ROTB_OVERFLOW_OVERWRITE_OLDEST,
+} StixctrlRotbOverflow;
+
 struct STIXCTRL
 {
     SysBusDevice parent_obj;
@@ -94,6 +106,10 @@ struct STIXCTRL
     uint32_t rotb_wr;
     uint32_t rotb_count;
     bool rotb_full;
+    /* RF-0 (Amendment B): the overflow policy; the string property is
+     * parsed at realize, the enum is what the ring paths read. */
+    StixctrlRotbOverflow rotb_overflow;
+    char *rotb_overflow_str;
     MemoryRegion rotb_block_window;
     /* AHB data windows (D-A device RAM, D-G reset-persistent): the
      * SRAM/ELUT/LACC area, the LVAR BRAM, LTRG and ETRG */
@@ -406,11 +422,20 @@ static void stixctrl_rotb_push(STIXCTRL *s)
  * hands over one chunk at a nominal swap (timer context, BQL held, the
  * device's re-entrancy guard engaged by the caller). It is appended only
  * with rotbConfig ENABLE = 1 and TESTMODE = 0 (in TESTMODE the window and
- * PUTBLOCK own the ring, §12). It goes in whole or not at all: with fewer
- * free blocks than the chunk it is dropped and IRQ 7 pulses once (the
- * docs say the hardware overwrites the oldest block; dropping keeps the
- * §12 drop-new rule and never leaves a partial chunk, plan Doc vs code
- * 7). Reaching capacity only sets FULL, as for PUTBLOCK.
+ * PUTBLOCK own the ring, §12). The overflow policy (RF-0, Amendment B)
+ * decides what a chunk that does not fit does:
+ * - drop-new (default): it is dropped whole, IRQ 7 pulses once (the docs
+ *   say the hardware overwrites the oldest block; dropping keeps the §12
+ *   drop-new rule and never leaves a partial chunk, plan Doc vs code 7);
+ * - overwrite-oldest: it always goes in, block by block — each block
+ *   into a full ring overwrites the oldest one (below). Partial chunks
+ *   are possible only across chunks (a torn frame at the read side),
+ *   never inside one append.
+ * Either way the result is APPENDED only when every block of the chunk
+ * is in the ring: the overwrites are visible in the per-block
+ * stixctrl_rotb_overwrite traces, the caller's stixdet_chunk vs
+ * stixdet_chunk_drop split stays untouched. Reaching capacity only sets
+ * FULL, as for PUTBLOCK.
  */
 StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
                                        uint32_t n_blocks,
@@ -426,18 +451,37 @@ StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
     if ((cfg >> STIXCTRL_ROTBCONFIG_TESTMODE) & 1u) {
         return STIX_DET_ROTB_TESTMODE;
     }
-    if (s->rotb_blocks - s->rotb_count < n_blocks) {
+    if (s->rotb_overflow == STIXCTRL_ROTB_OVERFLOW_DROP_NEW &&
+        s->rotb_blocks - s->rotb_count < n_blocks) {
         qemu_irq_pulse(s->irq_rotb);
         return STIX_DET_ROTB_FULL;
     }
     for (i = 0; i < n_blocks; i++) {
+        /* full ring: rd == wr and the slot at wr holds the oldest
+         * block. drop-new cannot get here (the chunk check above
+         * returned FULL), so this is overwrite-oldest: the read pointer
+         * advances with the overwrite (the dropped block is the one it
+         * leaves behind), count stays at capacity and FULL stays set,
+         * and IRQ 7 pulses once for this block. */
+        if (s->rotb_count == s->rotb_blocks) {
+            /* the trace names the dropped block: rd before the advance */
+            trace_stixctrl_rotb_overwrite(s->rotb_rd, s->rotb_count);
+            s->rotb_rd = (s->rotb_rd + 1) % s->rotb_blocks;
+            qemu_irq_pulse(s->irq_rotb);
+        }
         memcpy(&s->rotb_ring[s->rotb_wr * STIXCTRL_BLOCK_SIZE],
                blocks + i * STIXCTRL_BLOCK_SIZE, STIXCTRL_BLOCK_SIZE);
         /* M-4 (D-Uc write rule): the FPGA rewrite cures the cell */
         stix_edac_host_write(&s->edac, STIX_EDAC_ROTBUF,
                              (hwaddr)s->rotb_wr * STIXCTRL_BLOCK_SIZE,
                              STIXCTRL_BLOCK_SIZE);
-        stixctrl_rotb_push(s);
+        if (s->rotb_count == s->rotb_blocks) {
+            /* the overwrite case: wr advances over the freed slot, count
+             * and full stay (stixctrl_rotb_push would break both) */
+            s->rotb_wr = (s->rotb_wr + 1) % s->rotb_blocks;
+        } else {
+            stixctrl_rotb_push(s);
+        }
     }
     *rotb_count = s->rotb_count;
     return STIX_DET_ROTB_APPENDED;
@@ -485,6 +529,24 @@ static void stixctrl_rotb_command(STIXCTRL *s, uint32_t cmd)
             break;
         }
         if (s->rotb_full) {
+            if (s->rotb_overflow == STIXCTRL_ROTB_OVERFLOW_OVERWRITE_OLDEST) {
+                /* RF-0 (Amendment B): the oldest block (the one at rd,
+                 * which is also the slot wr points at) is overwritten:
+                 * the read pointer advances with it, count stays at
+                 * capacity and FULL stays set, IRQ 7 pulses once, and wr
+                 * advances over the freed slot. The BLOCK window then
+                 * shows the new oldest block. In TESTMODE the bytes are
+                 * whatever the window stores last left in the slot at
+                 * wr: under this policy a window store into the full
+                 * ring lands there (grlib_stixctrl_rotb_write), so the
+                 * PUTBLOCK commits it as the newest block, exactly like
+                 * the detector append brings its own bytes. */
+                trace_stixctrl_rotb_overwrite(s->rotb_rd, s->rotb_count);
+                s->rotb_rd = (s->rotb_rd + 1) % s->rotb_blocks;
+                qemu_irq_pulse(s->irq_rotb);
+                s->rotb_wr = (s->rotb_wr + 1) % s->rotb_blocks;
+                break;
+            }
             /* D-F: a PUTBLOCK into a full ring is dropped (drop-new) and
              * pulses IRQ 7 once per rejected write; reaching capacity
              * only sets FULL. The SW-PUTBLOCK half of the rule is an
@@ -535,9 +597,17 @@ static void grlib_stixctrl_rotb_write(void *opaque, hwaddr addr,
     bool testmode = (cfg >> STIXCTRL_ROTBCONFIG_TESTMODE) & 1u;
 
     /* the window is the TESTMODE fill path: stores are ignored while
-     * TESTMODE is off or the ring is full. They are block stores, not
-     * PUTBLOCK commands, so they never pulse IRQ 7 (D-F). */
-    if (!testmode || s->rotb_full) {
+     * TESTMODE is off, and while the ring is full under drop-new (D-F).
+     * RF-0 (Amendment B): with overwrite-oldest a store into the full
+     * ring lands at wr — the oldest slot, since full means rd == wr —
+     * so the following PUTBLOCK (rd advance + wr advance over the
+     * dropped oldest) commits it as the newest block, the TESTMODE twin
+     * of the detector append. The store itself still moves no pointer
+     * and never pulses IRQ 7: it is a block store, not a PUTBLOCK
+     * command. */
+    if (!testmode ||
+        (s->rotb_full &&
+         s->rotb_overflow != STIXCTRL_ROTB_OVERFLOW_OVERWRITE_OLDEST)) {
         trace_stixctrl_rotb_ignored(!testmode ? "window-write-not-testmode"
                                               : "window-write-full",
                                     (uint32_t)off);
@@ -1221,6 +1291,20 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
                    STIXCTRL_ROTBCMDSTA_BLOCKCOUNT_MASK, STIXCTRL->rotb_blocks);
         return;
     }
+    /* RF-0 (Amendment B): the overflow policy; no string means the
+     * default. Anything but the two policy names is a realize error, so
+     * a typo in a -global or a platform config aborts QEMU at startup. */
+    if (!STIXCTRL->rotb_overflow_str ||
+        !strcmp(STIXCTRL->rotb_overflow_str, "drop-new")) {
+        STIXCTRL->rotb_overflow = STIXCTRL_ROTB_OVERFLOW_DROP_NEW;
+    } else if (!strcmp(STIXCTRL->rotb_overflow_str, "overwrite-oldest")) {
+        STIXCTRL->rotb_overflow = STIXCTRL_ROTB_OVERFLOW_OVERWRITE_OLDEST;
+    } else {
+        error_setg(errp, "rotb-overflow must be 'drop-new' or "
+                   "'overwrite-oldest', not '%s'",
+                   STIXCTRL->rotb_overflow_str);
+        return;
+    }
     STIXCTRL->rotb_ring = g_malloc0((size_t)STIXCTRL->rotb_blocks * STIXCTRL_BLOCK_SIZE);
 
     sysbus_init_irq(sbd, &STIXCTRL->irq_detectors);
@@ -1422,6 +1506,10 @@ static void grlib_stixctrl_unrealize(DeviceState *dev)
     qdev_unrealize(DEVICE(&stixctrl->edac));
     g_free(stixctrl->rotb_ring);
     stixctrl->rotb_ring = NULL;
+    /* RF-0: rotb-overflow owns its string (no qdev property release
+     * since it became an object property, stixctrl_set_rotb_overflow) */
+    g_free(stixctrl->rotb_overflow_str);
+    stixctrl->rotb_overflow_str = NULL;
     stix_det_unrealize(&stixctrl->det);
     stix_att_unrealize(&stixctrl->att);
     stix_aspect_unrealize(&stixctrl->as);
@@ -1650,9 +1738,44 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     return g_string_free(json, false);
 }
 
+/*
+ * RF-0 (Amendment B): the ROTB overflow policy, "drop-new" (default:
+ * the §12/D-F rule, byte-identical to the pre-RF-0 model) or
+ * "overwrite-oldest" (the FSW's RotAccuCompactor.c:81-85 assumption, HW
+ * unconfirmed). The string is parsed into rotb_overflow at realize;
+ * anything else fails realize. Setup-only: a set after realize cannot
+ * take effect, so it is rejected instead of silently ignored (the
+ * stixspw link-down pattern inverted: there runtime-only, here
+ * setup-only). A -global or qom-set before realize (device_post_init
+ * runs before realize) still works.
+ */
+static char *stixctrl_get_rotb_overflow(Object *obj, Error **errp)
+{
+    return g_strdup(GRLIB_STIXCTRL(obj)->rotb_overflow_str);
+}
+
+static void stixctrl_set_rotb_overflow(Object *obj, const char *value,
+                                       Error **errp)
+{
+    STIXCTRL *s = GRLIB_STIXCTRL(obj);
+
+    if (DEVICE(obj)->realized) {
+        error_setg(errp, "rotb-overflow is read at realize only: it "
+                   "cannot be changed after realize");
+        return;
+    }
+    g_free(s->rotb_overflow_str);
+    s->rotb_overflow_str = g_strdup(value);
+}
+
 static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_UINT32("rotb-blocks", STIXCTRL, rotb_blocks,
                        STIXCTRL_ROTB_MAX_BLOCKS),
+    /* rotb-overflow (RF-0, Amendment B) is NOT here: a plain qdev
+     * DEFINE_PROP_STRING cannot reject a set after realize, and the
+     * policy must be read at realize only — see
+     * stixctrl_set_rotb_overflow and the object_property_add_str in
+     * grlib_stixctrl_instance_init. */
     DEFINE_PROP_BOOL("hk-adc", STIXCTRL, hk_adc, true),
     DEFINE_PROP_BOOL("powerstat", STIXCTRL, powerstat, true),
     DEFINE_PROP_BOOL("hk-prot", STIXCTRL, hk_prot, true),
@@ -1714,6 +1837,14 @@ static void grlib_stixctrl_instance_init(Object *obj)
                             TYPE_STIX_ATT);
     /* PL-2 (D-PLo): read-only, no setter */
     object_property_add_str(obj, "hw-state", stixctrl_get_hw_state, NULL);
+    /*
+     * RF-0 (Amendment B): setup-only with a realized guard
+     * (stixctrl_set_rotb_overflow); an instance property because the
+     * plain-qdev-string alternative cannot reject the post-realize set.
+     */
+    object_property_add_str(obj, "rotb-overflow",
+                            stixctrl_get_rotb_overflow,
+                            stixctrl_set_rotb_overflow);
 }
 
 static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)

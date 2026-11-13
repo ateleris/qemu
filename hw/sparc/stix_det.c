@@ -1715,8 +1715,9 @@ static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
  * 2. ActiveNominal toggles; 3. SUMCNT restarts at 0;
  * 4. with det-rotb on, the bank goes into the ROTB ring as one 49-block
  *    chunk (stixctrl_rotb_append: rotbConfig ENABLE = 1 and TESTMODE =
- *    0, all or nothing). The FSM is enabled here by construction: the
- *    tick only runs while it is;
+ *    0; all or nothing with the default drop-new policy, overwritten in
+ *    oldest-first order with rotb-overflow=overwrite-oldest, RF-0). The
+ *    FSM is enabled here by construction: the tick only runs while it is;
  * 5. the finished bank is zeroed (RotbCtrl's read and clear [D]), also
  *    when no chunk was taken, so every integration starts from zero.
  * The FSW never reads EACC/ETRG in NOMINAL; it reads the chunk

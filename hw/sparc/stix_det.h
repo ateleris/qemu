@@ -306,9 +306,14 @@ void stix_det_hw_state(StixDetState *d, QDict *det);
  * - stixctrl_scet_reg: the SCET as 0xC8 (UNSYNCED in bit 31) and 0xCC
  *   read right now;
  * - stixctrl_rotb_append: append @n_blocks blocks of STIXCTRL_BLOCK_SIZE
- *   to the ROTB ring if rotbConfig has ENABLE = 1 and TESTMODE = 0 and
- *   all of them fit; a chunk that does not fit is dropped whole and
- *   pulses IRQ 7 once. *rotb_count is the block count afterwards.
+ *   to the ROTB ring if rotbConfig has ENABLE = 1 and TESTMODE = 0. With
+ *   the default drop-new policy a chunk that does not fit is dropped
+ *   whole and pulses IRQ 7 once; with rotb-overflow=overwrite-oldest
+ *   (RF-0, Amendment B) it always goes in, each block into a full ring
+ *   overwriting the oldest one (rd advances, count stays at capacity,
+ *   IRQ 7 pulses per overwritten block, trace stixctrl_rotb_overwrite).
+ *   Both policies return APPENDED only when every block is in the ring.
+ *   *rotb_count is the block count afterwards.
  */
 void stixctrl_scet_reg(STIXCTRL *s, uint32_t *coarse_reg, uint16_t *fine);
 /* AS-3 (D-ASd): the same read with the timestamp offset by @off_ns

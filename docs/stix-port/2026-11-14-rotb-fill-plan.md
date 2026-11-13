@@ -429,3 +429,15 @@ under overwrite the ring refills during the skip), torn-frame drops
 drain recovers or re-overruns in a loop. This is the untested regime the
 owner named; the emulator shows FSW behaviour for each assumed HW policy,
 it does not decide which policy the FPGA implements.
+
+**RF-0 as built (2026-11-13).** `grlib-stixctrl.rotb-overflow =
+drop-new | overwrite-oldest` (default drop-new, byte-identical), read at
+realize (a set after realize is rejected); accepted-diffs §49. Review
+(GLM): 2 major fixed — a TESTMODE window store into a full ring now lands
+at wr under overwrite-oldest (no stale block resurrected), and the
+detector append path has its own qtest (`det-chunk-overwrite`: two
+49-block chunks into a 60-block ring -> 38 overwrites, window = the first
+chunk's block 38; `det-chunk-full` pins drop-new's whole-chunk drop);
+minors fixed: the overwrite trace carries the dropped block's rd, IRQMP
+latching noted (per-block count only in the trace). Suite 196/196; the
+overwrite tests are red on the pre-RF-0 binary.

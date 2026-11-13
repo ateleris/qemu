@@ -1346,40 +1346,57 @@ static void rotb_cfg(QTestState *qts, bool enable, bool testmode)
                (enable ? ROTB_CFG_ENABLE : 0u) | (testmode ? ROTB_CFG_TESTMODE : 0u));
 }
 
-/* does this QEMU know the rotb-blocks property? The RED run executes
- * against a pre-A2 binary, where an unknown -global property aborts QEMU
- * at startup (qdev_prop_set_globals uses &error_fatal) — so pass the
- * argument only when the model supports it. The ring size does not affect
- * any RED assertion; without it the default (104448 blocks) is used. */
+/* does this QEMU know the given grlib-stixctrl property? The RED run
+ * executes against an older binary, where an unknown -global property
+ * aborts QEMU at startup (qdev_prop_set_globals uses &error_fatal) — so
+ * pass such an argument only when the model supports it. */
+static bool rotb_prop_supported(const char *prop)
+{
+    QTestState *qts = stix_qtest_new();
+    QDict *resp;
+    QList *props;
+    const QListEntry *entry;
+    bool found = false;
+
+    resp = qtest_qmp(qts,
+                     "{'execute': 'device-list-properties',"
+                     " 'arguments': {'typename': 'grlib-stixctrl'}}");
+    props = qobject_to(QList, qdict_get(resp, "return"));
+    g_assert_nonnull(props);
+    QLIST_FOREACH_ENTRY(props, entry) {
+        QDict *p = qobject_to(QDict, qlist_entry_obj(entry));
+
+        if (g_str_equal(qdict_get_str(p, "name"), prop)) {
+            found = true;
+            break;
+        }
+    }
+    qobject_unref(resp);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    return found;
+}
+
+/* the ring size does not affect any assertion; without the property the
+ * default (104448 blocks) is used */
 static bool rotb_blocks_supported(void)
 {
     static int supported = -1;
 
     if (supported < 0) {
-        QTestState *qts = stix_qtest_new();
-        QDict *resp;
-        QList *props;
-        const QListEntry *entry;
-
-        resp = qtest_qmp(qts,
-                         "{'execute': 'device-list-properties',"
-                         " 'arguments': {'typename': 'grlib-stixctrl'}}");
-        props = qobject_to(QList, qdict_get(resp, "return"));
-        g_assert_nonnull(props);
-        supported = 0;
-        QLIST_FOREACH_ENTRY(props, entry) {
-            QDict *prop = qobject_to(QDict, qlist_entry_obj(entry));
-
-            if (g_str_equal(qdict_get_str(prop, "name"), "rotb-blocks")) {
-                supported = 1;
-                break;
-            }
-        }
-        qobject_unref(resp);
-        qtest_quit(qts);
-        stix_qtest_cleanup();
+        supported = rotb_prop_supported("rotb-blocks");
     }
+    return supported != 0;
+}
 
+/* RF-0 (Amendment B): the overflow policy, new in this change */
+static bool rotb_overflow_supported(void)
+{
+    static int supported = -1;
+
+    if (supported < 0) {
+        supported = rotb_prop_supported("rotb-overflow");
+    }
     return supported != 0;
 }
 
@@ -1396,6 +1413,21 @@ static QTestState *rotb_qtest_new(unsigned blocks)
         extra = g_strdup("");
     }
 
+    return stix_qtest_new_extra(extra);
+}
+
+/* one test instance with rotb-overflow=overwrite-oldest (RF-0): the
+ * overflow -global is passed only when the model has the property (a
+ * binary with rotb-overflow also has rotb-blocks, so the small ring
+ * always rides along) */
+static QTestState *rotb_qtest_new_ow(unsigned blocks)
+{
+    g_autofree gchar *extra = NULL;
+
+    g_assert(rotb_overflow_supported());
+    extra = g_strdup_printf(
+        "-global grlib-stixctrl.rotb-blocks=%u"
+        " -global grlib-stixctrl.rotb-overflow=overwrite-oldest", blocks);
     return stix_qtest_new_extra(extra);
 }
 
@@ -1529,6 +1561,121 @@ static void test_rotb_full_irq(void)
 
     rotb_cmd(qts, ROTB_CMD_RESETFIFO);
     g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* RF-0 (Amendment B): rotb-overflow=overwrite-oldest. A PUTBLOCK into a
+ * full ring overwrites the oldest block: rd advances (count stays at
+ * capacity, FULL stays set), IRQ 7 pulses once per PUTBLOCK, and the
+ * BLOCK window then shows the new oldest block — the second-oldest of
+ * the pre-overwrite ring. The bytes come along: under this policy a
+ * TESTMODE window store into the full ring lands at wr (the oldest
+ * slot, rd == wr while full), so the following PUTBLOCK commits it as
+ * the newest block — the drain shows markers 2, 3 and then the two
+ * window-written blocks, and the old oldest is gone. (The drop-new rule
+ * of D-F is unchanged: there the window store into the full ring is
+ * still ignored.) The detector append path (stixctrl_rotb_append)
+ * overwrites with its own bytes the same way (det-chunk-overwrite).
+ * RED on a pre-RF-0 build fails at the property gate below (the 5.2
+ * baseline skips there, like tmtc-hermetic). */
+static void test_rotb_overwrite(void)
+{
+    static const uint32_t drain[4] = {
+        0xAA000000u | 2u, 0xAA000000u | 3u, 0xBBBBBBBBu, 0xCCCCCCCCu
+    };
+    QTestState *qts;
+    uint32_t n, i;
+
+    if (!rotb_overflow_supported()) {
+        g_autofree gchar *bin = g_path_get_basename(qtest_qemu_binary(NULL));
+
+        /* only the 5.2 baseline (via its wrapper) may lack the property */
+        g_assert_cmpstr(bin, ==, "qemu-system-sparc-52-wrapper.sh");
+        g_test_skip("5.2 baseline: no rotb-overflow property");
+        return;
+    }
+
+    qts = rotb_qtest_new_ow(4);
+
+    rotb_cfg(qts, true, true);
+    qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    /* fill to exactly cap, block n carrying marker n */
+    for (n = 0; n < 4; n++) {
+        for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+            qtest_writel(qts, ROTB_WINDOW + 4u * i, 0xAA000000u | n);
+        }
+        rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 4);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    /* a window write into the full ring LANDS at wr (the oldest slot,
+     * rd == wr): it moves no pointer and pulses no IRQ, but the new
+     * bytes are immediately visible through the window read */
+    for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+        qtest_writel(qts, ROTB_WINDOW + 4u * i, 0xBBBBBBBBu);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 4);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+    for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+        g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 4u * i),
+                        ==, 0xBBBBBBBBu);
+    }
+
+    /* the 5th PUTBLOCK overwrites the oldest block (marker 0, whose
+     * slot now holds the new bytes): one pulse, count stays at
+     * capacity, FULL stays set */
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT,
+                     ==, ROTB_IRQ_BIT);
+    g_assert_cmpuint(rotb_count(qts), ==, 4);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
+
+    /* the window (any mode) shows the new oldest block: marker 1, the
+     * second-oldest of the filled ring — the new bytes sit behind it as
+     * the newest block */
+    for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+        g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 4u * i),
+                        ==, 0xAA000000u | 1u);
+    }
+
+    /* the same again: a second window-written block lands at wr (marker
+     * 1's slot), and the PUTBLOCK pulses IRQ 7 once more: once per
+     * overwritten block */
+    qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
+    for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+        qtest_writel(qts, ROTB_WINDOW + 4u * i, 0xCCCCCCCCu);
+    }
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT,
+                     ==, ROTB_IRQ_BIT);
+    g_assert_cmpuint(rotb_count(qts), ==, 4);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
+
+    /* drain in normal mode: rd advanced twice (markers 0 and 1
+     * overwritten), so the order is 2, 3 and then the two window-written
+     * blocks 0xBBBBBBBB, 0xCCCCCCCC as the newest — the old oldest
+     * (marker 0) and marker 1 are gone; FULL clears on the first
+     * GETBLOCK */
+    rotb_cfg(qts, true, false);
+    for (n = 0; n < 4; n++) {
+        for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+            g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW + 4u * i),
+                            ==, drain[n]);
+        }
+        rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+        if (n == 0) {
+            g_assert_cmpuint(rotb_full(qts), ==, 0);
+        }
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    g_assert_cmpuint(rotb_full(qts), ==, 0);
 
     qtest_quit(qts);
     stix_qtest_cleanup();
@@ -1967,6 +2114,61 @@ static void test_flash_create_error(void)
     g_test_trap_assert_stderr(pat);
 
     g_rmdir(dir);
+}
+
+/* RF-0 (Amendment B): the rotb-overflow realize guard, the same
+ * subprocess pattern as the two realize-error pairs above. The
+ * property's other test is /sparc/stix/rotb-overwrite. */
+
+#define ROTB_TEST_OVERFLOW_FLASH_ENV "STIX_TEST_ROTB_FLASH"
+
+/* g_test_trap_subprocess child (precedent: tmtc-bind-error): an unknown
+ * rotb-overflow value must fail realize with the value named in the
+ * error, not be ignored. RED on a pre-RF-0 binary: rotb-overflow is an
+ * unknown -global property, so QEMU dies at startup with a different
+ * message; the parent skips the 5.2 baseline. */
+static void test_rotb_overflow_reject_subprocess(void)
+{
+    const char *flash = g_getenv(ROTB_TEST_OVERFLOW_FLASH_ENV);
+    QTestState *qts;
+
+    g_assert_nonnull(flash);
+
+    /* qtest_init aborts: QEMU realize fails on the bad policy value */
+    qts = qtest_initf("-M leon3_generic "
+                      "-global grlib-stixflash.flash-file=%s "
+                      "-global grlib-stixctrl.rotb-overflow=overwrite-newest",
+                      flash);
+    qtest_quit(qts);
+}
+
+static void test_rotb_overflow_reject(void)
+{
+    g_autofree gchar *path = NULL;
+    g_autofree gchar *sub = stix_test_path("rotb-overflow-reject/subprocess");
+    int fd;
+
+    if (!rotb_overflow_supported()) {
+        g_autofree gchar *bin = g_path_get_basename(qtest_qemu_binary(NULL));
+
+        /* only the 5.2 baseline (via its wrapper) may lack the property */
+        g_assert_cmpstr(bin, ==, "qemu-system-sparc-52-wrapper.sh");
+        g_test_skip("5.2 baseline: no rotb-overflow property");
+        return;
+    }
+
+    fd = g_file_open_tmp("stix-flash-XXXXXX", &path, NULL);
+    g_assert(fd >= 0);
+    g_assert(ftruncate(fd, 1024 * 1024) == 0);
+    g_setenv(ROTB_TEST_OVERFLOW_FLASH_ENV, path, TRUE);
+
+    g_test_trap_subprocess(sub, 30 * G_USEC_PER_SEC, 0);
+    g_test_trap_assert_failed();
+    g_test_trap_assert_stderr("*rotb-overflow must be 'drop-new' or "
+                              "'overwrite-oldest'*");
+
+    close(fd);
+    g_unlink(path);
 }
 
 /* ---- P2-3: SPW register semantics (W1C, reserved bits, D-M) ---- */
@@ -7762,6 +7964,11 @@ static void test_det_chunk_full(void)
     g_assert_cmpuint(rotb_full(qts), ==, 0);
     g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT,
                      ==, ROTB_IRQ_BIT);
+    /* the drop leaves the ring untouched: the window (read pointer)
+     * still shows the first chunk's block 0 (RF-0: the drop-new
+     * counterpart of det-chunk-overwrite) */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR);
     qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
 
     det_step_ticks(qts, 10);
@@ -7777,6 +7984,63 @@ static void test_det_chunk_full(void)
     g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
 
     g_free(c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-chunk-overwrite (RF-0, Amendment B): the append path
+ * (stixctrl_rotb_append) with rotb-overflow=overwrite-oldest. With
+ * rotb-blocks=60 the first chunk fits (49 blocks); the second finds 11
+ * free, fills them, and overwrites the oldest blocks one by one: 98
+ * blocks pushed into 60 slots, so 38 are overwritten, count reaches
+ * capacity, FULL sets and IRQ 7 pulses per overwritten block (IRQMP
+ * latches the pulses into one pending bit — how many blocks were
+ * overwritten is visible only in the stixctrl_rotb_overwrite traces).
+ * The read pointer advanced 38 times over the overwritten blocks, so
+ * the window shows the oldest SURVIVING block: the first chunk's block
+ * 38, word0 descriptor 0x8000 | 38 (detector, block number 38; the
+ * block's byte 1 — the descriptor's low byte — is 38).
+ * The drop-new counterpart is det-chunk-full.
+ * RED on a pre-RF-0 build: the property gate below skips the 5.2
+ * baseline; a binary with rotb-blocks but without rotb-overflow drops
+ * the second chunk whole (BLOCKCOUNT stays 49, like det-chunk-full).
+ */
+static void test_det_chunk_overwrite(void)
+{
+    QTestState *qts;
+
+    if (!rotb_overflow_supported()) {
+        g_autofree gchar *bin = g_path_get_basename(qtest_qemu_binary(NULL));
+
+        /* only the 5.2 baseline (via its wrapper) may lack the property */
+        g_assert_cmpstr(bin, ==, "qemu-system-sparc-52-wrapper.sh");
+        g_test_skip("5.2 baseline: no rotb-overflow property");
+        return;
+    }
+
+    qts = rotb_qtest_new_ow(60);
+
+    rotb_cfg(qts, true, false);
+    qtest_writel(qts, IRQMP_CLEAR, ROTB_IRQ_BIT);
+    det_start_nom(qts, 39, 0, 9, 0xFFFFFFFFu);  /* 10-tick integrations */
+
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    g_assert_cmpuint(rotb_full(qts), ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT, ==, 0);
+
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(rotb_count(qts), ==, 60);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
+    g_assert_cmpuint(qtest_readl(qts, IRQMP_PENDING) & ROTB_IRQ_BIT,
+                     ==, ROTB_IRQ_BIT);
+
+    /* rd advanced over the 38 overwritten blocks: the window shows the
+     * oldest surviving block, the first chunk's block 38 */
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR | 38u);
+
     qtest_quit(qts);
     stix_qtest_cleanup();
 }
@@ -16009,6 +16273,11 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/rotb-fifo", test_rotb_fifo);
         qtest_add_func("/sparc/stix/rotb-window", test_rotb_window);
         qtest_add_func("/sparc/stix/rotb-full-irq", test_rotb_full_irq);
+        qtest_add_func("/sparc/stix/rotb-overwrite", test_rotb_overwrite);
+        qtest_add_func("/sparc/stix/rotb-overflow-reject/subprocess",
+                       test_rotb_overflow_reject_subprocess);
+        qtest_add_func("/sparc/stix/rotb-overflow-reject",
+                       test_rotb_overflow_reject);
         qtest_add_func("/sparc/stix/rotb-selftest-shape", test_rotb_selftest_shape);
         qtest_add_func("/sparc/stix/rotb-strobe", test_rotb_strobe);
         qtest_add_func("/sparc/stix/rotb-reset", test_rotb_reset);
@@ -16079,6 +16348,8 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/det-nominal-rule", test_det_nominal_rule);
         qtest_add_func("/sparc/stix/det-chunk-gating", test_det_chunk_gating);
         qtest_add_func("/sparc/stix/det-chunk-full", test_det_chunk_full);
+        qtest_add_func("/sparc/stix/det-chunk-overwrite",
+                       test_det_chunk_overwrite);
         qtest_add_func("/sparc/stix/det-chunk-sumdmask",
                        test_det_chunk_sumdmask);
         qtest_add_func("/sparc/stix/det-chunk-guard", test_det_chunk_guard);

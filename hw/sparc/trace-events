@@ -43,6 +43,7 @@ stixctrl_watchdog_cmd(uint32_t cmd, uint32_t reload, uint32_t count, int running
 stixctrl_watchdog_reset(const char *why) "watchdog resets the IDPU: %s"
 stixctrl_rotb_cmd(uint32_t cmd, uint32_t rd, uint32_t wr, uint32_t count, int full) "rotb cmd=%u rd=%u wr=%u count=%u full=%d"
 stixctrl_rotb_overflow(uint32_t count) "rotb overflow: block dropped, count=%u"
+stixctrl_rotb_overwrite(uint32_t rd, uint32_t count) "rotb overwrite: dropped block rd=%u count=%u"
 stixctrl_rotb_ignored(const char *what, uint32_t off) "rotb ignored %s (off=0x%x)"
 stixctrl_io_read(uint32_t addr, uint32_t val) "CTRL | Read requested: addr = 0x%x, regval = 0x%x"
 stixctrl_io_write(uint32_t addr, uint32_t val) "CTRL | Write completed addr = 0x%x, new regval = 0x%x"

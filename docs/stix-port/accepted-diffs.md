@@ -492,6 +492,76 @@ n=24); all green after. Existing `/sparc/stix/ctrl-rotb` passes
 unchanged on the composed 0x54 read. All six are expected red on the 5.2
 wrapper.
 
+## 49. ROTB overflow policy: `rotb-overflow` (Amendment B, RF-0)
+
+Numbered 49 (the next free number) and kept next to §12, the ROTB
+section it amends. Plan: `2026-11-14-rotb-fill-plan.md`, "Amendment B
+(2026-11-13): ROTB overflow semantics".
+
+What a write into a full ring does is unconfirmed (owner input: "some
+events and IRQs happen, but it is not really tested"). The model so far
+was drop-new everywhere (§12 D-F, §35). The FSW, however, is written
+for overwrite-oldest: the `RotAccuCompactor.c:81-85` comment resets on
+block 0 "in case ROTBUF overflow occured, start with 1st block again,
+and forget interrupted one", and the block-number mismatch at :90-97
+drops the frame until the next block 0 — the torn-frame case only an
+overwriting writer produces.
+
+- **The property:** `grlib-stixctrl.rotb-overflow` (string), `drop-new`
+  (default: the pre-RF-0 behaviour, byte-identical — golden runs and
+  the gate are untouched) or `overwrite-oldest`; anything else fails
+  realize ("rotb-overflow must be 'drop-new' or 'overwrite-oldest', not
+  '...'"), so a typo in a -global or a platform config aborts QEMU at
+  startup. The value is read at realize only: the property is an object
+  property with a realized guard (a plain qdev string property cannot
+  reject a set), so a set after realize fails with "rotb-overflow is
+  read at realize only: it cannot be changed after realize" instead of
+  being silently ignored. A -global still applies — device_post_init
+  sets it before realize.
+- **overwrite-oldest semantics:** a block written into a full ring
+  overwrites the oldest block — the read pointer advances with it
+  (count stays at capacity, FULL stays set), IRQ 7 pulses once per
+  overwritten block, new trace `stixctrl_rotb_overwrite(rd, count)`
+  (rd = the read pointer of the dropped block, traced before the
+  advance). Both ring paths do it: the detector/aspect append
+  (`stixctrl_rotb_append` — a chunk that does not fit no longer drops
+  whole; partial overwrite happens only across chunks, a torn frame at
+  the read side, never inside one append) and the TESTMODE PUTBLOCK
+  (D-F's drop branch becomes the overwrite). The append result stays
+  `appended` — the overwrites are the per-block traces, so the
+  `stixdet_chunk`/`stixdet_chunk_drop` split is unchanged.
+- **TESTMODE bytes:** under overwrite-oldest a window store into a full
+  ring lands at wr — the oldest slot, since full means rd == wr — so
+  the following PUTBLOCK (rd advance + wr advance) commits it as the
+  newest block: a TESTMODE overwrite brings the window's bytes, the
+  same way the detector append brings its own. (Under drop-new the
+  window store into the full ring is still ignored, §12 D-F
+  unchanged.) Pinned by the qtest `rotb-overwrite`.
+- **IRQMP latching:** the per-block IRQ 7 pulses latch into one level
+  bit, so the qtests can only assert that at least one overflow
+  happened since the last clear (pending >= 1, not a per-block count);
+  how many blocks were overwritten is visible only in the
+  `stixctrl_rotb_overwrite` traces.
+- **Unconfirmed HW:** the FSW comment expects overwrite-oldest
+  (`RotAccuCompactor.c:81-85`); the actual FPGA behaviour is
+  unconfirmed. The emulator shows the FSW behaviour for each assumed
+  policy; it does not decide which one the FPGA implements. The
+  experiment runs every overflow-reaching cell under both policies and
+  reports what the FSW does after the first overrun (the FDIR-051 skip,
+  the torn-frame drops, drain recovery or re-overrun).
+- **Tests:** `rotb-overwrite` (fill to cap, then two window-written
+  blocks, each committed by a PUTBLOCK: the window store into the full
+  ring lands, IRQ 7 per PUTBLOCK, count and FULL pinned at capacity,
+  the window shows the second-oldest block, drain order 2,3 then the
+  two new blocks — the old oldest is gone);
+  `det-chunk-overwrite` (the nominal append path, rotb-blocks=60: two
+  swaps, 98 blocks into 60 slots, count 60, FULL, IRQ 7 pending, the
+  window shows the oldest surviving block — the first chunk's block
+  38, descriptor 0x8000|38); `rotb-overflow-reject` (a bad value fails
+  realize naming the value); the drop-new counterpart pins stay in
+  `det-chunk-full` (the dropped chunk leaves the window at the first
+  chunk's block 0). All skip the 5.2 baseline (no property there).
+
 ## 13. STIXCTRL AHB windows mapped (baseline: unmapped)
 
 **Baseline:** the CTRL device registered only its APB register bank; the
