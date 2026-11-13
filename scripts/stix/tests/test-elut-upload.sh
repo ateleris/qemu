@@ -10,8 +10,10 @@
 # columns, 383 rows, a duplicate (subcol, pix) pair, a non-monotone row,
 # edges 0 and 4096), each with its error text; a golden first TC(237,7)
 # unit; the probe-args layout; check-dump's exit codes on a correct, a
-# constant and a wrong-size dump; and, when STIX_FSW_SRC points at the
-# FSW's ASW/ASW/src (read-only), the Python index tables against utils.c.
+# constant and a wrong-size dump; the Python index tables pinned against
+# the model's transcription in hw/sparc/stix_det.c (E-4); and, when
+# STIX_FSW_SRC points at the FSW's ASW/ASW/src (read-only), the same
+# tables against utils.c.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -264,6 +266,28 @@ EOF
     [ "$out" = MATCH ] && report "fsw-src tables match utils.c" ok ||
         report "fsw-src tables match utils.c" "$out"
 fi
+
+# 8. the model table pin (E-4): the Python copies match stix_det.c's
+# transcriptions of the FSW tables (hw/sparc/stix_det.c, from DP D-2 on)
+out="$(python3 - "$TOOL" "$REPO_ROOT/hw/sparc/stix_det.c" <<'EOF' 2>&1
+import importlib.util, re, sys
+spec = importlib.util.spec_from_file_location("elut_upload", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+src = open(sys.argv[2]).read()
+def table(name):
+    g = re.search(name + r"\s*\[[^]]*\]\s*=\s*\{([^}]*)\}", src)
+    return [int(x) for x in re.findall(r"\d+", g.group(1))]
+bad = []
+if table("stix_det_subcol_from_fpga_det") != m.SUBCOL_FROM_FPGA_DET:
+    bad.append("stix_det_subcol_from_fpga_det")
+if table("stix_det_fpga_det_from_subcol") != m.FPGA_DET_FROM_SUBCOL:
+    bad.append("stix_det_fpga_det_from_subcol")
+print("MISMATCH " + " ".join(bad) if bad else "MATCH")
+EOF
+)"
+[ "$out" = MATCH ] && report "model tables match stix_det.c" ok ||
+    report "model tables match stix_det.c" "$out"
 
 echo "test-elut-upload: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

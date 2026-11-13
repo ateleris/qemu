@@ -13,10 +13,17 @@
 # Cases: the SKIP 77 paths; the run-dir guard (--check-guard) in legacy
 # and slot mode; --dry-run in legacy and slot mode, positive and
 # negative (QEMU line, ports, the TC sequence, absolute pmemsave paths,
-# the run-2 forbids); argument errors; and a fake-QEMU run in legacy and
-# slot mode, which must boot a fresh private sparse flash in the run dir
-# (never the master) with the right argv and then FAIL (the fake probe sends
-# nothing and fake QEMU dumps nothing).
+# the run-2 forbids, the E-4 replay leg's -global/-trace/QMP wiring and
+# its absence in --negative); argument errors; the E-4 checker's
+# self-test; and fake-QEMU runs (fake-probe.py with FAKE_PMEMSAVE_CSV
+# writes the pmemsave dumps, fake-qemu.sh mode elut writes the golden
+# UART and the canned D-7 traces): a run-1 UART failure still stops
+# before run 2; the full positive gate PASSES in legacy and slot mode
+# (fresh private sparse flash, the .dssevs written by the gate, run 2's
+# replay argv, the E-4 verdict REPLAY-CHECK: PASS, slot-mode PASS
+# cleanup); with FAKE_QEMU_ELUT_TRACE=vacuous (no replay start) and
+# =fallback (a fallback line) the gate FAILs in run 2 at the E-4
+# verdict.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -186,6 +193,42 @@ gate STIX_ELUT_RUN_DIR="$W/dr" -- --dry-run --negative
     [ "$(grep -o -- 'ED\\ 07' <<< "$out" | wc -l)" -eq 96 ] &&
     grep -qF "$W/dr-neg/elut-dump.r1-apply.bin" <<< "$out"
 check "dry-run --negative: no TC(237,8), 96 TC(237,7), -neg dir" $? "rc=$rc"
+! grep -q 'det-replay-file\|stixdet_replay\|stixdet_elut_fallback\|dump-apid\|replay-dss' <<< "$out"
+check "dry-run --negative: no E-4 replay wiring" $? ""
+
+# the E-4 wiring in the positive dry-run's run 2
+CONF2="$(python3 - "$S/elut-upload.py" <<'EOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("elut_upload", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+print(m.unit_hex(m.tc_unit(4, 236, 1, bytes([0x04, 0x00]))))
+EOF
+)"
+[ "$CONF2" = "40 02 00 00 1D AC C0 04 00 07 19 EC 01 00 04 00 3D 0D" ]
+check "TC_CONF2 (seq 4) rebuilds with elut-upload.py" $? "$CONF2"
+r2q="$(sed -n '/^# run 2/,$p' <<< "$DRY" | sed -n '/(cd /,/qemu-stdout/p')"
+r2p="$(sed -n '/^# run 2/,$p' <<< "$DRY" | sed -n '/python3/,$p')"
+grep -qF -- "-global grlib-stixctrl.det-replay-file=$W/dr/dssevs.elut2" <<< "$r2q" &&
+    grep -qF -- "-trace stixdet_elut_fallback" <<< "$r2q" &&
+    grep -qF -- "-trace stixdet_replay_scan" <<< "$r2q" &&
+    grep -qF -- "-trace stixdet_replay_state" <<< "$r2q" &&
+    grep -qF -- "-trace stixspw_rx_truncated" <<< "$r2q"
+check "dry-run run 2: -global det-replay-file and the 4 traces" $? \
+    "$(grep -o -- '-trace [a-z_]*' <<< "$r2q" | tr '\n' ' ')"
+grep -qF -- "--send-at 5 --qmp-cmd" <<< "$r2p" &&
+    grep -qF -- "det-source" <<< "$r2p" &&
+    grep -qF -- "replay-dss" <<< "$r2p"
+check "dry-run run 2: qom-set det-source=replay-dss at @5" $? ""
+grep -qF -- "--dump-apid 0x5DC:$W/dr/ql.dump.elut2.hex" <<< "$r2p" &&
+    grep -qF -- "--send-at 115 --send-hex $(q "$CONF2")" <<< "$r2p" &&
+    grep -qF -- "0x5A7:5:1:00210504@10" <<< "$r2p" &&
+    grep -qF -- "--expect 0x5DC:21:6:1e@15" <<< "$r2p" &&
+    grep -qF -- "--expect 0x5DC:21:6:22@15" <<< "$r2p"
+check "dry-run run 2: 0x5DC dump, TC(236,1) at 115, exit-flush expects" $? ""
+! grep -q 'det-replay-file\|replay-dss' <<< "$r1" &&
+    ! grep -q 'stixdet_elut_fallback' <<< "$r1"
+check "dry-run run 1: no replay wiring" $? ""
 
 gate STIX_PORT_BASE=1 STIX_ELUT_RUN_DIR="$W/dr" -- --dry-run
 [ "$rc" -eq 0 ] &&
@@ -195,52 +238,163 @@ gate STIX_PORT_BASE=1 STIX_ELUT_RUN_DIR="$W/dr" -- --dry-run
     [ ! -e "$W/locks/stix-qtest-$B1.lock" ]
 check "dry-run slot 1: -global, --port B1, -s1 dir, no lock taken" $? "rc=$rc"
 
-# ---- a fake-QEMU run, legacy and slot mode
-fake_run() { # label env... : boots fake QEMU twice at most
-    local label="$1" dir
-    shift
+# ---- the E-4 checker's self-test (the verdict rules: good, vacuous,
+# fallback line, fallback-binned counts, a stray count, two dumps)
+out="$(python3 "$S/elut-replay-check.py" --self-test 2>&1)"
+if grep -q '^SELF-TEST: PASS' <<< "$out"; then
+    rc=0
+else
+    rc=1
+fi
+check "elut-replay-check self-test" "$rc" "$(tail -3 <<< "$out")"
+
+# ---- fake-QEMU runs: the E-4 verdicts and the full positive pass.
+# fake-probe.py (FAKE_PMEMSAVE_CSV) writes the pmemsave dumps; the
+# canned SSID 32 dump of the exit flush holds the replay's 4 counts at
+# the CSV's honoured ebin in subcol 0 only.
+python3 - "$S/ql-check.py" "$S/elut-upload.py" "$W/synth.csv" \
+    "$W/ql32.hex" "$W/ql32wrong.hex" <<'EOF'
+import importlib.util, sys
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+q = load("ql_check", sys.argv[1])
+m = load("elut_upload", sys.argv[2])
+rows = m.parse_csv_file(sys.argv[3])
+subcol = m.SUBCOL_FROM_FPGA_DET[0]
+ebin = m.apply_row(m.boundaries(rows[(subcol, 0)]))[2000]
+spectra = [(s, [4 if (s == subcol and e == ebin) else 0
+                for e in range(32)]) for s in range(32)]
+with open(sys.argv[4], "w") as f:
+    f.write(q.build_packet(q.ssid32_body(spectra)).hex() + "\n")
+# the rule-4 decoy: the counts at a wrong ebin (20 != the honoured one)
+spectra_wrong = [(s, [4 if (s == subcol and e == 20) else 0
+                      for e in range(32)]) for s in range(32)]
+with open(sys.argv[5], "w") as f:
+    f.write(q.build_packet(q.ssid32_body(spectra_wrong)).hex() + "\n")
+print("canned ssid32 dump: subcol %d ebin %d" % (subcol, ebin))
+EOF
+
+fake_run() { # label env...; set FAKE_PROBE_DUMP_FILE before the call to
+             # swap the canned SSID 32 dump
+    local label="$1"; shift
     : > "$W/qargv.$label"
     : > "$W/pargv.$label"
     gate "$@" STIX_TMTC_PROBE="$FPROBE" FAKE_PROBE_SECONDS=1 \
-        FAKE_QEMU_RUN_SECONDS=20 FAKE_QEMU_ARGV_FILE="$W/qargv.$label" \
-        FAKE_PROBE_ARGV_FILE="$W/pargv.$label" --
+        FAKE_QEMU_RUN_SECONDS=20 FAKE_PMEMSAVE_CSV="$W/synth.csv" \
+        FAKE_QEMU_ARGV_FILE="$W/qargv.$label" \
+        FAKE_PROBE_ARGV_FILE="$W/pargv.$label" \
+        FAKE_PROBE_DUMP="${FAKE_PROBE_DUMP_FILE:-$W/ql32.hex}" --
 }
-fake_run legacy STIX_ELUT_RUN_DIR="$W/fl"
-[ "$rc" -eq 1 ] && grep -q "^ELUT-SMOKE: FAIL (run 1 UART: 0 'problem erasing" \
-    <<< "$out"
-check "fake legacy: FAIL at the run-1 UART check, rc 1" $? \
+r2argv() { # file -> the second boot's argv lines
+    awk 'seen { print } /^end$/{ seen = 1 }' "$1"
+}
+
+# a run-1 UART failure still stops before run 2 (mode good: the golden
+# has no "problem erasing LUT" lines)
+fake_run norun FAKE_QEMU_MODE=good STIX_ELUT_RUN_DIR="$W/fl"
+[ "$rc" -eq 1 ] &&
+    grep -q "^ELUT-SMOKE: FAIL (run 1 UART: 0 'problem erasing" <<< "$out"
+check "fake run-1 FAIL stops at the UART check, rc 1" $? \
     "rc=$rc $(tail -3 <<< "$out")"
-FINO="$(sed -n 's/^flash-inode: //p' "$W/qargv.legacy" | head -1)"
+[ "$(grep -c '^argv:' "$W/qargv.norun")" -eq 1 ]
+check "fake run-1 FAIL: run 2 never starts" $? ""
+[ -e "$W/fl/flash.bin" ]
+check "fake run-1 FAIL keeps the flash" $? ""
+
+# the full positive pass: mode elut with the good traces
+fake_run good FAKE_QEMU_MODE=elut STIX_ELUT_RUN_DIR="$W/fl"
+[ "$rc" -eq 0 ] && grep -q "ELUT-SMOKE: PASS" <<< "$out" &&
+    grep -q "REPLAY-CHECK: PASS" <<< "$out"
+check "fake legacy: the full positive gate PASSES with the E-4 verdict" $? \
+    "rc=$rc $(tail -8 <<< "$out")"
+FINO="$(sed -n 's/^flash-inode: //p' "$W/qargv.good" | head -1)"
 [ -n "$FINO" ] && [ "$FINO" != none ] && [ "$FINO" != "$MINO" ] &&
     [ "$(stat -c %s "$W/fl/flash.bin")" -eq 17716740096 ] &&
     [ "$(du -k "$W/fl/flash.bin" | cut -f1)" -eq 0 ]
 check "fake legacy: QEMU boots a fresh, empty sparse flash.bin" $? \
     "inode $FINO master $MINO"
-grep -qx "cwd: $W/fl" "$W/qargv.legacy" &&
-    grep -qx -- "file:$W/fl/uart.elut1.raw" "$W/qargv.legacy" &&
-    grep -qx -- "unix:$W/fl/qmp.sock,server=on,wait=off" "$W/qargv.legacy" &&
-    grep -qx -- "stixspw_rx_truncated" "$W/qargv.legacy" &&
-    ! grep -q tmtc-port "$W/qargv.legacy" &&
-    grep -qx -- "$UIDB" "$W/pargv.legacy"
-check "fake legacy: QEMU argv, cwd and probe port" $? \
-    "$(head -30 "$W/qargv.legacy" | tr '\n' ' ')"
-[ "$(grep -c '^argv:' "$W/qargv.legacy")" -eq 1 ]
-check "fake legacy: run 2 never starts after a run-1 FAIL" $? ""
-[ -e "$W/fl/flash.bin" ]
-check "fake legacy: a FAIL keeps the flash" $? ""
+grep -qx "cwd: $W/fl" "$W/qargv.good" &&
+    grep -qx -- "file:$W/fl/uart.elut1.raw" "$W/qargv.good" &&
+    grep -qx -- "unix:$W/fl/qmp.sock,server=on,wait=off" "$W/qargv.good" &&
+    grep -qx -- "stixspw_rx_truncated" "$W/qargv.good" &&
+    ! grep -q tmtc-port "$W/qargv.good" &&
+    grep -qx -- "$UIDB" "$W/pargv.good"
+check "fake legacy: QEMU argv, cwd and probe port (run 1)" $? \
+    "$(head -30 "$W/qargv.good" | tr '\n' ' ')"
+r2="$(r2argv "$W/qargv.good")"
+grep -qx -- "file:$W/fl/uart.elut2.raw" <<< "$r2" &&
+    grep -qx -- "grlib-stixctrl.det-replay-file=$W/fl/dssevs.elut2" <<< "$r2" &&
+    grep -qx -- "stixdet_elut_fallback" <<< "$r2" &&
+    grep -qx -- "stixdet_replay_scan" <<< "$r2" &&
+    grep -qx -- "stixdet_replay_state" <<< "$r2"
+check "fake legacy: run 2 boots with the replay -global and traces" $? \
+    "$(tr '\n' ' ' <<< "$r2" | cut -c1-200)"
+[ "$(grep -c '^argv:' "$W/qargv.good")" -eq 2 ]
+check "fake legacy: two boots" $? ""
+grep -q "REPLAY-CHECK: honoured ebin" <<< "$out"
+check "fake legacy: the checker prints the honoured ebin" $? ""
+r2p="$(r2argv "$W/pargv.good")"
+grep -qx -- "0x5DC:$W/fl/ql.dump.elut2.hex" <<< "$r2p" &&
+    grep -qF -- "det-source" <<< "$r2p" &&
+    grep -qF -- '"replay-dss"' <<< "$r2p" &&
+    grep -qx -- "$CONF2" <<< "$r2p"
+check "fake legacy: run 2 probe args (dump, qom-set, TC_CONF2)" $? \
+    "$(tr '\n' ' ' <<< "$r2p" | cut -c1-200)"
 
-fake_run slot STIX_PORT_BASE=1 STIX_ELUT_RUN_DIR="$W/fl"
+# the E-4 verdicts: a vacuous run (no start line) and a fallback line
+fake_run vacuous FAKE_QEMU_MODE=elut FAKE_QEMU_ELUT_TRACE=vacuous \
+    STIX_ELUT_RUN_DIR="$W/fl"
+[ "$rc" -eq 1 ] && grep -q "^ELUT-SMOKE: FAIL (run 2 replay:" <<< "$out" &&
+    grep -q "never classified" <<< "$out"
+check "fake vacuous run FAILs the E-4 verdict, rc 1" $? \
+    "rc=$rc $(tail -4 <<< "$out")"
+[ "$(grep -c '^argv:' "$W/qargv.vacuous")" -eq 2 ] &&
+    [ "$(stat -c %s "$W/fl/dssevs.elut2")" -eq 20 ]
+check "fake vacuous: run 2 started, the gate wrote the 20-byte .dssevs" \
+    $? ""
+fake_run fbline FAKE_QEMU_MODE=elut FAKE_QEMU_ELUT_TRACE=fallback \
+    STIX_ELUT_RUN_DIR="$W/fl"
+[ "$rc" -eq 1 ] && grep -q "^ELUT-SMOKE: FAIL (run 2 replay:" <<< "$out" &&
+    grep -q "stixdet_elut_fallback lines" <<< "$out"
+check "fake fallback line FAILs the E-4 verdict, rc 1" $? \
+    "rc=$rc $(tail -4 <<< "$out")"
+
+# rule 4: the dump carries the counts at a wrong ebin
+FAKE_PROBE_DUMP_FILE="$W/ql32wrong.hex" \
+    fake_run wrongeb FAKE_QEMU_MODE=elut STIX_ELUT_RUN_DIR="$W/fl"
+[ "$rc" -eq 1 ] && grep -q "^ELUT-SMOKE: FAIL (run 2 replay:" <<< "$out" &&
+    grep -q "no count at the honoured ebin" <<< "$out"
+check "fake wrong-ebin dump FAILs the E-4 verdict (rule 4), rc 1" $? \
+    "rc=$rc $(tail -4 <<< "$out")"
+
+# a slot-mode FAIL: the slot tag on the FAIL line
+fake_run slotfail FAKE_QEMU_MODE=elut FAKE_QEMU_ELUT_TRACE=vacuous \
+    STIX_PORT_BASE=1 STIX_ELUT_RUN_DIR="$W/fl"
 [ "$rc" -eq 1 ] &&
-    grep -q "^ELUT-SMOKE: FAIL (run 1 UART: .* slot=1 busy=" <<< "$out"
-check "fake slot: FAIL with the slot tag, rc 1" $? \
+    grep -q "^ELUT-SMOKE: FAIL (run 2 replay:.* slot=1 busy=" <<< "$out"
+check "fake slot FAIL carries the slot tag, rc 1" $? \
+    "rc=$rc $(tail -4 <<< "$out")"
+
+# slot mode: a full PASS with the slot tag and the PASS cleanup
+fake_run slot FAKE_QEMU_MODE=elut STIX_PORT_BASE=1 \
+    STIX_ELUT_RUN_DIR="$W/fl"
+[ "$rc" -eq 0 ] && grep -q "ELUT-SMOKE: PASS.* slot=1 busy=" <<< "$out"
+check "fake slot: PASS with the slot tag, rc 0" $? \
     "rc=$rc $(tail -2 <<< "$out")"
 grep -qx "cwd: $W/fl-s1" "$W/qargv.slot" &&
     grep -qx -- "grlib-stixspw.tmtc-port=$B1" "$W/qargv.slot" &&
     grep -qx -- "$B1" "$W/pargv.slot" &&
-    [ "$(sed -n 's/^flash-inode: //p' "$W/qargv.slot")" != "$MINO" ] &&
-    [ "$(stat -c %s "$W/fl-s1/flash.bin")" -eq 17716740096 ]
-check "fake slot: -s1 dir, -global port, probe port, private flash" $? \
-    "$(tr '\n' ' ' < "$W/qargv.slot" | cut -c1-300)"
+    [ "$(sed -n 's/^flash-inode: //p' "$W/qargv.slot" | head -1)" != none ] &&
+    [ "$(sed -n 's/^flash-inode: //p' "$W/qargv.slot" | head -1)" != "$MINO" ]
+# (the full-size sparse check lives in the legacy good case: slot mode
+# deletes flash.bin on PASS, so it is gone by the time we look)
+check "fake slot: -s1 dir, -global port, probe port, fresh private flash" \
+    $? "$(tr '\n' ' ' < "$W/qargv.slot" | cut -c1-300)"
+[ ! -e "$W/fl-s1/flash.bin" ]
+check "fake slot: the PASS cleanup deleted the flash" $? ""
 
 echo "test-elut-smoke: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

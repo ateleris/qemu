@@ -7,7 +7,15 @@
 # silent — a hung guest (freeze). For pfm-boot-smoke: pfm writes one
 # watchdog RELOAD into the -trace file and stays alive (the positive
 # run's live trace), pfm-reset writes a watchdog "count expired" reset
-# and exits at once (the latency-off negative).
+# and exits at once (the latency-off negative). For elut-smoke: elut
+# writes the golden boot UART — run 1 with the 4 "problem erasing LUT
+# type=3" lines, run 2 without the "could not find LUT (type=3" line
+# (the seeded flash) — and, when the argv carries
+# grlib-stixctrl.det-replay-file=, the D-7 trace lines on stdout per
+# FAKE_QEMU_ELUT_TRACE: good (pre-scan + start + eof; the word/event
+# counts derived from the replay file's size), fallback (also one
+# stixdet_elut_fallback line), vacuous (pre-scan only: the replay
+# never started, the rows were never classified).
 #
 # FAKE_QEMU_ARGV_FILE, when set, gets one record per invocation appended:
 # "argv:" plus the arguments one per line, "cwd: <dir>" and
@@ -78,6 +86,68 @@ case "$MODE" in
         # the latency-off negative: the watchdog expires, QEMU exits
         echo "stixctrl_watchdog_reset watchdog resets the IDPU:" \
             "count expired" >> "$TRACE_FILE"
+        ;;
+    elut)
+        GOLDEN="$(dirname "$SELF")/../../../docs/stix-port/baseline/uart.golden.log"
+        case "$SERIAL_OUT" in
+            *elut1.raw)
+                cp "$GOLDEN" "$SERIAL_OUT"
+                i=0
+                while [ "$i" -lt 4 ]; do
+                    echo "00:00:01.0  LUTMgmt       *E problem erasing LUT type=3, copy $i" \
+                        >> "$SERIAL_OUT"
+                    i=$((i + 1))
+                done
+                ;;
+            *elut2.raw)
+                # the seeded flash: the type=3 LUT is found at boot
+                grep -v 'could not find LUT (type=3' "$GOLDEN" \
+                    > "$SERIAL_OUT"
+                REPLAY_FILE=""
+                for a in "$@"; do
+                    case "$a" in
+                        grlib-stixctrl.det-replay-file=*)
+                            REPLAY_FILE="${a#*=}" ;;
+                    esac
+                done
+                # the canned counts follow the replay file the gate
+                # wrote (one 0xE setup word, the rest events), so a
+                # DET7_COUNT change cannot drift the fake
+                NWORDS=0
+                NEVENTS=0
+                if [ -f "$REPLAY_FILE" ]; then
+                    NWORDS=$(( $(stat -c %s "$REPLAY_FILE") / 4 ))
+                    NEVENTS=$(( NWORDS - 1 ))
+                fi
+                case "${FAKE_QEMU_ELUT_TRACE:-good}" in
+                    good | fallback | vacuous)
+                        # the realize pre-scan always traces
+                        [ -n "$REPLAY_FILE" ] && echo \
+"stixdet_replay_scan replay pre-scan '$REPLAY_FILE': $NWORDS words, $NEVENTS events (fpga_det = dss_det), duration 0 ns, scanned in 0 ns"
+                        if [ -n "$REPLAY_FILE" ] &&
+                                [ "${FAKE_QEMU_ELUT_TRACE:-good}" != vacuous ]; then
+                            echo \
+"stixdet_replay_state replay state=start (nominal): t_tick=0 cursor=0 events_fed=0"
+                            echo \
+"stixdet_replay_state replay state=eof (end of file): t_tick=1 cursor=$NEVENTS events_fed=$NEVENTS"
+                        fi
+                        if [ "${FAKE_QEMU_ELUT_TRACE:-good}" = fallback ]; then
+                            echo \
+"stixdet_elut_fallback ELUT fallback: fpga_det 0 pix 0 degenerate row (constant 0), linear binning in use"
+                        fi
+                        ;;
+                    *)
+                        echo "fake-qemu: unknown FAKE_QEMU_ELUT_TRACE" \
+                            "'${FAKE_QEMU_ELUT_TRACE:-}'" >&2
+                        exit 3
+                        ;;
+                esac
+                ;;
+            *)
+                cp "$GOLDEN" "$SERIAL_OUT"
+                ;;
+        esac
+        sleep "${FAKE_QEMU_RUN_SECONDS:-30}"
         ;;
     *)
         echo "fake-qemu: unknown FAKE_QEMU_MODE '$MODE'" >&2

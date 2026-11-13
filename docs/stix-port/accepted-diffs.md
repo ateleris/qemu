@@ -3543,6 +3543,28 @@ has the index-space table, the recipe and the template flash.
   is now expected as its positive control.
 - **Run 2 boot:** no 0x142E (the boot TC20 timer) was seen; the context
   carries S20 = 0. Neither expected nor forbidden at connect.
+- **E-4 addendum (implemented, pending gates):** the positive run 2 also
+  proves the no-fallback side on the real ELUT. The gate writes a tiny
+  synthetic `.dssevs` into its own run dir (never a user file: one 0xE
+  setup word with baseline 2000 for `dss_det` 0, then 4 events at
+  `adc` 2000, `fpga_det` 0, `pix` 0, wait 0), starts run 2's QEMU with
+  `-global grlib-stixctrl.det-replay-file=` (realize-time) and the
+  `stixdet_elut_fallback` / `stixdet_replay_scan` / `stixdet_replay_state`
+  traces, sets `det-source=replay-dss` by QMP at @5, and ends NOMINAL
+  with TC(236,1) at 115 so the exit flush sends the one SSID 32 dump.
+  `elut-replay-check.py` then asserts the pre-scan line, a
+  `state=start (nominal)` line (the replay started at the SetEnable
+  edge where stix_det.c classifies the 384 rows — D-7 has no
+  per-classification summary trace, so this plus the SSID 32 check
+  carry the vacuity guard), zero `ELUT fallback` lines, and the counts
+  at exactly the CSV's ebin of `adc` 2000 in exactly the one subcol:
+  at `adc ≤ base` the linear fallback would have dropped the events,
+  so only the honoured branch can pass. `test-elut-smoke.sh` covers
+  the vacuous and fallback-line FAILs and the full fake PASS;
+  `test-elut-upload.sh` pins the Python index tables against
+  `stix_det.c`'s transcriptions. The replay runs inside the gate's own
+  run dir only; the DSS replay caveat below (a seeded flash, and
+  detector-smoke deleting its flash at every start) still applies.
 - **FSW behaviour, confirmed live by `--negative`:** without TC(237,8)
   the upload is not stored, but a NOMINAL entry on a flash with no ELUT
   file for the current ID applies it anyway: `load_lut(3, 0)` misses and
