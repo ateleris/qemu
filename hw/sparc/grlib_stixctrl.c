@@ -20,6 +20,7 @@
 #include "stix_det.h"
 #include "stix_att.h"
 #include "stix_edac.h"
+#include "stix_aspect.h"
 
 #include "trace.h"
 #include "qom/object.h"
@@ -163,6 +164,12 @@ struct STIXCTRL
      * the reset applies.
      */
     StixEdac edac;
+    /*
+     * Aspect plan AS-1 (D-ASa): the aspect unit behind CTRL APB
+     * 0x68-0x7B (asCmdSta, asQlData), the D-Da pattern; the tick, rows
+     * and knobs join with AS-2/AS-3.
+     */
+    StixAspectState as;
 };
 
 #define STIXCTRL_ADC_INJECT_NONE 0xFFFFFFFFu
@@ -939,6 +946,14 @@ static uint64_t grlib_stixctrl_read(void *opaque, hwaddr addr, unsigned size)
 
         return regval;
     }
+    /* AS-1 (D-ASa): asCmdSta (0x68) and asQlData (0x6C-0x7B) */
+    if (stix_aspect_owns(&stixctrl->as, addr)) {
+        uint32_t regval = stix_aspect_read(&stixctrl->as, addr);
+
+        trace_stixctrl_io_read((uint32_t)addr, regval);
+
+        return regval;
+    }
 
     uint32_t regval = ((volatile uint32_t *)&stixctrl->reg)[(uint32_t)addr / sizeof(uint32_t)];
 
@@ -1015,6 +1030,17 @@ static void grlib_stixctrl_write(void *opaque, hwaddr addr, uint64_t value, unsi
                                     ((uint32_t *)&stixctrl->reg)
                                     [(uint32_t)addr / sizeof(uint32_t)]);
         }
+        return;
+    }
+
+    /*
+     * AS-1 (D-ASa): the aspect registers (0x68-0x7B). After the hk-prot
+     * block, so these writes spend an unlock token like any other.
+     */
+    if (stix_aspect_owns(&stixctrl->as, addr)) {
+        stix_aspect_write(&stixctrl->as, addr, (uint32_t)value);
+        trace_stixctrl_io_write((uint32_t)addr,
+                                stix_aspect_read(&stixctrl->as, addr));
         return;
     }
 
@@ -1271,6 +1297,10 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    /* AS-1 (D-ASa): the aspect unit binds the register file (the tick
+     * and the rows come with the AS-2 generator) */
+    stix_aspect_realize(&STIXCTRL->as, STIXCTRL, &STIXCTRL->reg);
+
     //STIXCTRL->reference_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
     //STIXCTRL->timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, grlib_stixctrl_timer_tick, STIXCTRL);
     //timer_mod(STIXCTRL->timer, 1);
@@ -1359,6 +1389,15 @@ static void grlib_stixctrl_reset(DeviceState *d)
      * att-model=off leaves 0x5C alone
      */
     stix_att_reset(&stixctrl->att);
+
+    /*
+     * AS-1 (D-ASf): asCmdSta = 0 (channels off, AVGSIZE 0) and asQlData
+     * cleared — a watchdog reboot cuts the aspect supply and the FSW
+     * re-powers and re-configures it (OpModeMgmt.c:1066-1068 at boot,
+     * :229-230 on SAFE entry, :680 on NOMINAL); as-model=off leaves them
+     * alone
+     */
+    stix_aspect_reset(&stixctrl->as);
 }
 
 static void grlib_stixctrl_unrealize(DeviceState *dev)
@@ -1603,6 +1642,11 @@ static const Property grlib_stixctrl_properties[] = {
     DEFINE_PROP_UINT32("att-debounce-ms", STIXCTRL, att_cfg.debounce_ms, 10),
     DEFINE_PROP_BOOL("att-timeout-finishes", STIXCTRL, att_cfg.timeout_finishes,
                      true),
+    /*
+     * AS-1 (D-ASa): off keeps 0x68-0x7B plain storage, never reset
+     * (legacy, A/B comparison and rollback)
+     */
+    DEFINE_PROP_BOOL("as-model", STIXCTRL, as.model, true),
 };
 
 /*

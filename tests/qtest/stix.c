@@ -14811,6 +14811,133 @@ static void test_edac_hw_state(void)
     stix_qtest_cleanup();
 }
 
+/* ---- Aspect system: asCmdSta/asQlData semantics and reset (AS-1) ---- */
+
+/* Register offsets (StixIdpu.h:1643-1644); bit macros StixIdpu.h:667-691 */
+#define CTRL_ASCMDSTA   0x68u
+#define CTRL_ASQLDATA   0x6Cu
+/* the stored asCmdSta bits: ASAON (0), ASBON (1), AVGSIZE (10:8) */
+#define AS_CMDSTA_RW    0x703u
+
+/*
+ * as-reg-reset (D-ASf): asCmdSta and the four asQlData words read 0
+ * after a device reset (channels off, AVGSIZE 0). RED on the parent
+ * binary: the registers are plain storage there and survive the reset.
+ */
+static void test_as_reg_reset(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t off;
+
+    /* a fresh machine starts clear */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0);
+    for (off = 0; off < 16; off += 4) {
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==, 0);
+    }
+
+    /* non-zero register state, then the reset clears it */
+    ctrl_write(qts, CTRL_ASCMDSTA, 0xFFFFFFFFu);
+    for (off = 0; off < 16; off += 4) {
+        ctrl_write(qts, CTRL_ASQLDATA + off, 0x10000u | (0x1111u * off));
+    }
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0);
+    for (off = 0; off < 16; off += 4) {
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==, 0);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-rw: asCmdSta stores ASAON/ASBON (bits 0/1) and AVGSIZE (10:8) and
+ * reads them back; the reserved bits 2..7 and 11..31 are dropped on
+ * write and read 0 (StixIdpu.h:681-685).
+ */
+static void test_as_rw(void)
+{
+    QTestState *qts = stix_qtest_new();
+
+    ctrl_write(qts, CTRL_ASCMDSTA, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, AS_CMDSTA_RW);
+
+    ctrl_write(qts, CTRL_ASCMDSTA, 0x00000FFCu);    /* reserved 2..11 */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0x700u);
+
+    ctrl_write(qts, CTRL_ASCMDSTA, 0x00000000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0);
+
+    /* Aspect_setPower's shape: the channel bits only (Aspect.c:80-96) */
+    ctrl_write(qts, CTRL_ASCMDSTA, 0x00000003u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0x00000003u);
+
+    /* AVGSIZE = 4 (AVG16) on top of both channels */
+    ctrl_write(qts, CTRL_ASCMDSTA, 0x00000403u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0x00000403u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-ql-mask: an asQlData word is stored whole but only its DATA field
+ * (15:0) reads back; the upper 16 bits read 0 (ASQLDATA_RESERVED,
+ * Aspect.c:127-133).
+ */
+static void test_as_ql_mask(void)
+{
+    QTestState *qts = stix_qtest_new();
+    uint32_t off;
+
+    for (off = 0; off < 16; off += 4) {
+        ctrl_write(qts, CTRL_ASQLDATA + off, 0xFFFF0000u);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==, 0);
+        ctrl_write(qts, CTRL_ASQLDATA + off, 0x87654321u);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==, 0x4321u);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-model=off keeps the legacy model: 0x68-0x7B are plain storage
+ * (reserved bits included) and survive a device reset (D-ASa).
+ */
+static void test_as_model_off(void)
+{
+    QTestState *qts =
+        stix_qtest_new_extra("-global grlib-stixctrl.as-model=off");
+    uint32_t off;
+
+    ctrl_write(qts, CTRL_ASCMDSTA, 0xFFFFFFFFu);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0xFFFFFFFFu);
+    for (off = 0; off < 16; off += 4) {
+        ctrl_write(qts, CTRL_ASQLDATA + off, 0xFFFF0000u);
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==,
+                        0xFFFF0000u);
+    }
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0xFFFFFFFFu);
+    for (off = 0; off < 16; off += 4) {
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==,
+                        0xFFFF0000u);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+static void stix_aspect_register(void)
+{
+    qtest_add_func("/sparc/stix/as-reg-reset", test_as_reg_reset);
+    qtest_add_func("/sparc/stix/as-rw", test_as_rw);
+    qtest_add_func("/sparc/stix/as-ql-mask", test_as_ql_mask);
+    qtest_add_func("/sparc/stix/as-model-off", test_as_model_off);
+}
+
 static void stix_edac_register(void)
 {
     qtest_add_func("/sparc/stix/edac-reg-reset", test_edac_reg_reset);
@@ -14987,6 +15114,7 @@ int main(int argc, char **argv)
         stix_att_register();
         stix_flashdmg_register();
         stix_edac_register();
+        stix_aspect_register();
     }
 
     return g_test_run();
