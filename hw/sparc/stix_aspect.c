@@ -170,7 +170,16 @@ static void stix_aspect_flip(StixAspectState *a)
     StixDetRotbResult r;
     uint32_t coarse_reg, rotb_count = 0, row, d;
     uint16_t fine;
-    int64_t off_ns = 0;
+    /*
+     * Stamp the block at its scheduled flip time, not when the callback
+     * runs: without icount the virtual clock follows the host, so the
+     * callback runs a fraction of a ms late, and that host jitter (seen
+     * up to +-4 ms) would reach the FSW's once-per-request increment
+     * estimate floor((t2 - t1) / 63) of truncated ms (AspectCtrl.c:221-
+     * 233) and turn 1008 into 1007 -> inc 15. Under qtest the offset is 0.
+     */
+    int64_t off_ns = a->tick_deadline_ns -
+                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bool jittered = a->jitter_ms != 0;
     bool stepped = a->step_ms != 0 && a->block_seq >= a->step_start;
 
