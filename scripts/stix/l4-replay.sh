@@ -13,22 +13,29 @@
 #      STIX_L4_COLLECT_SECONDS (default 600), CONF @<end> to flush the
 #      last RAW_COUNTS file.  QEMU traces stixdet_chunk,
 #      stixdet_chunk_drop and stixdet_nominal_swap into collect.trace.
-#   2. truth + snapshot — build <run>/truth.txt from the collect UART
-#      and trace, never from TM, in the format l4-decode.py reads
-#      ('chunk <SCET s> <rcr>' per archived chunk, 'file <name> <scet>
-#      <chunks>' per RAW_COUNTS file).  Chunk SCETs come from the
-#      trace's stixdet_chunk lines (scet 0xC:0xF — the chunk header
-#      timestamp the FSW archives); the rcr tags and the file
-#      boundaries come from the UART in line order ('rcr = ' per chunk
-#      header, 'Flush DET stream' per file close; DEBUG_PRINT builds —
-#      the bundle's cflags carry -DDEBUG_PRINT).  The truth counts
-#      ARCHIVED chunks only: the chunk the FSW drops at NOMINAL entry
-#      ('Skipped first Det data chunk', ArchiveManager.c:140, expected
-#      exactly once per collection) is excluded, so archived =
-#      model chunks - 1 (asserted).  Gate before any request run (the
-#      bundle's "count the files" discipline): >= 12 files, >= 1 chunk,
-#      every rcr tag 0 (D-L4e stillness by rate; the decode re-verifies
-#      the structure rcr bytes).  Then the snapshot flash-collect.bin
+#   2. truth + snapshot — build <run>/truth.txt from the collect flash
+#      image with scripts/stix/l4-flash-truth.py (the archive the
+#      request runs will read — never TM, and not the UART: the rcr /
+#      Flush DET stream prints are TRACE calls, compiled out in these
+#      builds — plan amendment A).  The reader imports flash-damage
+#      .py's layout/IO code, enumerates the RAW_COUNTS files from the
+#      page-0 spares of the FS blocks, reads each file's pages (trimmed
+#      to the spare's fileSizeInBytes) and walks the chunks by their
+#      64-B headers (size u16 BE at 62 counts the whole chunk; the
+#      stored timestamp is the ARCHIVED chunk's SCET — the FSW
+#      overwrites it with the previous chunk's end).  --trace and
+#      --uart run the exact cross-checks: archived chunk k's ms == the
+#      k-th (0-based) stixdet_chunk trace line's scet ms (archived =
+#      model - 1: the first chunk of each flush epoch is dropped,
+#      ArchiveManager.c:138-144, each chunk is stored with the previous
+#      chunk's end, so the last model SCET is never archived) and exactly one 'Skipped first Det data
+#      chunk' TRACE_ERROR in the UART.  Truth format = l4-decode.py's
+#      ('chunk <SCET s.mmm> <rcr>' per archived chunk, 'file <name>
+#      <scet> <chunks>' per RAW_COUNTS file), SCETs ms-exact, files
+#      sorted by name SCET.  Gate before any request run (the bundle's
+#      "count the files" discipline): >= 12 files, >= 1 chunk, every
+#      rcr tag 0 (D-L4e stillness by rate; the decode re-verifies the
+#      structure rcr bytes).  Then the snapshot flash-collect.bin
 #      (sparse copy, size and allocation verified) in the collect dir.
 #   3. requests — for BUILD in {red, green}: fresh dir, flash.bin = a
 #      sparse copy of the snapshot, boot to CONFIGURATION only (no
@@ -143,6 +150,7 @@ done
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 L4TC="$REPO_ROOT/scripts/stix/l4-tc.py"
 L4DEC="$REPO_ROOT/scripts/stix/l4-decode.py"
+L4TRUTH="$REPO_ROOT/scripts/stix/l4-flash-truth.py"
 PROBE="${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}"
 RED_ELF="${STIX_L4_RED_ELF:-}"
 GREEN_ELF="${STIX_L4_GREEN_ELF:-}"
@@ -462,10 +470,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo "# phase 2: truth + snapshot"
     echo "(trace events: stixdet_chunk stixdet_chunk_drop" \
         "stixdet_nominal_swap stixspw_rx_truncated)"
-    echo "(inline truth builder: $COLLECT_DIR/collect.trace +"
-    echo " $COLLECT_DIR/uart.collect.txt -> $RUN_DIR/truth.txt;"
-    echo " archived = stixdet_chunk chunks - 1 dropped first, rcr tags"
-    echo " and file closes from the UART in line order)"
+    echo "(python3 $L4TRUTH $COLLECT_DIR/flash.bin --trace" \
+        "$COLLECT_DIR/collect.trace --uart $COLLECT_DIR/uart.collect.txt" \
+        "--out $RUN_DIR/truth.txt: the RAW_COUNTS files from the page-0"
+    echo " spares, the chunks by their 64-B headers; archived = model - 1"
+    echo " (the dropped first chunk), one 'Skipped first Det data chunk')"
     echo "(cd $COLLECT_DIR && timeout 60 cp --sparse=always flash.bin flash-collect.bin)"
 else
     tr -d '\000' < uart.collect.raw > uart.collect.txt
@@ -499,105 +508,18 @@ else
         exit 1
     fi
     echo "CHECK uart (collect): ok (banner, no context failure, no chunk-path error)"
+    # the truth from the collect flash image (the archive the request
+    # runs will read), with the trace and UART cross-checks
     set +e
-    python3 - "$COLLECT_DIR/collect.trace" \
-        "$COLLECT_DIR/uart.collect.txt" "$RUN_DIR/truth.txt" <<'TRUTH_EOF'
-import re
-import sys
-
-trace_path, uart_path, out_path = sys.argv[1:4]
-CHUNK = re.compile(r"^\S+ stixdet_chunk chunk: nom_bank \d+, \d+ blocks, "
-                   r"scet 0x([0-9a-f]+):0x([0-9a-f]+), ")
-RCR = re.compile(r"rcr = (\d+)")
-chunks, drops = [], 0
-for line in open(trace_path, errors="replace"):
-    m = CHUNK.match(line)
-    if m:
-        coarse = int(m.group(1), 16)
-        fine = int(m.group(2), 16)
-        chunks.append(coarse * 1000 + fine * 1000 // 0x10000)
-    elif " stixdet_chunk_drop " in line:
-        drops += 1
-skip = 0
-events = []                       # ("c", rcr) and ("f", None), in order
-for line in open(uart_path, errors="replace"):
-    if "Skipped first Det data chunk" in line:
-        skip += 1
-    m = RCR.search(line)
-    if m:
-        events.append(("c", int(m.group(1))))
-    elif "Flush DET stream" in line:
-        events.append(("f", None))
-errs = []
-if drops:
-    errs.append("%d stixdet_chunk_drop lines (want 0)" % drops)
-if skip != 1:
-    errs.append("%d 'Skipped first Det data chunk' lines (want 1)" % skip)
-if not chunks:
-    errs.append("no stixdet_chunk lines in %s" % trace_path)
-n = len(chunks)
-marks = [e for e in events if e[0] == "c"]
-if len(marks) == n:
-    # one print per model chunk; the first is the chunk dropped at
-    # NOMINAL entry [L: print order vs the drop]
-    drop_first_mark = True
-elif len(marks) == n - 1:
-    drop_first_mark = False   # the dropped chunk printed no rcr line
-else:
-    errs.append("%d 'rcr =' lines vs %d stixdet_chunk chunks (want n or n-1)"
-                % (len(marks), n))
-if errs:
-    sys.exit("; ".join(errs))
-archived = []                     # (ms, rcr)
-files = []
-cur = 0
-for kind, rcr in events:
-    if kind == "c":
-        if drop_first_mark:
-            drop_first_mark = False
-            continue
-        # the dropped chunk is model chunk 0 in both cases above, so
-        # archived chunk i is always model chunk i + 1
-        archived.append((chunks[len(archived) + 1], rcr))
-        cur += 1
-    elif cur:
-        files.append(cur)
-        cur = 0
-if cur:
-    files.append(cur)
-if sum(files) != len(archived):
-    sys.exit("the UART flush lines close %d chunks but %d are archived"
-             % (sum(files), len(archived)))
-# the wrapped builds search the files in rounds of <= 3 (filenames[3])
-# and zero the L4 counters at every round start (SciReport.c, old tree):
-# RED keeps the LAST round, i.e. the last len(files) % 3 files (3 if 0)
-last3 = (sum(files[-(len(files) % 3 or 3):]) if len(files) >= 2
-         else None)
-with open(out_path, "w") as f:
-    f.write("# l4-replay truth (UART + trace, never TM): %d model chunks, "
-            "%d archived (the first is dropped at NOMINAL entry),\n"
-            "# %d RAW_COUNTS files; chunk SCETs from stixdet_chunk, rcr "
-            "tags and file closes from the UART\n"
-            % (n, len(archived), len(files)))
-    for ms, rcr in archived:
-        f.write("chunk %d.%03d %d\n" % (ms // 1000, ms % 1000, rcr))
-    done = 0
-    for i, k in enumerate(files, 1):
-        ms = archived[done][0]
-        f.write("file RAW_COUNTS_%d %d.%03d %d\n"
-                % (i, ms // 1000, ms % 1000, k))
-        done += k
-rr = "n/a" if last3 is None else str(last3 + 1)
-print("TRUTH-STATS chunks=%d files=%d lastround=%s red-round=%s rcrmax=%d"
-      % (len(archived), len(files),
-         last3 if last3 is not None else "n/a", rr,
-         max((r for _, r in archived), default=0)))
-TRUTH_EOF
+    python3 "$L4TRUTH" "$COLLECT_DIR/flash.bin" \
+        --trace "$COLLECT_DIR/collect.trace" \
+        --uart "$COLLECT_DIR/uart.collect.txt" \
+        --out "$RUN_DIR/truth.txt"
     TRUTH_RC=$?
     set -e
     if [ "$TRUTH_RC" -ne 0 ]; then
-        echo "L4-REPLAY: FAIL (the truth builder failed, rc=$TRUTH_RC; see" \
-            "the messages above)${STIX_SLOT_TAG}"
+        echo "L4-REPLAY: FAIL (the flash truth reader failed, rc=$TRUTH_RC;" \
+            "see the messages above)${STIX_SLOT_TAG}"
         exit 1
     fi
     STATS="$(python3 - "$RUN_DIR/truth.txt" <<'STATS_EOF'
@@ -615,9 +537,15 @@ for line in open(sys.argv[1]):
     elif t[0] == "file":
         f += 1
         files.append(int(t[3]))
-k = sum(files[-(len(files) % 3 or 3):]) if len(files) >= 2 else 0
-print("chunks=%d files=%d lastround=%d red-round=%d rcrmax=%d"
-      % (c, f, k, k + 1 if files else 0, rcrmax))
+# fewer than 2 files: no red round (l4-decode.py's builder says n/a
+# too); the >= 12-file gate below stops the run before any use
+if len(files) >= 2:
+    k = sum(files[-(len(files) % 3 or 3):])
+    lr, rr = str(k), str(k + 1)
+else:
+    lr = rr = "n/a"
+print("chunks=%d files=%d lastround=%s red-round=%s rcrmax=%d"
+      % (c, f, lr, rr, rcrmax))
 STATS_EOF
 )"
     echo "TRUTH GATE: $STATS"

@@ -2,16 +2,19 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
 # Tests for scripts/stix/l4-replay.sh (the #1061 L4 replay wrapper,
-# L4-3).  Nothing boots: QEMU is tests/fake-qemu.sh (FAKE_QEMU_MODE=l4
-# writes the collect boot's canned chunk UART — one 'rcr =' line per
-# model chunk, a 'Flush DET stream' line every 2 chunks, the
-# dropped-first-chunk *E — and the stixdet_chunk trace at SCET
-# 1000000+i; the red/green boots get only the boot banner) and the
-# probe is tests/fake-probe.py (FAKE_PROBE_DUMP_MAP feeds each run dir
-# its own canned 0x5BC/0x5A7 dumps).  The canned dumps are built with
+# L4-3, plan amendment A).  Nothing boots: QEMU is tests/fake-qemu.sh
+# (FAKE_QEMU_MODE=l4 leaves the collect boot's small synthetic flash
+# image — 13 RAW_COUNTS files, 25 archived chunks, built with l4-flash
+# -truth.py's builder — plus the banner and the one "Skipped first Det
+# data chunk" TRACE_ERROR on the UART, and the stixdet_chunk trace at
+# SCET 1000001+i; the rcr/flush UART prints are compiled out in these
+# builds; the red/green boots get only the boot banner) and the probe
+# is tests/fake-probe.py (FAKE_PROBE_DUMP_MAP feeds each run dir its
+# own canned 0x5BC/0x5A7 dumps).  The canned dumps are built with
 # l4-decode.py's packet builder from the fake collection's known
-# truth: 26 model chunks at SCET 1000000+i, the first dropped by the
-# FSW, a file close every 2 chunks -> 25 archived chunks, 13 files
+# truth: 26 model chunks at SCET 1000001+i, archived[k] = model[k] (the
+# last model SCET is never archived), the flash holds a 1-chunk file then 2-chunk files -> 25
+# archived chunks, 13 files
 # (1 + 12 x 2), 13 % 3 = 1 file in the last search round: lastround 2,
 # red-round 3; GREEN A carries all 25 samples (rel 0..240 step 10), RED
 # A the last 3 (the carried-over sample 220 + the last file's 2), the
@@ -85,8 +88,8 @@ spec = importlib.util.spec_from_file_location("l4dec", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 w = sys.argv[2]
-# the fake collection: 26 model chunks at SCET 1000000+i, the first
-# dropped, a flush every 2 chunks -> 25 archived, 13 files, red-round 3
+# the fake collection: 26 model chunks at SCET 1000001+i, 25 archived
+# (a 1-chunk file then 2-chunk files) -> 13 files, red-round 3
 rels = [10 * j for j in range(25)]        # A start = 1000001
 
 
@@ -302,10 +305,18 @@ grep -q '^TRUTH GATE: chunks=25 files=13 lastround=2 red-round=3 rcrmax=0' \
     <<< "$out"
 check "fake legacy: the truth gate numbers" $? \
     "$(grep 'TRUTH GATE' <<< "$out")"
+grep -q '^FLASH-TRUTH: files=13 chunks=25 rcrmax=0' <<< "$out"
+check "fake legacy: the flash truth reader's summary" $? \
+    "$(grep 'FLASH-TRUTH' <<< "$out")"
 [ -f "$W/run/truth.txt" ] &&
     [ "$(grep -c '^chunk ' "$W/run/truth.txt")" -eq 25 ] &&
-    [ "$(grep -c '^file ' "$W/run/truth.txt")" -eq 13 ]
-check "fake legacy: truth.txt in the l4-decode format" $? ""
+    [ "$(grep -c '^file ' "$W/run/truth.txt")" -eq 13 ] &&
+    [ "$(grep -c '^file 0x02' "$W/run/truth.txt")" -eq 13 ] &&
+    [ "$(head -1 "$W/run/truth.txt")" = \
+        "# l4-flash-truth: 13 RAW_COUNTS files, 25 archived chunks read from $W/run/collect/flash.bin" ]
+check "fake legacy: truth.txt in the l4-decode format (on-flash names)" $? ""
+! grep -q 'rcr =' "$W/run/collect/uart.collect.txt"
+check "fake legacy: no rcr print on the collect UART (compiled out)" $? ""
 grep -q 'md5:' "$W/run/record.txt" && grep -q 'sha256:' "$W/run/record.txt" &&
     [ "$(grep -c '^elf .* md5:' "$W/run/record.txt")" -eq 3 ]
 check "fake legacy: record.txt holds the three ELFs' md5+sha256" $? ""
@@ -340,6 +351,14 @@ fake_run collectonly "$W/run-co" "$(dump_map "$W/run-co")" -- --collect-only
     grep -q '^L4-REPLAY (collect-only): PASS' <<< "$out" &&
     [ -f "$W/run-co/truth.txt" ] && [ ! -e "$W/run-co/red/l4.dump.hex" ]
 check "fake --collect-only: truth gate PASS, no request runs" $? \
+    "rc=$rc $(tail -3 <<< "$out")"
+
+# ---- the fake's own guard: a chunk count off the canned truth must
+#      stop the fake collect boot, never reach a PASS
+fake_run badn "$W/run-badn" "$(dump_map "$W/run-badn")" \
+    FAKE_QEMU_L4_CHUNKS=30 -- --collect-only
+[ "$rc" -ne 0 ] && ! grep -q 'PASS' <<< "$out"
+check "fake guard: FAKE_QEMU_L4_CHUNKS=30 -> no PASS, rc != 0" $? \
     "rc=$rc $(tail -3 <<< "$out")"
 
 # ---- the negatives: a ghost-less RED and a wrong RED count
