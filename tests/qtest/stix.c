@@ -2262,6 +2262,94 @@ static int stix_tc_connect(uint16_t port)
  * Connect to the TM server and send the ground station's 12-byte
  * STIX_CONTROL handshake.
  */
+/*
+ * gdb-legacy (accepted-diffs §47): the initial '?' stop reply is
+ * "T05core:01;" by default and "T05thread:01;" with
+ * -machine gdb-legacy=on, the form GDB < 7.1 (sparc-rtems-gdb 6.8)
+ * understands. Ask once per mode over a raw gdbstub socket.
+ */
+static char *stix_gdb_query_stop(bool legacy)
+{
+    int port = stix_free_tcp_port();
+    gchar *bios = NULL;
+    int bfd = g_file_open_tmp("stix-bios-XXXXXX", &bios, NULL);
+    gchar *extra;
+    QTestState *qts;
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        .sin_port = htons(port),
+    };
+    static const char q[] = "$?#3f";
+    GString *got = g_string_new(NULL);
+    char *start, *hash;
+    char c;
+    char *reply;
+    int fd;
+    QDict *rsp;
+
+    /*
+     * The qtest accelerator has no gdbstub: tcg goes first (QEMU takes
+     * the first -accel that works), frozen with -S. Without -kernel the
+     * machine wants a BIOS image; a 16-byte dummy, never executed.
+     */
+    g_assert(bfd >= 0);
+    g_assert(ftruncate(bfd, 16) == 0);
+    close(bfd);
+    extra = g_strdup_printf("-accel tcg -S -bios %s %s-gdb tcp:127.0.0.1:%d",
+                            bios, legacy ? "-machine gdb-legacy=on " : "",
+                            port);
+    qts = stix_qtest_new_extra(extra);
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    g_assert_cmpint(send(fd, q, sizeof(q) - 1, 0), ==, sizeof(q) - 1);
+    /* read past the ack '+' up to "$...#xx" (bounded: ~2 s) */
+    for (int i = 0; i < 2000; i++) {
+        ssize_t n = recv(fd, &c, 1, MSG_DONTWAIT);
+
+        if (n == 1) {
+            g_string_append_c(got, c);
+            hash = strchr(got->str, '#');
+            if (hash && strlen(hash) >= 3) {
+                break;
+            }
+            continue;
+        }
+        g_usleep(1000);
+    }
+    close(fd);
+    rsp = qtest_qmp(qts, "{ 'execute': 'qom-get', 'arguments': "
+                    "{ 'path': '/machine', 'property': 'gdb-legacy' } }");
+    g_assert(qdict_haskey(rsp, "return"));
+    g_assert_cmpint(qdict_get_bool(rsp, "return"), ==, legacy);
+    qobject_unref(rsp);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    unlink(bios);
+    g_free(bios);
+    g_free(extra);
+
+    start = strchr(got->str, '$');
+    g_assert_nonnull(start);
+    hash = strchr(start, '#');
+    g_assert_nonnull(hash);
+    reply = g_strndup(start + 1, hash - start - 1);
+    g_string_free(got, true);
+    return reply;
+}
+
+static void test_gdb_legacy_stop(void)
+{
+    char *def = stix_gdb_query_stop(false);
+    char *leg = stix_gdb_query_stop(true);
+
+    g_assert_cmpstr(def, ==, "T05core:01;");
+    g_assert_cmpstr(leg, ==, "T05thread:01;");
+    g_free(def);
+    g_free(leg);
+}
+
 static int stix_tm_connect(uint16_t port, bool small_rcvbuf)
 {
     static const char token[] = "STIX_CONTROL";
@@ -14546,6 +14634,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/ahb-windows", test_ahb_windows);
         qtest_add_func("/sparc/stix/bram-persist", test_bram_persist);
         qtest_add_func("/sparc/stix/tmtc-hermetic", test_tmtc_hermetic);
+        qtest_add_func("/sparc/stix/gdb-legacy-stop", test_gdb_legacy_stop);
         qtest_add_func("/sparc/stix/tmtc-bind-error/subprocess",
                        test_tmtc_bind_error_subprocess);
         qtest_add_func("/sparc/stix/tmtc-bind-error", test_tmtc_bind_error);

@@ -662,10 +662,29 @@ void gdb_breakpoint_remove_all(CPUState *cs)
 /*
  * The minimal system-mode stop reply packet is:
  *   T05core:{id};
+ * With the legacy option (STIX: for GDB < 7.1, which rejects "core"):
+ *   T05thread:{thread-id};
  */
+static bool gdb_legacy_stop_reply;
+
+void gdb_set_legacy_stop_reply(bool on)
+{
+    gdb_legacy_stop_reply = on;
+}
+
+bool gdb_get_legacy_stop_reply(void)
+{
+    return gdb_legacy_stop_reply;
+}
 
 void gdb_build_stop_packet(GString *buf, CPUState *cs)
 {
+    if (gdb_legacy_stop_reply) {
+        g_string_printf(buf, "T%02xthread:", GDB_SIGNAL_TRAP);
+        gdb_append_thread_id(cs, buf);
+        g_string_append_c(buf, ';');
+        return;
+    }
     g_string_printf(buf,
                     "T%02xcore:%02x;", GDB_SIGNAL_TRAP, gdb_get_cpu_index(cs));
 }

@@ -60,6 +60,18 @@ void gdb_unregister_coprocessor_all(CPUState *cpu);
 bool gdbserver_start(const char *port_or_device, Error **errp);
 
 /**
+ * gdb_set_legacy_stop_reply: answer the initial '?' query in the
+ * "T05thread:NN;" form instead of "T05core:NN;"
+ * @on: true for the legacy form
+ *
+ * GDB before 7.1 (e.g. the RTEMS 4.10 sparc-rtems-gdb 6.8) does not know
+ * the "core" field and rejects the system-mode stop reply. Modern GDB
+ * accepts both forms. System mode only; default off.
+ */
+void gdb_set_legacy_stop_reply(bool on);
+bool gdb_get_legacy_stop_reply(void);
+
+/**
  * gdb_feature_builder_init() - Initialize GDBFeatureBuilder.
  * @builder: The builder to be initialized.
  * @feature: The feature to be filled.

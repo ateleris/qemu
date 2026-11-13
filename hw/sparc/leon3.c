@@ -48,6 +48,7 @@
 #include "hw/intc/grlib_irqmp.h"
 #include "hw/misc/grlib_ahb_apb_pnp.h"
 #include "hw/sparc/grlib_stix.h"
+#include "exec/gdbstub.h"
 #include "stix_edac.h"
 #include "StixIdpu.h"
 
@@ -543,8 +544,31 @@ static void leon3_generic_hw_init(MachineState *machine)
      * baseline. See the baseline README for the carried state. */
 }
 
+/*
+ * gdb-legacy=on: the gdbstub answers the initial '?' query in the
+ * "T05thread:NN;" form, which GDB before 7.1 understands (the STIX
+ * toolchain's sparc-rtems-gdb 6.8 rejects the default "T05core:NN;").
+ * Default off: upstream behaviour. accepted-diffs §47.
+ */
+static bool leon3_get_gdb_legacy(Object *obj, Error **errp)
+{
+    return gdb_get_legacy_stop_reply();
+}
+
+static void leon3_set_gdb_legacy(Object *obj, bool value, Error **errp)
+{
+    gdb_set_legacy_stop_reply(value);
+}
+
 static void leon3_generic_machine_init(MachineClass *mc)
 {
+    ObjectClass *oc = OBJECT_CLASS(mc);
+
+    object_class_property_add_bool(oc, "gdb-legacy", leon3_get_gdb_legacy,
+                                   leon3_set_gdb_legacy);
+    object_class_property_set_description(oc, "gdb-legacy",
+        "Stop reply 'T05thread:NN;' for GDB < 7.1 (sparc-rtems-gdb 6.8)");
+
     mc->desc = "Leon-3 generic";
     mc->init = leon3_generic_hw_init;
     mc->default_cpu_type = SPARC_CPU_TYPE_NAME("LEON3");

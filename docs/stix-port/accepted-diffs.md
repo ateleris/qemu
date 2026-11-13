@@ -5259,3 +5259,35 @@ behaviour.
   tests (`edac-random` — it carries a reference implementation of the
   pinned draw, checked against canonical xorshift32 outputs computed
   outside the test — and `edac-hw-state`).
+
+## 47. gdb-legacy: stop reply for old GDB (baseline/upstream: "T05core:NN;")
+
+**Baseline and upstream:** the system-mode gdbstub answers GDB's initial
+`?` query with `T05core:NN;` (`gdbstub/system.c`,
+`gdb_build_stop_packet`). GDB before 7.1 does not know the `core` field
+and rejects the packet ("Malformed packet(b) (missing colon): re:01;"),
+so the STIX toolchain's debugger, `sparc-rtems-gdb` 6.8 from the RTEMS
+4.10 Windows build (`ASW\RTEMS-4.10\bin\sparc-rtems-gdb.exe`), cannot
+attach.
+
+- **The option:** `-machine leon3_generic,gdb-legacy=on` (a machine
+  property; with `-M leon3_generic` already given, `-machine
+  gdb-legacy=on` merges into it). The `?` reply then is
+  `T05thread:NN;` (the thread id as the other stop replies format it,
+  `gdb_append_thread_id`). Default off: upstream behaviour, byte for
+  byte. Modern GDB (15.1 tested) accepts both forms; only this packet
+  changes.
+- **Checked live (2026-11-13):** with the option, `sparc-rtems-gdb` 6.8
+  attaches, breaks at `Init`, continues, backtraces, shows locals and
+  steps on the AX gate ELF; without it the old error stays. Its
+  remaining warnings (packet size limited to 16384, no XML target
+  description) are harmless.
+- **Platform controller:** add it per config,
+  `qemu.extra_args = ["-machine", "gdb-legacy=on", "-gdb",
+  "tcp:127.0.0.1:1234"]`.
+- **Test:** qtest `gdb-legacy-stop` asks `?` over a raw gdbstub socket
+  in both modes (under `-accel tcg -S` with a dummy BIOS: the qtest
+  accelerator has no gdbstub) and reads the property back.
+- **Debugger note:** GDB's `kill` (Visual Studio "Stop Debugging", the
+  end of a `-batch` run) makes QEMU exit ("Terminated via GDBstub");
+  detach instead to keep the bench running.
