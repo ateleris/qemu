@@ -302,6 +302,10 @@ bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value);
  *   pulses IRQ 7 once. *rotb_count is the block count afterwards.
  */
 void stixctrl_scet_reg(STIXCTRL *s, uint32_t *coarse_reg, uint16_t *fine);
+/* AS-3 (D-ASd): the same read with the timestamp offset by @off_ns
+ * (whole milliseconds for the aspect jitter/step) */
+void stixctrl_scet_reg_at(STIXCTRL *s, int64_t off_ns,
+                          uint32_t *coarse_reg, uint16_t *fine);
 StixDetRotbResult stixctrl_rotb_append(STIXCTRL *s, const uint8_t *blocks,
                                        uint32_t n_blocks,
                                        uint32_t *rotb_count);

@@ -15465,6 +15465,319 @@ static void test_as_reset(void)
     stix_qtest_cleanup();
 }
 
+/* ---- Aspect system: the experiment knobs (AS-3) ---- */
+
+/* the N = 16 block period in ms (the legs' AVGSIZE 4) */
+#define AS_P16_MS       (AS_ROWS * 16)
+
+/*
+ * as-jitter (AS-3, D-ASd): as-jitter-next-ms shifts ONE flip's
+ * timestamp by the knob and is back to 0 for the next flip; only the
+ * timestamp moves, the payload keeps the ramp. At N = 16 the +-32 ms
+ * bound keeps the estimate pair in [976, 1040] ms (inc 15/16, the FSW
+ * ASSERTs stay out) — the entry/exit pair of the D-ASh row-2 shape.
+ * RED on the AS-2 binary: the property does not exist.
+ */
+static void test_as_jitter(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    QDict *st, *as;
+    uint8_t b1[AS_BLOCK_BYTES], b2[AS_BLOCK_BYTES], b3[AS_BLOCK_BYTES];
+    int64_t t0, t1, t2;
+
+    rotb_cfg(qts, true, false);
+    as_power(qts, 3, 4);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b1);
+    t0 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+
+    /* +32 ms on the next flip only */
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-jitter-next-ms", 32));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpint(qdict_get_int(as, "jitter_next_ms"), ==, 32);
+    qobject_unref(st);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b2);
+    t1 = as_scet_ns(ldl_be_p(b2 + 2), lduw_be_p(b2 + 6));
+    /* the entry pair: 1008 + 32 ms; the rows still encode block_seq 1 */
+    g_assert_cmpint(llabs(t1 - t0 - (AS_P16_MS + 32) * AS_TICK_NS), <=,
+                    20000);
+    /* the words are N = 16 sums of the ramp sample */
+    g_assert_cmpuint(as_row_word(b2, 0, 0), ==, 16u * AS_RAMP(0, 1, 0));
+
+    /* consumed: the knob is back to 0 and the exit pair is 1008 - 32 */
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpint(qdict_get_int(as, "jitter_next_ms"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "jittered"), ==, 1);
+    qobject_unref(st);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b3);
+    t2 = as_scet_ns(ldl_be_p(b3 + 2), lduw_be_p(b3 + 6));
+    g_assert_cmpint(llabs(t2 - t1 - (AS_P16_MS - 32) * AS_TICK_NS), <=,
+                    20000);
+
+    /* a negative jitter mirrors it: the entry pair is 1008 - 32 ms */
+    g_assert_true(as_qom_set_int(qts, "as-jitter-next-ms", -32));
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b1);
+    t1 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+    g_assert_cmpint(llabs(t1 - t2 - (AS_P16_MS - 32) * AS_TICK_NS), <=,
+                    20000);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-step (AS-3, D-ASd): as-step-next-ms is persistent — every flip
+ * from the armed as-step-at-block on carries +-d ms, earlier ones are
+ * clean (one gap event at the boundary, D-ASh row 3), and a pair of two
+ * stepped flips is nominal again; as-step-at-block = 0 arms at the
+ * next flip.
+ * RED on the AS-2 binary: the properties do not exist.
+ */
+static void test_as_step(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    QDict *st, *as;
+    uint8_t b1[AS_BLOCK_BYTES], b2[AS_BLOCK_BYTES];
+    int64_t t0, t1, t2, t3;
+
+    rotb_cfg(qts, true, false);
+    as_power(qts, 3, 4);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b1);
+    t0 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+
+    /* a -32 ms step starting at block_seq 2 */
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-step-at-block", 2));
+    g_assert_true(as_qom_set_int(qts, "as-step-next-ms", -32));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpint(qdict_get_int(as, "step_next_ms"), ==, -32);
+    g_assert_cmpuint(qdict_get_uint(as, "step_at_block"), ==, 2);
+    g_assert_cmpuint(qdict_get_uint(as, "step_start"), ==, 2);
+    qobject_unref(st);
+
+    /* the flip before the arming is clean */
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b2);
+    t1 = as_scet_ns(ldl_be_p(b2 + 2), lduw_be_p(b2 + 6));
+    g_assert_cmpint(llabs(t1 - t0 - AS_P16_MS * AS_TICK_NS), <=, 20000);
+
+    /* the armed flip carries the step, the next pair is nominal again */
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b1);
+    t2 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+    g_assert_cmpint(llabs(t2 - t1 - (AS_P16_MS - 32) * AS_TICK_NS), <=,
+                    20000);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b2);
+    t3 = as_scet_ns(ldl_be_p(b2 + 2), lduw_be_p(b2 + 6));
+    g_assert_cmpint(llabs(t3 - t2 - AS_P16_MS * AS_TICK_NS), <=, 20000);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "stepped"), ==, 2);
+    qobject_unref(st);
+
+    /* as-step-at-block = 0 arms at the next flip; the step persists */
+    qtest_system_reset(qts);
+    rotb_cfg(qts, true, false);
+    as_power(qts, 3, 4);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);  /* block 0, clean */
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b1);                 /* FIFO: consume block 0 */
+    t0 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+    g_assert_true(as_qom_set_int(qts, "as-step-next-ms", 16));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "step_at_block"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "step_start"), ==, 1);
+    qobject_unref(st);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b1);
+    t1 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b2);
+    t2 = as_scet_ns(ldl_be_p(b2 + 2), lduw_be_p(b2 + 6));
+    /* block 1 is +16 (pair 1024), block 2 too (pair 1008) */
+    g_assert_cmpint(llabs(t1 - t0 - (AS_P16_MS + 16) * AS_TICK_NS), <=,
+                    20000);
+    g_assert_cmpint(llabs(t2 - t1 - AS_P16_MS * AS_TICK_NS), <=, 20000);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "stepped"), ==, 2);
+    qobject_unref(st);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-drop (AS-3, D-ASd): as-drop-next = k skips the ROTB push of the
+ * next k flips — the double buffer keeps running (block_seq and the
+ * ramp advance, the pages flip), and the surviving timestamps stay on
+ * the real timeline (a drop shifts nothing), which is the model-side
+ * fact that keeps the FSW's archive time-rewrite chain continuous
+ * (ArchiveManager.c:243-245; D-ASh row 5: a loss without a time gap).
+ * RED on the AS-2 binary: the property does not exist.
+ */
+static void test_as_drop(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    QDict *st, *as;
+    uint8_t b0[AS_BLOCK_BYTES], b3[AS_BLOCK_BYTES];
+    int64_t t0, t3;
+
+    rotb_cfg(qts, true, false);
+    as_power(qts, 3, 4);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b0);
+    t0 = as_scet_ns(ldl_be_p(b0 + 2), lduw_be_p(b0 + 6));
+
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-drop-next", 2));
+
+    /* two flips land nowhere: the ring stays empty, the state advances */
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "drop_next"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 2);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped_knobs"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 1);
+    qobject_unref(st);
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "drop_next"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped_knobs"), ==, 2);
+    qobject_unref(st);
+
+    /* the third flip after the knob pushes: the ramp jumps to seq 3 */
+    qtest_clock_step(qts, AS_P16_MS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, b3);
+    g_assert_cmpuint(as_row_word(b3, 0, 0), ==, 16u * AS_RAMP(0, 3, 0));
+    g_assert_cmpuint(as_row_word(b3, 62, 3), ==, 16u * AS_RAMP(3, 3, 62));
+    t3 = as_scet_ns(ldl_be_p(b3 + 2), lduw_be_p(b3 + 6));
+    /* the timestamps keep the real timeline: 3 periods over the gap */
+    g_assert_cmpint(llabs(t3 - t0 - 3 * AS_P16_MS * AS_TICK_NS), <=, 20000);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 4);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 2);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped"), ==, 2);
+    qobject_unref(st);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-knob-reject (AS-3, D-ASd): the N-aware validator refuses, with the
+ * state unchanged (the adc-inject setter pattern): ppm outside +-5000
+ * or < 0 while N = 1 is latched; jitter/step outside +-32 ms; a
+ * (rate, step, jitter) combination whose worst-case pair delta leaves
+ * the FSW's increment estimate outside 1..16 (AspectCtrl.c:219-230);
+ * jitter/drop while as-enable=false (a one-shot must not outlive the
+ * off window; the persistent step is allowed there).
+ * RED on the AS-2 binary: the properties do not exist.
+ */
+static void test_as_knob_reject(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    QDict *st, *as;
+
+    /* N = 1 latched (nothing powered yet): any negative ppm truncates
+     * the 63 ms pair to 62 (inc 0), and any nonzero jitter/step busts
+     * the 63 ms floor */
+    g_assert_false(as_qom_set_int(qts, "as-rate-ppm", -1));
+    g_assert_false(as_qom_set_int(qts, "as-rate-ppm", -5001));
+    g_assert_false(as_qom_set_int(qts, "as-rate-ppm", 5001));
+    g_assert_false(as_qom_set_int(qts, "as-jitter-next-ms", 1));
+    g_assert_false(as_qom_set_int(qts, "as-jitter-next-ms", 33));
+    g_assert_false(as_qom_set_int(qts, "as-jitter-next-ms", -33));
+    g_assert_false(as_qom_set_int(qts, "as-step-next-ms", 32));
+    g_assert_false(as_qom_set_int(qts, "as-step-next-ms", -33));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpint(qdict_get_int(as, "jitter_next_ms"), ==, 0);
+    g_assert_cmpint(qdict_get_int(as, "step_next_ms"), ==, 0);
+    g_assert_cmpint(qdict_get_int(as, "rate_ppm"), ==, 0);
+    qobject_unref(st);
+
+    /* at N = 16: rate 5000 alone fits, jitter on top fits, a step on
+     * top of both busts the 1070 ms cap (1013.04 + 32 + 32) */
+    as_power(qts, 3, 4);
+    qtest_clock_step(qts, AS_TICK_NS);      /* row 0 latches N = 16 */
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-rate-ppm", 5000));
+    g_assert_true(as_qom_set_int(qts, "as-jitter-next-ms", 32));
+    g_assert_false(as_qom_set_int(qts, "as-step-next-ms", 32));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpint(qdict_get_int(as, "jitter_next_ms"), ==, 32);
+    g_assert_cmpint(qdict_get_int(as, "step_next_ms"), ==, 0);
+    qobject_unref(st);
+    /* without the jitter the step fits */
+    g_assert_true(as_qom_set_int(qts, "as-jitter-next-ms", 0));
+    g_assert_true(as_qom_set_int(qts, "as-step-next-ms", 32));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpint(qdict_get_int(as, "jitter_next_ms"), ==, 0);
+    g_assert_cmpint(qdict_get_int(as, "step_next_ms"), ==, 32);
+    qobject_unref(st);
+
+    /* at N = 4 the same jitter + step fit (252 +- 64 ms); the reset
+     * cleared the knob state but kept the scene rate, so zero it */
+    qtest_system_reset(qts);
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-rate-ppm", 0));
+    as_power(qts, 3, 2);
+    qtest_clock_step(qts, 4 * AS_TICK_NS);  /* row 0 latches N = 4 */
+    g_assert_true(as_qom_set_int(qts, "as-jitter-next-ms", 32));
+    g_assert_true(as_qom_set_int(qts, "as-step-next-ms", 32));
+
+    /* jitter/drop are refused while as-enable=false; the persistent
+     * step is not (it applies when generation resumes). N = 4 latched
+     * first: at N = 1 the step itself would not validate. */
+    qtest_system_reset(qts);
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-rate-ppm", 0));
+    as_power(qts, 3, 2);
+    qtest_clock_step(qts, 2 * AS_TICK_NS);  /* row 0 latches N = 4 */
+    g_assert_true(stix_qom_set_bool(qts, AS_CTRL, "as-enable", false));
+    g_assert_false(as_qom_set_int(qts, "as-jitter-next-ms", 6));
+    g_assert_false(stix_qom_set_u64(qts, AS_CTRL, "as-drop-next", 1));
+    g_assert_true(as_qom_set_int(qts, "as-step-next-ms", 16));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpint(qdict_get_int(as, "jitter_next_ms"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "drop_next"), ==, 0);
+    g_assert_cmpint(qdict_get_int(as, "step_next_ms"), ==, 16);
+    qobject_unref(st);
+    /* re-enabled, the one-shots arm again */
+    g_assert_true(stix_qom_set_bool(qts, AS_CTRL, "as-enable", true));
+    g_assert_true(as_qom_set_int(qts, "as-jitter-next-ms", 6));
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-drop-next", 1));
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_aspect_register(void)
 {
     qtest_add_func("/sparc/stix/as-reg-reset", test_as_reg_reset);
@@ -15480,6 +15793,11 @@ static void stix_aspect_register(void)
     qtest_add_func("/sparc/stix/as-push-gating", test_as_push_gating);
     qtest_add_func("/sparc/stix/as-hw-state", test_as_hw_state);
     qtest_add_func("/sparc/stix/as-reset", test_as_reset);
+    /* AS-3: the experiment knobs */
+    qtest_add_func("/sparc/stix/as-jitter", test_as_jitter);
+    qtest_add_func("/sparc/stix/as-step", test_as_step);
+    qtest_add_func("/sparc/stix/as-drop", test_as_drop);
+    qtest_add_func("/sparc/stix/as-knob-reject", test_as_knob_reject);
 }
 
 static void stix_edac_register(void)

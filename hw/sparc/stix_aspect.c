@@ -35,6 +35,14 @@
  * D-ASh trip points are pinned on (a negative rate shortens the block;
  * at N=16, -2000 ppm gives a 1005..1006 ms pair delta and inc = 15).
  * Since the period is an integer ns count, ppm is carried exactly.
+ *
+ * The experiment knobs (AS-3, D-ASd): as-jitter-next-ms shifts ONE
+ * flip's timestamp then resets, as-step-next-ms (+ as-step-at-block)
+ * shifts every flip from the armed one on, as-drop-next skips the ROTB
+ * push of the next k flips — all at whole-ms exactness in the
+ * corrected-SCET ns domain, validated N-aware by the shared pair check
+ * so the FSW's increment estimate (AspectCtrl.c:219-230) stays in
+ * 1..16. They are state, not scene: the reset clears them (D-ASf).
  */
 
 #include "qemu/osdep.h"
@@ -147,14 +155,32 @@ static void stix_aspect_row_done(StixAspectState *a)
  * obeys the rotbConfig ENABLE /\ !TESTMODE gating and the drop-new
  * ring rule; a timer callback holds the BQL, so it can never interleave
  * inside a detector chunk (D-Dj).
+ *
+ * AS-3 (D-ASd): the one-shot jitter (the next flip only, then 0) and
+ * the persistent step (every flip from step_start on) shift the block
+ * timestamp by whole ms in the corrected-SCET ns domain, so the FSW's
+ * whole-ms truncation (Timing.c:395-399) sees exactly +-d ms; the
+ * as-drop-next counter skips only the ROTB push — the pages keep
+ * flipping on the real timeline, which is what keeps the FSW's archive
+ * time-rewrite chain continuous across a loss (ArchiveManager.c:243-245,
+ * D-ASh row 5).
  */
 static void stix_aspect_flip(StixAspectState *a)
 {
     StixDetRotbResult r;
     uint32_t coarse_reg, rotb_count = 0, row, d;
     uint16_t fine;
+    int64_t off_ns = 0;
+    bool jittered = a->jitter_ms != 0;
+    bool stepped = a->step_ms != 0 && a->block_seq >= a->step_start;
 
-    stixctrl_scet_reg(a->owner, &coarse_reg, &fine);
+    if (jittered) {
+        off_ns += (int64_t)a->jitter_ms * 1000000LL;
+    }
+    if (stepped) {
+        off_ns += (int64_t)a->step_ms * 1000000LL;
+    }
+    stixctrl_scet_reg_at(a->owner, off_ns, &coarse_reg, &fine);
     stw_be_p(a->blk, STIX_ASPECT_DESC);
     stl_be_p(a->blk + 2, coarse_reg);
     stw_be_p(a->blk + 6, fine);
@@ -168,15 +194,36 @@ static void stix_aspect_flip(StixAspectState *a)
     a->flip_coarse = coarse_reg;
     a->flip_fine = fine;
 
-    r = stixctrl_rotb_append(a->owner, a->blk, 1, &rotb_count);
-    trace_stixasp_push(a->block_seq, stix_aspect_rotb_name[r], rotb_count);
-    if (r == STIX_DET_ROTB_APPENDED) {
-        a->pushed++;
-    } else {
+    if (jittered) {
+        trace_stixasp_jitter(a->block_seq, a->jitter_ms);
+        a->jitter_ms = 0;           /* one-shot: the next flip is clean */
+        a->jittered++;
+    }
+    if (stepped) {
+        if (!a->step_fired) {
+            trace_stixasp_step(a->block_seq, a->step_ms);
+            a->step_fired = true;   /* the boundary, once per arming */
+        }
+        a->stepped++;
+    }
+
+    if (a->drop_next != 0) {
+        a->drop_next--;
         a->dropped++;
-        if (r == STIX_DET_ROTB_FULL) {
-            a->rotb_full++;
-            trace_stixasp_drop(a->block_seq, "rotb-full");
+        a->dropped_knobs++;
+        trace_stixasp_drop(a->block_seq, "knob");
+    } else {
+        r = stixctrl_rotb_append(a->owner, a->blk, 1, &rotb_count);
+        trace_stixasp_push(a->block_seq, stix_aspect_rotb_name[r],
+                           rotb_count);
+        if (r == STIX_DET_ROTB_APPENDED) {
+            a->pushed++;
+        } else {
+            a->dropped++;
+            if (r == STIX_DET_ROTB_FULL) {
+                a->rotb_full++;
+                trace_stixasp_drop(a->block_seq, "rotb-full");
+            }
         }
     }
     a->block_seq++;
@@ -247,9 +294,10 @@ void stix_aspect_unrealize(StixAspectState *a)
  * re-powers and re-configures at every boot/SAFE/NOMINAL entry
  * (OpModeMgmt.c:1066-1068), so the tick stops, the registers start
  * from 0 (channels off, AVGSIZE 0) and the row/buffer state, the
- * counters and the one-shot state clear. The scene knobs (as-pattern,
- * as-sun, as-rate-ppm, as-enable) survive: they describe the Sun, the
- * D-Db rule. as-model=off keeps today's plain storage and no reset
+ * counters and the experiment knobs (jitter, step, drop: state, not
+ * scene) clear. The scene knobs (as-pattern, as-sun, as-rate-ppm,
+ * as-enable) survive: they describe the Sun, the D-Db rule.
+ * as-model=off keeps today's plain storage and no reset
  * (grlib_stixctrl.c falls through to the register file).
  */
 void stix_aspect_reset(StixAspectState *a)
@@ -274,9 +322,18 @@ void stix_aspect_reset(StixAspectState *a)
     a->block_seq = 0;
     a->pushed = 0;
     a->dropped = 0;
+    a->dropped_knobs = 0;
     a->rotb_full = 0;
+    a->jittered = 0;
+    a->stepped = 0;
     a->flip_coarse = 0;
     a->flip_fine = 0;
+    a->jitter_ms = 0;
+    a->step_ms = 0;
+    a->step_at = 0;
+    a->step_start = 0;
+    a->step_fired = false;
+    a->drop_next = 0;
     a->reg->asCmdSta = 0;
     for (i = 0; i < 4; i++) {
         a->reg->asQlData[i] = 0;
@@ -401,25 +458,36 @@ static void stix_aspect_rate_get(Object *obj, Visitor *v,
 }
 
 /*
- * D-ASd: the rate is bounded to +-5000 and, N-aware against the
- * latched AVGSIZE, every possible whole-ms estimate-pair delta of the
- * 63*N block period must keep the FSW's increment estimate inside
- * 1..16 (AspectCtrl.c:219-230 would ASSERT otherwise): floor(P) >= 63
- * and floor(P) + 1 <= 1070 for P = 63*N*(1+ppm*1e-6) ms — at N=1 any
- * negative ppm truncates the pair delta to 62 and is rejected. Raw
- * AVGSIZE 5..7 (N = 32..128) is out of the FSW contract
- * (Aspect.c:108-118 validates 0..4); the pair check runs there only
- * against the 63-ms floor.
+ * D-ASd, the N-aware pair check shared by the rate/step/jitter setters:
+ * the FSW's once-per-request increment estimate is floor(pair delta / 63)
+ * from two whole-ms-truncated timestamps (Timing_ToMs, Timing.c:395-399),
+ * and its ASSERTs (AspectCtrl.c:219-230) hang unless it stays in 1..16.
+ * A (rate, step, jitter) combination is accepted only if every pair
+ * delta it can produce does: the pair period P = 63*N*(1+ppm*1e-6) ms
+ * shifts by up to |step| + |jitter| ms at the estimate pair, and the
+ * truncated delta is floor(P) or floor(P) + 1, so the envelope must
+ * keep floor(P - spread) >= 63 and floor(P + spread) + 1 <= 1070, i.e.
+ * P - spread >= 63 ms and P + spread < 1070 ms at the latched N (at
+ * N = 1 that rejects any ppm < 0 and any +-32 ms jitter/step; a +-32 ms
+ * jitter alone needs N >= 2, together with a +-32 ms step N >= 3). Raw AVGSIZE 5..7 (N = 32..128) is out of the FSW
+ * contract (Aspect.c:108-118 validates 0..4); the upper bound is not
+ * enforced there (P already exceeds it).
  */
-static bool stix_aspect_rate_ok(StixAspectState *a, int32_t ppm)
+static bool stix_aspect_pair_ok(StixAspectState *a, int32_t ppm,
+                                int32_t step_ms, int32_t jitter_ms)
 {
     int64_t p_ns = (int64_t)STIX_ASPECT_ROWS * a->row_n *
                    (STIX_ASPECT_TICK_NS + ppm);
+    int64_t spread_ns = (int64_t)(step_ms < 0 ? -step_ms : step_ms) *
+                        1000000LL +
+                        (int64_t)(jitter_ms < 0 ? -jitter_ms : jitter_ms) *
+                        1000000LL;
 
-    if (p_ns < STIX_ASPECT_ROWS * STIX_ASPECT_TICK_NS) {
+    if (p_ns - spread_ns < (int64_t)STIX_ASPECT_ROWS * STIX_ASPECT_TICK_NS) {
         return false;               /* the pair delta can truncate < 63 ms */
     }
-    if (a->row_n <= 16 && p_ns >= 1070LL * 1000000LL) {
+    if (a->row_n <= 16 &&
+        p_ns + spread_ns >= 1070LL * 1000000LL) {
         return false;               /* the pair delta can reach inc > 16 */
     }
     return true;
@@ -439,10 +507,11 @@ static void stix_aspect_rate_set(Object *obj, Visitor *v,
                    STIX_ASPECT_PPM_MAX);
         return;
     }
-    if (!stix_aspect_rate_ok(a, value)) {
-        error_setg(errp, "%s: %d ppm leaves the FSW's increment estimate "
-                   "outside 1..16 at the latched N = %u", name, value,
-                   a->row_n);
+    if (!stix_aspect_pair_ok(a, value, a->step_ms, a->jitter_ms)) {
+        error_setg(errp, "%s: %d ppm with the armed step %d ms and jitter "
+                   "%d ms leaves the FSW's increment estimate outside "
+                   "1..16 at the latched N = %u", name, value, a->step_ms,
+                   a->jitter_ms, a->row_n);
         return;
     }
     a->rate_ppm = value;
@@ -469,7 +538,139 @@ static void stix_aspect_enable_set(Object *obj, Visitor *v,
         return;
     }
     a->enable = value;
+    if (!value) { /* the one-shots never outlive the off window */
+        a->jitter_ms = 0;
+        a->drop_next = 0;
+    }
     stix_aspect_trace_scene(a);
+}
+
+/* ---- the experiment knobs (AS-3, D-ASd), write-only (det-inject
+ * pattern): the current values live in the hw-state "as" section ---- */
+
+/*
+ * as-jitter-next-ms: added to the NEXT flipped block's timestamp only,
+ * then back to 0 — a one-block error, the two gap events (entry +d,
+ * exit -d) of D-ASh row 2. Refused while as-enable=false (a one-shot
+ * must not outlive the off window) and by the N-aware pair check with
+ * the armed step.
+ */
+static void stix_aspect_jitter_set(Object *obj, Visitor *v,
+                                   const char *name, void *opaque,
+                                   Error **errp)
+{
+    StixAspectState *a = stix_aspect_of(obj, opaque);
+    int32_t value;
+
+    if (!visit_type_int32(v, name, &value, errp)) {
+        return;
+    }
+    if (value < -STIX_ASPECT_STEP_MS_MAX ||
+        value > STIX_ASPECT_STEP_MS_MAX) {
+        error_setg(errp, "%s: %d ms is outside +-%d", name, value,
+                   STIX_ASPECT_STEP_MS_MAX);
+        return;
+    }
+    if (!a->enable) {
+        error_setg(errp, "%s: refused while as-enable=false", name);
+        return;
+    }
+    if (!stix_aspect_pair_ok(a, a->rate_ppm, a->step_ms, value)) {
+        error_setg(errp, "%s: %d ms with the armed step %d ms and rate "
+                   "%d ppm leaves the FSW's increment estimate outside "
+                   "1..16 at the latched N = %u", name, value, a->step_ms,
+                   a->rate_ppm, a->row_n);
+        return;
+    }
+    a->jitter_ms = value;
+}
+
+/*
+ * as-step-next-ms: a persistent step — every flip from the armed one on
+ * carries +-d ms (a biased FPGA epoch; the single boundary gap of
+ * D-ASh row 3, or the corrupted estimate pair of row 7). 0 clears it.
+ * Not refused while as-enable=false: it is state, and it applies when
+ * generation resumes. Arming resolves as-step-at-block (0 = the next
+ * flip) against the live block_seq at once.
+ */
+static void stix_aspect_step_set(Object *obj, Visitor *v,
+                                 const char *name, void *opaque,
+                                 Error **errp)
+{
+    StixAspectState *a = stix_aspect_of(obj, opaque);
+    int32_t value;
+
+    if (!visit_type_int32(v, name, &value, errp)) {
+        return;
+    }
+    if (value < -STIX_ASPECT_STEP_MS_MAX ||
+        value > STIX_ASPECT_STEP_MS_MAX) {
+        error_setg(errp, "%s: %d ms is outside +-%d", name, value,
+                   STIX_ASPECT_STEP_MS_MAX);
+        return;
+    }
+    if (!stix_aspect_pair_ok(a, a->rate_ppm, value, a->jitter_ms)) {
+        error_setg(errp, "%s: %d ms with the rate %d ppm and jitter %d ms "
+                   "leaves the FSW's increment estimate outside 1..16 at "
+                   "the latched N = %u", name, value, a->rate_ppm,
+                   a->jitter_ms, a->row_n);
+        return;
+    }
+    a->step_ms = value;
+    if (value != 0) { /* 0 clears; keep the last start for the hw-state */
+        a->step_start = a->step_at ? a->step_at : a->block_seq;
+        a->step_fired = false;
+    }
+}
+
+/*
+ * as-step-at-block: where the step starts — 0 = the next flip,
+ * otherwise the block_seq (the model-wide flip counter, in the hw-state
+ * and the stixasp_flip trace) whose flip begins the step, the exact
+ * placement the D-ASh row-7 leg needs. It is resolved when the step is
+ * armed (or here, if one is armed already); a block_seq already passed
+ * applies from the next flip.
+ */
+static void stix_aspect_step_at_set(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    StixAspectState *a = stix_aspect_of(obj, opaque);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    a->step_at = value;
+    if (a->step_ms != 0) {
+        a->step_start = value ? value : a->block_seq;
+        a->step_fired = false;
+    }
+}
+
+/*
+ * as-drop-next: the next k flipped blocks are not appended (the double
+ * buffer keeps running; the archive's time-rewrite chain,
+ * ArchiveManager.c:243-245, leaves no time gap — the only signature is
+ * the payload content jump, D-ASh row 5). It counts down at the flips.
+ * Refused while as-enable=false: no flips happen there, and the count
+ * must not outlive the off window.
+ */
+static void stix_aspect_drop_set(Object *obj, Visitor *v,
+                                 const char *name, void *opaque,
+                                 Error **errp)
+{
+    StixAspectState *a = stix_aspect_of(obj, opaque);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (!a->enable) {
+        error_setg(errp, "%s: refused while as-enable=false", name);
+        return;
+    }
+    a->drop_next = value;
 }
 
 /* ---- the hw-state "as" section (D-ASg), one accessor, pure ---- */
@@ -498,7 +699,17 @@ void stix_aspect_hw_state(StixAspectState *a, QDict *as)
     qdict_put_int(as, "rows", a->row);
     qdict_put_int(as, "pushed", a->pushed);
     qdict_put_int(as, "dropped", a->dropped);
+    qdict_put_int(as, "dropped_knobs", a->dropped_knobs);
     qdict_put_int(as, "rotb_full", a->rotb_full);
+    qdict_put_int(as, "jittered", a->jittered);
+    qdict_put_int(as, "stepped", a->stepped);
+    /* the experiment knobs' current values (AS-3, D-ASd; fields added
+     * to the schema-4 section, no schema bump) */
+    qdict_put_int(as, "jitter_next_ms", a->jitter_ms);
+    qdict_put_int(as, "step_next_ms", a->step_ms);
+    qdict_put_int(as, "step_at_block", a->step_at);
+    qdict_put_int(as, "step_start", a->step_start);
+    qdict_put_int(as, "drop_next", a->drop_next);
     qdict_put_int(as, "flip_coarse", a->flip_coarse);
     qdict_put_int(as, "flip_fine", a->flip_fine);
     for (i = 0; i < 4; i++) {
@@ -540,4 +751,31 @@ void stix_aspect_class_init(ObjectClass *klass, size_t as_offset)
     object_class_property_set_description(klass, "as-enable",
         "the generation switch: false = no samples, no rows, no blocks "
         "at all (runtime; survives a device reset)");
+    /* AS-3 (D-ASd), the experiment knobs: write-only, the current
+     * values are in the hw-state "as" section; state, not scene (the
+     * device reset clears them) */
+    object_class_property_add(klass, "as-jitter-next-ms", "int32",
+                              &int32_type_info, NULL,
+                              stix_aspect_jitter_set, NULL, opaque);
+    object_class_property_set_description(klass, "as-jitter-next-ms",
+        "one-shot: the next flipped block's timestamp shifts by this "
+        "many ms (-32..32), then the knob is back to 0 (runtime)");
+    object_class_property_add(klass, "as-step-next-ms", "int32",
+                              &int32_type_info, NULL,
+                              stix_aspect_step_set, NULL, opaque);
+    object_class_property_set_description(klass, "as-step-next-ms",
+        "persistent: every flip from the armed one on shifts its "
+        "timestamp by this many ms (-32..32); 0 clears (runtime)");
+    object_class_property_add(klass, "as-step-at-block", "uint32",
+                              &uint32_type_info, NULL,
+                              stix_aspect_step_at_set, NULL, opaque);
+    object_class_property_set_description(klass, "as-step-at-block",
+        "where the step starts: 0 = the next flip, otherwise the "
+        "block_seq whose flip begins it (runtime)");
+    object_class_property_add(klass, "as-drop-next", "uint32",
+                              &uint32_type_info, NULL,
+                              stix_aspect_drop_set, NULL, opaque);
+    object_class_property_set_description(klass, "as-drop-next",
+        "the next k flipped blocks are not appended (the pages keep "
+        "flipping); counts down at the flips (runtime)");
 }

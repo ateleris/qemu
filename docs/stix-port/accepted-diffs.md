@@ -5433,12 +5433,55 @@ aspect archive stayed empty and every aspect-burst request answered
   is not bounded for these latched N > 16, so such a guest with a fast
   rate can drive the FSW's inc > 16 ASSERT (AspectCtrl.c:229-230), i.e.
   a hang, when a burst request runs; that is the FSW's own behaviour.
+- **The experiment knobs (AS-3, D-ASd).** Write-only runtime class
+  properties on `/machine/stixctrl` (the det-inject pattern; the current
+  values are in the hw-state `as` section, below), state, not scene: the
+  device reset clears them (D-ASf). `as-jitter-next-ms` (int32,
+  ±32 ms): the NEXT flipped block's timestamp carries it, then the knob
+  is back to 0 — a one-block error, the two gap events (entry +d, exit
+  −d) of row 2. `as-step-next-ms` (int32, ±32 ms): persistent, every
+  flip from the armed one on carries it (a biased FPGA epoch; the single
+  boundary gap of row 3, or the corrupted once-per-request estimate pair
+  of row 7); 0 clears. `as-step-at-block` (uint32): 0 = the next flip,
+  otherwise the block_seq whose flip starts the step (the row-7
+  placement), resolved when the step is armed (re-resolved by re-arming,
+  or by setting it while a step is live); a block_seq already passed
+  applies from the next flip. `as-drop-next` (uint32):
+  the next k flipped blocks are not appended — the pages keep flipping
+  on the real timeline, and because the archive rewrites every record's
+  start to the previous record's raw end (ArchiveManager.c:243-245,
+  :265-266) a loss leaves no time gap at all, only the payload content
+  jump (row 5). The timestamp shifts run in the corrected-SCET ns domain
+  (`stixctrl_scet_reg_at`, new in grlib_stixctrl.c), so a ±d ms knob
+  moves the FSW's whole-ms view (Timing_ToMs, Timing.c:395-399) by
+  exactly d ms; the drop skips only the `stixctrl_rotb_append` push.
+  The setters validate N-aware against the latched AVGSIZE (the
+  adc-inject setter pattern): the ±32 ms bound, and one shared pair
+  check — a (rate, step, jitter) combination is accepted only if every
+  pair delta it can produce keeps the FSW's increment estimate
+  floor(delta/63) inside 1..16 (the ASSERTs, AspectCtrl.c:219-230):
+  with P = 63·N·(1+ppm·1e-6) ms, P − |step| − |jitter| ≥ 63 ms and
+  P + |step| + |jitter| < 1070 ms must hold at the latched N (at N = 1
+  that rejects any ppm < 0 — the AS-2 rule, now the same check — and
+  any nonzero step/jitter; a ±32 ms jitter alone needs N ≥ 2, with a
+  ±32 ms step as well N ≥ 3). `as-jitter-next-ms` and
+  `as-drop-next` are additionally refused while `as-enable=false` (a
+  one-shot must not outlive the off window, and `as-enable=false`
+  clears an armed one). They are set at run time (QMP qom-set): at
+  startup N = 1 is latched, so a nonzero jitter/step on the command line
+  is refused and QEMU exits. The persistent step is
+  not. New traces: `stixasp_jitter`/`stixasp_step` (block_seq, delta_ms,
+  at the affected flip / the step boundary) and `stixasp_drop`'s reason
+  "knob". The hw-state `as` section gains the knobs' current values
+  (jitter_next_ms, step_next_ms, step_at_block, step_start, drop_next)
+  and the counters jittered/stepped/dropped_knobs — fields added to the
+  schema-4 section, no schema bump.
 - **Observability (D-ASg).** `asQlData[0..3]` update at every row end
   with the last completed N-sum (the D-ASe "very last accumulation per
   diode"); traces only from actions: `stixasp_scene` (a knob set),
   `stixasp_tick_arm`, `stixasp_flip` (block_seq, N, SCET),
   `stixasp_push` (block_seq, result, rotb_count), `stixasp_drop`
-  (block_seq, reason — rotb-full until AS-3 adds the knob drops); the
+  (block_seq, reason — knob or rotb-full); the
   controller hw-state gained an `as` section
   (`stix_aspect_hw_state`: channels, AVGSIZE raw + latched N, the
   scene knobs, tick state, block_seq, open-page rows, counters
@@ -5462,5 +5505,11 @@ aspect archive stayed empty and every aspect-burst request answered
   `as-hw-state` (schema 4, the section, setter refusals) and
   `as-reset` (tick stops, state clears, scene survives, power-on
   restarts) — all red on the AS-1 binary (no generator, no `as`
-  section, unknown properties).
+  section, unknown properties). The AS-3 block `as-jitter` (one flip's
+  timestamp shifted, the next clean, the knob back to 0), `as-step`
+  (all flips from the armed block_seq on shifted, earlier ones clean,
+  next-flip arming with 0), `as-drop` (k pushes missing from the ring,
+  the pages and the timeline unaffected) and `as-knob-reject` (the
+  N-aware validator; every refusal leaves the state unchanged) — red on
+  the AS-2 binary (unknown properties, missing hw-state keys).
 

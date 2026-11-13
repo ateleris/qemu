@@ -114,6 +114,8 @@ stixasp_tick_arm(int armed, int64_t deadline_ns) "tick armed=%d deadline_ns=%" P
 stixasp_flip(uint32_t block_seq, uint32_t n_ms, uint32_t coarse, uint32_t fine) "flip: block %u, n=%u ms, scet 0x%08x:0x%04x"
 stixasp_push(uint32_t block_seq, const char *result, uint32_t rotb_count) "push: block %u %s, rotb_count=%u"
 stixasp_drop(uint32_t block_seq, const char *why) "drop: block %u (%s)"
+stixasp_jitter(uint32_t block_seq, int32_t delta_ms) "jitter: block %u, delta=%d ms"
+stixasp_step(uint32_t block_seq, int32_t delta_ms) "step: block %u, delta=%d ms"
 
 # tmtc_io_server.c (STIX)
 stixtmtc_accept_failed(void) "accept failed"

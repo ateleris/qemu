@@ -207,8 +207,9 @@ static void stixctrl_hk_last_clear(STIXCTRL *s)
 
 static stixCtrl_scet_s nsToSCET(int64_t ns)
 {
-	/* ns >= 0 by construction: the correction is only ever set to
-	 * now - target, and the elapsed time since then is >= 0. */
+	/* ns >= 0: the correction is only ever set to now - target and the
+	 * elapsed time since then is >= 0; stixctrl_scet_reg_at clamps its
+	 * negative offsets at 0. */
 	int64_t coarse = ns / STIX_NSEC_PER_SEC;
 	int64_t rem = ns - coarse * STIX_NSEC_PER_SEC;
 	stixCtrl_scet_s scet;
@@ -231,15 +232,29 @@ void stixctrl_scet_now(STIXCTRL *s, uint32_t *coarse, uint16_t *fine)
 
 /*
  * D-5: the SCET exactly as the 0xC8/0xCC read composes it (bit 31 of
- * the seconds is the UNSYNCED status flag), for the detector chunks
+ * the seconds is the UNSYNCED status flag), for the detector chunks.
+ * The @off_ns variant (AS-3, D-ASd) serves the aspect jitter/step: the
+ * block timestamp shifted by whole milliseconds in the corrected-SCET
+ * ns domain, so the sub-ms phase (the FSW's Timing_ToMs truncation,
+ * Timing.c:395-399, sees exactly +-d ms) and the UNSYNCED flag survive.
  */
-void stixctrl_scet_reg(STIXCTRL *s, uint32_t *coarse_reg, uint16_t *fine)
+void stixctrl_scet_reg_at(STIXCTRL *s, int64_t off_ns,
+                          uint32_t *coarse_reg, uint16_t *fine)
 {
-    stixCtrl_scet_s scet = nsToSCET(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
-                                    s->time_correction_ns);
+    int64_t ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                 s->time_correction_ns + off_ns;
+    stixCtrl_scet_s scet;
 
+    /* a negative shift within 32 ms of a SCET epoch 0 stops at 0 rather
+     * than wrapping the fine field (not reached by the gate legs) */
+    scet = nsToSCET(ns < 0 ? 0 : ns);
     *coarse_reg = scet.coarse | (s->unsynced_flag << 31);
     *fine = scet.fine;
+}
+
+void stixctrl_scet_reg(STIXCTRL *s, uint32_t *coarse_reg, uint16_t *fine)
+{
+    stixctrl_scet_reg_at(s, 0, coarse_reg, fine);
 }
 
 void stixctrl_set_scet_commit_hook(STIXCTRL *s,
