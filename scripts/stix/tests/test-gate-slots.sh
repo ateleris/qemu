@@ -58,6 +58,11 @@ if git -C "$REPO_ROOT" cat-file -e "$REF^{commit}" 2>/dev/null; then
     mkdir -p "$OLD"
     git -C "$REPO_ROOT" archive "$REF" scripts/stix docs/stix-port/baseline \
         | tar -x -C "$OLD"
+    # Intended change: the boot golden itself moved on (cache EDAC
+    # enabled, E_EDAC_MODULE_CACHE = 1); the legacy case compares the
+    # scripts, so both sides check against today's golden.
+    cp "$REPO_ROOT/docs/stix-port/baseline/uart.golden.log" \
+        "$OLD/docs/stix-port/baseline/uart.golden.log"
 else
     echo "skip - legacy identity: $REF not in this repository"
 fi
