@@ -237,6 +237,18 @@ check "stix_slot_busy takes no lock (slot 3 stays free)" $? \
     "out=$out calls=$(cat "$WORK/flock.calls")"
 release_all
 
+# --- busy= sees a lock taken the way stix_slot_try takes it: flock(1)
+# locks an inherited fd and exits, so /proc/locks no longer lists it ---
+: >> "$(lockf 2)"
+( exec 9>>"$(lockf 2)"; flock -n 9 || exit 1; exec sleep 600 ) \
+    > /dev/null 2>&1 < /dev/null &
+HOLDERS+=($!)
+for i in $(seq 50); do is_held 2 && break; sleep 0.1; done
+out="$(helper 'STIX_SLOT=1; STIX_SLOT_MODE=1; stix_slot_busy')"
+[ "$out" = 1 ] && is_held 2
+check "busy= counts a slot whose flock(1) taker has exited" $? "out=$out"
+release_all
+
 # --- the sparse-copy guard (a fake 8 MiB master with 16 KiB of data) ---
 M="$WORK/master/flash.bin"
 mkdir -p "$WORK/master" "$WORK/run"

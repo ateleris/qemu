@@ -87,7 +87,10 @@ stix_slot_held() { # k
     id="$(printf '%02x:%02x:%s' $(((t[0] >> 8) & 0xfff)) \
         $(((t[0] & 0xff) | ((t[0] >> 12) & 0xfff00))) "${t[1]}")"
     case "$held" in *" $id "*) return 0 ;; esac
-    return 1
+    # stix_slot_try's lock is taken by flock(1), which exits at once: the
+    # kernel then reports the owner as pid 0 and leaves the lock out of
+    # /proc/locks, but the holder's fdinfo still lists it
+    grep -qs -- " $id " /proc/[0-9]*/fdinfo/* 2>/dev/null
 }
 
 # The number of held slot locks in 0..STIX_SLOTS other than our own.
