@@ -2,7 +2,9 @@
 
 Status: draft, 2026-11-13; reviewed by GLM 2026-11-12 — 4 MAJOR + 13
 MINOR findings, all resolved (see Review resolutions; every finding was
-re-verified against the tree before the fix). Base: track worktree
+re-verified against the tree before the fix). PL-11a implemented
+2026-11-13 (see its "As built" note in the commit's section). Base:
+track worktree
 `~/dev/qemu-stix-platform` (branch `stix-uprev-pl11`, integration tip
 `a5dc6d5c11`), which already carries the attenuator (A-1..A-5), flash
 damage (X-1..X-5), memory upsets (M-1..M-7) and detector (D-1..D-7)
@@ -191,7 +193,10 @@ PL-8 `reported`, PL-10 gdb | — | state.py:28 reported=None; no gdb gate | unch
   keepalive) keep today's path. Under `on_guest_reset = cold` the hooks
   fire twice (RESET on the dying process, power.py:344-351, then
   `spawned` on the fresh one, :359-370) — harmless here, and another
-  reason reapply only re-sets and never re-captures.
+  reason reapply only re-sets and never re-captures. Armed `at_sim`
+  faults are controller-side too: they survive a power cycle and fire
+  at their absolute sim time (the bench clock is continuous across
+  cycles).
 - **D-PSb — one watch idiom.** Everything watchable goes through
   hw-state → state leaves; no separate per-device getters. The
   attenuator and EDAC sections are mapped as-is (no emulator change);
@@ -333,6 +338,17 @@ golden.
 - Risks: an apply that fails at re-apply must not wedge power-on (S3
   logging, D-PSa); ordering before `cont` (the link-down precedent,
   platform-plan.md:1641-1643) [L] — the run-smoke variant proves it.
+- **As built (2026-11-13, commit PL-11a).** Built as specified, with
+  these notes: the fake also answers `qom-get` for the nine attenuator
+  fault properties (device defaults: the booleans false, the offset 0)
+  — SETTABLE alone would not be enough, since the first apply reads
+  the prior back; the reapply record carries the cycle's reason as
+  `why` (the `force.reapply` shape); the gate scenario checks the leaf
+  with gt/lt bounds (500/100), not an exact value, so the idle truth
+  (20) and the offset (800) need no pin; `run-gates.toml` (the PL-7
+  container's run-mode config) lists the new scenario too. No
+  flash rows exist yet (comment-reserved), so the "already active"
+  tolerance of D-PSa is a note in `Faults.reapply` until PL-11g.
 
 ### PL-11b: watch the attenuator and the EDAC (no emulator change)
 

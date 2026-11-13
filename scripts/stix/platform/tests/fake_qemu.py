@@ -24,9 +24,20 @@ import time
 
 PROPS_NEW = ["flash-file", "inverted-storage"]
 PROPS_OLD = ["flash-file"]
+# the attenuator fault properties (the catalogue's qom rows on
+# /machine/stixctrl/attenuator); the fake stores them like the device
+ATTENUATOR = ("attenuator.sensor_ab.stuck_open",
+              "attenuator.sensor_ab.stuck_closed",
+              "attenuator.sensor_bc.stuck_open",
+              "attenuator.sensor_bc.stuck_closed",
+              "attenuator.motor1.dead", "attenuator.motor2.dead",
+              "attenuator.mechanism.jammed", "attenuator.current.zero",
+              "attenuator.current.offset")
 SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject",
-            "upset-inject") + \
+            "upset-inject") + ATTENUATOR + \
     tuple("adc-inject[%d]" % ch for ch in range(128))
+# read-back before the first set: the booleans are false, the offset 0
+ATT_DEFAULT = {"attenuator.current.offset": 0}
 
 
 def greeting():
@@ -178,6 +189,7 @@ class Fake:
             return {"status": "running" if self.running else "paused",
                     "running": self.running} if ex == "query-status" else {}
         if ex == "cont":
+            self.set_log.append(["cont"])   # ordering marker for the gates
             self.set_running(True)
             if not self.booted and self.uart:
                 self.booted = True
@@ -208,6 +220,8 @@ class Fake:
                                   else self.hw_spw())
             if (a["path"], prop) in self.props:
                 return self.props[(a["path"], prop)]
+            if prop in ATTENUATOR:
+                return ATT_DEFAULT.get(prop, False)
             raise KeyError("Property '%s' not found" % prop)
         if ex == "qom-set":
             prop = a.get("property")
@@ -229,6 +243,9 @@ class Fake:
         raise KeyError("The command %s has not been found" % ex)
 
     def guest_reset(self):
+        # this fake keeps all props across the reset; the real device
+        # drops link-down/adc-inject (stix_att.c:504-512 keeps only the
+        # attenuator's faults), and the controller re-applies those
         if self.no_reboot:
             self.event("SHUTDOWN", {"guest": True, "reason": "guest-reset"})
             os._exit(0)

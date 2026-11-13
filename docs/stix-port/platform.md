@@ -307,8 +307,10 @@ stops at once). Retention runs at the end.
 
 The gate scenarios: `gate-spw-link` (nominal, fault_no_recovery,
 fault_with_recovery), `gate-keepalive` (the NOMINAL-entry re-arm, R1),
-`gate-timesync` (aligned, mismatch), the optional `gate-timecode-loss`,
-and `gate-negative`, which must fail with exactly one unmatched await
+`gate-timesync` (aligned, mismatch), `gate-fault-reapply` (nominal,
+fault_reapply: the attenuator offset fault survives a cold cycle only
+through the re-apply), the optional `gate-timecode-loss`, and
+`gate-negative`, which must fail with exactly one unmatched await
 (`tests/run-smoke.sh` checks both).
 
 ## The fault catalogue
@@ -338,6 +340,21 @@ validated before anything is marked; an apply that fails at its trigger
 leaves nothing armed or active; every inject and clear is a `fault` log
 record with the resolved params and seed, so a run can be replayed from
 its log.
+
+**Power cycles and faults (PL-11a, D-PSa).** The catalogue's active
+list is controller-side and survives a power cycle; the device does not
+(a cold cycle is a new QEMU process; a warm reset keeps only what the
+device itself keeps, e.g. the attenuator's faults but not adc-inject).
+So at every cold power-on (before `cont`, the link-down precedent) and
+warm guest reset, every active LASTING fault of the device-state kinds
+(`qom` today; the flash rows when they land) is re-applied: one
+`fault` record per row with `action: "reapply"` and the cycle's reason.
+The stored `prior` stays the one captured at the first apply, so
+`fault.clear` still writes the pre-fault value, not the faulted one.
+One-shots (`transient`/`permanent` — the `memory.*` rows) are never
+re-applied; the controller-side kinds (link, timecodes, keepalive) and
+`adc` keep their own re-apply paths. A re-apply that fails at the
+device is a `reapply-error` record and never fails the power-on.
 
 The v1 entries (all on existing model hooks): `spw.link.disconnect`,
 `timecode.missing`, `timecode.wrong_value`, `obt.jump`,

@@ -33,6 +33,7 @@ scenarios = [
     "gate-spw-link.json",
     "gate-keepalive.json",
     "gate-timesync.json",
+    "gate-fault-reapply.json",
     # "gate-timecode-loss.json",
 ]
 # variants = ["aligned"]     # only these variants, or a glob

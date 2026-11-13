@@ -24,7 +24,9 @@ Lifecycle (PL-4 review SF4):
 - `until_cleared` and `until_write` faults are *active* until cleared;
   `transient` and `permanent` ones are one-shot events, never active,
   and may be injected again;
-- apply returns the state it replaced, and undo restores exactly that.
+- apply returns the state it replaced, and undo restores exactly that;
+- after a power cycle the active device-state faults are re-applied
+  (PL-11a, D-PSa), with the prior of the first apply kept.
 """
 
 import json
@@ -43,6 +45,12 @@ PERSISTENCE = ("transient", "until_cleared", "permanent", "until_write")
 LASTING = ("until_cleared", "until_write")
 ACTIONS = ("link_down", "timecodes_off", "timecode_inject", "obt_jump",
            "keepalive_off", "adc", "qom")
+# the kinds reapply covers (D-PSa): device state the power cycle can
+# lose. The controller-side kinds (link, timecodes, keepalive) and adc
+# keep their own paths; flash_damage joins in PL-11g, whose reapply
+# logs the device's "the spec is already active" (grlib_stixflash.c:
+# 1562) as "already active", not an error
+REAPPLY_KINDS = ("qom",)
 CHANGES = ("truth", "presented")
 # the qom action reaches the STIX devices only (stixctrl and its
 # sub-models such as the attenuator, and stixspw)
@@ -269,6 +277,41 @@ class Faults:
                        "mode": entry["mode"], "params": params,
                        "seed": seed, "persistence": entry["persistence"],
                        "expected_detection": entry["expected_detection"]})
+
+    def reapply(self, why):
+        """Power-cycle re-apply (PL-11a, D-PSa): the device lost what it
+        does not keep (a cold cycle is a new process; a warm reset keeps
+        only what the device itself keeps), so the apply function of
+        every active LASTING device-state fault runs again. Not _apply:
+        the stored prior stays the one captured at the first apply
+        (fault.clear must write the pre-fault value, not the faulted
+        one) and the record says action reapply. A failed re-apply is
+        logged (S3) and never fails the power-on; one-shots are never
+        active and the other kinds have their own re-apply paths."""
+        with self.lock:
+            items = [(fid, st) for fid, st in self.active.items()
+                     if not st.get("pending")]
+        for fid, st in items:
+            entry = self.cat[fid]
+            if entry["persistence"] not in LASTING or \
+                    entry["action"]["kind"] not in REAPPLY_KINDS:
+                continue
+            with self.lock:
+                if self.active.get(fid) is not st:
+                    continue        # cleared while we were walking
+            try:
+                apply_fn, _ = self.actions[entry["action"]["kind"]]
+                apply_fn(entry, st["params"])
+            except Exception as e:
+                self.log.emit("ctl", "fault", "fault." + fid,
+                              {"action": "reapply-error", "why": why,
+                               "params": st["params"], "seed": st["seed"],
+                               "error": "%s: %s"
+                               % (type(e).__name__, e)})
+                continue
+            self.log.emit("ctl", "fault", "fault." + fid,
+                          {"action": "reapply", "why": why,
+                           "params": st["params"], "seed": st["seed"]})
 
     def clear(self, id):
         entry = self.cat.get(id)

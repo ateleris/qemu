@@ -6,7 +6,8 @@
 # root /tmp/stix-plat/run-smoke; in slot k the slot's band and
 # /tmp/stix-plat/run-smoke-s<k>. Checks:
 #   1. run mode over the gate scenarios (gate-spw-link x3, gate-keepalive,
-#      gate-timesync x3) exits 0 and every run's report says pass
+#      gate-timesync x3, gate-fault-reapply x2) exits 0 and every run's
+#      report says pass
 #   2. gate-negative alone exits 1, with exactly one failed check: the
 #      await_event 142d of the step before the clear
 # STIX_RUN_SMOKE_LONG=1 adds the optional gate-timecode-loss to 1.
@@ -58,7 +59,7 @@ EOT
 
 PLAT="$HERE/../stixplat.py"
 GATES=(--scenario gate-spw-link.json --scenario gate-keepalive.json
-       --scenario gate-timesync.json)
+       --scenario gate-timesync.json --scenario gate-fault-reapply.json)
 if [ "${STIX_RUN_SMOKE_LONG:-0}" = 1 ]; then
     GATES+=(--scenario gate-timecode-loss.json)
 fi
@@ -79,7 +80,7 @@ python3 - "$REP1" "$rc" <<'PYEOF' || fail=1
 import json, sys
 s = json.load(open(sys.argv[1] + "summary.json"))
 bad = [r["name"] for r in s["runs"] if r["verdict"] != "pass"]
-ok = sys.argv[2] == "0" and s["exit"] == 0 and len(s["runs"]) >= 7 \
+ok = sys.argv[2] == "0" and s["exit"] == 0 and len(s["runs"]) >= 9 \
     and not bad
 print("%s gates: exit %s, %d runs, not passed: %s"
       % ("ok  " if ok else "FAIL", sys.argv[2], len(s["runs"]), bad))

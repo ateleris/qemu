@@ -5,7 +5,8 @@ TM relay + TC proxy, behind the platform.*, force.*, fault.* and tc.*
 verbs.
 
 What a device reset clears (link-down, adc-inject) is re-applied after
-a warm guest reset and before `cont` after a cold power-on (D-PLf).
+a warm guest reset and before `cont` after a cold power-on (D-PLf); so
+are the active device-state faults (PL-11a, D-PSa).
 """
 
 import json
@@ -126,11 +127,13 @@ class Platform:
             if self.timecodes is not None:
                 self._q().qom_set(STIXSPW, "timecodes", self.timecodes)
             self.forcing.reapply("cold power-on")
+            self.faults.reapply("cold power-on")
         elif event == "guest_reset":
             # the device reset cleared link-down and adc-inject
             if self.link_down:
                 self._q().qom_set(STIXSPW, "link-down", True)
             self.forcing.reapply("warm guest reset")
+            self.faults.reapply("warm guest reset")
             self.keepalive.on_boot()
             self.timesync.on_boot()
         elif event == "boot":

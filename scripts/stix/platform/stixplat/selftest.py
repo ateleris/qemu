@@ -2362,6 +2362,91 @@ def t_fault_model(env):
         ctl.shutdown()
 
 
+def t_fault_reapply(env):
+    """PL-11a (D-PSa): a power cycle re-applies the active device-state
+    faults (qom) and keeps the prior from the first apply; one-shots and
+    the controller-side kinds are not re-applied; a failed re-apply is
+    logged and never raises (S3)."""
+    clk, f, calls, fail, recs = _fault_rig()
+    f.inject("attenuator.current.offset", params={"offset": 800})
+    f.inject("memory.cache.seu")
+    f.inject("spw.link.disconnect")
+    n = len(calls)
+    f.reapply("cold power-on")
+    check(calls[n:] == [("apply", "attenuator.current.offset")],
+          "only the qom fault re-applied: %r" % calls[n:])
+    check(f.active["attenuator.current.offset"]["prior"] ==
+          "prior-attenuator.current.offset", "the stored prior is kept")
+    r = [x for x in recs() if x["action"] == "reapply"]
+    check(len(r) == 1 and r[0]["why"] == "cold power-on" and
+          r[0]["params"] == {"offset": 800}, "reapply record %r" % r)
+    f.clear("attenuator.current.offset")
+    check(calls[-1] == ("undo", "attenuator.current.offset",
+                        "prior-attenuator.current.offset"),
+          "clear after reapply undoes with the first prior: %r"
+          % (calls[-1],))
+    # a failed re-apply: logged, the fault stays active, no raise
+    f.inject("attenuator.current.offset", params={"offset": 800})
+    fail["v"] = True
+    f.reapply("warm guest reset")
+    last = recs()[-1]
+    check(last["action"] == "reapply-error" and
+          "STIX is off" in last["error"], "reapply-error record %r" % last)
+    check("attenuator.current.offset" in f.active, "still active")
+    fail["v"] = False
+    # against the fake: the re-apply qom-set lands after spawn and
+    # before cont, the one-shot memory upset does not come back, and
+    # the clear after both cycles writes the pre-fault value
+    ATT_SET = ["/machine/stixctrl/attenuator", "attenuator.current.offset"]
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        cmd("fault.inject", {"id": "attenuator.current.offset",
+                             "params": {"offset": 800}})
+        cmd("fault.inject", {"id": "memory.cache.seu"})
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-1] == ["/machine/stixctrl/edac", "upset-inject",
+                           "cache,0xE0180040,0x1"] and
+              ATT_SET + [800] in sets, "first inject: %r" % sets)
+        cmd("platform.power.off", {})
+        cmd("platform.power.on", {})
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets == [ATT_SET + [800]],
+              "re-applied after spawn, before cont, the transient "
+              "memory row is not: %r" % sets)
+
+        def reapplies():
+            return [(x.obj["path"], x.obj["data"])
+                    for x in ctl.log.since(0) if x.kind == "fault"
+                    and x.obj["data"].get("action") == "reapply"]
+        rr = reapplies()
+        check([(p, d["why"], d["params"]) for p, d in rr] ==
+              [("fault.attenuator.current.offset", "cold power-on",
+                {"offset": 800})], "the cold reapply record: %r" % (rr,))
+        e = raises(VerbError, cmd, "fault.inject",
+                   {"id": "attenuator.current.offset",
+                    "params": {"offset": 1}})
+        check(e.status == 409, "the second inject still 409s")
+        cmd("platform.power.boot", {})
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets == [ATT_SET + [800], ["cont"]],
+              "the re-apply qom-set landed before cont: %r" % sets)
+        ctl.power.qmp.execute("x-fake-guest-reset")
+        wait_for(lambda: len(reapplies()) == 2, what="the warm reapply")
+        check(reapplies()[-1][1]["why"] == "warm guest reset",
+              "the warm reapply record: %r" % (reapplies()[-1],))
+        cmd("fault.clear", {"id": "attenuator.current.offset"})
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-1] == ATT_SET + [0] and
+              all(x[1:2] != ["upset-inject"] for x in sets),
+              "the clear writes the pre-fault value, not the faulted "
+              "one: %r" % sets[-1])
+    finally:
+        ctl.shutdown()
+
+
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
@@ -3014,6 +3099,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("fault model: truth|presented, qom", t_fault_model),
+         ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),
