@@ -188,9 +188,13 @@ stix_slot_setup() { # [peek]
                     "(locks $(stix_slot_lock 1) .. $(stix_slot_lock "$n"))"
                 exit 2
             fi
+            # a wait is visible, not only a longer run time (gate V6)
+            [ "$waited" -ne 0 ] || echo "slot: all $n busy, waiting up to" \
+                "${STIX_SLOT_WAIT:-1800}s for a free one"
             sleep 1
             waited=$((waited + 1))
         done
+        [ "$waited" -eq 0 ] || echo "slot: waited ${waited}s"
     else
         case "$req" in
             '' | *[!0-9]* | 0*)

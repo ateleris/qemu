@@ -103,13 +103,16 @@ check "auto, slot 1 held: slot 2 and its -globals" $? "$out"
 # --- all auto slots held -> bounded wait, then exit 2 ---
 hold 2
 hold 3
-t0=$SECONDS
+# monotonic, not $SECONDS: the WSL wall clock is stepped by timesyncd
+mono() { cut -d. -f1 /proc/uptime; }
+t0=$(mono)
 out="$(helper 'stix_slot_setup' STIX_PORT_BASE=auto STIX_SLOT_WAIT=2)"
 rc=$?
-el=$((SECONDS - t0))
+el=$(($(mono) - t0))
 [ "$rc" -eq 2 ] && [ "$el" -ge 2 ] && [ "$el" -le 6 ] &&
-    echo "$out" | grep -q "all 3 slots held"
-check "auto, all slots held: bounded wait then exit 2" $? \
+    echo "$out" | grep -q "all 3 slots held" &&
+    echo "$out" | grep -q "all 3 busy, waiting up to 2s"
+check "auto, all slots held: bounded wait (announced) then exit 2" $? \
     "rc=$rc el=$el: $out"
 
 # --- a fourth run waits and gets the slot that frees ---
@@ -121,8 +124,10 @@ kill -9 "${HOLDERS[1]}" 2>/dev/null
 wait "${HOLDERS[1]}" 2>/dev/null
 wait "$wpid"
 rc=$?
-[ "$rc" -eq 0 ] && grep -q "got 2" "$WORK/waiter.out"
-check "auto: a waiting run takes the slot that frees" $? \
+[ "$rc" -eq 0 ] && grep -q "got 2" "$WORK/waiter.out" &&
+    grep -q "^slot: all 3 busy, waiting" "$WORK/waiter.out" &&
+    grep -qE "^slot: waited [0-9]+s" "$WORK/waiter.out"
+check "auto: a waiting run takes the slot that frees (wait shown)" $? \
     "rc=$rc: $(cat "$WORK/waiter.out")"
 release_all
 
