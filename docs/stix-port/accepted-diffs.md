@@ -5512,4 +5512,66 @@ aspect archive stayed empty and every aspect-burst request answered
   the pages and the timeline unaffected) and `as-knob-reject` (the
   N-aware validator; every refusal leaves the state unchanged) — red on
   the AS-2 binary (unknown properties, missing hw-state keys).
+- **The live gate (AS-4).** `scripts/stix/aspect-smoke.sh` and
+  `scripts/stix/aspect-check.py` (both new; the plan's D-ASi timeline,
+  the ideal leg only — the experiment legs are AS-5). The smoke boots a
+  fresh-flash run dir (`/tmp/stix-aspect-run`, the detector-smoke
+  guards, the slot library, `--dry-run`/`--check-guard`/`--negative`)
+  and drives, in seconds from the TMTC connect: CONF @50, S20 = 0 @60,
+  NOMINAL @70 (T_nom; `AspectCtrl_configure` re-applies the AVGSIZE
+  param at NOMINAL entry, OpModeMgmt.c:641 with AspectCtrl.c:536-548,
+  and boot already set 4, OpModeMgmt.c:1066-1068 — every archived block
+  is N = 16), a no-op `as-sun 0` qom-set over QMP @75 (the QMP path the
+  AS-5 knob legs use), CONF @320 (T_exit; the NOMINAL→CONF flush,
+  OpModeMgmt.c:292-294, writes the one aspect file, and the QL flush
+  puts TM(21,6) SSIDs 30-34 on 0x5DC), then both request paths:
+  TC(238,1) level 5 @340 (one box over the whole archive, tmin 0 /
+  tmax 0x0FFFFF x 0.1 s / time_binwidth 16; the payload layout of
+  TM_238.c:20-79 with TCData.h:406-420), TC(238,2) @350 (the list
+  report TM(238,3) on APID 0x5A8 = PID_90 + CAT_DIAGNOSTICS,
+  TM_238.c:116 with :157-158 — verified before the first live run), and
+  TC(238,10) @400 ([0, 0x0FFFFFFF] s, averaging 16, TCData.h:433-435),
+  hold to +480. The Background task drains the request FIFO every 30 s
+  (background.c:63, :174-178), so the user-path answer is allowed 45 s;
+  TC(238,10) is event-driven (AspectCtrl.c:509, background.c:183-187)
+  and answers within its own window. The probe dumps every 0x5DC packet
+  (`--dump-apid`, the SSID at byte 16) and the checker asserts the D-ASh
+  row 1 signature on BOTH paths (`--expect-ideal 1 0 --summing 16
+  --averaging 16`): exactly one SSID 42 product per user_request_number
+  (1 = the TC(238,1) request number, 0 = the TC(238,10) path always,
+  AspectCtrl.c:107 with :530), every non-final packet of exactly 510
+  samples (TMData.h:595-596) with a short or empty-termination last
+  one, SGF FIRST→CONT→…→LAST, summingFpga 16 (the once-per-request
+  estimate off the file's first two records, AspectCtrl.c:219-233),
+  averagingTc 16, and packet starts 510 · averaging · N = 130560 ms apart (each row advances
+  the time by the estimate, AspectCtrl.c:364, one sample per averaging
+  rows, :372) with a ±3 ms slack
+  (the start times are Timing_MsToSCET of the accumulated estimate,
+  AspectCtrl.c:409-411, and Timing_ToMs truncates, Timing.c:395-399,
+  :401-410). The positive forbids EID 0x543F/0x5440/0x5446 from the
+  TC(238,1) on and TM(1,8) from NOMINAL on. `--negative` boots with
+  `-global grlib-stixctrl.as-enable=false` and asserts the failure
+  reports instead: TM(5,2) EID 0x543F "no BSD data found"
+  (SciReport.c:535-544 via :597-601, within 45 s), TM(1,8) FID_48435
+  "no selected data (scientific + aspect) found" for the TC(238,10)
+  (AspectCtrl.c:530-531, TMData.h:214; FID_48435 takes no failure
+  parameters, TMForm.c:309-347, so the app data is packet id, PSC, FID
+  = 1DAC C008 BD33, TM_1.c:108-127; the TMForm_sendExecutionCompletedReport
+  branch, TMForm.c:109-150), the TM(1,8) forbid disarmed at +325 s
+  before the expected one, and `--expect-none` (no SSID 42 packet at
+  all). UART: `Skipped first Det data chunk` once (ArchiveManager.c:140)
+  in both modes, `Skipped first Aspect data chunk` once in the positive
+  and 0 in the negative (ArchiveManager.c:219), no other *E line from
+  the chunk/archive/filesystem tags, and none of the ROTB compactor
+  errors. Trace: the stixasp_* events into asp.trace (the flips'
+  block_seq/SCET are the AS-5 legs' placement evidence), ≥ 100 pushes
+  and 0 drops on the positive, 0 flips and 0 pushes on the negative
+  (the tick arms on the channel-power writes, generation is off). The
+  three service-238 TC units are built at script start by a CRC-16/
+  CCITT-FALSE builder anchored byte-for-byte on the four known mode TC
+  units of nominal-smoke.sh/detector-smoke.sh (seq 1, 2, 3, 5), so the
+  gate exits before booting if the builder ever disagrees. The host
+  test `scripts/stix/tests/test-aspect-check.sh` builds the synthetic
+  dumps (good + one per failure signature) with the checker's own
+  packet builders and pins the CLI exit codes and verdict lines.
 
