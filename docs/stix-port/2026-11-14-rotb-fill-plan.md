@@ -370,3 +370,62 @@ shift: **3 (~125 M insn/s, ~6-8x LEON: "fast CPU")** vs **6 / 7 (~LEON
 bracket)**. M1..M4 keep their meaning with "no icount" read as "shift 3".
 All runs are then deterministic in guest time once the drive is
 event-driven (RF-3).
+
+## Amendment A review (GLM, 2026-11-13) — resolutions
+
+- **BLOCKER (RF-2b stop marker) fixed:** "Filesystem full, removing 32
+  oldest files" is a TRACE in ArchiveManager.c, compiled out
+  (`ArchiveManager.c:20-23`, `ENABLE_TRACE_ARCHIVE_MANAGER` 0 at
+  `configFSW.h:99`; DEBUG_PRINT revives only TRACE_ERROR,
+  `commonFSW.h:349-356`). RF-2b keys on the TRACE_ERROR
+  `"Partition of type %u is full"` (`MemFilesystem.c:734`), printed once
+  per failing write.
+- **Partition 0 corrected:** bounds are inclusive
+  (`MemFilesystem.c:1006`, `File.c:201`); LIMIT_FS_SIZE=32 -> 64 CBs,
+  fixed partitions 14 CBs -> partition 0 = CBs 12..61 = **50 CBs = 3000
+  files = 750 MiB**, full in ~25 min at 2 files/s. (Full flight FS: 1076
+  CBs = 64,560 files.)
+- **Verified:** one file = one block, RAW_COUNTS limit 256 KiB
+  (`MemStream.h:16`, `MemStream.c:214-217`); the delete-32 path runs in
+  the drain task and erases synchronously (`File.c:758-772` ->
+  `MemFilesystem.c:1094-1114`); the N-oldest scan is RAM-only (fileCatalog),
+  O(3000), << 1 ms.
+- **CPU cost per page not in the flash knobs:** `BCH_encode` over each
+  page plus a 4 KiB copy (`File.c:476-486,511-518`) — LEON CPU time that
+  does not scale with tread/tprog. The break-even statement is "at icount
+  shift s, with the per-page CPU cost included".
+
+## Amendment B (2026-11-13): ROTB overflow semantics
+
+**Owner input:** the FPGA ROTB is a ring with a write pointer running
+ahead and a read pointer the FSW sees through one fixed 512 B window
+(GETBLOCK = return-and-advance). When the write pointer catches the read
+pointer, "some events and IRQs happen, but it is not really tested".
+
+**The model today is drop-new:** a nominal chunk that does not fit is
+dropped whole and IRQ 7 pulses once (`grlib_stixctrl.c:429-432`,
+`stixdet_chunk_drop`); a TESTMODE PUTBLOCK into a full ring is dropped
+(D-F, accepted-diffs). The FSW, however, is written for
+**overwrite-oldest**: `RotAccuCompactor.c:81-85` resets on block 0 "in
+case ROTBUF overflow occured, start with 1st block again, and forget
+interrupted one", and a block-number mismatch drops the frame until the
+next block 0 (`:90-97`) — the torn-frame case only an overwriting writer
+produces. The real behaviour is unconfirmed.
+
+**Change (QEMU, RF-0):** a `grlib-stixctrl` property
+`rotb-overflow = drop-new | overwrite-oldest` (default drop-new: no
+golden or gate changes). overwrite-oldest: a block written into a full
+ring overwrites the oldest block, the read pointer advances with it
+(count stays at capacity, FULL stays set), IRQ 7 pulses once per
+overwritten block; partial chunks are possible (torn frames at the read
+side). New trace `stixctrl_rotb_overwrite(rd, count)`. qtests: per-block
+overwrite, rd advance, IRQ count, window shows the new oldest block.
+**Experiment:** every cell that reaches overflow is run under both
+policies; the read-out reports what the FSW does after the first overrun
+under each: the FDIR-051 skip (`RotAccumulator.c:104-142`: it reads
+`blocksCount` once, then GETBLOCKs until a block SCET > start + 60 s —
+under overwrite the ring refills during the skip), torn-frame drops
+(UART "packet sequence error", `RotAccuCompactor.c:94`), and whether the
+drain recovers or re-overruns in a loop. This is the untested regime the
+owner named; the emulator shows FSW behaviour for each assumed HW policy,
+it does not decide which policy the FPGA implements.
