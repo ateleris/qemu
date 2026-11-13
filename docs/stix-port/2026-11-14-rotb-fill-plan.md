@@ -341,3 +341,19 @@ after the event-driven drive. Trace citations are `hw/sparc/trace-events`.
   cost as (a).
 Recommendation: (b) for the matrix, plus one (a) aging run later only if
 (b) shows the delete path matters.
+
+**O-R1 resolved (owner, 2026-11-13): option (b), and no new build is
+needed.** Every AX build, including our AX gate ELF and the #1061 builds,
+already uses `-DLIMIT_FS_SIZE=32` (`2026-11-11-flash-latency-plan.md:166`,
+`tasks.vs.json:14,26,50`): 64 control blocks, partition 0 = ~53 CBs x 60
+= ~3180 files (~800 MB), full in ~30-35 min guest at 0.1 s + flare. The
+matrix therefore runs on the **AX gate ELF** (the bench configuration the
+owner's flight-comparable experience comes from), not on
+`ASW_pfm_v186.elf` (1090 CBs). New task **RF-2b aging run**: one M1 run
+(fast, latency off) at 0.1 s + flare until the first "Filesystem full,
+removing 32 oldest files" (UART, `ArchiveManager.c:63`; a TRACE, so
+check it reaches the AX gate ELF's UART — DEBUG_PRINT is on) plus ~5 min;
+sparse-copy the flash.bin as `aged-flash.bin` (archived, read-only); every
+"full" run starts from a sparse copy of it. Recon 2 (param indices) uses
+the AX block: 312/313 hold for the AX gate ELF, still gated by the
+TC(237,19) read-back.
