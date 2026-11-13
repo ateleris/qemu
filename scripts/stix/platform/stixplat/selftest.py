@@ -2447,6 +2447,112 @@ def t_fault_reapply(env):
         ctl.shutdown()
 
 
+def t_att_edac_leaves(env):
+    """PL-11b (D-PSb): the stixctrl hw-state's attenuator and edac
+    sections map to instrument.attenuator.* / instrument.memory.*
+    leaves; a poison arm and its clear are change records, two stable
+    reads are not."""
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        wait_for(lambda: ctl.state.get("instrument.attenuator") is not None,
+                 what="the attenuator leaves")
+        # the leaf paths and values are the fake's idle attenuator
+        # (stix_att.c:966-998 at reset: parked at "out", AB actuates at
+        # OUT so the presented cmdsta carries the AB bit, no fault)
+        t = ctl.state.get("instrument.attenuator.truth")
+        check(t["position"]["truth"] == "out" and
+              t["position_ppm"]["truth"] == 0 and
+              t["sensor_ab"]["truth"] is True and
+              t["sensor_bc"]["truth"] is False and
+              t["motor1_driving"]["truth"] is False and
+              t["motor2_driving"]["truth"] is False and
+              t["att_c"]["truth"] == 20 and t["moves"]["truth"] == 0 and
+              t["last_end"]["truth"] == "none" and
+              t["last_end_ns"]["truth"] == 0,
+              "the attenuator truth leaves: %r" % t)
+        p = ctl.state.get("instrument.attenuator.presented")
+        check(p["sensor_ab"]["truth"] is True and
+              p["sensor_bc"]["truth"] is False and
+              p["cmdsta"]["truth"] == 1024 and
+              p["att_c"]["truth"] == 20,
+              "the attenuator presented leaves: %r" % p)
+        check(ctl.state.get("instrument.attenuator.fsw_accesses")
+              ["truth"] == 0 and
+              ctl.state.get("instrument.attenuator.faults_active")
+              ["truth"] == "",
+              "fsw_accesses and faults_active")
+        for mem in ("cache", "sdram", "rotbuf"):
+            for k in ("injected", "corrected", "detected"):
+                lf = ctl.state.get("instrument.memory.%s.%s" % (mem, k))
+                check(lf is not None and lf["truth"] == 0,
+                      "instrument.memory.%s.%s at zero: %r" % (mem, k, lf))
+        check(ctl.state.get("instrument.memory.poisons")["truth"] == [],
+              "no poisons armed")
+        check(ctl.state.get("instrument.memory.bram") is None,
+              "the bram maps no leaf (no EDAC counters)")
+
+        def changes():
+            return [x for x in ctl.log.since(0) if x.kind == "state" and
+                    x.obj["path"].startswith(("instrument.attenuator",
+                                              "instrument.memory"))]
+        seen = len(changes())
+        time.sleep(0.3)                # several state polls, all stable
+        check(len(changes()) == seen,
+              "no change record for the stable reads: %r"
+              % changes()[seen:])
+        # an active fault tags its target's leaves (state.py fault_ids)
+        cmd("fault.inject", {"id": "attenuator.sensor_ab.stuck_open"})
+        check(ctl.state.get(
+            "instrument.attenuator.truth.sensor_ab")["fault_ids"] ==
+            ["attenuator.sensor_ab.stuck_open"], "the fault tag")
+        # arm a poison through the catalogue row: the counter and the
+        # poisons leaf move, each with one change record
+        cmd("fault.inject", {"id": "memory.cache.seu"})
+        wait_for(lambda: ctl.state.get(
+                     "instrument.memory.cache.injected")["truth"] == 1,
+                 what="the injected counter")
+        wait_for(lambda: len(ctl.state.get(
+                     "instrument.memory.poisons")["truth"]) == 1,
+                 what="the poison record")
+        rec = ctl.state.get("instrument.memory.poisons")["truth"][0]
+        check(rec == {"id": 0, "memory": "cache", "address": 0xE0180040,
+                      "mask": 1, "mode": "seu", "persist": False},
+              "the poison record mirrors the device: %r" % rec)
+        # every memory row is transient/permanent: a one-shot event,
+        # never active (faults.py:25), so it tags no leaf — the counter
+        # and the poisons leaf are the record
+        check(not ctl.state.get(
+            "instrument.memory.cache.injected").get("fault_ids"),
+            "a one-shot memory fault tags no leaf")
+        ch = [x.obj["data"] for x in changes()
+              if x.obj["path"] == "instrument.memory.poisons"]
+        check(len(ch) == 2 and ch[0]["old"] is None and          # creation
+              ch[1]["old"]["truth"] == [] and
+              len(ch[1]["new"]["truth"]) == 1,
+              "creation, then one change record on the arm: %r" % ch)
+        # the clear: the device's own upset-clear (no platform verb
+        # until PL-11f), driven straight on the fake's QMP
+        ctl.power.qmp.execute("qom-set", {
+            "path": "/machine/stixctrl/edac",
+            "property": "upset-clear", "value": "all"})
+        wait_for(lambda: ctl.state.get(
+                     "instrument.memory.poisons")["truth"] == [],
+                 what="the poison cleared")
+        ch = [x.obj["data"] for x in changes()
+              if x.obj["path"] == "instrument.memory.poisons"]
+        check(len(ch) == 3 and ch[2]["old"]["truth"] and
+              ch[2]["new"]["truth"] == [],
+              "one change record on the clear: %r" % ch)
+        check(ctl.state.get("instrument.memory.cache.injected")
+              ["truth"] == 1,
+              "the counter stays (only the poison is retired)")
+    finally:
+        ctl.shutdown()
+
+
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
@@ -3100,6 +3206,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("fault catalogue + forcing", t_faults),
          ("fault model: truth|presented, qom", t_fault_model),
          ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
+         ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),

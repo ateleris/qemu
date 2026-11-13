@@ -8,8 +8,11 @@
 qom-list-properties for grlib-stixflash WITHOUT inverted-storage.
 Otherwise it serves QMP on the -qmp unix socket like a frozen (-S)
 leon3: cont/stop/quit, the RESUME/STOP/SHUTDOWN/RESET events, qom-get
-vclock-ns, obt and both hw-state JSONs, qom-set obt, and the test-only
-x-fake-guest-reset, which behaves per -no-reboot / -action like QEMU.
+vclock-ns, obt and both hw-state JSONs (the ctrl one carries the
+attenuator and edac sections, PL-11b), qom-set obt, the upset
+verbs on the EDAC (they move the hw-state's poisons and counters),
+and the test-only x-fake-guest-reset, which behaves per -no-reboot /
+-action like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
 `noqmp` accepts the QMP connection and never answers; `badstate`
 serves a hw-state without its keys.
@@ -34,10 +37,13 @@ ATTENUATOR = ("attenuator.sensor_ab.stuck_open",
               "attenuator.mechanism.jammed", "attenuator.current.zero",
               "attenuator.current.offset")
 SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject",
-            "upset-inject") + ATTENUATOR + \
+            "upset-inject", "upset-clear") + ATTENUATOR + \
     tuple("adc-inject[%d]" % ch for ch in range(128))
 # read-back before the first set: the booleans are false, the offset 0
 ATT_DEFAULT = {"attenuator.current.offset": 0}
+# the EDAC device (the memory.* catalogue rows' target); its upset
+# verbs move the hw-state's edac section, like the device's
+EDAC = "/machine/stixctrl/edac"
 
 
 def greeting():
@@ -90,6 +96,14 @@ class Fake:
         self.uart_append = False
         self.props = {}
         self.set_log = []
+        # the EDAC state the hw-state section shows (stix_edac.c:
+        # 714-759): no poisons armed, the counters at zero. The bram
+        # has no EDAC: no counters and its upsets arm no poison (M-5),
+        # so it never appears here
+        self.poisons = []
+        self.edac_counters = {m: {"injected": 0, "corrected": 0,
+                                  "detected": 0}
+                              for m in ("sdram", "cache", "rotbuf")}
         for i, a in enumerate(args):
             nxt = args[i + 1] if i + 1 < len(args) else ""
             if a == "-qmp" and nxt.startswith("unix:"):
@@ -168,6 +182,21 @@ class Fake:
                          "fine": (v % 1_000_000_000) * 65536
                          // 1_000_000_000, "unsynced": True},
                 "det": {"quarter_on": [False] * 4},
+                # the attenuator section (stix_att.c:966-998), idle at
+                # "out": AB actuates at OUT (stix_att.c:291-293), so the
+                # presented cmdsta carries the AB bit (bit 10,
+                # StixIdpu.h:722); att_c is HK ch 8's idle adc
+                "attenuator": {
+                    "truth": {"position": "out", "position_ppm": 0,
+                              "sensor_ab": True, "sensor_bc": False,
+                              "motor1_driving": False,
+                              "motor2_driving": False, "att_c": 20,
+                              "moves": 0, "last_end": "none",
+                              "last_end_ns": 0},
+                    "presented": {"sensor_ab": True, "sensor_bc": False,
+                                  "cmdsta": 1024, "att_c": 20},
+                    "fsw_accesses": 0, "faults_active": ""},
+                "edac": self.hw_edac(),
                 # the aspect generator (AS-2), powered off
                 "as": {"asaon": False, "asbon": False, "avgsize": 0,
                        "n": 1, "pattern": "ramp", "sun": 0,
@@ -188,6 +217,68 @@ class Fake:
                 "obt": self.obt(), "obt_kind": "platform", "rx_queued": 0,
                 "counters": {"tm_dropped": 0, "rx_dropped": 0,
                              "tc_resync": 0, "tmtc_connected": False}}
+
+    def hw_edac(self):
+        """The edac section (stix_edac.c:714-759): the armed poisons as
+        records — the ids are positions in the list, renumbered by the
+        next read after a clear, like the device's — plus the
+        per-memory counters."""
+        poisons = []
+        for i, p in enumerate(self.poisons):
+            rec = {"id": i, "memory": p["memory"], "address": p["address"],
+                   "mask": p["mask"], "mode": p["mode"],
+                   "persist": p["persist"]}
+            if "block" in p:
+                rec["block"] = p["block"]
+                rec["offset"] = p["offset"]
+            poisons.append(rec)
+        return {"poisons": poisons,
+                "counters": {m: dict(c)
+                             for m, c in self.edac_counters.items()}}
+
+    def upset_inject(self, spec):
+        """The device's upset-inject (stix_edac.c:874-1031), as far as
+        the hw-state shows it: a poison record and the injected
+        counter. bram is silent — no record, no counters (stix_edac.c:
+        887-891); corrected/detected move only when the FSW actually
+        reads the poisoned word, which the fake does not model."""
+        f = spec.split(",")
+        if f[0] == "bram":
+            return
+        if f[0] == "rotbuf":          # "<block>:<offset>" (M-4)
+            block, off = f[1].split(":")
+            rec = {"memory": "rotbuf", "block": int(block, 0),
+                   "offset": int(off, 0),
+                   "address": int(block, 0) * 0x200 + int(off, 0)}
+        else:
+            rec = {"memory": f[0], "address": int(f[1], 0)}
+        rec["mask"] = int(f[2], 0)
+        # bit count 1 = seu, >= 2 = de; the mode field overrides
+        rec["mode"] = "de" if bin(rec["mask"]).count("1") != 1 else "seu"
+        if len(f) > 3 and f[3] in ("seu", "de"):
+            rec["mode"] = f[3]
+        rec["persist"] = len(f) > 4 and f[4] == "1"
+        for i, p in enumerate(self.poisons):
+            if p["memory"] == rec["memory"] and \
+                    p["address"] == rec["address"]:
+                self.poisons[i] = rec      # re-arm: replace, no re-count
+                return
+        self.poisons.append(rec)
+        self.edac_counters[f[0]]["injected"] += 1
+
+    def upset_clear(self, spec):
+        """upset-clear (stix_edac.c:1044-1091): "all", or an index into
+        the poisons list."""
+        if spec == "all":
+            self.poisons = []
+            return
+        try:
+            i = int(spec, 0)
+        except ValueError:
+            raise KeyError("expected \"all\" or an index, not %r" % spec)
+        if i < 0 or i >= len(self.poisons):
+            raise KeyError("no upset %d armed (%d)" % (i, len(self.poisons)))
+        del self.poisons[i]
 
     def command(self, msg):
         ex = msg.get("execute")
@@ -237,6 +328,10 @@ class Fake:
                 self.obt_vbase = self.vclock()
                 return {}
             if prop in SETTABLE:
+                if a["path"] == EDAC and prop == "upset-inject":
+                    self.upset_inject(a["value"])
+                elif a["path"] == EDAC and prop == "upset-clear":
+                    self.upset_clear(a["value"])
                 # a plain store; the self-test reads it back
                 self.props[(a["path"], prop)] = a["value"]
                 self.set_log.append((a["path"], prop, a["value"]))

@@ -139,6 +139,19 @@ The path prefix is `/api/v1`. Read endpoints:
 
 `GET /` serves the web UI (below).
 
+The state tree (D-PLo) holds one leaf per watched value, each
+`{truth, presented, reported, unit, index_space, t_sim, status,
+fault_ids}`. The namespaces and where each comes from:
+
+| Namespace | From |
+|---|---|
+| `platform.*` | the controller's own state (power, boot, SpW link, time codes, OBT, keep-alive, time sync) |
+| `idpu.scet.*`, `idpu.watchdog.*`, `idpu.spw.*` | the SpW device's hw-state |
+| `instrument.supplies.*`, `instrument.hk_adc.<ch>`, `instrument.hk_prot.*` | the stixctrl hw-state |
+| `instrument.detector.quarter.<q>` | the hw-state's `det` section |
+| `instrument.attenuator.*` | the hw-state's `attenuator` section (PL-11b): `truth.{position, position_ppm, sensor_ab, sensor_bc, motor1_driving, motor2_driving, att_c, moves, last_end, last_end_ns}`, `presented.{sensor_ab, sensor_bc, cmdsta, att_c}`, `fsw_accesses`, `faults_active` |
+| `instrument.memory.*` | the hw-state's `edac` section (PL-11b): per-memory `injected`/`corrected`/`detected` counters for `cache`, `sdram` and `rotbuf`, and `poisons` (the armed upsets as one leaf; a change record per arm and per clear). `instrument.memory.bram` maps no leaf: the bram has no EDAC counters and its upsets arm no poison |
+
 Every state change is `POST /api/v1/cmd/<verb>` with a JSON object of
 arguments, `Content-Type: application/json` and `X-Stix-Platform: 1`.
 

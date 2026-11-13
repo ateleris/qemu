@@ -72,6 +72,38 @@ def leaves_from_hw(ctrl, spw, t_sim):
         for q, on in enumerate(ctrl["det"]["quarter_on"]):
             out["instrument.detector.quarter.%d" % q] = leaf(
                 on, index_space="quarter", t_sim=t_sim)
+        # PL-11b (D-PSb): the attenuator and EDAC sections the stixctrl
+        # hw-state already carries (stix_att.c:966-998 wired at
+        # grlib_stixctrl.c:1621, stix_edac.c:714-759 at :1624-1625),
+        # mapped as-is — no emulator change. .get throughout, so an
+        # older-schema hw-state without the sections still loads.
+        att = ctrl.get("attenuator")
+        if att:
+            for k, v in att.get("truth", {}).items():
+                out["instrument.attenuator.truth." + k] = leaf(
+                    v, t_sim=t_sim)
+            for k, v in att.get("presented", {}).items():
+                out["instrument.attenuator.presented." + k] = leaf(
+                    v, t_sim=t_sim)
+            out["instrument.attenuator.fsw_accesses"] = leaf(
+                att.get("fsw_accesses"), t_sim=t_sim)
+            out["instrument.attenuator.faults_active"] = leaf(
+                att.get("faults_active"), t_sim=t_sim)
+        ed = ctrl.get("edac")
+        if ed:
+            # instrument.memory.bram maps no leaf: a bram upset arms no
+            # poison and is silent (stix_edac.c:887-891), and the
+            # counters loop skips the bram (no EDAC, :747-750), so the
+            # memory.bram.* faults can never tag one
+            for mem, c in ed.get("counters", {}).items():
+                for k, v in c.items():
+                    out["instrument.memory.%s.%s" % (mem, k)] = leaf(
+                        v, t_sim=t_sim)
+            # the armed poisons as one leaf (the upsets-active records,
+            # stix_edac.c:730-740); they change only on arm/clear, so
+            # their change records are real events
+            out["instrument.memory.poisons"] = leaf(ed.get("poisons"),
+                                                    t_sim=t_sim)
     return out
 
 
@@ -127,8 +159,12 @@ class StateTree:
                            if prefix is None or p == prefix or
                            p.startswith(prefix + "."))
         for p, lf in items:
+            # a catalogue target names the signal (instrument.attenuator.
+            # sensor_ab); a device that exports both sides has leaves
+            # under .truth./.presented. — match the target on either
+            q = p.replace(".truth.", ".").replace(".presented.", ".")
             ids = [f for t, fs in faults.items() for f in fs
-                   if p == t or p.startswith(t + ".")]
+                   if any(x == t or x.startswith(t + ".") for x in (p, q))]
             if ids:
                 lf["fault_ids"] = ids
         if not items:

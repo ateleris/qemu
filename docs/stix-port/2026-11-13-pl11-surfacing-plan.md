@@ -369,6 +369,31 @@ golden.
 - Gate: self-test (leaf paths/values from the fake, change records on
   poison arm/clear, no change record for stable reads); core-smoke
   with `--check-ui`; the catalogue untouched.
+- **As built (2026-11-13, commit PL-11b).**
+  Built as specified, with these notes: platform.md had no state-leaf
+  list to extend, so one was added next to the `GET /state` row (a
+  namespace → source table; PL-11c/d extend it); the fake's edac
+  section is live — `upset-inject` (joined by `upset-clear` in
+  SETTABLE) arms a poison record and bumps the memory's `injected`
+  counter, mirroring `stix_edac.c:809-1031` as far as the hw-state
+  shows it (no corrected/detected: the fake models no memory access;
+  bram silent) — the arm/clear change-record gate needs that; the
+  fake's idle attenuator pins position "out", presented cmdsta 1024
+  (the AB bit, StixIdpu.h:722) and att_c 20, but does not react to the
+  attenuator fault properties (their fault_ids tagging is checked
+  instead); the self-test drives the clear through the fake's QMP
+  directly, since no platform verb reaches `upset-clear` before PL-11f
+  and debug.qmp's whitelist (D-PSd) is still PL-11d work.
+  Two corrections to the plan found by the self-test: (1) the catalogue
+  targets name the signal (`instrument.attenuator.sensor_ab`) while the
+  device exports `.truth.`/`.presented.` leaves, so the prefix match
+  never tagged them — `State.get` now matches a target with either
+  segment removed (the motor1/motor2/mechanism targets still name no
+  leaf: `motor1_driving` is not under `motor1.`; PL-11h); (2) every
+  `memory.*` row is transient/permanent, a one-shot event that is never
+  active, so it tags no leaf — the counters and `poisons` leaf are the
+  record (the gate asserts no tag). Gates: self-test PASS, core-smoke
+  PASS.
 
 ### PL-11c: watch the detector and the ROTB (small emulator change)
 
