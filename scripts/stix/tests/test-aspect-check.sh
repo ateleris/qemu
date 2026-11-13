@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 #
-# Host test for scripts/stix/aspect-check.py (aspect plan AS-4): the
-# self-test, then synthetic SSID 42 dumps — the good ideal dump (both
-# request paths of D-ASi) and one dump per failure signature
+# Host test for scripts/stix/aspect-check.py (aspect plan AS-4/AS-5):
+# the self-test, then synthetic SSID 42 dumps — the good ideal dump
+# (both request paths of D-ASi) and one dump per failure signature
 # (summingFpga, averagingTc, a missing and an unexpected request path, a
 # mid-series short packet, no full packet, a start-time step, the
-# product and SGF shapes, the decode errors, --expect-none). The dumps
+# product and SGF shapes, the decode errors, --expect-none), then the
+# AS-5 leg signatures (D-ASh rows 2-7: --expect-forced-abort/
+# -forced-complete/-tiny/-epoch2/-collapse/-content-jump, each passing
+# on its good shape and failing on its signature's absence). The dumps
 # are built with the checker's own packet builders, so the test pins the
 # CLI behaviour (exit codes, verdict lines), the self-test the parsing.
 set -u
@@ -99,6 +102,52 @@ tcp[0] |= 0x10
 write("tc-bit.dump", [bytes(tcp)])
 write_lines("nothex.dump", ["zz"])
 write("none-good.dump", ql(0))
+
+# the AS-5 leg signatures (D-ASh rows 2-7); the first live runs are [L],
+# so the good dumps assert direction/rough magnitude, not pinned counts
+# row 2 (--jitter): FIRST(15) + LAST(0) one block apart
+write("fa-good.dump", mod.burst_strided(1, 0, [15, 0], seq=0, stride=1008))
+write("fa-full.dump", mod.burst(1, 0, [510, 3], seq=0))
+write("fa-span.dump", mod.burst_strided(1, 0, [15, 0], seq=0,
+                                        stride=130560))
+# row 3 (--step-gap): one forced packet, the archive delivered
+write("fc-good.dump", mod.burst(1, 0, [15, 510, 130], seq=0))
+write("fc-two.dump", mod.burst(1, 0, [15, 510, 17, 130], seq=0))
+# rows 4/7 epoch 1 (--drift, --step-1031): ~100 forced 0/1-sample
+# packets, summing 15, averaging 64, a leading 0-sample one
+write("tiny-good.dump", mod.burst_strided(1, 0, [0] + [1] * 99, seq=0,
+                                          stride=1008, summing=15,
+                                          averaging=64))
+write("tiny-few.dump", mod.burst_strided(1, 0, [0] + [1] * 9, seq=0,
+                                         stride=1008, summing=15,
+                                         averaging=64))
+write("tiny-big.dump", mod.burst_strided(
+    1, 0, [0] + [1] * 39 + [3] + [1] * 59, seq=0, stride=1008,
+    summing=15, averaging=64))
+write("tiny-sum.dump", mod.burst_strided(1, 0, [0] + [1] * 99, seq=0,
+                                         stride=1008, summing=16,
+                                         averaging=64))
+# row 7 epoch 2: one small consistent product
+write("e2-good.dump", mod.burst_strided(2, 0, [62], seq=0, summing=16,
+                                        averaging=64))
+write("e2-sum.dump", mod.burst_strided(2, 0, [62], seq=0, summing=15,
+                                       averaging=64))
+# row 6 (--avg): the ~8x value step down, then a small rhythm
+pre = [16 * (300 + i) for i in range(60)]
+post = [2 * (360 + i) for i in range(12)]
+write("col-good.dump", mod.a0_ramp_packets(1, pre + post, [36, 36, 0],
+                                           seq=0, stride=1008))
+write("col-flat.dump", mod.a0_ramp_packets(
+    1, [16 * (900 + i) for i in range(72)], [36, 36, 0], seq=0,
+    stride=1008))
+# row 5 (--drop): one ~+3072 content jump in an otherwise smooth A0
+smooth = [(64 * (i // 63) + i % 63) * 16 for i in range(600)]
+jumped = smooth[:300] + [v + 3072 for v in smooth[300:]]
+write("jump-good.dump", mod.a0_ramp_packets(1, jumped, [510, 90], seq=0))
+write("jump-none.dump", mod.a0_ramp_packets(1, smooth, [510, 90], seq=0))
+write("unclaimed.dump", mod.burst_strided(1, 0, [15, 0], seq=0,
+                                          stride=1008) +
+      mod.burst(7, 9000, [510, 3], seq=2))
 PY
 
 run() { # dump args...: runs the checker on $TMP/<dump>, sets OUT/RC
@@ -197,6 +246,50 @@ check "a missing dump: exit 2 and an ERROR line" $? "$OUT"
 run good.dump --expect-ideal --samples
 echo "$OUT" | grep -q "sample 0: 0000 0000 0000 0000"
 check "--samples prints the diode values" $? "$OUT"
+
+# 8. the AS-5 leg signatures (D-ASh rows 2-7): the good shape passes,
+# each failure signature fails with its needle, and the NOTE lines
+# carry the observed numbers
+run fa-good.dump --expect-forced-abort 1
+[ "$RC" -eq 0 ] && echo "$OUT" | grep -q "^ASPECT-CHECK: PASS" &&
+    echo "$OUT" | grep -q "^ASPECT-CHECK NOTE: forced-abort urn 1:"
+check "fa-good: forced-abort PASS with a NOTE" $? "$OUT"
+fail fa-full.dump --expect-forced-abort 1 "no forced mid-series packet" \
+    "a full-packet abort shape fails"
+fail fa-span.dump --expect-forced-abort 1 "the product spans 130559 ms" \
+    "a too-long abort span fails"
+run fc-good.dump --expect-forced-complete 1
+check "fc-good: forced-complete PASS" "$?" "$OUT"
+fail fc-two.dump --expect-forced-complete 1 "want exactly 1" \
+    "two forced packets fail"
+run tiny-good.dump --expect-tiny 1
+[ "$RC" -eq 0 ] && echo "$OUT" | grep -q \
+    "NOTE: tiny urn 1: 100 packet(s): 1 x 0-sample, 99 x 1-sample"
+check "tiny-good: tiny PASS with the leading 0-sample packet" $? "$OUT"
+fail tiny-few.dump --expect-tiny 1 "10 packet(s), want" \
+    "too few forced packets fails"
+fail tiny-big.dump --expect-tiny 1 "carry more than 2 sample(s)" \
+    "a 3-sample forced packet fails"
+fail tiny-sum.dump --expect-tiny 1 "summingFpga 16, want 15" \
+    "a clean estimate fails the tiny check"
+run e2-good.dump --expect-epoch2 2
+check "e2-good: epoch2 PASS" "$?" "$OUT"
+fail e2-sum.dump --expect-epoch2 2 "summingFpga 15, want 16" \
+    "a corrupted epoch-2 estimate fails"
+run col-good.dump --expect-collapse 1
+[ "$RC" -eq 0 ] && echo "$OUT" | grep -q \
+    "NOTE: collapse urn 1: step"
+check "col-good: collapse PASS with a NOTE" $? "$OUT"
+fail col-flat.dump --expect-collapse 1 "want exactly 1" \
+    "a flat series fails the collapse"
+run jump-good.dump --expect-ideal 1 --expect-content-jump
+[ "$RC" -eq 0 ] && echo "$OUT" | grep -q \
+    "NOTE: content-jump urn 1: jump"
+check "jump-good: ideal + content-jump PASS" $? "$OUT"
+fail jump-none.dump --expect-ideal 1 --expect-content-jump \
+    "0 content jump(s), want exactly 1" "a smooth series fails the jump"
+fail unclaimed.dump --expect-forced-abort 1 0 "unclaimed product" \
+    "an unclaimed urn fails"
 
 echo "----------------------------------------"
 echo "pass=$PASS fail=$FAIL"

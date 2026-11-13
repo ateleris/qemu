@@ -47,11 +47,33 @@ TM(1,8) FID_48435, AspectCtrl.c:531).
 
 Usage:
   aspect-check.py DUMP [--expect-ideal [URN ...]] [--expect-none]
+                     [--expect-forced-abort URN ...]
+                     [--expect-forced-complete URN ...]
+                     [--expect-tiny URN ...] [--expect-epoch2 URN ...]
+                     [--expect-collapse URN ...] [--expect-content-jump]
                      [--summing N] [--averaging A] [--samples]
   aspect-check.py --self-test
---expect-ideal defaults to URNs "1 0" (the TC(238,1) request number
-then the TC(238,10) path); --summing/--averaging default to 16 (the
-ideal leg's N and time_binwidth; the AS-5 legs pass their own).
+The modes are the D-ASh signatures of the aspect-smoke.sh legs (aspect
+plan AS-5, docs/stix-port/2026-11-13-aspect-plan.md); every SSID 42
+product must be claimed by exactly one mode. --expect-ideal is the
+D-ASh row 1 shape (default URNs "1 0"; --summing/--averaging default
+to 16). --expect-forced-abort is row 2 (--jitter): one product per
+urn, a forced mid-series packet, the series ends early (start span
+below ABORT_SPAN_MS). --expect-forced-complete is row 3
+(--step-gap): exactly one forced mid-series packet and the full
+archive delivered (span above ABORT_SPAN_MS). --expect-tiny is rows
+4/7 epoch 1 (--drift, --step-1031): the corrupted-estimate packets -
+summingFpga 15 and averagingTc 64 are pinned by the mechanism, every
+packet carries at most 2 samples (the leading 0-sample forced packet
+allowed, plan MINOR 3), and there are tens of them. --expect-epoch2
+is row 7's second epoch (summing 16, averaging 64, one small
+product). --expect-collapse is row 6 (--avg): the series ends early
+and the TM values step down ~8x at the AvgSize change.
+--expect-content-jump is row 5 (--drop, with --expect-ideal): the
+time chain is continuous but the ramp's A0 values jump once. The
+first live runs are [L]: the modes assert direction and rough
+magnitude and print ASPECT-CHECK NOTE lines with the observed
+numbers so the reviewer can pin them.
 Exit codes: 0 decoded (and the check passed), 1 a decode error or a
 failed check, 2 bad usage or an unreadable file. stdlib only.
 """
@@ -69,6 +91,24 @@ SEG_NAMES = {SEG_CONT: "CONT", SEG_FIRST: "FIRST", SEG_LAST: "LAST",
              SEG_STANDALONE: "STANDALONE"}
 SEQ_MOD = 1 << 14      # CCSDS source sequence count
 STEP_TOL_MS = 3        # whole-ms truncation slack of two start times
+
+# the AS-5 leg signatures ([L] rough magnitudes, D-ASh rows 2-7): a
+# completing product spans the ~250 s archive, an aborted one ends at
+# the knob stamp (~150 s) minus the NOMINAL start (~72 s)
+ABORT_SPAN_MS = 120000
+# row 4/7: inc = 15 is deterministic (the truncated pair delta 1005..1007
+# < 1008, Timing.c:395-399 + AspectCtrl.c:219-233), averaging 64 is the
+# TC(238,1) binwidth; ~100 gap-forced packets of 0/1 samples
+TINY_SUMMING, TINY_AVERAGING = 15, 64
+TINY_MIN_PACKETS, TINY_MAX_PACKETS = 30, 130
+TINY_MAX_SAMPLES = 2
+# row 7 second epoch: all records post-step and consistent (inc = 16)
+EPOCH2_SUMMING, EPOCH2_AVERAGING = 16, 64
+# row 5/6 payload events on diode A0 (minimal-signed diffs mod 2**16):
+# the ramp advances 16 or 256 per sample; a 2-block content loss is
+# ~+3072 (folded), the Avg16->Avg2 change drops the values ~8x
+JUMP_MIN, JUMP_MAX = 1024, 8192
+COLLAPSE_STEP, COLLAPSE_MAX_POST = 2048, 128
 
 
 class DecodeError(Exception):
@@ -345,6 +385,314 @@ def check_none(products):
     return []
 
 
+# --- the AS-5 leg signatures (D-ASh rows 2-7) ---------------------------
+#
+# All [L]-loose: direction and rough magnitude, with NOTE lines carrying
+# the observed numbers. Shared helpers first.
+
+def one_product_each(products, urns, what):
+    """Exactly one product per requested urn. Returns (fails, products
+    by urn)."""
+    fails = []
+    by_urn = {}
+    for prod in products:
+        urn = prod["packets"][0]["header"]["user_request_number"]
+        by_urn.setdefault(urn, []).append(prod)
+    for urn in urns:
+        n = len(by_urn.get(urn, []))
+        if n != 1:
+            fails.append(f"{what}: user_request_number {urn}: {n} "
+                         f"product(s), want 1")
+    return fails, by_urn
+
+
+def signed_diffs(series):
+    """Consecutive differences folded into [-32768, 32768): the ramp
+    lives mod 2**16 and the folding keeps one big step one big step."""
+    return [((b - a + 32768) % 65536) - 32768
+            for a, b in zip(series, series[1:])]
+
+
+def a0_series(prod):
+    """The product's diode A0 values, packet by packet."""
+    return [s[0] for p in prod["packets"] for s in p["samples"]]
+
+
+def span_ms(prod):
+    hs = prod["packets"][0]["header"], prod["packets"][-1]["header"]
+    return (scet_to_ms(hs[1]["coarse"], hs[1]["fine"]) -
+            scet_to_ms(hs[0]["coarse"], hs[0]["fine"]))
+
+
+def start_deltas(prod):
+    hs = [p["header"] for p in prod["packets"]]
+    return [scet_to_ms(h["coarse"], h["fine"]) -
+            scet_to_ms(g["coarse"], g["fine"])
+            for g, h in zip(hs, hs[1:])]
+
+
+def check_headers(prod, urn, summing, averaging, what):
+    fails = []
+    for k, p in enumerate(prod["packets"]):
+        h = p["header"]
+        if h["summingFpga"] != summing:
+            fails.append(f"{what} urn {urn} packet {k}: summingFpga "
+                         f"{h['summingFpga']}, want {summing}")
+        if h["averagingTc"] != averaging:
+            fails.append(f"{what} urn {urn} packet {k}: averagingTc "
+                         f"{h['averagingTc']}, want {averaging}")
+    return fails
+
+
+def check_sgf_ends(prod, urn, what):
+    pkts = prod["packets"]
+    fails = []
+    if pkts[0]["seg"] != SEG_FIRST:
+        fails.append(f"{what} urn {urn}: first packet SGF "
+                     f"{SEG_NAMES[pkts[0]['seg']]}, want FIRST")
+    if pkts[-1]["seg"] != SEG_LAST:
+        fails.append(f"{what} urn {urn}: last packet SGF "
+                     f"{SEG_NAMES[pkts[-1]['seg']]}, want LAST")
+    return fails
+
+
+def note(what, urn, text):
+    print(f"ASPECT-CHECK NOTE: {what} urn {urn}: {text}")
+
+
+def check_forced_abort(products, urns, summing, averaging):
+    """Row 2 (--jitter): the request hits a gap with budget 1 left
+    (forced packet) and a second one with none left (forced final +
+    FSW_ERROR): one short-lived product per urn with a forced mid-series
+    packet."""
+    what = "forced-abort"
+    fails, by_urn = one_product_each(products, urns, what)
+    for urn in urns:
+        if urn not in by_urn:
+            continue
+        prod = by_urn[urn][0]
+        pkts = prod["packets"]
+        if len(pkts) < 2:
+            fails.append(f"{what} urn {urn}: {len(pkts)} packet(s), "
+                         f"want a forced packet and the error's final one")
+            continue
+        fails += check_sgf_ends(prod, urn, what)
+        fails += check_headers(prod, urn, summing, averaging, what)
+        shorts = [k for k, p in enumerate(pkts[:-1])
+                  if len(p["samples"]) < MAX_SAMPLES]
+        if not shorts:
+            fails.append(f"{what} urn {urn}: no forced mid-series packet "
+                         f"(all non-final packets full)")
+        span = span_ms(prod)
+        if span >= ABORT_SPAN_MS:
+            fails.append(f"{what} urn {urn}: the product spans {span} ms, "
+                         f"want an early end (< {ABORT_SPAN_MS})")
+        note(what, urn, f"{len(pkts)} packet(s) with "
+             f"{[len(p['samples']) for p in pkts]} sample(s), start "
+             f"deltas {start_deltas(prod)} ms, span {span} ms")
+    return fails
+
+
+def check_forced_complete(products, urns, summing, averaging):
+    """Row 3 (--step-gap): one gap event consumes the budget, the
+    request completes: the full archive with exactly one forced
+    mid-series packet."""
+    what = "forced-complete"
+    fails, by_urn = one_product_each(products, urns, what)
+    for urn in urns:
+        if urn not in by_urn:
+            continue
+        prod = by_urn[urn][0]
+        pkts = prod["packets"]
+        if len(pkts) < 2:
+            fails.append(f"{what} urn {urn}: {len(pkts)} packet(s), want "
+                         f"the forced one and the rest of the archive")
+            continue
+        fails += check_sgf_ends(prod, urn, what)
+        fails += check_headers(prod, urn, summing, averaging, what)
+        shorts = [k for k, p in enumerate(pkts[:-1])
+                  if len(p["samples"]) < MAX_SAMPLES]
+        if len(shorts) != 1:
+            fails.append(f"{what} urn {urn}: {len(shorts)} forced "
+                         f"mid-series packet(s), want exactly 1")
+        if len(pkts[-1]["samples"]) >= MAX_SAMPLES:
+            fails.append(f"{what} urn {urn}: the last packet is full, "
+                         f"want a short one")
+        span = span_ms(prod)
+        if span <= ABORT_SPAN_MS:
+            fails.append(f"{what} urn {urn}: the product spans {span} ms, "
+                         f"want the whole archive (> {ABORT_SPAN_MS})")
+        note(what, urn, f"{len(pkts)} packet(s) with "
+             f"{[len(p['samples']) for p in pkts]} sample(s), start "
+             f"deltas {start_deltas(prod)} ms, span {span} ms")
+    return fails
+
+
+def check_tiny(products, urns):
+    """Rows 4/7 epoch 1 (--drift, --step-1031): the corrupted estimate
+    inc = 15 gaps at every block; with averaging 64 and the budget of
+    100 that is ~100 forced packets of 0/1 samples, then FSW_ERROR. The
+    leading 0-sample forced packet is the plan's MINOR 3."""
+    what = "tiny"
+    fails, by_urn = one_product_each(products, urns, what)
+    for urn in urns:
+        if urn not in by_urn:
+            continue
+        prod = by_urn[urn][0]
+        pkts = prod["packets"]
+        if not TINY_MIN_PACKETS <= len(pkts) <= TINY_MAX_PACKETS:
+            fails.append(f"{what} urn {urn}: {len(pkts)} packet(s), want "
+                         f"the ~100 gap-forced ones "
+                         f"({TINY_MIN_PACKETS}..{TINY_MAX_PACKETS})")
+        big = [k for k, p in enumerate(pkts)
+               if len(p["samples"]) > TINY_MAX_SAMPLES]
+        if big:
+            fails.append(f"{what} urn {urn}: packet(s) {big} carry more "
+                         f"than {TINY_MAX_SAMPLES} sample(s)")
+        fails += check_headers(prod, urn, TINY_SUMMING, TINY_AVERAGING,
+                               what)
+        counts = [len(p["samples"]) for p in pkts]
+        note(what, urn, f"{len(pkts)} packet(s): "
+             f"{counts.count(0)} x 0-sample, "
+             f"{counts.count(1)} x 1-sample, max {max(counts) if counts else 0}")
+    return fails
+
+
+def check_epoch2(products, urns):
+    """Row 7's second epoch: the discriminator. All records post-step
+    and consistent: inc = 16, one small product."""
+    what = "epoch2"
+    fails, by_urn = one_product_each(products, urns, what)
+    for urn in urns:
+        if urn not in by_urn:
+            continue
+        prod = by_urn[urn][0]
+        pkts = prod["packets"]
+        if not 1 <= len(pkts) <= 2:
+            fails.append(f"{what} urn {urn}: {len(pkts)} packet(s), "
+                         f"want 1 (or 2)")
+        total = sum(len(p["samples"]) for p in pkts)
+        if not 2 <= total <= MAX_SAMPLES:
+            fails.append(f"{what} urn {urn}: {total} sample(s), want the "
+                         f"small second epoch (2..{MAX_SAMPLES})")
+        for k, p in enumerate(pkts):
+            if len(p["samples"]) > MAX_SAMPLES:
+                fails.append(f"{what} urn {urn}: packet {k} over "
+                             f"{MAX_SAMPLES} samples")
+        fails += check_headers(prod, urn, EPOCH2_SUMMING, EPOCH2_AVERAGING,
+                               what)
+        note(what, urn, f"{len(pkts)} packet(s) with "
+             f"{[len(p['samples']) for p in pkts]} sample(s), span "
+             f"{span_ms(prod)} ms")
+    return fails
+
+
+def check_collapse(products, urns, summing, averaging):
+    """Row 6 (--avg): the once-per-request estimate stays 16, so every
+    post-change block gaps; budget 1 aborts at the second one. The
+    values step down ~8x (N=2 sums divided by the still-16 averaging)."""
+    what = "collapse"
+    fails, by_urn = one_product_each(products, urns, what)
+    for urn in urns:
+        if urn not in by_urn:
+            continue
+        prod = by_urn[urn][0]
+        pkts = prod["packets"]
+        if len(pkts) < 2:
+            fails.append(f"{what} urn {urn}: {len(pkts)} packet(s), want "
+                         f"the pre-change data and the error's final one")
+            continue
+        fails += check_sgf_ends(prod, urn, what)
+        fails += check_headers(prod, urn, summing, averaging, what)
+        if len(pkts[-1]["samples"]) >= MAX_SAMPLES:
+            fails.append(f"{what} urn {urn}: the last packet is full, "
+                         f"want a short one")
+        span = span_ms(prod)
+        if span >= ABORT_SPAN_MS:
+            fails.append(f"{what} urn {urn}: the product spans {span} ms, "
+                         f"want an early end (< {ABORT_SPAN_MS})")
+        series = a0_series(prod)
+        dds = signed_diffs(series)
+        runs = []
+        i = 0
+        while i < len(dds):
+            if dds[i] <= -JUMP_MIN:
+                j = i
+                while j < len(dds) and dds[j] <= -JUMP_MIN:
+                    j += 1
+                runs.append((i, j))
+                i = j
+            else:
+                i += 1
+        if len(runs) != 1 or runs[0][1] - runs[0][0] > 2:
+            fails.append(f"{what} urn {urn}: {len(runs)} value step(s) "
+                         f"down, want exactly 1 (spanning <= 2 samples)")
+        else:
+            lo, hi = runs[0]
+            drop = sum(dds[lo:hi])
+            if drop > -COLLAPSE_STEP:
+                fails.append(f"{what} urn {urn}: the value step is {drop}, "
+                             f"want <= {-COLLAPSE_STEP} (the ~8x "
+                             f"N=2/averaging-16 collapse)")
+            late = [d for d in dds[hi:] if abs(d) > COLLAPSE_MAX_POST]
+            if late:
+                fails.append(f"{what} urn {urn}: after the step the sample "
+                             f"rhythm jumps {late}, want |d| <= "
+                             f"{COLLAPSE_MAX_POST}")
+            if lo < 10:
+                fails.append(f"{what} urn {urn}: only {lo} sample(s) "
+                             f"before the step, want >= 10")
+            note(what, urn, f"step {dds[lo:hi]} at sample {lo}, "
+                 f"{len(series)} sample(s), span {span} ms")
+    return fails
+
+
+def check_content_jump(products):
+    """Row 5 (--drop): no time gap at all (the archive's rewrite chain),
+    the request completes - the only signature is the ramp content
+    jumping once (two lost blocks, folded into +-3072 on A0)."""
+    what = "content-jump"
+    fails = []
+    for prod in products:
+        urn = prod["packets"][0]["header"]["user_request_number"]
+        series = a0_series(prod)
+        dds = signed_diffs(series)
+        runs = []
+        i = 0
+        while i < len(dds):
+            if abs(dds[i]) >= JUMP_MIN:
+                j = i
+                while j < len(dds) and abs(dds[j]) >= JUMP_MIN:
+                    j += 1
+                runs.append((i, j))
+                i = j
+            else:
+                i += 1
+        if len(runs) != 1 or runs[0][1] - runs[0][0] > 2:
+            fails.append(f"{what} urn {urn}: {len(runs)} content jump(s), "
+                         f"want exactly 1 (spanning <= 2 samples)")
+            continue
+        lo, hi = runs[0]
+        jump = sum(dds[lo:hi])
+        if not JUMP_MIN <= abs(jump) <= JUMP_MAX:
+            fails.append(f"{what} urn {urn}: the content jump is {jump}, "
+                         f"want a 2-block loss (|{JUMP_MIN}..{JUMP_MAX}|)")
+        note(what, urn, f"jump {dds[lo:hi]} at sample {lo}, "
+             f"{len(series)} sample(s)")
+    return fails
+
+
+def check_claimed(products, claimed):
+    """Every SSID 42 product must be claimed by exactly one mode."""
+    fails = []
+    for prod in products:
+        urn = prod["packets"][0]["header"]["user_request_number"]
+        if urn not in claimed:
+            fails.append(f"user_request_number {urn}: unclaimed product "
+                         f"(no --expect-* mode asked for it)")
+    return fails
+
+
 # --- self-test ----------------------------------------------------------
 
 def be(v, n):
@@ -407,6 +755,54 @@ def burst(urn, t0_ms, counts, seq=0, summing=16, averaging=16, jump=None):
 
 def lines_of(pkts):
     return [p.hex() for p in pkts]
+
+
+def burst_strided(urn, t0_ms, counts, seq=0, stride=None, summing=16,
+                  averaging=16):
+    """burst() with a per-packet start stride (the gap-forced packets
+    follow the raw record times, not a full packet)."""
+    stride = stride if stride is not None \
+        else MAX_SAMPLES * averaging * summing
+    pkts = []
+    t = t0_ms
+    for k, n in enumerate(counts):
+        samples = [[(i + k) & 0xFFFF, 0, 0, 0] for i in range(n)]
+        seg = SEG_STANDALONE if len(counts) == 1 else (
+            SEG_FIRST if k == 0 else
+            SEG_LAST if k == len(counts) - 1 else SEG_CONT)
+        c, f = ms_to_scet(t)
+        pkts.append(build_packet(
+            ssid42_body(c, f, urn, averaging, summing, samples), seg, seq))
+        seq = (seq + 1) % SEQ_MOD
+        t += stride
+    return pkts
+
+
+def a0_ramp_packets(urn, series, splits, seq=0, summing=16, averaging=16,
+                    stride=None):
+    """One product whose A0 follows @series (split into packets of
+    @splits sample counts; the other diodes 0), packet starts advancing
+    @stride (default: a full packet)."""
+    stride = stride if stride is not None \
+        else MAX_SAMPLES * averaging * summing
+    pkts = []
+    t = 0
+    pos = 0
+    for k, n in enumerate(splits):
+        samples = []
+        for i in range(n):
+            v = series[pos + i] if pos + i < len(series) else 0
+            samples.append([v, 0, 0, 0])
+        pos += n
+        seg = SEG_STANDALONE if len(splits) == 1 else (
+            SEG_FIRST if k == 0 else
+            SEG_LAST if k == len(splits) - 1 else SEG_CONT)
+        c, f = ms_to_scet(t)
+        pkts.append(build_packet(
+            ssid42_body(c, f, urn, averaging, summing, samples), seg, seq))
+        seq = (seq + 1) % SEQ_MOD
+        t += stride
+    return pkts
 
 
 def must_fail(lines, what, needle):
@@ -563,6 +959,123 @@ def self_test():
     prods, _ = decode_lines(lines_of(burst(0, 0, [3], seq=0)))
     assert check_none(prods) == ["1 SSID 42 packet(s) in the dump, want 0"]
 
+    # --- the AS-5 leg signatures (D-ASh rows 2-7) -----------------------
+
+    # row 2, forced-abort: FIRST(15) + LAST(0) one block apart
+    good = burst_strided(1, 0, [15, 0], seq=0, stride=1008)
+    prods, _ = decode_lines(lines_of(good))
+    assert check_forced_abort(prods, [1], 16, 16) == [], \
+        check_forced_abort(prods, [1], 16, 16)
+    # ... a missing urn, a full-packet shape and a too-long span fail
+    f = check_forced_abort([], [1], 16, 16)
+    assert f == ["forced-abort: user_request_number 1: 0 product(s), "
+                 "want 1"], f
+    prods, _ = decode_lines(lines_of(burst(1, 0, [510, 3], seq=0)))
+    f = check_forced_abort(prods, [1], 16, 16)
+    assert len(f) == 2 and "no forced mid-series packet" in f[0] and \
+        "spans" in f[1], f
+    prods, _ = decode_lines(lines_of(
+        burst_strided(1, 0, [15, 0], seq=0, stride=130560)))
+    f = check_forced_abort(prods, [1], 16, 16)
+    # 130560 ms reads back as 130559: ms -> SCET floors the 1/65536 s
+    # fine count and Timing_ToMs floors again (the live runs show it too)
+    assert len(f) == 1 and "the product spans 130559 ms" in f[0], f
+
+    # row 3, forced-complete: one forced packet, the archive delivered
+    good = burst(1, 0, [15, 510, 130], seq=0)
+    prods, _ = decode_lines(lines_of(good))
+    assert check_forced_complete(prods, [1], 16, 16) == [], \
+        check_forced_complete(prods, [1], 16, 16)
+    # ... two forced packets fail, an aborted span fails
+    prods, _ = decode_lines(lines_of(burst(1, 0, [15, 510, 17, 130],
+                                           seq=0)))
+    f = check_forced_complete(prods, [1], 16, 16)
+    assert len(f) == 1 and "want exactly 1" in f[0], f
+    prods, _ = decode_lines(lines_of(
+        burst_strided(1, 0, [15, 3], seq=0, stride=1008)))
+    f = check_forced_complete(prods, [1], 16, 16)
+    assert any("spans 1007 ms" in x for x in f), f
+
+    # rows 4/7, tiny: ~100 forced packets of 0/1 samples, summing 15
+    good = burst_strided(1, 0, [0] + [1] * 99, seq=0, stride=1008,
+                         summing=15, averaging=64)
+    prods, _ = decode_lines(lines_of(good))
+    assert check_tiny(prods, [1]) == [], check_tiny(prods, [1])
+    # ... too few packets, a 3-sample packet and a wrong estimate fail
+    prods, _ = decode_lines(lines_of(
+        burst_strided(1, 0, [0] + [1] * 9, seq=0, stride=1008,
+                      summing=15, averaging=64)))
+    f = check_tiny(prods, [1])
+    assert len(f) == 1 and "10 packet(s), want" in f[0], f
+    prods, _ = decode_lines(lines_of(
+        burst_strided(1, 0, [0] + [1] * 39 + [3] + [1] * 59, seq=0,
+                      stride=1008, summing=15, averaging=64)))
+    f = check_tiny(prods, [1])
+    assert len(f) == 1 and "carry more than 2 sample(s)" in f[0], f
+    prods, _ = decode_lines(lines_of(
+        burst_strided(1, 0, [0] + [1] * 99, seq=0, stride=1008,
+                      summing=16, averaging=64)))
+    f = check_tiny(prods, [1])
+    assert len(f) == 100 and all("summingFpga 16, want 15" in x
+                                 for x in f), f[0]
+
+    # row 7 epoch 2: one small consistent product, summing 16
+    good = burst_strided(2, 0, [62], seq=0, summing=16, averaging=64)
+    prods, _ = decode_lines(lines_of(good))
+    assert check_epoch2(prods, [2]) == [], check_epoch2(prods, [2])
+    prods, _ = decode_lines(lines_of(
+        burst_strided(2, 0, [62], seq=0, summing=15, averaging=64)))
+    f = check_epoch2(prods, [2])
+    assert len(f) == 1 and "summingFpga 15, want 16" in f[0], f
+    f = check_epoch2([], [2])
+    assert f == ["epoch2: user_request_number 2: 0 product(s), want 1"], f
+
+    # row 6, collapse: the ~8x value step down, then a small rhythm
+    pre = [16 * (300 + i) for i in range(60)]           # ~16*s rhythm
+    post = [2 * (360 + i) for i in range(12)]           # ~2*s: /8
+    series = pre + post
+    good = a0_ramp_packets(1, series, [36, 36, 0], seq=0, stride=1008)
+    prods, _ = decode_lines(lines_of(good))
+    f = check_collapse(prods, [1], 16, 16)
+    assert f == [], f
+    # ... no step: the collapse must fail
+    flat = [16 * (900 + i) for i in range(72)]
+    prods, _ = decode_lines(lines_of(
+        a0_ramp_packets(1, flat, [36, 36, 0], seq=0, stride=1008)))
+    f = check_collapse(prods, [1], 16, 16)
+    assert len(f) == 1 and "want exactly 1" in f[0], f
+    # ... a step without the post-step rhythm (a one-off blip) fails
+    blip = pre + [pre[-1] // 8] + [16 * (900 + i) for i in range(11)]
+    prods, _ = decode_lines(lines_of(
+        a0_ramp_packets(1, blip, [36, 35, 1], seq=0, stride=1008)))
+    f = check_collapse(prods, [1], 16, 16)
+    assert any("rhythm jumps" in x for x in f), f
+
+    # row 5, content-jump: one ~+3072 step in an otherwise smooth A0
+    smooth = [(64 * (i // 63) + i % 63) * 16 for i in range(600)]
+    jumped = smooth[:300] + [v + 3072 for v in smooth[300:]]
+    good = a0_ramp_packets(1, jumped, [510, 90], seq=0)
+    prods, _ = decode_lines(lines_of(good))
+    assert check_content_jump(prods) == [], check_content_jump(prods)
+    # ... a smooth series has no jump; two jumps fail
+    prods, _ = decode_lines(lines_of(a0_ramp_packets(1, smooth,
+                                                     [510, 90], seq=0)))
+    f = check_content_jump(prods)
+    assert len(f) == 1 and "0 content jump(s), want exactly 1" in f[0], f
+    twice = smooth[:300] + [v + 3072 for v in smooth[300:450]] + \
+        [v + 6144 for v in smooth[450:]]
+    prods, _ = decode_lines(lines_of(a0_ramp_packets(1, twice, [510, 90],
+                                                     seq=0)))
+    f = check_content_jump(prods)
+    assert len(f) == 1 and "2 content jump(s)" in f[0], f
+
+    # the modes claim their urns: an unclaimed product fails
+    # (the second burst continues the APID's sequence count)
+    prods, _ = decode_lines(lines_of(good) + lines_of(
+        burst(7, 9000, [510, 3], seq=len(good))))
+    f = check_claimed(prods, {1: "content-jump"})
+    assert len(f) == 1 and "unclaimed product" in f[0], f
+
     print("ASPECT-CHECK SELF-TEST: PASS")
     return 0
 
@@ -583,6 +1096,29 @@ def main():
                          "request number and the TC(238,10) path)")
     ap.add_argument("--expect-none", action="store_true",
                     help="check the negative leg: no SSID 42 packet at all")
+    ap.add_argument("--expect-forced-abort", type=int, nargs="+",
+                    metavar="URN",
+                    help="D-ASh row 2 (--jitter): one product per urn, a "
+                         "forced mid-series packet, the series ends early")
+    ap.add_argument("--expect-forced-complete", type=int, nargs="+",
+                    metavar="URN",
+                    help="D-ASh row 3 (--step-gap): exactly one forced "
+                         "mid-series packet, the archive fully delivered")
+    ap.add_argument("--expect-tiny", type=int, nargs="+", metavar="URN",
+                    help="D-ASh rows 4/7 epoch 1 (--drift, --step-1031): "
+                         "the corrupted-estimate packets, summing 15 and "
+                         "averaging 64, <= 2 samples each, tens of them")
+    ap.add_argument("--expect-epoch2", type=int, nargs="+", metavar="URN",
+                    help="D-ASh row 7's second epoch (--step-1031): one "
+                         "small consistent product, summing 16, "
+                         "averaging 64")
+    ap.add_argument("--expect-collapse", type=int, nargs="+",
+                    metavar="URN",
+                    help="D-ASh row 6 (--avg): the series ends early and "
+                         "the values step down ~8x at the AvgSize change")
+    ap.add_argument("--expect-content-jump", action="store_true",
+                    help="D-ASh row 5 (--drop, with --expect-ideal): the "
+                         "ramp's A0 values jump once, times continuous")
     ap.add_argument("--summing", type=int_arg, default=16, metavar="N",
                     help="the expected summingFpga (default 16)")
     ap.add_argument("--averaging", type=int_arg, default=16, metavar="A",
@@ -595,6 +1131,9 @@ def main():
         return self_test()
     if args.expect_ideal is not None and args.expect_none:
         ap.error("--expect-ideal and --expect-none are exclusive")
+    if args.expect_content_jump and args.expect_ideal is None:
+        ap.error("--expect-content-jump claims no product: give it with "
+                 "--expect-ideal")
     if not args.dump:
         ap.error("a dump file is required")
     try:
@@ -611,16 +1150,60 @@ def main():
     report(products, n_ql, args.samples, sys.stdout)
     urns = args.expect_ideal if args.expect_ideal else [1, 0]
     fails, passed = [], []
+    claimed = {}
     if args.expect_ideal is not None:
         fails += check_ideal(products, urns, args.summing, args.averaging)
         passed.append(f"ideal: one product per urn {urns}, "
                       f"{MAX_SAMPLES}-sample packets, "
                       f"summing {args.summing}, averaging {args.averaging}")
+        for u in urns:
+            claimed[u] = "ideal"
     if args.expect_none:
         fails += check_none(products)
         passed.append("none: no SSID 42 packet")
+    if args.expect_forced_abort is not None:
+        fails += check_forced_abort(products, args.expect_forced_abort,
+                                    args.summing, args.averaging)
+        passed.append(f"forced-abort: urns {args.expect_forced_abort} "
+                      f"end early with a forced packet")
+        for u in args.expect_forced_abort:
+            claimed[u] = "forced-abort"
+    if args.expect_forced_complete is not None:
+        fails += check_forced_complete(products,
+                                       args.expect_forced_complete,
+                                       args.summing, args.averaging)
+        passed.append(f"forced-complete: urns "
+                      f"{args.expect_forced_complete} deliver the "
+                      f"archive with one forced packet")
+        for u in args.expect_forced_complete:
+            claimed[u] = "forced-complete"
+    if args.expect_tiny is not None:
+        fails += check_tiny(products, args.expect_tiny)
+        passed.append(f"tiny: urns {args.expect_tiny} gap-forced "
+                      f"0/1-sample packets, summing {TINY_SUMMING}, "
+                      f"averaging {TINY_AVERAGING}")
+        for u in args.expect_tiny:
+            claimed[u] = "tiny"
+    if args.expect_epoch2 is not None:
+        fails += check_epoch2(products, args.expect_epoch2)
+        passed.append(f"epoch2: urn {args.expect_epoch2} one small "
+                      f"consistent product, summing {EPOCH2_SUMMING}, "
+                      f"averaging {EPOCH2_AVERAGING}")
+        for u in args.expect_epoch2:
+            claimed[u] = "epoch2"
+    if args.expect_collapse is not None:
+        fails += check_collapse(products, args.expect_collapse,
+                                args.summing, args.averaging)
+        passed.append(f"collapse: urns {args.expect_collapse} end early "
+                      f"with the ~8x value step")
+        for u in args.expect_collapse:
+            claimed[u] = "collapse"
+    if args.expect_content_jump:
+        fails += check_content_jump(products)
+        passed.append("content-jump: one ramp jump, times continuous")
     if not passed:
         return 0
+    fails += check_claimed(products, claimed)
     for x in fails:
         print(f"ASPECT-CHECK MISMATCH: {x}")
     if fails:
