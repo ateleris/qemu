@@ -205,6 +205,18 @@ STIX_PORT_BASE=auto bash scripts/stix/flash-damage-smoke.sh \
 #    injected SDRAM double error must reboot the guest):
 STIX_PORT_BASE=auto bash scripts/stix/edac-smoke.sh \
     build/qemu-system-sparc          # add --negative, --dry-run
+
+# 10. L4 replay gate (GH #1061 RED/GREEN replay, plan
+#     2026-11-13-l4-replay-plan.md; the three wrapped ELFs come from the
+#     environment and stay outside the repo; fresh flash per phase, slot
+#     mode REQUIRED — the collect enters NOMINAL; ~12 min collect + two
+#     request boots at the defaults; SKIP 77 without the ELFs):
+STIX_PORT_BASE=auto \
+STIX_L4_RED_ELF=$HOME/dev/stix-state/gh1061/elf/ASW_em_red3.elf \
+STIX_L4_GREEN_ELF=$HOME/dev/stix-state/gh1061/elf/ASW_em_green3.elf \
+STIX_L4_COLLECT_ELF=$HOME/dev/stix-state/gh1061/elf/ASW_em_collect.elf \
+    bash scripts/stix/l4-replay.sh \
+    build/qemu-system-sparc          # add --collect-only, --dry-run
 ```
 
 Notes:

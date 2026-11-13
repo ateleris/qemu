@@ -1221,6 +1221,113 @@ probe out of it):
   for sdram/rotbuf also pass `-global stix-edac.edac-at-boot=all-on`
   before QEMU starts.
 
+## L4 replay (#1061)
+
+`scripts/stix/l4-replay.sh` reproduces GitHub issue #1061 ("Packet data
+override at the end of files in L4 data", fixed by PR #1064) in the
+emulator, using the issue's own RED/GREEN flight builds (plan:
+`2026-11-13-l4-replay-plan.md`). One collection on a fresh flash, a flash
+snapshot, then RED and GREEN each on their own copy of that snapshot,
+each sent request A (the whole archive) and B (an empty window after
+it). What it shows:
+
+- **GREEN delivers every archived chunk**: A's TM(21,6) SSID-24 packets
+  cover every archived chunk exactly once on the relative-time axis, and
+  B answers with TM(5,2) 0x543F (no data found) only. The fix hoists the
+  zeroing of the L4 staging counters out of the file-search loop, once
+  per box (ASW SciReport.c:623-628, the "prevent data override" comment
+  at :672).
+- **RED keeps only the last search round**: the wrapped RED build
+  (old tree `76775361`) searches the RAW_COUNTS files in rounds of at
+  most 3 (`filenames[3]`, old SciReport.c:616) and zeroes the L4
+  counters at the start of **every** round (old `case 4:`, :660-663,
+  after the `nFiles == 0` break :631-632), so only the samples staged
+  during the last round survive — the last `nfiles % 3` files, 3 files
+  when 0, plus the one carried-over time-bin sample. B then produces
+  0x543F **plus one packet** byte-identical to A's last structure (the
+  D2 ghost: a level-4 request that finds no files re-materializes the
+  previous request's staged tail via the post-box
+  `level_4_report(..., false)` (SciReport.c:480-491) and the final
+  flush (:526); GREEN's per-box reset empties the staging → 0x543F only,
+  ASW SciReport.c:862-865).
+
+The command line (the wrapped ELFs come from the environment, the bundle
+stays outside the repo):
+
+```bash
+STIX_PORT_BASE=auto \
+STIX_L4_RED_ELF=$HOME/dev/stix-state/gh1061/elf/ASW_em_red3.elf \
+STIX_L4_GREEN_ELF=$HOME/dev/stix-state/gh1061/elf/ASW_em_green3.elf \
+STIX_L4_COLLECT_ELF=$HOME/dev/stix-state/gh1061/elf/ASW_em_collect.elf \
+    bash scripts/stix/l4-replay.sh build/qemu-system-sparc
+```
+
+- `--collect-only` runs phases 1-2 only (snapshot + truth + gate, no
+  request runs — the expensive part, validated alone); `--dry-run`
+  prints the QEMU/probe lines of all four phases and boots nothing;
+  `--check-guard` runs the run-dir/slot guards alone. Without the ELFs
+  the wrapper prints `SKIP:` and exits 77.
+- `STIX_L4_RUN_DIR` (default `/tmp/stix-l4-replay`) holds the
+  `collect/`, `red/` and `green/` subdirs plus `truth.txt` and
+  `record.txt`; the shared uprev/baseline/GS dirs are refused — the
+  collect enters NOMINAL and writes a flash context, like every NOMINAL
+  session above.
+- `STIX_L4_COLLECT_SECONDS` (default 600) is the flare-on time of
+  phase 1; `STIX_L4_REQ_B_AT` (default +600 s) places request B well
+  after A's 30-s service slot. Slot mode (`STIX_PORT_BASE`, as
+  everywhere) holds one slot for the whole wrapper.
+
+The four phases:
+
+1. **collect** — fresh flash, boot the collection build
+   (`STIX_L4_COLLECT_ELF`, default the GREEN ELF; collection behaviour
+   is identical in RED and GREEN) to NOMINAL, `det-flare true` over QMP
+   at +75 s (the flare recipe above), hold `STIX_L4_COLLECT_SECONDS`,
+   CONF at the end to flush the last RAW_COUNTS file; QEMU traces
+   `stixdet_chunk`, `stixdet_chunk_drop`, `stixdet_nominal_swap`.
+2. **truth + snapshot** — `scripts/stix/l4-flash-truth.py` reads the
+   collect flash image — the same archive the request runs will read —
+   never TM, and not the UART (the `rcr =` / `Flush DET stream` prints
+   are TRACE calls, compiled out in these builds). It enumerates the
+   RAW_COUNTS files from the page-0 spares (File.c:328, :342, :387),
+   reads each file's pages trimmed to the spare's `fileSizeInBytes`
+   (File.c:490) and walks the chunks by their 64-B headers
+   (sci_utils.h:8-14; the size u16 at 62 counts the whole chunk incl.
+   its header, RotAccuCompactor.c:169-173). With `--trace` it asserts
+   the exact mapping **archived[k] == the k-th `stixdet_chunk` SCET**
+   and **archived = model − 1**: the FSW stores each chunk with the
+   previous chunk's end (ArchiveManager.c:133,168,182-185) and drops
+   the first chunk of the collection (ArchiveManager.c:138-144 — the
+   one "Skipped first Det data chunk" TRACE_ERROR the UART still
+   prints; `--uart` asserts it). Gate before any request run: ≥ 12
+   files, every chunk tag RCR 0. Then the snapshot `flash-collect.bin`
+   (verified sparse copy).
+3. **requests** — for BUILD ∈ {RED, GREEN}: a fresh dir, `flash.bin` =
+   a sparse copy of the snapshot, boot to CONFIGURATION only (no
+   NOMINAL entry: no context write, no detector, the archive frozen).
+   CONF, S20=0, TC(237,13) with the L4 pixel mask 0xFFF, then request A
+   (start = the truth's first archived chunk) at +70 s and request B
+   (an empty window after the data) at `STIX_L4_REQ_B_AT`; nothing else
+   is sent between A and B. The probe dumps 0x5BC (L4) and 0x5A7
+   (events).
+4. **verdict** — `scripts/stix/l4-decode.py` per build against
+   `truth.txt`: GREEN A every chunk exactly once, GREEN B silent; RED A
+   the red-round sample count with every sample byte-identical to
+   GREEN's same-relative-time sample, RED B the ghost (primary:
+   byte-identical structure incl. the rel-time bytes). PASS line:
+
+   ```
+   L4-REPLAY: PASS (green <G>/<N> complete, B silent; red <R>/<N> = the red-round <R> signature, ghost primary; identity ok — an emulator result, not hardware evidence)
+   ```
+
+   On a PASS the three working `flash.bin` copies are dropped; the
+   snapshot and every decode artefact stay in the run dir.
+
+**Caveat.** The verdict — emulator shows FSW behaviour for our input;
+supports a mechanism, does not prove the flight cause — is an emulator
+result, not hardware evidence: QEMU runs the real RED/GREEN binaries,
+but the detector input and the flash are the emulator's.
+
 ## Notes and limits
 
 - **Order doesn't matter.** The bridge retries the QEMU connection. QEMU

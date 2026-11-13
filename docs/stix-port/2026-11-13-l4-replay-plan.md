@@ -1,6 +1,8 @@
 # L4 request replay — GH #1061 RED/GREEN in the emulator: plan
 
-Status: plan, nothing built. 2026-11-13, revised the same day after the
+Status: built and live-validated 2026-11-13 (L4-1..L4-3a, L4-4 docs;
+first live PASS in "As-built" at the end; `--long` not built). Plan of
+2026-11-13, revised the same day after the
 independent plan review (`~/dev/stix-state/tools/glm/l4-plan-review.md`;
 resolutions at the end). Track worktree `~/dev/qemu-stix-l4`
 (branch `stix-uprev-l4`, main-line tip `49d36da19d`); this draft edits **only
@@ -86,10 +88,11 @@ box-end / request-final flush (ASW SciReport.c:857-865, :526).
    - GREEN: every archived chunk appears exactly once on the relative-time
      axis; B produces **only** TM(5,2) 0x543F (no data found) and zero
      SSID-24 packets;
-   - RED: only the last search round survives (3 files' chunks + the one
-     carried-over time-bin sample — the bundle's "15 = 14 + 1" signature,
-     TEST_PLAN §8); B produces 0x543F **plus one packet** whose L4 structure
-     is byte-identical to A's last structure (D2 ghost);
+   - RED: only the last search round survives (the last `nfiles % 3` files,
+     3 when 0, + the one carried-over time-bin sample — the bundle's
+     "15 = 14 + 1" signature, TEST_PLAN §8); B produces 0x543F **plus one
+     packet** whose L4 structure is byte-identical to A's last structure
+     (D2 ghost);
    - every sample RED sends is byte-identical to GREEN's same-relative-time
      sample.
 3. Reusable tooling: `l4-tc.py` (builder), `l4-decode.py` (decoder), and
@@ -525,3 +528,42 @@ The review also upgraded the old-tree citations to [C] (its own `git show
   definitions; upstream GitHub activity; the `ASW_em_collect.elf` (the
   bundle's filler-patched build — unnecessary here, the emulator produces
   real counts).
+
+## As-built (2026-11-13)
+
+The first live full run (L4-4's docs commit; `--long` is **not** built —
+docs part only). QEMU built from main-line `fad852c452`; the three wrapped
+ELFs from the bundle directory; `STIX_PORT_BASE=auto`; **all 20 checks
+ok**, `L4-REPLAY: PASS`.
+
+- **collect** — 600 s on `ASW_em_collect.elf` via `STIX_L4_COLLECT_ELF`
+  (the plan's default is the GREEN ELF; the Out-of-scope bullet above
+  called the collect build unnecessary — the run used it anyway; the
+  collection code is identical in RED and GREEN, so either is valid):
+  604 archived chunks in 121 files, rcrmax 0, snapshot
+  `flash-collect.bin` allocated 30460 KiB.
+- **RED `ASW_em_red3.elf`** — A sent 5 samples = red-round 5 (121 % 3 = 1
+  → the last file's 4 chunks + the 1 carried sample, exactly the
+  last-round rule of the Goal-2 bullet above); B's single packet GHOST
+  primary (byte-identical structure incl. the rel-time bytes); identity
+  with GREEN ok; one TM(5,2) 0x543F.
+- **GREEN `ASW_em_green3.elf`** — A 604/604, each exactly once (dups 0,
+  rcr [0], ebin 0x3e1); B silent (0 packets, GHOST none); one TM(5,2)
+  0x543F.
+- **File count is a property of the build, not a truth invariant.** An
+  earlier 600 s collect on the GREEN ELF produced 24 files for the same
+  604 chunks (23 files of 26 chunks + 1 of 6); the collect ELF writes 5
+  chunks per file (120 files of 5 + 1 of 4 = 121), so the search walks
+  many 3-file rounds. The chunk truth (the per-chunk SCETs) is the same
+  rule in both.
+  The plan's file-count estimates ("~7 chunks per file, a file every
+  ~7 s", "Key facts"; the derived counts in D-L4d/D-L4f) are superseded
+  by this. The ≈ 1 chunk/s rate and the one-dropped-chunk rule held on
+  both collects: archived = model − 1 with exactly one "Skipped first
+  Det data chunk" line, whether 24 or 121 files — the drop is per mode
+  epoch, never per file close (ArchiveManager.c:138-144).
+- **L4-3a review outcome** (no BLOCKER/MAJOR; 5 MINORs, all fixed in
+  `521b771bf6`): the size-word and name-SCET cross-checks in
+  `l4-flash-truth.py`, red-round reported n/a below 2 files, the
+  fake-qemu guard now exits non-zero, structural failure tests in the
+  host harness, stale comments removed.
