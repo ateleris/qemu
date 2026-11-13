@@ -179,6 +179,9 @@ def parse_fill_csv(path):
     rows = []
     with open(path, newline="") as fh:
         for row in csv.DictReader(fh):
+            # the drive writes "rotb.count" etc.; accept bare names too
+            row = {k.split(".", 1)[1] if k and k.startswith("rotb.")
+                   else k: v for k, v in row.items()}
             try:
                 rows.append({
                     "wall_mono": float(row["wall_mono"]),
