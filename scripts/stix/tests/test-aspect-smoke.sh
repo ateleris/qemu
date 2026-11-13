@@ -121,7 +121,14 @@ printf '%s' "$out" > "$TMP/drop"
 dry --avg
 want "avg: the AvgSize TC and its acceptance" \
     "19EC0600" "0x5A1:1:7:1DACC00B" "stix-aspect-run-avg-s"
-want "avg: the AvgSize TC is sent at @150" "--send-at 150 --send-hex"
+want "avg (Amendment B2): Avg2 @332, NOMINAL @340, CONF @400, request @410" \
+    "--send-at 332 --send-hex 400200001DACC00B" \
+    "--send-at 340 --send-hex 400200001DACC00E" \
+    "--send-at 400 --send-hex 400200001DACC00F" \
+    "--send-at 410 --send-hex 400200001DACC00C" \
+    "0x5A7:5:2:544000000001@90" "--seconds 550"
+lacks "avg: no TC(238,10) path, no @150 knob" "400200001DACC00D" \
+    "--send-at 150"
 printf '%s' "$out" > "$TMP/avg"
 
 dry --step-1031
@@ -132,6 +139,13 @@ want "step-1031: gap budget 100 + read-back, avg 64, a second epoch" \
   "$(grep -o -- "--send-at" "$TMP/drift" | wc -l)" ]
 report "step-1031: more TC sends than drift (the second epoch)" \
     "$([ $? -eq 0 ] && echo ok || echo "send-at count not above drift's")"
+want "step-1031 (Amendment B3): request @340, epoch 2, urn 2 from 405 s" \
+    "--send-at 340 --send-hex 400200001DACC00C" \
+    "--send-at 400 --send-hex 400200001DACC00E" \
+    "--send-at 460 --send-hex 400200001DACC00F" \
+    "--send-at 470 --send-hex 400200001DACC010" \
+    "0000019500" "0x5A7:5:2:544000000001@60" "--seconds 560"
+lacks "step-1031: no TC(238,10) path" "400200001DACC00D"
 printf '%s' "$out" > "$TMP/step-1031"
 
 dry --step-1031-control

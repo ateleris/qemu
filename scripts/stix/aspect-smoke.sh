@@ -20,8 +20,8 @@
 #        (TC20), and in the positive TM(1,8)
 #   @75  QMP qom-set /machine/stixctrl as-sun 0 (a no-op; the QMP path
 #        the AS-5 knob legs use)
-#   @150 the leg's knob (one qom-set over QMP, or --avg's TC(236,6)):
-#        mid-NOMINAL, ~78 archived blocks in
+#   @150 the leg's knob (one qom-set over QMP): mid-NOMINAL, ~78
+#        archived blocks in (--drift's rate goes @55, pre-NOMINAL)
 #   @320 TC(236,1) 04 00 (CONF again): TM(1,1), TM(5,1) 0021 05 04
 #        within 10 s (its arrival is T_exit), TM(1,7), and the QL flush
 #        TM(21,6) SSIDs 30..34 on 0x5DC within 15 s. The NOMINAL->CONF
@@ -67,16 +67,16 @@
 #                      64: a gap at every block, ~100 forced packets of
 #                      0/1 samples (a leading 0-sample one, MINOR 3),
 #                      then EID 0x5440 / TM(1,8).
-#   --drop             row 5: as-drop-next 2 @150; no time gap (the
-#                      archive's rewrite chain, ArchiveManager.c:243-245),
-#                      the ideal signature + one ramp content jump.
-#   --avg              row 6: TC(236,6) 03 01 00 01 @150 (system 3 =
-#                      E_SYSTEM_ASPECT, HWConfig.h:13, parameter 1 =
-#                      E_ASP_PARAM_CONFIG_SUMMED_VALUES, HWConfig.h:48,
-#                      value 1 = AVG2; HWConfig.c:1005-1008,
-#                      Aspect.c:108-118): the stale inc-16 estimate gaps
-#                      at every post-change block, budget 1 aborts at
-#                      the second one, values step down ~8x.
+#   --drop             row 5 (corrected, plan Amendment B1): as-drop-next
+#                      2 @150; the archive stores each block with the
+#                      previous block's end, so the gap shows one record
+#                      later: one gap event, the request completes.
+#   --avg              Amendment B2 (row 6 redesigned: TC(236,6) is
+#                      CONF/MAINTENANCE-only, TCVerifDynamic.c:66): Avg16
+#                      epoch 1, @332 TC(236,6) 03 01 00 01 (Avg2) in CONF,
+#                      epoch 2 @340-@400, then one averaging-64 request
+#                      over both files with budget 100: epoch 1's packet,
+#                      then a gap-forced packet per Avg2 record, 0x5440.
 #   --step-1031        row 7 (#1031-shaped): a -1 ms step armed at the
 #                      FIRST archived flip's own block_seq (the first
 #                      stixasp_push after the epoch's skip + 1: the
@@ -85,11 +85,13 @@
 #                      the estimate pair straddles the step -> 1007 ms ->
 #                      inc 15). A watcher arms the knob over QMP the
 #                      moment the trace shows the first appended push.
-#                      Plus the second epoch: @335 NOMINAL again, @405
-#                      CONF (the second file via the NOMINAL->CONF
-#                      flush), @412 a second TC(238,1) urn 2 with the
-#                      window [330 s, ...] inside the second file (the
-#                      epoch discriminator: inc 16, one small product)
+#                      Plus the second epoch (plan Amendment B3: the
+#                      epoch-1 request @340 is answered in CONF first):
+#                      @400 NOMINAL again, @460 CONF (the second file
+#                      via the NOMINAL->CONF flush), @470 a second
+#                      TC(238,1) urn 2 with the window [405 s, ...]
+#                      inside the second file (the epoch discriminator:
+#                      inc 16, one small product). No TC(238,10) path.
 #                      + @414 TC(238,2). The TC(238,10) at @400
 #                      re-requests the same epochs and fails like urn 1.
 #   --step-1031-control  row 7's control: the same -1 ms step mid-window
@@ -207,7 +209,15 @@ done
 ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="${STIX_ASPECT_RUN_DIR:-/tmp/stix-aspect-run}"
-DURATION="${STIX_ASPECT_SECONDS:-480}"
+# per-leg default and floor: the two-epoch legs of Amendment B end later
+# (--avg's 0x5440 window closes at +500 s, --step-1031's urn-2 answer at
+# +530 s); the others end with the TC(238,10) group at +445 s
+case "$LEG" in
+    avg) DEFAULT_SECONDS=550; MIN_SECONDS=520 ;;
+    step-1031) DEFAULT_SECONDS=560; MIN_SECONDS=540 ;;
+    *) DEFAULT_SECONDS=480; MIN_SECONDS=450 ;;
+esac
+DURATION="${STIX_ASPECT_SECONDS:-$DEFAULT_SECONDS}"
 PROBE="${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}"
 ASPCHECK="$REPO_ROOT/scripts/stix/aspect-check.py"
 # Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
@@ -293,9 +303,9 @@ case "$DURATION" in
         exit 2
         ;;
 esac
-if [ "$DURATION" -lt 450 ]; then
-    echo "STIX_ASPECT_SECONDS must be >= 450 (the TC(238,10) group ends" \
-        "at +445 s; got: $DURATION)"
+if [ "$DURATION" -lt "$MIN_SECONDS" ]; then
+    echo "STIX_ASPECT_SECONDS must be >= $MIN_SECONDS for this leg (its" \
+        "last expected answer; got: $DURATION)"
     exit 2
 fi
 
@@ -397,7 +407,7 @@ units[14] = tc(14, 0xEC, 1, bytes([5, 0]))
 units[15] = tc(15, 0xEC, 1, bytes([4, 0]))
 # the second-epoch request: urn 2, window [330 s, ...] inside the second
 # file (the first file ends ~T_exit 1 = ~325 s, the second starts ~337 s)
-units[16] = tc238_1(16, 2, 330, 64)
+units[16] = tc238_1(16, 2, 405, 64)
 units[17] = tc(17, 0xEE, 2, b"")
 for seq in sorted(units):
     print(units[seq])
@@ -444,8 +454,15 @@ if [ "$NEGATIVE" -eq 1 ]; then
                --forbid "0x5A7:5:2:5446")
 elif [ "$LEG" = "jitter" ] || [ "$LEG" = "drift" ] || \
         [ "$LEG" = "avg" ] || [ "$LEG" = "step-1031" ]; then
+    # a missed window ends the probe run: >= 60 s on the #1031-shaped
+    # legs (two 30 s Background slots), 90 s on --avg (Amendment B4)
+    case "$LEG" in
+        avg) ASK1_WIN=90 ;;
+        drift | step-1031) ASK1_WIN=60 ;;
+        *) ASK1_WIN=45 ;;
+    esac
     ASK1_ARGS=(--forbid "0x5A7:5:2:543f"
-               --expect "0x5A7:5:2:544000000001@45"
+               --expect "0x5A7:5:2:544000000001@$ASK1_WIN"
                --forbid "0x5A7:5:2:5446")
 else
     ASK1_ARGS=(--forbid "0x5A7:5:2:543f"
@@ -461,10 +478,15 @@ fi
 if [ "$NEGATIVE" -eq 1 ]; then
     ASK2_ARGS=(--expect "0x5A1:1:8:1DACC008BD33")
     NOM_FORBID_18=(--forbid "0x5A1:1:8@325")
-elif [ "$LEG" = "jitter" ] || [ "$LEG" = "avg" ]; then
+elif [ "$LEG" = "avg" ] || [ "$LEG" = "step-1031" ]; then
+    # Amendment B: no TC(238,10) path on the two-epoch legs; any TM(1,8)
+    # (e.g. --avg's TC(236,6) rejected as wrong mode) fails the run
+    ASK2_ARGS=()
+    NOM_FORBID_18=(--forbid "0x5A1:1:8")
+elif [ "$LEG" = "jitter" ]; then
     ASK2_ARGS=(--expect "0x5A1:1:8:1DACC008BD33")
     NOM_FORBID_18=(--forbid "0x5A1:1:8@325")
-elif [ "$LEG" = "drift" ] || [ "$LEG" = "step-1031" ]; then
+elif [ "$LEG" = "drift" ]; then
     ASK2_ARGS=(--expect "0x5A1:1:8:1DACC00DBD33")
     NOM_FORBID_18=(--forbid "0x5A1:1:8@325")
 else
@@ -474,7 +496,7 @@ fi
 # the #1031-shaped legs request with averaging 64 (TC seq 12/13 instead
 # of 6/8, so the TM(1,x) acceptance echoes carry those seq bytes)
 case "$LEG" in
-    drift | step-1031)
+    drift | step-1031 | avg)
         TC_A1="$TC_238_1_64"; TC_A2="$TC_238_2"; TC_A10="$TC_238_10_64"
         ACK1="1DACC00C"; ACK10="1DACC00D" ;;
     *)
@@ -499,53 +521,93 @@ case "$LEG" in
     step-1031c)
         KNOB_ARGS=(--qmp-cmd "$(qom_set /machine/stixctrl \
             as-step-next-ms -1)") ;;
-    avg)
-        KNOB_ARGS=(--send-hex "$TC_236_6_AVG2"
-                   --expect "0x5A1:1:1:1DACC00B"
-                   --expect "0x5A1:1:7:1DACC00B")
-        ;;
     drift)
         KNOB_AT=55
         KNOB_ARGS=(--qmp-cmd "$(qom_set /machine/stixctrl \
             as-rate-ppm -2000)") ;;
 esac
-# --step-1031's second epoch: NOMINAL again @335 (all records post-step;
-# the @320 flush reset the archive's skip flag, so the epoch's first
-# block is skipped into the SECOND file, ArchiveManager.c:217-223/
-# :270-278), CONF again @405 (the NOMINAL->CONF flush writes it), then
-# the epoch-2 request: urn 2, window [330 s, ...] - the first file
-# (start ~72 s, duration ~250 s) falls out of the window, the second
-# (start ~337 s) is found (the range match is overlap-based,
-# MemFilesystemHelper.c:57-71)
+# The request/list times and the extra groups per leg (Amendment B).
+# Default: the urn-1 request @340, the list @350, the TC(238,10) path
+# @400. The two-epoch legs answer every request in CONF and drop the
+# TC(238,10) path:
+# --avg: @320 CONF (file 1, Avg16), @332 TC(236,6) 03 01 00 01 = Avg2
+#   (12 s after CONF: the NOMINAL->CONF mode commits only after the
+#   flush, OpModeMgmt.c:287-302/:702), @334/@335 budget 100 + read-back,
+#   @340 NOMINAL (epoch 2, 126 ms blocks), @400 CONF (file 2), @410 the
+#   averaging-64 request over both files, @412 the list.
+# --step-1031: @340 the epoch-1 request and @342 the list in CONF, then
+#   @400 NOMINAL (epoch 2), @460 CONF (file 2), @470 the urn-2 request
+#   with the window start 405 s (SCET counts from boot; file 1 ends
+#   ~325 s, file 2 ~460 s; the overlap match finds file 2 only,
+#   MemFilesystemHelper.c:57-71), @472 its list.
+T_REQ=340
+T_LIST=350
+PRE_REQ_ARGS=()
 E2_ARGS=()
-if [ "$LEG" = "step-1031" ]; then
-    E2_ARGS=(
-        --send-at 335 --send-hex "$TC_NOM2"
-        --expect "0x5A1:1:1:1DACC00E"
-        --expect "0x5A7:5:1:00210405@10"
-        --expect "0x5A1:1:7:1DACC00E"
-        --send-at 405 --send-hex "$TC_CONF3"
-        --expect "0x5A1:1:1:1DACC00F"
-        --expect "0x5A7:5:1:00210504@10"
-        --expect "0x5A1:1:7:1DACC00F"
-        --expect "0x5DC:21:6:1e@15"
-        --expect "0x5DC:21:6:1f@15"
-        --expect "0x5DC:21:6:20@15"
-        --expect "0x5DC:21:6:21@15"
+A10_ARGS=(
+    --send-at 400 --send-hex "$TC_A10"
+    --expect "0x5A1:1:1:$ACK10"
+    ${ASK2_ARGS+"${ASK2_ARGS[@]}"}
+)
+ql_flush() { # the QL flush TM(21,6) SSIDs 30-34 of a NOMINAL->CONF
+    printf '%s\n' --expect "0x5DC:21:6:1e@15" --expect "0x5DC:21:6:1f@15" \
+        --expect "0x5DC:21:6:20@15" --expect "0x5DC:21:6:21@15" \
         --expect "0x5DC:21:6:22@15"
-        --forbid "0x5A7:5:1:00210402"
-        --send-at 412 --send-hex "$TC_238_1_E2"
-        --expect "0x5A1:1:1:1DACC010"
-        --expect "0x5A1:1:7:1DACC010@45"
-        --forbid "0x5A7:5:2:543f"
-        --forbid "0x5A7:5:2:5440"
-        --forbid "0x5A7:5:2:5446"
-        --send-at 414 --send-hex "$TC_238_2_E2"
-        --expect "0x5A1:1:1:1DACC011"
-        --expect "0x5A1:1:7:1DACC011"
-        --expect "0x5A8:238:3"
-    )
-fi
+}
+mapfile -t QL_FLUSH < <(ql_flush)
+case "$LEG" in
+    avg)
+        T_REQ=410
+        T_LIST=412
+        A10_ARGS=()
+        PRE_REQ_ARGS=(
+            --send-at 332 --send-hex "$TC_236_6_AVG2"
+            --expect "0x5A1:1:1:1DACC00B"
+            --expect "0x5A1:1:7:1DACC00B"
+            --send-at 334 --send-hex "$TC_237_18"
+            --expect "0x5A1:1:1:1DACC009"
+            --expect "0x5A1:1:7:1DACC009"
+            --send-at 335 --send-hex "$TC_237_19"
+            --expect "0x5A1:1:1:1DACC00A"
+            --expect "0x5A1:1:7:1DACC00A"
+            --expect "0x5A8:237:20:01DD0000000064"
+            --send-at 340 --send-hex "$TC_NOM2"
+            --expect "0x5A1:1:1:1DACC00E"
+            --expect "0x5A7:5:1:00210405@10"
+            --expect "0x5A1:1:7:1DACC00E"
+            --send-at 400 --send-hex "$TC_CONF3"
+            --expect "0x5A1:1:1:1DACC00F"
+            --expect "0x5A7:5:1:00210504@10"
+            --expect "0x5A1:1:7:1DACC00F"
+            "${QL_FLUSH[@]}"
+            --forbid "0x5A7:5:1:00210402"
+        ) ;;
+    step-1031)
+        T_LIST=342
+        A10_ARGS=()
+        E2_ARGS=(
+            --send-at 400 --send-hex "$TC_NOM2"
+            --expect "0x5A1:1:1:1DACC00E"
+            --expect "0x5A7:5:1:00210405@10"
+            --expect "0x5A1:1:7:1DACC00E"
+            --send-at 460 --send-hex "$TC_CONF3"
+            --expect "0x5A1:1:1:1DACC00F"
+            --expect "0x5A7:5:1:00210504@10"
+            --expect "0x5A1:1:7:1DACC00F"
+            "${QL_FLUSH[@]}"
+            --forbid "0x5A7:5:1:00210402"
+            --send-at 470 --send-hex "$TC_238_1_E2"
+            --expect "0x5A1:1:1:1DACC010"
+            --expect "0x5A1:1:7:1DACC010@60"
+            --forbid "0x5A7:5:2:543f"
+            --forbid "0x5A7:5:2:5440"
+            --forbid "0x5A7:5:2:5446"
+            --send-at 472 --send-hex "$TC_238_2_E2"
+            --expect "0x5A1:1:1:1DACC011"
+            --expect "0x5A1:1:7:1DACC011"
+            --expect "0x5A8:238:3@60"
+        ) ;;
+esac
 
 # TM(5,x) on 0x5A7, the subtype from the EID's severity nibble (1 ->
 # TM(5,1), 5 -> TM(5,2), 9 -> TM(5,3)); TM(1,x) on 0x5A1; TM(237,20) and
@@ -616,17 +678,16 @@ PROBE_ARGS=(
     --expect "0x5DC:21:6:22@15"
     --forbid "0x5A7:5:1:00210402"
     ${BUDGET_ARGS+"${BUDGET_ARGS[@]}"}
-    --send-at 340 --send-hex "$TC_A1"
+    ${PRE_REQ_ARGS+"${PRE_REQ_ARGS[@]}"}
+    --send-at "$T_REQ" --send-hex "$TC_A1"
     --expect "0x5A1:1:1:$ACK1"
     --expect "0x5A1:1:7:$ACK1"
     ${ASK1_ARGS+"${ASK1_ARGS[@]}"}
-    --send-at 350 --send-hex "$TC_A2"
+    --send-at "$T_LIST" --send-hex "$TC_A2"
     --expect "0x5A1:1:1:1DACC007"
     --expect "0x5A1:1:7:1DACC007"
     --expect "0x5A8:238:3"
-    --send-at 400 --send-hex "$TC_A10"
-    --expect "0x5A1:1:1:$ACK10"
-    ${ASK2_ARGS+"${ASK2_ARGS[@]}"}
+    ${A10_ARGS+"${A10_ARGS[@]}"}
     ${E2_ARGS+"${E2_ARGS[@]}"}
     --hold
 )
@@ -658,13 +719,22 @@ read -r -d '' STEP_WATCHER_PY <<'EOF' || true
 import json, socket, sys, time
 
 trace, qmp_path, log = sys.argv[1], sys.argv[2], sys.argv[3]
+# the archive's first record is the NOMINAL epoch's first appended push:
+# the ROTB also accepts pushes at boot (before the FSW puts it into test
+# mode), so "the first appended push" is the first one that FOLLOWS a
+# not-appended (rotb-testmode/-disabled) push
 base = None
 end = time.monotonic() + 400
 while base is None:
     try:
         with open(trace) as f:
+            seen_off = False
             for line in f:
-                if " appended," in line and "stixasp_push" in line:
+                if "stixasp_push" not in line:
+                    continue
+                if " appended," not in line:
+                    seen_off = True
+                elif seen_off:
                     base = int(line.split("block ")[1].split()[0])
                     break
     except OSError:
@@ -928,11 +998,13 @@ case "$LEG" in
         ASPECT_ARGS+=(--expect-forced-complete 1 0 --summing 16 \
             --averaging 16) ;;
     avg)
-        ASPECT_ARGS+=(--expect-collapse 1 0 --summing 16 --averaging 16) ;;
+        # Amendment B2: one urn-1 request over the Avg16 and Avg2 epochs
+        ASPECT_ARGS+=(--expect-stale 1) ;;
     drift)
         ASPECT_ARGS+=(--expect-tiny 1 0) ;;
     step-1031)
-        ASPECT_ARGS+=(--expect-tiny 1 0 --expect-epoch2 2) ;;
+        # Amendment B3: no TC(238,10) path, so no urn 0
+        ASPECT_ARGS+=(--expect-tiny 1 --expect-epoch2 2) ;;
 esac
 if [ ! -s asp.dump.hex ]; then
     echo "CHECK aspect: FAIL (no 0x5DC packet dumped)"
@@ -991,7 +1063,8 @@ SKIPPED_DET="$(grep -c 'Skipped first Det data chunk' uart.aspect.txt \
 SKIPPED_ASP="$(grep -c 'Skipped first Aspect data chunk' \
     uart.aspect.txt || true)"
 EXPECT_SKIP=1
-[ "$LEG" = "step-1031" ] && EXPECT_SKIP=2
+# the two-epoch legs flush twice with data (Amendment B)
+[ "$LEG" = "step-1031" ] || [ "$LEG" = "avg" ] && EXPECT_SKIP=2
 # as-enable=false stops only the aspect generator: the detector still
 # archives, so its first chunk is still skipped once (AS-4: Det 1, Asp 0)
 EXPECT_DET="$EXPECT_SKIP"
@@ -1004,7 +1077,9 @@ EXPECT_ASP="$EXPECT_SKIP"
 TERMINATE="$(grep -c 'Terminating aspect report due to too many gaps' \
     uart.aspect.txt || true)"
 case "$LEG" in
-    jitter | drift | avg | step-1031) EXPECT_TERMINATE=2 ;;
+    jitter | drift) EXPECT_TERMINATE=2 ;;
+    # the two-epoch legs have no TC(238,10) path: one failed request
+    avg | step-1031) EXPECT_TERMINATE=1 ;;
     *) EXPECT_TERMINATE=0 ;;
 esac
 [ "$NEGATIVE" -eq 1 ] && EXPECT_TERMINATE=0
@@ -1046,8 +1121,13 @@ if [ -f asp.trace ]; then
     APP_N="$(grep -c 'stixasp_push.* appended,' asp.trace || true)"
     JIT_N="$(grep -c 'stixasp_jitter' asp.trace || true)"
     STEP_N="$(grep -c 'stixasp_step' asp.trace || true)"
-    APP1_SEQ="$(sed -n 's/.*push: block \([0-9]*\) appended,.*/\1/p' \
-        asp.trace | head -1)"
+    # the NOMINAL epoch's first appended push (the boot-time pushes
+    # before the FSW's ROTB test mode are appended too, but never
+    # archived): the first appended push after a not-appended one
+    APP1_SEQ="$(sed -n 's/.*push: block \([0-9]*\) \([a-z-]*\),.*/\1 \2/p' \
+        asp.trace | awk '$2 != "appended" { off = 1; next }
+                         off && !done { print $1; done = 1 }')"
+    # (no early awk exit: under pipefail a SIGPIPE'd sed ends the run)
 else
     PUSH_N=""; FLIP_N=""; DROP_N=""; APP_N=""; JIT_N=""; STEP_N=""
     APP1_SEQ=""
@@ -1069,7 +1149,7 @@ else
                 TRACE_BAD="$TRACE_BAD, want the 2 knob drops"
             [ "$(grep -c 'stixasp_drop.* (knob)' asp.trace 2>/dev/null)" \
                 = 2 ] || TRACE_BAD="$TRACE_BAD, no knob-drop lines" ;;
-        ideal | jitter | step-gap | drift | step-1031 | step-1031c)
+        ideal | jitter | step-gap | drift | step-1031 | step-1031c | avg)
             [ "${DROP_N:-1}" -eq 0 ] || TRACE_BAD="$TRACE_BAD, drops" ;;
     esac
     case "$LEG" in
@@ -1163,9 +1243,10 @@ case "$LEG" in
             "event, the request completes with one forced packet)" \
             "${STIX_SLOT_TAG}" ;;
     avg)
-        echo "ASPECT-SMOKE (--avg): PASS (D-ASh row 6: the stale estimate" \
-            "gaps at every post-change block, abort + the ~8x value" \
-            "step)${STIX_SLOT_TAG}" ;;
+        echo "ASPECT-SMOKE (--avg): PASS (Amendment B2: one request over" \
+            "an Avg16 and an Avg2 epoch; the file-1 estimate is stale for" \
+            "every Avg2 record -> gap-forced 0/1-sample packets, 0x5440)" \
+            "${STIX_SLOT_TAG}" ;;
     step-1031)
         echo "ASPECT-SMOKE (--step-1031): PASS (D-ASh row 7: inc 15 from" \
             "the straddling pair, ~100 forced 0/1-sample packets, 0x5440," \

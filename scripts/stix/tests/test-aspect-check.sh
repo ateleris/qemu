@@ -115,6 +115,9 @@ write("fc-good.dump", mod.burst(1, 0, [15, 510, 130], seq=0))
 write("fc-two.dump", mod.burst(1, 0, [15, 510, 17, 130], seq=0))
 # rows 4/7 epoch 1 (--drift, --step-1031): ~100 forced 0/1-sample
 # packets, summing 15, averaging 64, a leading 0-sample one
+write("stale-good.dump", mod.stale_packets(1))
+write("stale-few.dump", mod.stale_packets(1, forced=20))
+write("stale-early.dump", mod.stale_packets(1, t2=300000))
 write("tiny-good.dump", mod.burst_strided(1, 0, [0] + [1] * 99, seq=0,
                                           stride=1008, summing=15,
                                           averaging=64))
@@ -259,9 +262,15 @@ fail fa-full.dump --expect-forced-abort 1 "no forced mid-series packet" \
 fail fa-span.dump --expect-forced-abort 1 "the product spans 130559 ms" \
     "a too-long abort span fails"
 run fc-good.dump --expect-forced-complete 1
-check "fc-good: forced-complete PASS" "$?" "$OUT"
+check "fc-good: forced-complete PASS" "$RC" "$OUT"
 fail fc-two.dump --expect-forced-complete 1 "want exactly 1" \
     "two forced packets fail"
+run stale-good.dump --expect-stale 1
+check "stale-good: epoch 1's packet + 99 forced Avg2 packets PASS" "$RC" "$OUT"
+fail stale-few.dump --expect-stale 1 "21 packet(s), want" \
+    "too few forced packets fails the stale check"
+fail stale-early.dump --expect-stale 1 "start before epoch 2" \
+    "a forced packet in epoch 1 fails the stale check"
 run tiny-good.dump --expect-tiny 1
 [ "$RC" -eq 0 ] && echo "$OUT" | grep -q \
     "NOTE: tiny urn 1: 100 packet(s): 1 x 0-sample, 99 x 1-sample"

@@ -104,6 +104,13 @@ TINY_MIN_PACKETS, TINY_MAX_PACKETS = 30, 130
 TINY_MAX_SAMPLES = 2
 # row 7 second epoch: all records post-step and consistent (inc = 16)
 EPOCH2_SUMMING, EPOCH2_AVERAGING = 16, 64
+# --avg (Amendment B2): the estimate from file 1 (inc 16) applied to the
+# Avg2 epoch 2 (NOMINAL again @340): packet 0 is epoch 1's open packet,
+# then one gap-forced 0/1-sample packet per Avg2 record
+STALE_SUMMING, STALE_AVERAGING = 16, 64
+STALE_FIRST_MIN = 100           # epoch 1's open packet (~235 samples)
+STALE_MIN_FORCED = 50           # of the ~100 the budget allows
+STALE_EPOCH2_MS = 330000        # epoch 2 starts at the @340 NOMINAL
 # row 5/6 payload events on diode A0 (minimal-signed diffs mod 2**16):
 # the ramp advances 16 or 256 per sample; a 2-block content loss is
 # ~+3072 (folded), the Avg16->Avg2 change drops the values ~8x
@@ -556,6 +563,78 @@ def check_tiny(products, urns):
              f"{counts.count(0)} x 0-sample, "
              f"{counts.count(1)} x 1-sample, max {max(counts) if counts else 0}")
     return fails
+
+
+def scet_ms_of(pkt):
+    h = pkt["header"]
+    return scet_to_ms(h["coarse"], h["fine"])
+
+
+def check_stale(products, urns):
+    """Amendment B2 (--avg): one request over two epochs, Avg16 then
+    Avg2. The once-per-request estimate (file 1's first pair: inc 16)
+    is stale for every Avg2 record (126 ms vs 1008 ms): packet 0 is
+    epoch 1's open packet, forced at the epoch boundary; then a gap at
+    every epoch-2 record forces 0/1-sample packets until the budget
+    (100) is gone -> FSW_ERROR (0x5440, asserted by the probe)."""
+    what = "stale"
+    fails, by_urn = one_product_each(products, urns, what)
+    for urn in urns:
+        if urn not in by_urn:
+            continue
+        prod = by_urn[urn][0]
+        pkts = prod["packets"]
+        if len(pkts) < 1 + STALE_MIN_FORCED:
+            fails.append(f"{what} urn {urn}: {len(pkts)} packet(s), want "
+                         f"epoch 1's packet + >= {STALE_MIN_FORCED} "
+                         f"gap-forced ones")
+            continue
+        first = pkts[0]
+        if len(first["samples"]) <= STALE_FIRST_MIN:
+            fails.append(f"{what} urn {urn}: packet 0 has "
+                         f"{len(first['samples'])} sample(s), want epoch "
+                         f"1's open packet (> {STALE_FIRST_MIN})")
+        if scet_ms_of(first) >= STALE_EPOCH2_MS:
+            fails.append(f"{what} urn {urn}: packet 0 starts at "
+                         f"{scet_ms_of(first)} ms, want epoch 1 "
+                         f"(< {STALE_EPOCH2_MS})")
+        rest = pkts[1:]
+        big = [k + 1 for k, p in enumerate(rest)
+               if len(p["samples"]) > TINY_MAX_SAMPLES]
+        if big:
+            fails.append(f"{what} urn {urn}: forced packet(s) {big[:5]} "
+                         f"carry more than {TINY_MAX_SAMPLES} sample(s)")
+        early = [k + 1 for k, p in enumerate(rest)
+                 if scet_ms_of(p) < STALE_EPOCH2_MS]
+        if early:
+            fails.append(f"{what} urn {urn}: forced packet(s) {early[:5]} "
+                         f"start before epoch 2 ({STALE_EPOCH2_MS} ms)")
+        fails += check_headers(prod, urn, STALE_SUMMING, STALE_AVERAGING,
+                               what)
+        counts = [len(p["samples"]) for p in rest]
+        note(what, urn, f"packet 0: {len(first['samples'])} samples at "
+             f"{scet_ms_of(first)} ms; {len(rest)} forced packet(s) from "
+             f"{scet_ms_of(rest[0])} ms: {counts.count(0)} x 0-sample, "
+             f"{counts.count(1)} x 1-sample")
+    return fails
+
+
+def stale_packets(urn, seq=0, first=235, forced=99, t0=76000,
+                  t2=341000, step=126):
+    """One --avg product: epoch 1's open packet, then @forced 1-sample
+    packets @step ms apart from @t2 (summing 16, averaging 64)."""
+    counts = [first] + [1] * forced
+    pkts = []
+    for k, n in enumerate(counts):
+        t = t0 if k == 0 else t2 + (k - 1) * step
+        samples = [[(i + k) & 0xFFFF, 0, 0, 0] for i in range(n)]
+        seg = SEG_FIRST if k == 0 else (
+            SEG_LAST if k == len(counts) - 1 else SEG_CONT)
+        c, f = ms_to_scet(t)
+        pkts.append(build_packet(ssid42_body(
+            c, f, urn, STALE_AVERAGING, STALE_SUMMING, samples), seg, seq))
+        seq = (seq + 1) % SEQ_MOD
+    return pkts
 
 
 def check_epoch2(products, urns):
@@ -1069,6 +1148,26 @@ def self_test():
     f = check_content_jump(prods)
     assert len(f) == 1 and "2 content jump(s)" in f[0], f
 
+    # Amendment B2, stale: epoch 1's packet + 99 forced Avg2 packets
+    prods, _ = decode_lines(lines_of(stale_packets(1)))
+    assert check_stale(prods, [1]) == [], check_stale(prods, [1])
+    # ... too few forced packets, a small packet 0, a forced packet in
+    # epoch 1 and a wrong averaging each fail
+    prods, _ = decode_lines(lines_of(stale_packets(1, forced=20)))
+    f = check_stale(prods, [1])
+    assert len(f) == 1 and "21 packet(s)" in f[0], f
+    prods, _ = decode_lines(lines_of(stale_packets(1, first=40)))
+    f = check_stale(prods, [1])
+    assert len(f) == 1 and "packet 0 has 40 sample(s)" in f[0], f
+    prods, _ = decode_lines(lines_of(stale_packets(1, t2=300000)))
+    f = check_stale(prods, [1])
+    assert len(f) == 1 and "start before epoch 2" in f[0], f
+    tiny_hdr = burst_strided(1, 0, [235] + [1] * 60, seq=0, stride=126,
+                             summing=16, averaging=16)
+    prods, _ = decode_lines(lines_of(tiny_hdr))
+    f = check_stale(prods, [1])
+    assert any("averagingTc 16, want 64" in x for x in f), f
+
     # the modes claim their urns: an unclaimed product fails
     # (the second burst continues the APID's sequence count)
     prods, _ = decode_lines(lines_of(good) + lines_of(
@@ -1104,6 +1203,10 @@ def main():
                     metavar="URN",
                     help="D-ASh row 3 (--step-gap): exactly one forced "
                          "mid-series packet, the archive fully delivered")
+    ap.add_argument("--expect-stale", type=int, nargs="+", metavar="URN",
+                    help="Amendment B2 (--avg): epoch 1's packet, then "
+                         ">= 50 gap-forced 0/1-sample packets in the Avg2 "
+                         "epoch 2, summing 16, averaging 64")
     ap.add_argument("--expect-tiny", type=int, nargs="+", metavar="URN",
                     help="D-ASh rows 4/7 epoch 1 (--drift, --step-1031): "
                          "the corrupted-estimate packets, summing 15 and "
@@ -1184,6 +1287,13 @@ def main():
                       f"averaging {TINY_AVERAGING}")
         for u in args.expect_tiny:
             claimed[u] = "tiny"
+    if args.expect_stale is not None:
+        fails += check_stale(products, args.expect_stale)
+        passed.append(f"stale: urns {args.expect_stale} epoch 1's packet "
+                      f"then gap-forced Avg2 packets, summing "
+                      f"{STALE_SUMMING}, averaging {STALE_AVERAGING}")
+        for u in args.expect_stale:
+            claimed[u] = "stale"
     if args.expect_epoch2 is not None:
         fails += check_epoch2(products, args.expect_epoch2)
         passed.append(f"epoch2: urn {args.expect_epoch2} one small "

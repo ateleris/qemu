@@ -805,3 +805,115 @@ AS-5 and at the merge.
 | MINOR 1 (averaging wording) | accepted | D-ASc: "averaging defaults to N, overridden to 64 on the #1031-shaped legs" |
 | MINOR 2 (--avg budget/averaging unpinned) | accepted | D-ASi: `--avg` pins the default budget 1 and averaging 16, expecting 0x5440 at the second post-change gap |
 | MINOR 3 (first forced packet carries 0 samples at averaging 64) | accepted | rows 4/7 and AS-5 note the leading 0-sample packet (63 < 64, counter not reset); aspect-check.py allows it |
+
+## Amendment B (2026-11-13, the first live AS-5 runs)
+
+Seven legs passed live (ideal, negative, jitter, step-gap, drift, drop,
+step-1031-control; commit `1a936defa9`). Three plan statements did not
+survive the live runs.
+
+**B1, row 5 (`--drop`) — corrected, done in AS-5.** The archive stores
+each aspect block with the *previous* block's end (ArchiveManager.c, the
+"override the time of the last ending chunk" step after the
+`aspBlockSkipedFirst` branch). Dropped blocks never reach the archive,
+so the first record after the drop still reads contiguous, and the next
+one carries the post-drop end: the gap is delayed by one record, not
+removed. Live: one gap event, forced packet, the request completes
+(packets 303/510/143, the forced start delta ≈ 2 blocks longer than
+`--step-gap`'s). The leg now asserts the forced-complete signature;
+"no time gap at all" in D-ASd and D-ASh row 5 is superseded.
+
+**B2, row 6 (`--avg`) — the TC is mode-gated.** TC(236,6) is applicable
+only in MAINTENANCE and CONFIGURATION (TCVerifDynamic.c:66); sent at @150
+in NOMINAL it gets TM(1,8) FID_48301 (wrong operation mode, param 5 =
+NOMINAL). So an AvgSize change *inside* one NOMINAL epoch cannot happen
+by TC, and the once-per-request estimate cannot go stale within an
+epoch. The realistic hazard is a request spanning **two epochs with
+different AvgSize**. Redesign (`--avg`):
+- epoch 1 as now (Avg16, NOMINAL @70 → CONF @320, file 1);
+- @325 TC(236,6) `03 01 00 01` (Avg2) in CONF → TM(1,1)/TM(1,7);
+- @330 NOMINAL (epoch 2, blocks every 63 × 2 ms = 126 ms), @390 CONF
+  (file 2 flushed);
+- budget 100 (TC(237,18)/(237,19) as on `--drift`) and a level-5
+  TC(238,1) over the whole archive with averaging 64, urn 1, @400;
+  TC(238,2) @402;
+- expectation [L]: the estimate comes from file 1's first pair (inc 16,
+  1008 ms); the epoch boundary is one gap event (budget 100 → 99); then
+  every Avg2 record differs from the estimate by 882 ms → a gap per
+  record → the row-4 pattern (~99 forced 0/1-sample packets) →
+  EID 0x5440 with the 45 s window widened to 90 s. Asserted: 0x5440,
+  ≥ 50 forced packets, and the forced packets' start times inside
+  epoch 2 (direction + rough magnitude; the exact count is recorded).
+- the leg's default `STIX_ASPECT_SECONDS` is 540 (request @400, the
+  0x5440 window of 90 s ends @490, plus margin).
+- The TC(238,10) path is dropped on this leg (one request is enough to
+  show the mechanism; it keeps the run inside one Background slot).
+
+**B3, `--step-1031` — the epoch-1 request is sent inside epoch 2.** The
+D-ASi order (@335 NOMINAL again, @340 the epoch-1 request) put the
+request into NOMINAL; it got TM(1,1)/TM(1,7) but no answer within its
+45 s window, which ended the run at ≈ +381 s. The only documented
+NOMINAL skip is a flare in progress (SciReport.c:354-358); whether the
+emulated detector trips the flare flag in epoch 2 is **open (O-B1)** and
+not needed for the leg. Reorder so each request is answered in CONF:
+- @320 CONF (file 1), @330/@331 budget 100 + read-back, @340 TC(238,1)
+  urn 1 averaging 64, @342 TC(238,2); EID 0x5440 within 60 s;
+- @400 NOMINAL (epoch 2, −1 ms step still armed at the first archived
+  block of epoch 1 only), @460 CONF (file 2), @470 TC(238,1) urn 2 with
+  the window start at a fixed 405 s (these legs never set the time, so
+  SCET counts from boot: the ideal leg's first archived block after the
+  @70 NOMINAL is stamped ≈ 76 s; 405 s lies after the @400 entry and
+  before epoch 2's first archived record), @472 TC(238,2); the urn-2
+  answer within 60 s; forbids 0x543F/0x5440/0x5446 after @470;
+- the TC(238,10) path dropped on this leg as on `--avg`;
+- the leg's default `STIX_ASPECT_SECONDS` 560.
+
+**B4, probe windows.** A missed expectation ends the whole probe run, so
+every request-answer window on the #1031-shaped legs is ≥ 60 s (two
+Background slots of 30 s, background.c:63).
+
+**Open O-B1.** Why the request sent at +340 in epoch-2 NOMINAL was not
+served for 41 s (≥ one Background slot). Candidates: the flare flag
+(SciReport.c:354), or the slot phase plus Background load in NOMINAL.
+A dedicated run would tell; not a gate item.
+
+### Amendment B review resolutions (GLM review 2026-11-13, all accepted)
+
+- **BLOCKER (mode race):** the NOMINAL→CONF transition commits the mode
+  only after the archive flush (OpModeMgmt.c:287-302, :702), so a
+  TC(236,6) 5 s after CONF may still see NOMINAL. `--avg` timeline:
+  @320 CONF, **@332** TC(236,6) `03 01 00 01` with
+  `--forbid 0x5A1:1:8:<its seq>` (a rejection names FID_48301 instead of
+  timing out), @334/@335 budget 100 + read-back, **@340** NOMINAL
+  (epoch 2), **@400** CONF (file 2), **@410** TC(238,1) urn 1
+  averaging 64, @412 TC(238,2), EID 0x5440 within 90 s, default
+  `STIX_ASPECT_SECONDS` **550**.
+- **MAJOR (first forced packet):** the boundary's forced packet is
+  epoch 1's open packet (~235 samples, start ≈ 76 s), so a new check
+  mode `--expect-stale` (not `--expect-collapse`, which encodes the dead
+  single-epoch design) asserts: one product per urn; packet 0 large
+  (> 100 samples) starting in epoch 1; ≥ 50 further forced packets of
+  0/1 samples whose starts lie in epoch 2 (≥ 330 s); every header
+  summing 16 / averaging 64 (the stale-estimate evidence); EID 0x5440
+  in the probe. Exact counts are printed in a NOTE ([L]).
+- **MAJOR (step persistence):** the model's step stays in force from
+  `as-step-at-block` on (stix_aspect.c:160-161, :184-186), so epoch 2's
+  flips are shifted too. Harmless (uniform −1 ms keeps epoch-2 deltas at
+  1008 ms → inc 16, the urn-2 request succeeds). The B3 text "epoch 1
+  only" is superseded; no disarm needed.
+- **MINOR (window start):** 405 s is after file 1's end (~325 s) and
+  before file 2's end (~460 s); whether it precedes epoch 2's first
+  record does not matter (the skip loop, AspectCtrl.c:247-262, handles
+  a start inside file 2; the estimate pair is independent of the
+  window). Expected urn-2 samples ≈ 48-52 (recorded, not asserted).
+- **MINOR (code):** `--avg` and `--step-1031` expect 2 skip lines of
+  each kind (two epochs) and **one** gap-terminate line (the TC(238,10)
+  path is dropped on both); the request-answer windows become 60/90 s;
+  per-leg default `STIX_ASPECT_SECONDS` (avg 550, step-1031 560); the
+  ≥ 450 floor applies to the legs that keep the TC(238,10) group.
+- **O-B1 (plausible, not verified):** one request per 30 s Background
+  tick (background.c:63, SciReport.c:361-392) at Background priority 150
+  under the NOMINAL real-time tasks, plus the full archive walk and ~101
+  forced TM sends, easily exceeds 41 s; the flare gate is the only
+  documented *skip*. A discriminating run (TC(238,10) bypasses the tick)
+  is noted for later, not a gate item.
