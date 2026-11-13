@@ -871,6 +871,7 @@ TCP TMTC server: off (-global grlib-stixspw.tmtc-server=off)
     - `hk_prot`: IRQEN, PROTSTAT, HOTSAMPLE, and the 9 thresholds and
       ProtEn bits;
     - `watchdog`: running, count, reload (`stixctrl_wdg_count`);
+      plus `enabled` (2026-11-12, accepted-diffs §10);
     - `scet`: coarse, fine (`stixctrl_scet_now`) and the UNSYNCED flag
       (`unsynced_flag`, grlib_stixctrl.c:707);
     - `det`: `quarter_on[4]` (idefxConfig 3:0) now. The FSM, the QL bank

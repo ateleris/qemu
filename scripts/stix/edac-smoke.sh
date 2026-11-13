@@ -40,8 +40,9 @@
 #            13) ..." (WDT.c:151), storeBadTrapInfo records the AHBSTAT
 #            address in the BRAM boot record (WDT.c:86-126) and forces
 #            the watchdog (WDT.c:182);
-#          - the model turns the FORCE into a system reset
-#            (grlib_stixctrl.c:281-287); QEMU re-boots the guest (no
+#          - the model turns the FORCE into a system reset (the FORCE
+#            command, not the counter — the AX ELF's watchdog never
+#            runs, accepted-diffs §10); QEMU re-boots the guest (no
 #            -no-reboot — the only gate that omits it). The TMTC
 #            transport survives the guest reset (grlib_stixspw.c:1429:
 #            "the TMTC transport (P2-1) is kept"), so the probe's

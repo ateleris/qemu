@@ -73,9 +73,14 @@ struct STIXCTRL
     StixCtrlScetCommitFn scet_commit_fn;
     void *scet_commit_opaque;
     /* Watchdog (0xD4), counted lazily from QEMU_CLOCK_VIRTUAL: while
-     * running, COUNT = wdg_count - cycles elapsed since wdg_base_ns. */
+     * running, COUNT = wdg_count - cycles elapsed since wdg_base_ns.
+     * wdg_enabled is the ENABLE/DISABLE command state; wdg_running says
+     * the counter is actually decrementing (the timer armed). They differ
+     * only after an expiry while enabled: enabled, COUNT 0, timer off,
+     * reset request pending. */
     uint32_t wdg_reload;
     uint32_t wdg_count;
+    bool wdg_enabled;
     bool wdg_running;
     int64_t wdg_base_ns;
     QEMUTimer *wdg_timer;
@@ -237,16 +242,27 @@ void stixctrl_set_scet_commit_hook(STIXCTRL *s,
     s->scet_commit_opaque = opaque;
 }
 
-/* Watchdog, from the FSW driver (BSW WDT.c header comment, WDT.c,
- * HWControl/Watchdog.c): not running at power-up; RELOAD loads COUNT from
- * RELOADVAL and enables counting; DISABLE stops counting, ENABLE resumes
- * it; CHANGE sets RELOADVAL only; FORCE resets the IDPU at once. COUNT
- * drops by one every 105 ms (WATCHDOG_CYCLE_DURATION) and the IDPU resets
- * when it reaches 0 (~6.6 s at the FSW's 63 cycles). Before this the
- * register read back the raw last write (COUNT = 0), so the FSW's
- * Watchdog task logged "invalid number of cycles" every second and
- * raised FDIR — a path the hardware never takes. */
+/*
+ * Watchdog (0xD4): after a reset the watchdog is DISABLED with
+ * COUNT = RELOADVAL = 0x3F and does not count. RELOAD ("feed") loads
+ * COUNT from RELOADVAL and restarts the 105 ms cycle (WATCHDOG_CYCLE_
+ * DURATION, ASW HWControl/Watchdog.c:12) from now; it never changes
+ * enabled/disabled — a disabled watchdog just holds the reloaded value.
+ * ENABLE resumes counting from the current COUNT, DISABLE freezes it
+ * (both idempotent); CHANGE sets RELOADVAL only; FORCE resets the IDPU
+ * at once. COUNT drops by one every 105 ms and the IDPU resets when it
+ * reaches 0 (~6.6 s at the FSW's 63 cycles).
+ *
+ * Why RELOAD does not enable (accepted-diffs §10): the BSW WDT.c:21 note
+ * "it also enables watchdog counting if it was disabled" was written for
+ * FPGA build 248 (WDT.c:13), before the ENABLE command existed (build
+ * 252, WDT.c:29-34). The flight driver enables explicitly (ASW
+ * HWControl/Watchdog.c:146-150 Watchdog_enable: ENABLE, [DISABLE if
+ * DISABLE_WATCHDOG], RELOAD), so the -DDISABLE_WATCHDOG AX gate ELFs keep
+ * feeding (Watchdog.c:193) a watchdog that never runs — as on the FPGA.
+ */
 #define STIX_WDG_CYCLE_NS (105 * 1000 * 1000LL)
+#define STIX_WDG_RESET_COUNT 0x3Fu  /* 6-bit COUNT/RELOADVAL all-ones */
 
 static uint32_t stixctrl_wdg_count(STIXCTRL *s)
 {
@@ -281,6 +297,7 @@ static void stixctrl_wdg_expired(void *opaque)
     STIXCTRL *s = opaque;
 
     trace_stixctrl_watchdog_reset("count expired");
+    /* the command state stays enabled; the pending reset re-inits */
     s->wdg_running = false;
     s->wdg_count = 0;
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
@@ -292,7 +309,13 @@ static void stixctrl_wdg_write(STIXCTRL *s, uint32_t value)
 
     switch (cmd) {
     case STIXCTRL_WATCHDOG_COMMAND_V_RELOAD:
-        stixctrl_wdg_run(s, s->wdg_reload);
+        /* COUNT := RELOADVAL, the cycle restarts now; it does not
+         * enable: a disabled watchdog holds the reloaded value */
+        if (s->wdg_enabled) {
+            stixctrl_wdg_run(s, s->wdg_reload);
+        } else {
+            s->wdg_count = s->wdg_reload;
+        }
         break;
     case STIXCTRL_WATCHDOG_COMMAND_V_FORCE:
     case STIXCTRL_WATCHDOG_COMMAND_V_FORCE1:
@@ -302,13 +325,15 @@ static void stixctrl_wdg_write(STIXCTRL *s, uint32_t value)
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         break;
     case STIXCTRL_WATCHDOG_COMMAND_V_DISABLE:
+        s->wdg_enabled = false;
         if (s->wdg_running) {
-            stixctrl_wdg_stop(s);
+            stixctrl_wdg_stop(s);   /* freeze at the current COUNT */
         }
         break;
     case STIXCTRL_WATCHDOG_COMMAND_V_ENABLE:
+        s->wdg_enabled = true;
         if (!s->wdg_running) {
-            stixctrl_wdg_run(s, s->wdg_count);
+            stixctrl_wdg_run(s, s->wdg_count);   /* resume, no reload */
         }
         break;
     case STIXCTRL_WATCHDOG_COMMAND_V_CHANGE:
@@ -1261,12 +1286,14 @@ static void grlib_stixctrl_reset(DeviceState *d)
     stixctrl->staged_secs = 0;
     stixctrl->unsynced_flag = 0;
 
-    /* the watchdog is not running after a reset (WDT.c: "it is not
-     * running at startup"); the FSW programs it again at init */
+    /* the watchdog resets disabled with COUNT = RELOADVAL = 0x3F and
+     * does not count (WDT.c:13: "it is not running at startup"); the
+     * FSW programs it again at init (Watchdog.c:70) */
     timer_del(stixctrl->wdg_timer);
+    stixctrl->wdg_enabled = false;
     stixctrl->wdg_running = false;
-    stixctrl->wdg_count = 0;
-    stixctrl->wdg_reload = 0;
+    stixctrl->wdg_count = STIX_WDG_RESET_COUNT;
+    stixctrl->wdg_reload = STIX_WDG_RESET_COUNT;
 
     /* the ROTB FIFO pointers reset with the device; the ring CONTENT is
      * kept (zeroed only at realize). The FSW issues RESETFIFO at init
@@ -1414,7 +1441,8 @@ static void stixctrl_hw_state_line(QDict *lines, const char *name,
  * in between are equal. "schema" versions the layout; every index
  * names its space (ch = HK ADC channel, line = hkProtConfig selector,
  * quarter = idefxConfig bit). Since M-6a the edac section carries the
- * memory-upset state (D-Ug), which bumped the schema to 2.
+ * memory-upset state (D-Ug), which bumped the schema to 2; the watchdog
+ * section gained "enabled" (the ENABLE/DISABLE command state, §10) at 3.
  */
 static char *stixctrl_get_hw_state(Object *obj, Error **errp)
 {
@@ -1430,7 +1458,7 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     uint16_t fine;
     GString *json;
 
-    qdict_put_int(root, "schema", 2);   /* M-6a: the edac section */
+    qdict_put_int(root, "schema", 3);   /* M-6a edac, §10 watchdog.enabled */
     qdict_put_int(root, "vclock_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     qdict_put_bool(model, "hk_adc", s->hk_adc);
@@ -1509,6 +1537,7 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     qdict_put(root, "hk_prot", prot);
 
     qdict_put_bool(wdg, "running", s->wdg_running);
+    qdict_put_bool(wdg, "enabled", s->wdg_enabled);
     qdict_put_int(wdg, "count", stixctrl_wdg_count(s));
     qdict_put_int(wdg, "reload", s->wdg_reload);
     qdict_put(root, "watchdog", wdg);

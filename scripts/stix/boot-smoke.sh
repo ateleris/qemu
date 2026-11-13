@@ -83,9 +83,12 @@ python3 "$REPO_ROOT/scripts/stix/normalize-log.py" \
     "$GOLDEN_DIR/uart.golden.log" uart.golden.norm
 
 # Compare the BOOT SEQUENCE only: everything through the first
-# "init: SAFE mode" line. Beyond it, steady-state content (periodic
-# Watchdog/HK lines) is window-edge sensitive — the ~60 s "invalid number
-# of cycles" line lands inside a 90 s wall-clock window nondeterministically.
+# "init: SAFE mode" line. The cut predates R3, when the FSW's
+# once-per-second "invalid number of cycles" watchdog print made the
+# steady state window-edge sensitive; since R3 the golden UART goes
+# silent after boot (the modeled watchdog reads back 63, and since §10 a
+# DISABLE_WATCHDOG build never runs it at all), but the boot-only cut
+# stays as the stable contract.
 cut_boot() {
     awk '{ print } /init: SAFE mode/ { exit }' "$1"
 }

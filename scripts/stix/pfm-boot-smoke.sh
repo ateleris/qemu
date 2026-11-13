@@ -10,6 +10,12 @@
 # at about 6.8 s. With the latency model on (the default since F-3) the
 # task sleeps through every NAND op, as on the IDPU.
 #
+# Both PFM ELFs enable the watchdog explicitly (Watchdog_enable, ASW
+# HWControl/Watchdog.c:143-151: ENABLE, RELOAD), so the RELOAD-does-not-
+# enable fix (accepted-diffs §10) does not change this gate: the counter
+# runs from boot, the negative's expiry and the positive's per-second
+# RELOAD feeds behave as before.
+#
 # Positive mode, at the shipped defaults (no t*-us override):
 #   - pfm-boot-drive.py checks the TM side and drives NOMINAL with TCs
 #     anchored on TM events (its docstring has the windows). Measured on

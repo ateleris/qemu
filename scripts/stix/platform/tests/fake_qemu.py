@@ -140,7 +140,7 @@ class Fake:
 
     def hw_ctrl(self):
         v = self.vclock()
-        return {"schema": 1, "vclock_ns": v,
+        return {"schema": 3, "vclock_ns": v,
                 "model": {"hk_adc": True, "powerstat": True,
                           "hk_prot": True, "det_model": True},
                 "supplies": {"enables": 0, "powerstat": 0, "lines": {
@@ -151,7 +151,8 @@ class Fake:
                 "hk_prot": {"irqen": 0, "protstat": 0, "hotsample": 0,
                             "lines": [{"line": 1, "ch": 5, "bit": 0,
                                        "threshold": 0, "prot_en": False}]},
-                "watchdog": {"running": False, "count": 0, "reload": 0},
+                "watchdog": {"running": False, "enabled": False,
+                             "count": 0, "reload": 0},
                 "scet": {"coarse": v // 1_000_000_000,
                          "fine": (v % 1_000_000_000) * 65536
                          // 1_000_000_000, "unsynced": True},

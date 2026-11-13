@@ -918,6 +918,9 @@ must change before its PFM sequence can pass:
     counter (`stixctrl_wdg_run` from `grlib_stixctrl.c:241-243` [C]);
   - so the AX gates run with a live watchdog only through this model
     behaviour. They depend on it, so it is **not changed in this track**.
+  - Resolved 2026-11-12: the model no longer re-arms on RELOAD
+    (accepted-diffs §10) — the AX gates no longer run a live watchdog,
+    as on the FPGA.
   - Both PFM ELFs have the watchdog on (the debug ELF writes ENABLE,
     RELOAD; v186 ends ENABLE, RELOAD) [M].
   - The earlier "55 s gdb halt, no reset" spike ran the AX ELF with the
@@ -1000,7 +1003,8 @@ must change before its PFM sequence can pass:
 - A vmstate or snapshot of the flash device.
 - A full-run PFM UART golden: the gate pins only the debug ELF's
   post-SAFE key lines (Q8).
-- Watchdog DISABLE stickiness in the CTRL model (follow-up, Q5).
+- Watchdog DISABLE stickiness in the CTRL model (follow-up, Q5;
+  resolved 2026-11-12, accepted-diffs §10).
 
 ## Review resolutions
 

@@ -1104,16 +1104,17 @@ static void test_ctrl_rotb(void)
     stix_qtest_cleanup();
 }
 
-/* CTRL watchdog (0xD4). Semantics from the FSW driver (BSW WDT.c header
- * comment, WDT.c and HWControl/Watchdog.c): COMMAND bits 31:29, RELOADVAL
- * bits 16:11, COUNT bits 5:0. Not running at power-up. RELOAD loads COUNT
- * from RELOADVAL and also enables counting; DISABLE stops it; ENABLE
- * resumes; CHANGE sets RELOADVAL without touching COUNT; FORCE resets the
- * IDPU at once. COUNT drops by one every 105 ms (Watchdog.c
- * WATCHDOG_CYCLE_DURATION) and the IDPU resets when it runs out.
- * Unmodeled, the register read back 0 after every feed, so the FSW's
- * Watchdog task logged an error each second and raised FDIR — a path the
- * hardware never takes. */
+/* CTRL watchdog (0xD4). COMMAND bits 31:29, RELOADVAL bits 16:11, COUNT
+ * bits 5:0 (StixIdpu.h). After a reset the watchdog is disabled with
+ * COUNT = RELOADVAL = 63 and does not count. RELOAD loads COUNT from
+ * RELOADVAL and restarts the 105 ms cycle (Watchdog.c
+ * WATCHDOG_CYCLE_DURATION); it does NOT enable a disabled watchdog (the
+ * WDT.c:21 "also enables" note is build-248 text, superseded when the
+ * ENABLE command arrived — accepted-diffs §10). DISABLE freezes COUNT,
+ * ENABLE resumes from it (both idempotent); CHANGE sets RELOADVAL only;
+ * FORCE resets the IDPU at once. The -DDISABLE_WATCHDOG AX gate ELFs feed
+ * every second (Watchdog.c Watchdog_feed) without ever enabling, so their
+ * watchdog never runs, as on the FPGA. */
 #define WDG                0xD4u
 #define WDG_CMD(c)         ((uint32_t)(c) << 29)
 #define WDG_RELOAD         WDG_CMD(1)
@@ -1122,6 +1123,7 @@ static void test_ctrl_rotb(void)
 #define WDG_ENABLE         WDG_CMD(6)
 #define WDG_CHANGE(n)      (WDG_CMD(7) | ((uint32_t)(n) << 11))
 #define WDG_COUNT(qts)     (ctrl_read(qts, WDG) & 0x3Fu)
+#define WDG_RELOADVAL(qts) ((ctrl_read(qts, WDG) >> 11) & 0x3Fu)
 #define WDG_CYCLE_NS       (105 * 1000 * 1000LL)
 
 /* true if a RESET event arrived; the QMP round trip pulls in any event
@@ -1142,18 +1144,21 @@ static void test_ctrl_watchdog(void)
 {
     QTestState *qts = stix_qtest_new();
 
-    /* power-up: not running */
-    g_assert_cmpuint(WDG_COUNT(qts), ==, 0);
+    /* power-up: disabled, COUNT = RELOADVAL = 63, nothing counts */
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
+    g_assert_cmpuint(WDG_RELOADVAL(qts), ==, 63);
     qtest_clock_step(qts, 100 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
     g_assert_false(wdg_saw_reset(qts));
 
-    /* the FSW init sequence, DISABLE_WATCHDOG build (Watchdog_init ->
-     * setRefreshInterval(63), enable): CHANGE, RELOAD, DISABLE, ENABLE,
-     * DISABLE, RELOAD. The final feed must read back 63 cycles — the
-     * check behind the per-second "invalid number of cycles" error. */
+    /* the DISABLE_WATCHDOG init sequence (Watchdog_init ->
+     * Watchdog_setRefreshInterval(63), Watchdog.c:70 and :122-136, with
+     * isEnabled TRUE from :50): WDT_setWdgInterval's CHANGE, RELOAD,
+     * DISABLE, then ENABLE, DISABLE, RELOAD. It must leave the watchdog
+     * disabled, frozen at 63. */
     ctrl_write(qts, WDG, WDG_CHANGE(63));
-    g_assert_cmpuint(WDG_COUNT(qts), ==, 0);       /* CHANGE keeps COUNT */
-    g_assert_cmpuint((ctrl_read(qts, WDG) >> 11) & 0x3Fu, ==, 63);
+    g_assert_cmpuint(WDG_RELOADVAL(qts), ==, 63);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);      /* CHANGE keeps COUNT */
     ctrl_write(qts, WDG, WDG_RELOAD);
     ctrl_write(qts, WDG, WDG_DISABLE);
     ctrl_write(qts, WDG, WDG_ENABLE);
@@ -1161,13 +1166,38 @@ static void test_ctrl_watchdog(void)
     ctrl_write(qts, WDG, WDG_RELOAD);
     g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
 
-    /* RELOAD enabled counting: one cycle per 105 ms */
+    /* RELOAD on a disabled watchdog does not start counting: COUNT
+     * holds 63 (the feed the AX gate ELF issues every second,
+     * Watchdog.c:193) */
+    ctrl_write(qts, WDG, WDG_RELOAD);
+    qtest_clock_step(qts, 20 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
+
+    /* 1 s feeds keep it frozen at 63, and 100 cycles without a feed
+     * never reset either — the disabled watchdog never runs */
+    for (int i = 0; i < 5; i++) {
+        ctrl_write(qts, WDG, WDG_RELOAD);
+        g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
+        qtest_clock_step(qts, 1000 * 1000 * 1000LL);
+    }
+    qtest_clock_step(qts, 100 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
+    g_assert_false(wdg_saw_reset(qts));
+
+    /* watchdog on (the non-DISABLE_WATCHDOG driver): ENABLE, RELOAD
+     * counts one per 105 ms */
+    ctrl_write(qts, WDG, WDG_ENABLE);
+    ctrl_write(qts, WDG, WDG_RELOAD);
     qtest_clock_step(qts, 10 * WDG_CYCLE_NS);
     g_assert_cmpuint(WDG_COUNT(qts), ==, 53);
 
-    /* DISABLE freezes the count, ENABLE resumes from it */
+    /* DISABLE freezes the count, ENABLE resumes from it; both
+     * idempotent */
     ctrl_write(qts, WDG, WDG_DISABLE);
     qtest_clock_step(qts, 20 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 53);
+    ctrl_write(qts, WDG, WDG_DISABLE);
+    qtest_clock_step(qts, WDG_CYCLE_NS);
     g_assert_cmpuint(WDG_COUNT(qts), ==, 53);
     ctrl_write(qts, WDG, WDG_ENABLE);
     qtest_clock_step(qts, 3 * WDG_CYCLE_NS);
@@ -1188,9 +1218,10 @@ static void test_ctrl_watchdog(void)
     qtest_clock_step(qts, 2 * WDG_CYCLE_NS);
     qtest_qmp_eventwait(qts, "RESET");
 
-    /* reset stops the watchdog again */
-    g_assert_cmpuint(WDG_COUNT(qts), ==, 0);
+    /* reset returns to disabled, COUNT = RELOADVAL = 63, not counting */
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
     qtest_clock_step(qts, 100 * WDG_CYCLE_NS);
+    g_assert_cmpuint(WDG_COUNT(qts), ==, 63);
     g_assert_false(wdg_saw_reset(qts));
 
     /* FORCE resets at once (WDT_forceIdpuReset, the trap handler) */
@@ -9017,7 +9048,7 @@ static off_t plat_file_size(const char *path)
 
 /*
  * D-PLo: /machine/stixctrl hw-state is a read-only JSON string (schema
- * 2 since the M-6a edac section) that follows hkCmdSta (enables,
+ * 3: the M-6a edac section, then §10 watchdog.enabled) that follows hkCmdSta (enables,
  * POWERSTAT), idefxConfig (quarter power), an injection (truth = the
  * pre-injection value, presented = the injected one), the last
  * conversion, a protection trip, the watchdog and the SCET with its
@@ -9045,10 +9076,10 @@ static void test_ctrl_hw_state(void)
                             "-D %s", log);
     qts = plat_qtest_new(extra);
 
-    /* a. JSON, schema 2 (M-6a's edac section), with the virtual time */
+    /* a. JSON, schema 3 (M-6a edac, §10 watchdog.enabled), with the virtual time */
     st = plat_hw_state(qts, ctrl);
     g_assert(st != NULL);
-    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 2);
+    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 3);
     g_assert(qdict_haskey(st, "vclock_ns"));
     sup = plat_dict(st, "supplies");
     g_assert_cmpint(qdict_get_int(sup, "enables"), ==, 0);
@@ -9135,12 +9166,20 @@ static void test_ctrl_hw_state(void)
     g_assert_cmpint(qdict_get_int(prot, "hotsample"), ==, 600);
     qobject_unref(st);
 
-    /* f. the watchdog (RELOAD with 63 cycles) and the SCET */
+    /* f. the watchdog (disabled after reset; ENABLE + RELOAD with 63
+     * cycles, the watchdog-on driver order) and the SCET */
+    st = plat_hw_state(qts, ctrl);
+    wdg = plat_dict(st, "watchdog");
+    g_assert(!qdict_get_bool(wdg, "enabled"));
+    g_assert(!qdict_get_bool(wdg, "running"));
+    qobject_unref(st);
     ctrl_write(qts, WDG, WDG_CHANGE(63));
+    ctrl_write(qts, WDG, WDG_ENABLE);
     ctrl_write(qts, WDG, WDG_RELOAD);
     qtest_clock_step(qts, 2 * WDG_CYCLE_NS);
     st = plat_hw_state(qts, ctrl);
     wdg = plat_dict(st, "watchdog");
+    g_assert(qdict_get_bool(wdg, "enabled"));
     g_assert(qdict_get_bool(wdg, "running"));
     g_assert_cmpint(qdict_get_int(wdg, "reload"), ==, 63);
     g_assert_cmpint(qdict_get_int(wdg, "count"), ==, 61);

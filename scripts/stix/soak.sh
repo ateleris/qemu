@@ -16,7 +16,11 @@
 #
 # The heartbeat is TM flow, not UART growth: R3 models the watchdog device,
 # so the FSW Watchdog task's once-per-second error print is gone and a
-# healthy guest can have a silent UART for the whole window. Housekeeping
+# healthy guest can have a silent UART for the whole window. With RELOAD no
+# longer enabling a disabled watchdog (accepted-diffs §10) the
+# DISABLE_WATCHDOG AX gate ELF never runs the watchdog at all, so a guest
+# stall no longer ends in a watchdog reset — TM flow is the only liveness
+# signal here. Housekeeping
 # TM packets arrive about once per second on the TMTC TCP port that
 # tmtc-probe.py reads (started here, as the operational configuration).
 # A chunk line is what the probe prints per received chunk:
@@ -192,7 +196,8 @@ done
 
 # UART growth is reported, not gated: since R3 models the watchdog, a
 # healthy guest can have a silent UART (the once-per-second watchdog error
-# print is gone). The TM gate above is the liveness verdict.
+# print is gone; on the AX ELF the watchdog never runs, §10). The TM gate
+# above is the liveness verdict.
 TM_TOTAL=$(grep '^# total' tm.soak-probe.log 2>/dev/null | awk '{print $3}' || true)
 echo "SOAK: PASS (${SECONDS_TOTAL}s; TM chunks/slice:${SLICE_COUNTS}  —" \
     "${N_SLICES} slices of ${SLICE}s; UART grew $SIZE_START -> $SIZE_END" \

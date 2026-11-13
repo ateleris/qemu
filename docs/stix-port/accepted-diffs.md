@@ -312,26 +312,56 @@ task checks COUNT after every feed (`HWControl/Watchdog.c:199`). It logged
 `Watchdog *E invalid number of cycles after reset: exp=63 hw=0` once per
 second and raised the FDIR path, which the hardware never takes.
 
-**Model (R3):** a command register, with semantics taken from the FSW
-driver (BSW `WDT.c` header comment, `WDT.c`, `HWControl/Watchdog.c`):
-- Not running at power-up or after a system reset.
-- CHANGE sets RELOADVAL only. RELOAD loads COUNT from RELOADVAL and starts
-  counting. DISABLE freezes COUNT, ENABLE resumes from it. FORCE resets
-  the IDPU at once. SAFE does nothing.
-- While running, COUNT drops by one every 105 ms (`WATCHDOG_CYCLE_DURATION`)
-  on `QEMU_CLOCK_VIRTUAL`, counted lazily. At 0 the model requests a guest
-  reset (~6.6 s after the last feed at the FSW's 63 cycles). With
-  `-no-reboot`, QEMU then exits.
-- A read returns RELOADVAL and the live COUNT.
+**Model (R3; RELOAD amended 2026-11-12, see the resolution below):** a
+command register. FSW `file:line` below is STIX-FSW 600a7a72 as in
+§34: `Watchdog.c` is `ASW/ASW/src/HWControl/Watchdog.c`, `WDT.c` is
+`ASW/BSW_ASW/src/BSW/WDT/WDT.c`.
+- Disabled at power-up and after every system reset: COUNT = RELOADVAL
+  = 0x3F (63), the counter does not run.
+- RELOAD ("feed") loads COUNT from RELOADVAL and restarts the 105 ms
+  cycle from now. It never changes enabled/disabled: a disabled
+  watchdog just holds the reloaded value.
+- ENABLE resumes counting from the current COUNT, DISABLE freezes it at
+  the current COUNT (both idempotent). CHANGE sets RELOADVAL only.
+  FORCE/FORCE1/FORCE2 reset the IDPU at once. SAFE does nothing.
+- While counting, COUNT drops by one every 105 ms
+  (`WATCHDOG_CYCLE_DURATION`, `Watchdog.c:12`) on `QEMU_CLOCK_VIRTUAL`,
+  counted lazily. At 0 the model requests a guest reset (~6.6 s after
+  the last feed at the FSW's 63 cycles). With `-no-reboot`, QEMU then
+  exits.
+- A read returns RELOADVAL and the live COUNT. The hw-state watchdog
+  section is `running`/`enabled`/`count`/`reload` (schema 3; `enabled`
+  is the ENABLE/DISABLE command state, added 2026-11-12).
 - Trace events: `stixctrl_watchdog_cmd`, `stixctrl_watchdog_reset`.
 
-**Open point:** the ELFs are built with `-DDISABLE_WATCHDOG`, yet
-`Watchdog_feed()` still issues RELOAD every second. The model treats RELOAD
-as "load and run", per the `WDT.c` header. Whether RELOAD restarts
-counting while disabled is still to be confirmed against the FPGA/HSWICD
-description (roadmap §3). Effect: a Watchdog task that stalls for over
-~6.6 s resets the IDPU, and the soak reports it as an early QEMU exit
-(exit 2).
+**Resolution (was the open point, 2026-11-12):** RELOAD no longer
+starts a disabled watchdog. The old "RELOAD also enables counting"
+reading came from the BSW `WDT.c:21` header note, which was written for
+FPGA build 248 (`WDT.c:13`), whose command list has no ENABLE — build
+252 added CHANGE (`WDT.c:29-34`) and the ENABLE/DISABLE emitter
+`WDT_setState` (`WDT.c:297-309`). The flight driver enables explicitly:
+`Watchdog_setRefreshInterval` (`Watchdog.c:122-136`) and
+`Watchdog_enable` (`Watchdog.c:143-151`) both write ENABLE, then DISABLE
+on a `-DDISABLE_WATCHDOG` build, then feed (`WDT_feedWdg`,
+`WDT.c:312-315` = RELOAD). The AX gate ELFs are
+`-DDISABLE_WATCHDOG` builds (the build task adds it, `tasks.vs.json:14`)
+whose Watchdog task still feeds every second (`Watchdog_feed`,
+`Watchdog.c:165-193`); on hardware their watchdog therefore never runs,
+and the old model ran it. This closes the flash-latency plan's
+"watchdog DISABLE stickiness" follow-up (Q5) and the Phase 1 hand-back
+item "Watchdog RELOAD while DISABLEd".
+
+**Gate effect:** the AX gates no longer have a live watchdog; a stall
+on an AX ELF no longer resets the IDPU (the soak's TM-flow gate is the
+only liveness verdict there, and `edac-smoke.sh` is unaffected — its
+reset is the trap handler's FORCE, `WDT.c:182`, not the counter). The
+PFM gates are unchanged: both PFM ELFs enable the watchdog (their init
+ends ENABLE, RELOAD), so the negative mode still expires at ~6.6 s and
+the positive still feeds once per second. The golden is unaffected: the
+per-feed COUNT check (`Watchdog.c:197`) reads 63 right after the feed
+in both the old and the new model, the cycles check at
+`Watchdog.c:180-190` is compiled out of `-DDISABLE_WATCHDOG` builds,
+and the boot UART is silent after init either way.
 
 **Golden regenerated** (`docs/stix-port/baseline/`, `run-flags.txt`). It
 is now captured from this model, not the repaired v5.2 model, on the
@@ -350,11 +380,17 @@ reference and is not gated.
 silent after boot, so the soak's liveness gate is TM flow per 60 s slice
 (commit "stix: soak heartbeat = TM flow").
 
-**Evidence:** qtest `/sparc/stix/ctrl-watchdog`: power-up not running,
-CHANGE keeps COUNT, RELOAD starts at 63, one cycle per 105 ms, the
-DISABLE/ENABLE freeze, a 1 s feed cadence never expires, no feed resets
-once the count runs out, reset stops it, and FORCE resets at once. It is
-expected red on the 5.2 wrapper.
+**Evidence:** qtest `/sparc/stix/ctrl-watchdog` (rewritten for the
+amended semantics): power-up disabled with COUNT = RELOADVAL = 63 and no
+reset after 100 cycles; the `DISABLE_WATCHDOG` init sequence (CHANGE,
+RELOAD, DISABLE, ENABLE, DISABLE, RELOAD — `Watchdog.c:54-70`,
+`:122-136`, `:143-151`) leaves it frozen at 63, never resets with 1 s
+feeds and never resets after 100 unfed cycles; RELOAD while disabled
+does not start counting (COUNT stays 63 after 20 cycles); ENABLE+RELOAD
+counts one per 105 ms; a 1 s feed cadence never expires; no feed resets
+once the count runs out (~6.6 s); DISABLE freezes and ENABLE resumes
+(both idempotent); a system reset returns to disabled with COUNT 63;
+FORCE resets at once. It is expected red on the 5.2 wrapper.
 
 ## 11. CTRL IRQ outputs wired per line (baseline: all on output 0, last-wins)
 
