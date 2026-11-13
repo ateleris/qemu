@@ -17,7 +17,15 @@ VOLATILE = ("idpu.scet.coarse", "idpu.scet.fine", "idpu.watchdog.count",
             "platform.obt", "platform.timecode.last_timecnt",
             "platform.timecode.last_vclock_ns",
             "platform.timecode.next_due_vclock_ns",
-            "platform.keepalive.sent", "platform.keepalive.suppressed")
+            "platform.keepalive.sent", "platform.keepalive.suppressed",
+            # PL-11c: the replay position and the ROTB FIFO pointers
+            # move on their own while the detector runs
+            "instrument.detector.replay.pos_ns",
+            "instrument.detector.replay.events",
+            "instrument.detector.replay.dropped",
+            "instrument.detector.replay.unsupported",
+            "instrument.rotb.count", "instrument.rotb.rd",
+            "instrument.rotb.wr")
 
 
 def leaf(truth, presented=None, unit=None, index_space=None, t_sim=0,
@@ -72,6 +80,30 @@ def leaves_from_hw(ctrl, spw, t_sim):
         for q, on in enumerate(ctrl["det"]["quarter_on"]):
             out["instrument.detector.quarter.%d" % q] = leaf(
                 on, index_space="quarter", t_sim=t_sim)
+        # PL-11c (D-PSb): the det section's scene/FSM/replay fields (the
+        # stix_det_hw_state accessor, D-PLm req 8) and the rotb section.
+        # .get within these sections, so a hw-state without the new
+        # fields still maps them (the older sections above still index
+        # directly); quarter_on keeps its path (no rename — API v1).
+        det = ctrl.get("det")
+        if det:
+            for k in ("source", "flare", "quiet_cps", "flare_cps",
+                      "ql_bank"):
+                out["instrument.detector." + k] = leaf(det.get(k),
+                                                       t_sim=t_sim)
+            for k, v in det.get("fsm", {}).items():
+                out["instrument.detector.fsm." + k] = leaf(v, t_sim=t_sim)
+            rep = det.get("replay")
+            if rep:
+                for k, v in rep.items():
+                    # pos_ns and the event counters join VOLATILE
+                    # above: they move on their own while a replay runs
+                    out["instrument.detector.replay." + k] = leaf(
+                        v, t_sim=t_sim)
+        rb = ctrl.get("rotb")
+        if rb:
+            for k in ("count", "full", "enable", "rd", "wr", "capacity"):
+                out["instrument.rotb." + k] = leaf(rb.get(k), t_sim=t_sim)
         # PL-11b (D-PSb): the attenuator and EDAC sections the stixctrl
         # hw-state already carries (stix_att.c:966-998 wired at
         # grlib_stixctrl.c:1621, stix_edac.c:714-759 at :1624-1625),

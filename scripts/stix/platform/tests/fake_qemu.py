@@ -9,10 +9,10 @@ qom-list-properties for grlib-stixflash WITHOUT inverted-storage.
 Otherwise it serves QMP on the -qmp unix socket like a frozen (-S)
 leon3: cont/stop/quit, the RESUME/STOP/SHUTDOWN/RESET events, qom-get
 vclock-ns, obt and both hw-state JSONs (the ctrl one carries the
-attenuator and edac sections, PL-11b), qom-set obt, the upset
-verbs on the EDAC (they move the hw-state's poisons and counters),
-and the test-only x-fake-guest-reset, which behaves per -no-reboot /
--action like QEMU.
+attenuator, edac, det and rotb sections, PL-11b/PL-11c), qom-set obt,
+the upset verbs on the EDAC (they move the hw-state's poisons and
+counters), and the test-only x-fake-guest-reset, which behaves per
+-no-reboot / -action like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
 `noqmp` accepts the QMP connection and never answers; `badstate`
 serves a hw-state without its keys.
@@ -165,7 +165,7 @@ class Fake:
 
     def hw_ctrl(self):
         v = self.vclock()
-        return {"schema": 4, "vclock_ns": v,
+        return {"schema": 5, "vclock_ns": v,
                 "model": {"hk_adc": True, "powerstat": True,
                           "hk_prot": True, "det_model": True},
                 "supplies": {"enables": 0, "powerstat": 0, "lines": {
@@ -181,7 +181,20 @@ class Fake:
                 "scet": {"coarse": v // 1_000_000_000,
                          "fine": (v % 1_000_000_000) * 65536
                          // 1_000_000_000, "unsynced": True},
-                "det": {"quarter_on": [False] * 4},
+                # the detector (stix_det.c, PL-11c): the scene defaults
+                # (stix_det_instance_init), the FSM off, no replay table
+                # loaded (idle), quarter power off
+                "det": {"quarter_on": [False] * 4, "source": "synthetic",
+                        "flare": False, "quiet_cps": 20, "flare_cps": 2000,
+                        "ql_bank": 0, "fsm": {"enable": False},
+                        "replay": {"state": "idle", "pos_ns": 0,
+                                   "events": 0, "dropped": 0,
+                                   "unsupported": 0, "table": "",
+                                   "count": 0, "duration_ns": 0}},
+                # the ROTB ring (grlib_stixctrl.c, PL-11c): empty and
+                # disabled, the default capacity
+                "rotb": {"count": 0, "full": False, "enable": False,
+                         "rd": 0, "wr": 0, "capacity": 104448},
                 # the attenuator section (stix_att.c:966-998), idle at
                 # "out": AB actuates at OUT (stix_att.c:291-293), so the
                 # presented cmdsta carries the AB bit (bit 10,

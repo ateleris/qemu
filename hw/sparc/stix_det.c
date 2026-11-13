@@ -2225,47 +2225,59 @@ static void stix_det_replay_offset_ms_set(Object *obj, Visitor *v,
 }
 
 /*
+ * The replay's state word (D-PLm req 4), shared by det-replay-status
+ * and the hw-state accessor below so the two faces cannot drift: idle
+ * (no table loaded), armed (loaded, waiting for its trigger — the
+ * nominal SetEnable edge or a det-replay-start=true), running, ended
+ * (EOF reached) or stopped (a det-replay-start=false stop; a device
+ * reset re-arms instead, so it reads armed again).
+ */
+static const char *stix_det_replay_state_name(const StixDetState *d)
+{
+    if (!d->replay_loaded) {
+        return "idle";
+    } else if (d->replay_running) {
+        return "running";
+    } else if (d->replay_stopped) {
+        return "stopped";
+    } else if (d->replay_ended) {
+        return "ended";
+    }
+    return "armed";
+}
+
+/* the table's last event time in ns; 0 for an empty or absent table */
+static uint64_t stix_det_replay_duration_ns(const StixDetState *d)
+{
+    if (!d->replay_n_ev) {
+        return 0;
+    }
+    return (uint64_t)d->replay_ev[d->replay_n_ev - 1].t_tick *
+           STIX_DET_TICK_NS;
+}
+
+/*
  * det-replay-status (D-PLm req 4): one atomic read-only line with the
- * replay's state and progress, for the platform controller. The state
- * is idle (no table loaded), armed (loaded, waiting for its trigger —
- * the nominal SetEnable edge or a det-replay-start=true), running,
- * ended (EOF reached) or stopped (a det-replay-start=false stop; a
- * device reset re-arms instead, so it reads armed again).
+ * replay's state and progress, for the platform controller.
  */
 static void stix_det_replay_status_get(Object *obj, Visitor *v,
                                        const char *name, void *opaque,
                                        Error **errp)
 {
     StixDetState *d = stix_det_of(obj, opaque);
-    uint64_t duration_ns = 0;
-    const char *state;
     char *value;
 
-    if (!d->replay_loaded) {
-        state = "idle";
-    } else if (d->replay_running) {
-        state = "running";
-    } else if (d->replay_stopped) {
-        state = "stopped";
-    } else if (d->replay_ended) {
-        state = "ended";
-    } else {
-        state = "armed";
-    }
-    if (d->replay_n_ev) {
-        duration_ns = (uint64_t)(d->replay_ev[d->replay_n_ev - 1].t_tick *
-                                 STIX_DET_TICK_NS);
-    }
     value = g_strdup_printf("state=%s,pos_ns=%" PRIu64 ",events=%" PRIu64
                             ",dropped=%" PRIu64 ",unsupported=%" PRIu64
                             ",table=%s,count=%u,duration_ns=%" PRIu64,
-                            state,
-                            (uint64_t)(d->replay_time_tick *
+                            stix_det_replay_state_name(d),
+                            (uint64_t)((uint64_t)d->replay_time_tick *
                                        STIX_DET_TICK_NS),
                             d->replay_events_done, d->replay_dropped,
                             d->replay_unsupported,
                             d->replay_file ? d->replay_file : "",
-                            d->replay_n_ev, duration_ns);
+                            d->replay_n_ev,
+                            stix_det_replay_duration_ns(d));
     visit_type_str(v, name, &value, errp);
     g_free(value);
 }
@@ -2477,6 +2489,41 @@ bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value)
         break;
     }
     return true;
+}
+
+/*
+ * The hw-state "det" object (D-PLm req 8, platform plan PL-11c),
+ * filled by the controller's stixctrl_get_hw_state next to its own
+ * quarter_on: the scene (det-source/-flare/-quiet-cps/-flare-cps), the
+ * QL bank in use (fsmSta.ActiveQl), the FSM enable, and the replay
+ * progress det-replay-status carries — the same source fields, never
+ * the parsed string. Pure like the getters: nothing is advanced, no
+ * register, timer or IRQ is touched and nothing traces (D-Ai), so two
+ * reads with no virtual time in between are equal. The caller owns
+ * @det (it already holds "quarter_on").
+ */
+void stix_det_hw_state(StixDetState *d, QDict *det)
+{
+    QDict *fsm = qdict_new(), *rep = qdict_new();
+
+    qdict_put_str(det, "source", stix_det_source_name[d->source]);
+    qdict_put_bool(det, "flare", d->flare);
+    qdict_put_int(det, "quiet_cps", d->quiet_cps);
+    qdict_put_int(det, "flare_cps", d->flare_cps);
+    qdict_put_int(det, "ql_bank", d->active_ql_bank);
+    qdict_put_bool(fsm, "enable", d->enable);
+    qdict_put(det, "fsm", fsm);
+
+    qdict_put_str(rep, "state", stix_det_replay_state_name(d));
+    qdict_put_int(rep, "pos_ns",
+                  (uint64_t)d->replay_time_tick * STIX_DET_TICK_NS);
+    qdict_put_int(rep, "events", d->replay_events_done);
+    qdict_put_int(rep, "dropped", d->replay_dropped);
+    qdict_put_int(rep, "unsupported", d->replay_unsupported);
+    qdict_put_str(rep, "table", d->replay_file ? d->replay_file : "");
+    qdict_put_int(rep, "count", d->replay_n_ev);
+    qdict_put_int(rep, "duration_ns", stix_det_replay_duration_ns(d));
+    qdict_put(det, "replay", rep);
 }
 
 /*

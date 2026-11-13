@@ -419,6 +419,40 @@ golden.
 - Gate: qtest extension (fields, purity, schema pin 4); boot/nominal/
   fault/att/edac/detector smokes unchanged; self-test leaves;
   platform.md's hw-state schema mention updated.
+- **As built (2026-11-13, commit PL-11c).**
+  Built as specified, with these notes: (1) the schema went **4 → 5**,
+  not 3 → 4 — the aspect track's AS-2 took 4 first (its hw-state
+  comment had pre-agreed "the second merger takes 5"), and the fake had
+  already followed to 4; both now serve 5. Two qtest pins needed the
+  bump, not one: ctrl-hw-state (the plan's stix.c:9048 cite) and
+  as-hw-state, whose schema==4 pin AS-2 added. (2) platform.md has no
+  hw-state schema prose to update (as PL-11b's as-built already found):
+  its only "schema" text is the verbs' argument schemas — the leaf
+  table gained the det/rotb rows instead. (3) the det accessor shares
+  two small helpers extracted from the det-replay-status string
+  builder (the state word and the duration), so the string and the
+  JSON cannot drift; the rotb section is filled inline in
+  stixctrl_get_hw_state (every field already sits in STIXCTRL — no
+  separate accessor needed), `enable` being rotbConfig bit 31. (4) the
+  qtest gate is a new `/sparc/stix/det-rotb-hw-state` (the
+  edac-hw-state pattern) rather than an extension of test_ctrl_hw_state
+  (which keeps its own schema pin): boot-state fields with types, the
+  scene knobs following a qom-set, the FSM enable + QL bank following a
+  NOMINAL entry (one QL swap), the rotb count/rd/wr/full following
+  TESTMODE putblock/getblock/RESETFIFO on an 8-block ring
+  (rotb-blocks=8; capacity pinned at 8), and the purity double-read
+  with the tick armed. Gates: qtest det-rotb-hw-state, ctrl-hw-state
+  and as-hw-state green; self-test `detector + ROTB state leaves
+  (PL-11c)` PASS.
+
+- **Review (GLM, 2026-11-13): 0 blocker/major, 4 minor, all fixed.**
+  The replay counters (events/dropped/unsupported) join VOLATILE with
+  pos_ns (they move every poll while a replay runs); the `.get`
+  comment now claims tolerance only within the new sections; the
+  status string and the JSON compute pos_ns with the same 64-bit
+  product; the qtest registration stays in the EDAC register function
+  (defined after the det/platform ones) with a comment saying why.
+  Gates: suite 194/194, self-test PASS, core-smoke PASS.
 
 ### PL-11d: watch the flash + open the debug.qmp hatch
 

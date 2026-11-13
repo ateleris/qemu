@@ -23,6 +23,7 @@
 #include "hw/core/irq.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "qobject/qdict.h"
 #include "hw/sparc/grlib_stix.h"
 #include "StixIdpu.h"
 
@@ -291,6 +292,14 @@ void stix_det_add_counts(StixDetState *d, uint32_t fpga_det, uint32_t pix,
 uint32_t stix_det_read(StixDetState *d, hwaddr addr);
 /* false when the write was dropped (a read-only register) */
 bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value);
+
+/*
+ * The hw-state "det" object (D-PLm req 8, platform PL-11c): the scene,
+ * the QL bank in use, the FSM enable and the replay progress, filled
+ * by the controller's stixctrl_get_hw_state next to its quarter_on.
+ * Pure: nothing advanced, nothing traced. The caller owns @det.
+ */
+void stix_det_hw_state(StixDetState *d, QDict *det);
 
 /*
  * Provided by grlib_stixctrl.c for the detector model (D-5):

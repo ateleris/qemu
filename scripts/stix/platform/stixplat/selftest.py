@@ -2553,6 +2553,63 @@ def t_att_edac_leaves(env):
         ctl.shutdown()
 
 
+def t_det_rotb_leaves(env):
+    """PL-11c (D-PSb): the stixctrl hw-state's det (scene, FSM, replay)
+    and rotb sections map to instrument.detector.* and instrument.rotb.*
+    leaves; the volatile ones (replay.pos_ns, rotb count/rd/wr) flood no
+    change record, two stable reads add none."""
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        wait_for(lambda: ctl.state.get("instrument.detector") is not None,
+                 what="the detector leaves")
+        # the leaf paths and values are the fake's idle det section (the
+        # stix_det scene defaults, FSM off, no replay table)
+        d = ctl.state.get("instrument.detector")
+        check(d["source"]["truth"] == "synthetic" and
+              d["flare"]["truth"] is False and
+              d["quiet_cps"]["truth"] == 20 and
+              d["flare_cps"]["truth"] == 2000 and
+              d["ql_bank"]["truth"] == 0 and
+              d["fsm"]["enable"]["truth"] is False,
+              "the detector scene/FSM leaves: %r" % d)
+        rep = d["replay"]
+        check(rep["state"]["truth"] == "idle" and
+              rep["pos_ns"]["truth"] == 0 and
+              rep["events"]["truth"] == 0 and
+              rep["dropped"]["truth"] == 0 and
+              rep["unsupported"]["truth"] == 0 and
+              rep["table"]["truth"] == "" and
+              rep["count"]["truth"] == 0 and
+              rep["duration_ns"]["truth"] == 0,
+              "the replay leaves at boot: %r" % rep)
+        for q in range(4):
+            lf = ctl.state.get("instrument.detector.quarter.%d" % q)
+            check(lf is not None and lf["truth"] is False and
+                  lf["index_space"] == "quarter",
+                  "quarter.%d keeps its path and space: %r" % (q, lf))
+        # the ROTB ring: empty, disabled, the default capacity
+        for k, v in (("count", 0), ("full", False), ("enable", False),
+                     ("rd", 0), ("wr", 0), ("capacity", 104448)):
+            lf = ctl.state.get("instrument.rotb." + k)
+            check(lf is not None and lf["truth"] == v,
+                  "instrument.rotb.%s == %r: %r" % (k, v, lf))
+
+        def changes():
+            return [x for x in ctl.log.since(0) if x.kind == "state" and
+                    x.obj["path"].startswith(("instrument.detector",
+                                              "instrument.rotb"))]
+        seen = len(changes())
+        time.sleep(0.3)                # several state polls, all stable
+        check(len(changes()) == seen,
+              "no change record for the stable reads (and the volatile "
+              "ones flood none): %r" % changes()[seen:])
+    finally:
+        ctl.shutdown()
+
+
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
@@ -3207,6 +3264,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("fault model: truth|presented, qom", t_fault_model),
          ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
          ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
+         ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),

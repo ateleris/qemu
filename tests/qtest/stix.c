@@ -9408,7 +9408,8 @@ static off_t plat_file_size(const char *path)
 
 /*
  * D-PLo: /machine/stixctrl hw-state is a read-only JSON string (schema
- * 3: the M-6a edac section, then §10 watchdog.enabled) that follows hkCmdSta (enables,
+ * 5: the M-6a edac section, §10 watchdog.enabled, the §48 aspect
+ * section, then PL-11c's det/rotb fields) that follows hkCmdSta (enables,
  * POWERSTAT), idefxConfig (quarter power), an injection (truth = the
  * pre-injection value, presented = the injected one), the last
  * conversion, a protection trip, the watchdog and the SCET with its
@@ -9436,10 +9437,11 @@ static void test_ctrl_hw_state(void)
                             "-D %s", log);
     qts = plat_qtest_new(extra);
 
-    /* a. JSON, schema 4 (M-6a edac, §10 watchdog.enabled, §48 as) */
+    /* a. JSON, schema 5 (M-6a edac, §10 watchdog.enabled, §48 as,
+     * PL-11c det/rotb) */
     st = plat_hw_state(qts, ctrl);
     g_assert(st != NULL);
-    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 4);
+    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 5);
     g_assert(qdict_haskey(st, "vclock_ns"));
     sup = plat_dict(st, "supplies");
     g_assert_cmpint(qdict_get_int(sup, "enables"), ==, 0);
@@ -14811,6 +14813,121 @@ static void test_edac_hw_state(void)
     stix_qtest_cleanup();
 }
 
+/*
+ * det-rotb-hw-state (PL-11c, D-PLm req 8 / D-PSb): the controller's
+ * hw-state "det" section carries the scene (source, flare, quiet_cps,
+ * flare_cps), the QL bank in use (fsmSta.ActiveQl), the FSM enable and
+ * the replay fields (the det-replay-status line's data through the one
+ * accessor, never the parsed string), and the new "rotb" section
+ * carries the ROTB FIFO state (count, full, the rotbConfig ENABLE bit,
+ * rd, wr, capacity). Pure like every section: two reads with no
+ * clock_step in between are byte-equal. RED before PL-11c: det holds
+ * quarter_on only and there is no rotb section, schema 4.
+ */
+static void test_det_rotb_hw_state(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    g_autofree char *a = NULL, *b = NULL;
+    QDict *st, *det, *fsm, *rep, *rotb;
+
+    /* at reset: the scene defaults, the FSM off, no replay table, an
+     * empty disabled ROTB ring (rotb-blocks=8 for the full case) */
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    g_assert_cmpuint(qdict_get_uint(st, "schema"), ==, 5);
+    det = plat_dict(st, "det");
+    g_assert_cmpstr(qdict_get_str(det, "source"), ==, "synthetic");
+    g_assert_false(qdict_get_bool(det, "flare"));
+    g_assert_cmpuint(qdict_get_uint(det, "quiet_cps"), ==, 20);
+    g_assert_cmpuint(qdict_get_uint(det, "flare_cps"), ==, 2000);
+    g_assert_cmpuint(qdict_get_uint(det, "ql_bank"), ==, 0);
+    fsm = plat_dict(det, "fsm");
+    g_assert_false(qdict_get_bool(fsm, "enable"));
+    rep = plat_dict(det, "replay");
+    g_assert_cmpstr(qdict_get_str(rep, "state"), ==, "idle");
+    g_assert_cmpuint(qdict_get_uint(rep, "pos_ns"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rep, "events"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rep, "dropped"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rep, "unsupported"), ==, 0);
+    g_assert_cmpstr(qdict_get_str(rep, "table"), ==, "");
+    g_assert_cmpuint(qdict_get_uint(rep, "count"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rep, "duration_ns"), ==, 0);
+    rotb = plat_dict(st, "rotb");
+    g_assert_cmpuint(qdict_get_uint(rotb, "count"), ==, 0);
+    g_assert_false(qdict_get_bool(rotb, "full"));
+    g_assert_false(qdict_get_bool(rotb, "enable"));
+    g_assert_cmpuint(qdict_get_uint(rotb, "rd"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rotb, "wr"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rotb, "capacity"), ==, 8);
+    qobject_unref(st);
+
+    /* the scene knobs follow the QOM properties (a runtime qom-set) */
+    g_assert_true(stix_qom_set_u64(qts, "/machine/stixctrl",
+                                   "det-quiet-cps", 55));
+    g_assert_true(stix_qom_set_u64(qts, "/machine/stixctrl",
+                                   "det-flare-cps", 4321));
+    g_assert_true(stix_qom_set_bool(qts, "/machine/stixctrl",
+                                    "det-flare", true));
+    g_assert_true(stix_qom_set_str(qts, "/machine/stixctrl", "det-source",
+                                   "zero"));
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    det = plat_dict(st, "det");
+    g_assert_cmpstr(qdict_get_str(det, "source"), ==, "zero");
+    g_assert(qdict_get_bool(det, "flare"));
+    g_assert_cmpuint(qdict_get_uint(det, "quiet_cps"), ==, 55);
+    g_assert_cmpuint(qdict_get_uint(det, "flare_cps"), ==, 4321);
+    qobject_unref(st);
+
+    /* the FSM enable and the QL bank follow fsmCmd: NOMINAL entry with
+     * QlIntTime 1 (a 2-tick period), one tick past the swap */
+    det_start(qts, 1);
+    det_step_ticks(qts, 2);
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    det = plat_dict(st, "det");
+    g_assert(qdict_get_bool(plat_dict(det, "fsm"), "enable"));
+    g_assert_cmpuint(qdict_get_uint(det, "ql_bank"), ==, 1);
+    qobject_unref(st);
+
+    /* the ROTB FIFO state follows the rotbConfig/rotbCmdSta writes
+     * (TESTMODE putblock/getblock, the ring test's own idiom) */
+    rotb_cfg(qts, true, true);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    rotb_cmd(qts, ROTB_CMD_PUTBLOCK);
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    rotb = plat_dict(st, "rotb");
+    g_assert(qdict_get_bool(rotb, "enable"));
+    g_assert_cmpuint(qdict_get_uint(rotb, "wr"), ==, 2);
+    g_assert_cmpuint(qdict_get_uint(rotb, "rd"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(rotb, "count"), ==, 1);
+    g_assert_false(qdict_get_bool(rotb, "full"));
+    qobject_unref(st);
+    for (unsigned i = 0; i < 7; i++) {
+        rotb_cmd(qts, ROTB_CMD_PUTBLOCK);   /* fill the 8-block ring */
+    }
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    rotb = plat_dict(st, "rotb");
+    g_assert_cmpuint(qdict_get_uint(rotb, "count"), ==, 8);
+    g_assert(qdict_get_bool(rotb, "full"));
+    qobject_unref(st);
+    rotb_cmd(qts, ROTB_CMD_RESETFIFO);
+    st = plat_hw_state(qts, "/machine/stixctrl");
+    rotb = plat_dict(st, "rotb");
+    g_assert_cmpuint(qdict_get_uint(rotb, "count"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rotb, "rd"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(rotb, "wr"), ==, 0);
+    g_assert_false(qdict_get_bool(rotb, "full"));
+    qobject_unref(st);
+
+    /* pure: two reads with the tick armed but no clock_step between
+     * are byte-equal */
+    a = plat_hw_state_str(qts, "/machine/stixctrl");
+    b = plat_hw_state_str(qts, "/machine/stixctrl");
+    g_assert_cmpstr(a, ==, b);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 /* ---- Aspect system: asCmdSta/asQlData semantics and reset (AS-1) ---- */
 
 /* Register offsets (StixIdpu.h:1643-1644); bit macros StixIdpu.h:667-691 */
@@ -15317,7 +15434,7 @@ static void test_as_hw_state(void)
     int i;
 
     st = plat_hw_state(qts, AS_CTRL);
-    g_assert_cmpuint(qdict_get_uint(st, "schema"), ==, 4);
+    g_assert_cmpuint(qdict_get_uint(st, "schema"), ==, 5);   /* PL-11c */
     as = plat_dict(st, "as");
     g_assert_false(qdict_get_bool(as, "asaon"));
     g_assert_false(qdict_get_bool(as, "asbon"));
@@ -15844,6 +15961,9 @@ static void stix_edac_register(void)
     qtest_add_func("/sparc/stix/edac-bram-reject", test_edac_bram_reject);
     qtest_add_func("/sparc/stix/edac-random", test_edac_random);
     qtest_add_func("/sparc/stix/edac-hw-state", test_edac_hw_state);
+    /* a det/ROTB test, registered here because it is defined after
+     * the det and platform register functions (PL-11c) */
+    qtest_add_func("/sparc/stix/det-rotb-hw-state", test_det_rotb_hw_state);
 }
 
 int main(int argc, char **argv)

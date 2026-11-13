@@ -1498,8 +1498,9 @@ static void stixctrl_hw_state_line(QDict *lines, const char *name,
  * quarter = idefxConfig bit). Since M-6a the edac section carries the
  * memory-upset state (D-Ug), which bumped the schema to 2; the watchdog
  * section gained "enabled" (the ENABLE/DISABLE command state, §10) at 3;
- * the aspect section joined at 4 (D-ASg; the platform track's PL-11c
- * also claims 3 -> 4, so the second merger takes 5).
+ * the aspect section joined at 4 (D-ASg); the det section gained the
+ * scene/FSM/replay fields and the rotb section is new (platform track
+ * PL-11c, D-PLm req 8), which takes 5.
  */
 static char *stixctrl_get_hw_state(Object *obj, Error **errp)
 {
@@ -1508,15 +1509,15 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     QDict *sup = qdict_new(), *lines = qdict_new();
     QDict *adc = qdict_new(), *prot = qdict_new(), *wdg = qdict_new();
     QDict *scet = qdict_new(), *det = qdict_new(), *model = qdict_new();
-    QDict *edac = qdict_new(), *as = qdict_new();
+    QDict *edac = qdict_new(), *as = qdict_new(), *rotb = qdict_new();
     QList *plines = qlist_new(), *qon = qlist_new();
     uint32_t cmdsta = stixctrl_hkcmdsta(s);
     uint32_t enables, good, sta, ch, line, q, coarse;
     uint16_t fine;
     GString *json;
 
-    qdict_put_int(root, "schema", 4);   /* M-6a edac, §10 watchdog.enabled,
-                                         * D-ASg aspect */
+    qdict_put_int(root, "schema", 5);   /* M-6a edac, §10 watchdog.enabled,
+                                         * D-ASg aspect, PL-11c det/rotb */
     qdict_put_int(root, "vclock_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     qdict_put_bool(model, "hk_adc", s->hk_adc);
@@ -1608,14 +1609,31 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     qdict_put(root, "scet", scet);
 
     /*
-     * idefxConfig 3:0 = quarter power. The FSM, QL bank and replay come
-     * through the detector branch's accessor (D-PLm req. 8)
+     * idefxConfig 3:0 = quarter power. The FSM, QL bank, scene and
+     * replay come through the detector branch's accessor (D-PLm req 8,
+     * PL-11c), which fills @det in place
      */
     for (q = 0; q < 4; q++) {
         qlist_append_bool(qon, (s->reg.idefxConfig >> q) & 1u);
     }
     qdict_put(det, "quarter_on", qon);
+    stix_det_hw_state(&s->det, det);
     qdict_put(root, "det", det);
+
+    /*
+     * PL-11c (D-PSb): the ROTB ring's FIFO state (D-A). ENABLE is
+     * rotbConfig bit 31 (the bit READY follows in rotbCmdSta);
+     * capacity is the rotb-blocks property. Pure reads.
+     */
+    qdict_put_int(rotb, "count", s->rotb_count);
+    qdict_put_bool(rotb, "full", s->rotb_full);
+    qdict_put_bool(rotb, "enable",
+                   !!((s->reg.rotbConfig >> STIXCTRL_ROTBCONFIG_ENABLE)
+                      & 1u));
+    qdict_put_int(rotb, "rd", s->rotb_rd);
+    qdict_put_int(rotb, "wr", s->rotb_wr);
+    qdict_put_int(rotb, "capacity", s->rotb_blocks);
+    qdict_put(root, "rotb", rotb);
 
     /* A-3 (D-Ah): the attenuator's truth/presented/faults summary */
     qdict_put(root, "attenuator", stix_att_hw_state(&s->att));
