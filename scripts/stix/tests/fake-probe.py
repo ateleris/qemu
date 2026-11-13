@@ -11,6 +11,10 @@ FAKE_PROBE_LINES names a file whose lines are printed right after the
 connect line, "%T" replaced by the current HH:MM:SS (canned EXPECT OK
 lines). FAKE_PROBE_DUMP names a file copied to the path of the probe's
 --dump-apid APID:PATH argument (a canned packet dump).
+FAKE_PROBE_DUMP_MAP, when set, refines that per destination: pairs
+"DEST=SRC" (comma-separated); a --dump-apid whose DEST path is a key
+gets that SRC, the others FAKE_PROBE_DUMP (so the l4-replay test can
+feed different canned dumps to the red and green boots).
 
 FAKE_PMEMSAVE_CSV, when set, makes every --qmp-cmd pmemsave write its
 target file: a *-pre* dump of the requested size filled with zeros,
@@ -44,10 +48,22 @@ if lines_file:
             print(line.rstrip("\n").replace("%T", time.strftime("%H:%M:%S")),
                   flush=True)
 dump_file = os.environ.get("FAKE_PROBE_DUMP")
-if dump_file and "--dump-apid" in sys.argv:
-    dump_path = sys.argv[sys.argv.index("--dump-apid") + 1].split(":", 1)[1]
-    with open(dump_file) as src, open(dump_path, "a") as dst:
-        dst.write(src.read())
+dump_map = os.environ.get("FAKE_PROBE_DUMP_MAP")
+if ("--dump-apid" in sys.argv) and (dump_file or dump_map):
+    mapping = {}
+    if dump_map:
+        for pair in dump_map.split(","):
+            if "=" in pair:
+                dest, src = pair.split("=", 1)
+                mapping[dest] = src
+    for i, a in enumerate(sys.argv[:-1]):
+        if a != "--dump-apid":
+            continue
+        dest = sys.argv[i + 1].split(":", 1)[1]
+        src = mapping.get(dest, dump_file)
+        if src:
+            with open(src) as f, open(dest, "a") as dst:
+                dst.write(f.read())
 pm_csv = os.environ.get("FAKE_PMEMSAVE_CSV")
 if pm_csv:
     spec = importlib.util.spec_from_file_location(

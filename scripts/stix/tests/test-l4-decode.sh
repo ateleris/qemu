@@ -147,7 +147,7 @@ if [ "$rc" -eq 0 ] && grep -qF "REQUEST 42 (A)" <<< "$out" && \
 else
     report "report A complete" "rc=$rc: $(tail -2 <<< "$out" | tr '\n' ' ')"
 fi
-if grep -qF "last3files=4 red-round=5" <<< "$out"; then
+if grep -qF "lastround=4 red-round=5" <<< "$out"; then
     report "TRUTH round math" ok
 else
     report "TRUTH round math" "$(grep TRUTH <<< "$out")"

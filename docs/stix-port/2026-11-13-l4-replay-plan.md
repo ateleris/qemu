@@ -389,6 +389,49 @@ live runs are the reviewer's.
   recipe, `baseline/README.md` the wrapper line, and this plan's as-built
   notes — only in L4-4, not in this draft.
 
+## Amendment A (2026-11-13, first live collect): the truth comes from the flash
+
+**Finding.** The first live `--collect-only` (GREEN, 600 s flare) produced
+605 `stixdet_chunk` trace lines but **no** `rcr =` and no `Flush DET stream`
+UART line: those are plain `TRACE` calls (RotAccuCompactor.c:163,
+ArchiveManager.c:113), compiled out in these builds (`TRACE` is defined
+empty per file, e.g. commonCallbacks.c:18; only `TRACE_ERROR` such as
+"Skipped first Det data chunk" reaches the UART). None of the three bundle
+ELFs contains either format string (checked with `strings`). The L4-3
+truth builder therefore cannot work; the probe and UART checks of the run
+passed.
+
+**Second finding (L4-3 review, verified in the old tree).** The wrapped
+builds search the files in rounds of at most 3 (`filenames[3]`) and zero
+the L4 counters at every round start (SciReport.c, 76775361, the
+`case 4:` inside the search loop), so RED keeps the **last round**:
+the last `nfiles % 3` files (3 when 0) + 1 carried sample. The bundle's
+"15 = 14 + 1" is the `360 % 3 = 0` case. L4-3 now computes `lastround`.
+
+**Decision D-L4-A.** The truth is read from the **collect flash snapshot**
+(`flash-collect.bin`), the archive the requests themselves will read, never
+from TM:
+- enumerate the RAW_COUNTS files the FSW stored (type, name = start SCET +
+  duration, FilesystemDefinition.h:64-73) with the FSW's own on-flash
+  layout, reusing the layout code of `scripts/stix/flash-damage.py`
+  (a read-only `list` subcommand, or a shared module);
+- walk each file's chunks by the chunk header (sci_utils.h:8-14: timestamp
+  6 B, duration 2 B, mask 4 B, RCR 2 B, triggers, chunk size 2 B at 62)
+  → per chunk: SCET, RCR; per file: name, start, chunk count;
+- cross-check against the `stixdet_chunk` trace: every archived chunk's
+  SCET must be a model chunk's SCET, the missing ones exactly the dropped
+  first chunk of each flush epoch (count asserted against the UART's
+  "Skipped first Det data chunk" lines, which do print);
+- the truth file format for l4-decode.py stays as it is.
+Open questions for the review: (Q-A1) how the FSW locates a file's pages
+(block header vs spare `pageAddress`, File.c/MemFilesystem.c — cite);
+(Q-A2) whether a file's data is contiguous in the 256-KiB block and where
+its valid length is recorded (the last chunk may be partial or padded);
+(Q-A3) the chunk timestamp encoding (coarse/fine vs 0.1 s) relative to
+the trace's `scet 0xC:0xF`; (Q-A4) the BCH/ECC layer: read data as the FSW
+sees it (flash-damage.py already models the word-swapped BCH), but a
+truth reader needs no correction on an undamaged image — confirm.
+
 ## Risks and checks
 
 - **GREEN has never booted here.** First live step, before any collection:

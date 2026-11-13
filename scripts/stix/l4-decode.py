@@ -41,13 +41,13 @@ request A is one rel per chunk line (the wrapper sends A with start =
 the truth's first chunk and a box covering the whole collection, so
 every chunk contributes exactly one sample: chunks exceed the 0.1-s
 bin, tunit 1); chunks before the request start are excluded.  The
-TRUTH line also reports last3files and red-round = last3files + 1:
+TRUTH line also reports lastround and red-round = lastround + 1:
 the "15 = 14 + 1" RED signature (TEST_PLAN §8) the wrapper checks the
 RED totals against.
 
 Report lines (L4-3's wrapper greps these):
   CAPTURE <file>: lines=<n> packets=<p> skipped=<s>
-  TRUTH <file>: chunks=<c> files=<f> last3files=<k> red-round=<k1>
+  TRUTH <file>: chunks=<c> files=<f> lastround=<k> red-round=<k1>
       rcr=[..]
   REQUEST <req> (A|B): packets=<p> samples=<s> rel=<min>..<max>
       dups=<d> rcr=[..] ebins=[..] pixel=[..] closing=[..]
@@ -262,16 +262,21 @@ class Truth:
         self.chunks = chunks
         self.files = files
 
-    def last3files(self):
-        return sum(f.nchunks for f in self.files[-3:])
+    def lastround(self):
+        """The chunks of the last search round: the wrapped builds
+        search the files in rounds of <= 3 (filenames[3]) and zero the
+        L4 counters at every round start, so the last round holds the
+        last len(files) % 3 files (3 when that is 0)."""
+        n = len(self.files) % 3 or 3
+        return sum(f.nchunks for f in self.files[-n:])
 
     def red_round(self):
         """The RED survivors: the last search round's chunks (the
-        wrapped builds search 3 files per round) plus the one
+        wrapped builds search <= 3 files per round) plus the one
         carried-over time-bin sample (TEST_PLAN §8)."""
         if len(self.files) < 2:
             return None
-        return self.last3files() + 1
+        return self.lastround() + 1
 
 
 def _scet_ms(text):
@@ -507,10 +512,10 @@ def identity_line(res, path):
 def truth_line(truth, path):
     rr = truth.red_round()
     rcrs = sorted({c.rcr for c in truth.chunks})
-    return ("TRUTH %s: chunks=%d files=%d last3files=%d red-round=%s "
+    return ("TRUTH %s: chunks=%d files=%d lastround=%d red-round=%s "
             "rcr=%s"
             % (path, len(truth.chunks), len(truth.files),
-               truth.last3files() if truth.files else 0,
+               truth.lastround() if truth.files else 0,
                rr if rr is not None else "n/a",
                _fmt_set(rcrs, "%d")))
 
@@ -732,7 +737,7 @@ def self_test():
               and exp["extra"] == 0 and not exp["ok"], str(exp))
         check("4 truth: 1799 chunks, 360 files, last3 14, round 15",
               (len(truth.chunks), len(truth.files),
-               truth.last3files(), truth.red_round())
+               truth.lastround(), truth.red_round())
               == (1799, 360, 14, 15))
         b_red = analyze_b(red, 712)
         check("4 RED 712 ghost primary", b_red["ghost"] == "primary",
@@ -837,8 +842,8 @@ def self_test():
                                            120300]
               and [f.name for f in t.files] == ["RAW_COUNTS_a",
                                                 "RAW_COUNTS_b"])
-        check("8 last3files 4, red-round 5",
-              t.last3files() == 4 and t.red_round() == 5)
+        check("8 lastround 4, red-round 5",
+              t.lastround() == 4 and t.red_round() == 5)
         try:
             read_truth_lines(["chunk 100.3"])
             check("8 short truth line refused", False, "accepted")

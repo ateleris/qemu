@@ -149,6 +149,50 @@ case "$MODE" in
         esac
         sleep "${FAKE_QEMU_RUN_SECONDS:-30}"
         ;;
+    l4)
+        # The l4-replay wrapper's boots: the collect boot writes the
+        # canned chunk UART (one 'rcr =' line per model chunk, a
+        # 'Flush DET stream' line every FAKE_QEMU_L4_FLUSH_EVERY chunks
+        # and after the last, the dropped-first-chunk *E) and fills the
+        # -trace file with FAKE_QEMU_L4_CHUNKS stixdet_chunk lines at
+        # SCET 1000000+i (the truth the test's canned dumps follow);
+        # the red/green request boots write only the boot banner.
+        N="${FAKE_QEMU_L4_CHUNKS:-26}"
+        FE="${FAKE_QEMU_L4_FLUSH_EVERY:-2}"
+        case "$SERIAL_OUT" in
+            *uart.collect.raw*)
+                {
+                    echo "00:00:00.150  Main             init: SAFE mode"
+                    echo "00:01:16.0  ArchiveManager   *E Skipped first Det data chunk"
+                } > "$SERIAL_OUT"
+                i=0
+                while [ "$i" -lt "$N" ]; do
+                    echo "00:01:17.0  RotAccuComp     rcr = 0" \
+                        >> "$SERIAL_OUT"
+                    if [ $((i % FE)) -eq $((FE - 1)) ] ||
+                            [ "$i" -eq $((N - 1)) ]; then
+                        echo "00:01:17.5  ArchiveManager   Flush DET stream: 36576 bytes" \
+                            >> "$SERIAL_OUT"
+                    fi
+                    i=$((i + 1))
+                done
+                ;;
+            *)
+                echo "00:00:00.150  Main             init: SAFE mode" \
+                    > "$SERIAL_OUT"
+                ;;
+        esac
+        if [ -n "$TRACE_FILE" ] && [ -f "$TRACE_FILE" ]; then
+            i=0
+            while [ "$i" -lt "$N" ]; do
+                printf '2026-11-13T10:00:00.000000Z stixdet_chunk chunk: nom_bank 0, 49 blocks, scet 0x%08x:0x0000, int_ticks=10 eacc_events=1800 rotb_count=%d at vclock_ns=%d\n' \
+                    "$((1000000 + i))" "$i" $((i * 1000000000)) \
+                    >> "$TRACE_FILE"
+                i=$((i + 1))
+            done
+        fi
+        sleep "${FAKE_QEMU_RUN_SECONDS:-30}"
+        ;;
     *)
         echo "fake-qemu: unknown FAKE_QEMU_MODE '$MODE'" >&2
         exit 3
