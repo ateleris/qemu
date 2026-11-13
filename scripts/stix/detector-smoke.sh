@@ -93,8 +93,12 @@
 # min time, 1 s; the 1800 events come within a tick). The UART must show
 # "Skipped first Det data chunk" (ArchiveManager.c:140, the chunk reached
 # the archive) exactly once, and no *E line from the chunk path, the
-# archive or the filesystem (check "uart-chunk"). The flash.bin space
-# allocated by the run is printed for the NAND cost record.
+# archive or the filesystem (check "uart-chunk"). Since AS-2 the aspect
+# generator feeds the same archive: "Skipped first Aspect data chunk"
+# (ArchiveManager.c:219) is whitelisted the same way and counted — one
+# line per flush cycle that carried aspect blocks, here the boot epoch
+# only (the @215 flush is not followed by another NOMINAL). The flash.bin
+# space allocated by the run is printed for the NAND cost record.
 # --no-rotb runs the zero sky with -global grlib-stixctrl.det-rotb=off:
 # the nominal swaps go on but no chunk is made. It passes only when
 # exactly the two chunk checks fail as planned: "uart-chunk" (no "Skipped
@@ -760,24 +764,30 @@ fi
 # TRACE_ERROR (ArchiveManager.c:140); later chunks are archived silently
 SKIPPED_FIRST="$(grep -c 'Skipped first Det data chunk' uart.detector.txt \
     || true)"
+# AS-2: the aspect blocks reach the same archive and get the same skip
+# once per flush cycle that carried aspect blocks (ArchiveManager.c:219);
+# the line is whitelisted like the detector one, still counted
+SKIPPED_ASPECT="$(grep -c 'Skipped first Aspect data chunk' \
+    uart.detector.txt || true)"
 # ... and no error from the chunk path, the archive or the filesystem on
 # the fresh flash (the FSW TRACE_TAGs of RotAccumulator.c,
 # RotAccuCompactor.c, ArchiveManager.c and MemoryMgmt/)
 CHUNK_TAGS='Archive|RotAccuComp|RotAccumulator|FS|FSapi|MemStream'
 CHUNK_TAGS="$CHUNK_TAGS|MemCommon|FIFO"
 CHUNK_ERR="$(grep -E "^[[:space:]]*[0-9:.]+ +($CHUNK_TAGS) +\\*E" \
-    uart.detector.txt | grep -v 'Skipped first Det data chunk' | head -3 ||
+    uart.detector.txt | grep -Ev 'Skipped first (Det|Aspect) data chunk' | head -3 ||
     true)"
 if [ -n "$CHUNK_ERR" ]; then
     echo "CHECK uart-chunk: FAIL (chunk/archive/filesystem error:" \
         "$(echo "$CHUNK_ERR" | head -1 | cut -c1-120))"
     FAILED+=(uart-chunk)
-elif [ "$SKIPPED_FIRST" -eq 1 ]; then
-    echo "CHECK uart-chunk: ok ('Skipped first Det data chunk' once, no" \
-        "chunk/archive/filesystem error)"
+elif [ "$SKIPPED_FIRST" -eq 1 ] && [ "$SKIPPED_ASPECT" -eq 1 ]; then
+    echo "CHECK uart-chunk: ok ('Skipped first Det/Aspect data chunk'" \
+        "once each, no chunk/archive/filesystem error)"
 else
     echo "CHECK uart-chunk: FAIL ($SKIPPED_FIRST 'Skipped first Det data" \
-        "chunk' lines; expected 1)"
+        "chunk' and $SKIPPED_ASPECT 'Skipped first Aspect data chunk'" \
+        "lines; expected 1 each)"
     FAILED+=(uart-chunk)
 fi
 

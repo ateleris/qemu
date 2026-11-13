@@ -151,7 +151,7 @@ class Fake:
 
     def hw_ctrl(self):
         v = self.vclock()
-        return {"schema": 3, "vclock_ns": v,
+        return {"schema": 4, "vclock_ns": v,
                 "model": {"hk_adc": True, "powerstat": True,
                           "hk_prot": True, "det_model": True},
                 "supplies": {"enables": 0, "powerstat": 0, "lines": {
@@ -167,7 +167,14 @@ class Fake:
                 "scet": {"coarse": v // 1_000_000_000,
                          "fine": (v % 1_000_000_000) * 65536
                          // 1_000_000_000, "unsynced": True},
-                "det": {"quarter_on": [False] * 4}}
+                "det": {"quarter_on": [False] * 4},
+                # the aspect generator (AS-2), powered off
+                "as": {"asaon": False, "asbon": False, "avgsize": 0,
+                       "n": 1, "pattern": "ramp", "sun": 0,
+                       "rate_ppm": 0, "enable": True, "tick": False,
+                       "block_seq": 0, "rows": 0, "pushed": 0,
+                       "dropped": 0, "rotb_full": 0, "flip_coarse": 0,
+                       "flip_fine": 0, "ql": [0, 0, 0, 0]}}
 
     def hw_spw(self):
         return {"schema": 1, "vclock_ns": self.vclock(), "ls": 5,

@@ -9436,10 +9436,10 @@ static void test_ctrl_hw_state(void)
                             "-D %s", log);
     qts = plat_qtest_new(extra);
 
-    /* a. JSON, schema 3 (M-6a edac, §10 watchdog.enabled), with the virtual time */
+    /* a. JSON, schema 4 (M-6a edac, §10 watchdog.enabled, §48 as) */
     st = plat_hw_state(qts, ctrl);
     g_assert(st != NULL);
-    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 3);
+    g_assert_cmpint(qdict_get_int(st, "schema"), ==, 4);
     g_assert(qdict_haskey(st, "vclock_ns"));
     sup = plat_dict(st, "supplies");
     g_assert_cmpint(qdict_get_int(sup, "enables"), ==, 0);
@@ -14930,12 +14930,556 @@ static void test_as_model_off(void)
     stix_qtest_cleanup();
 }
 
+/* ---- Aspect system: the generator core (AS-2) ---- */
+
+/*
+ * The block (RotAccumulator.h:24-31): exactly 512 B — u16 descriptor
+ * 0x4000 (aspect, bits 13..7 and 6..0 zero), the SCET as the 0xC8/0xCC
+ * read at the flip (6 B), then 63 rows x 4 u16 big-endian (A0, A1, B0,
+ * B1) at offset 8 + 8*r. One block per 63*N ms (the diode tick is
+ * 1 ms; the FSW's ASPECT_SAMPLE_RATE 1024 comment is unused,
+ * AspectCtrl.h:12 — the [F] 1 kHz tick wins).
+ */
+#define AS_BLOCK_BYTES  512u
+#define AS_ROWS         63u
+#define AS_DATA_OFF     8u
+#define AS_DESC_ASPECT  0x4000u
+#define AS_TICK_NS      1000000LL
+#define AS_CTRL         "/machine/stixctrl"
+
+/* the [F] ramp bases per diode (D-ASc) */
+#define AS_RAMP(d, seq, row)    \
+    (((d) * 0x100u + ((((seq) & 0x3Fu) << 6) | (row))) & 0xFFFu)
+
+/* qom-set of a signed integer property (as-rate-ppm); false when refused */
+static bool as_qom_set_int(QTestState *qts, const char *prop, int64_t value)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': %s, 'value': %" PRId64 "}}",
+                            AS_CTRL, prop, value);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
+/* the channel bits of asCmdSta: ASAON (bit 0) and ASBON (bit 1) */
+static void as_power(QTestState *qts, uint32_t channels, uint32_t avgsize)
+{
+    ctrl_write(qts, CTRL_ASCMDSTA, channels | (avgsize << 8));
+}
+
+/* one 512 B block from the ring, as the FSW reads it, then GETBLOCK */
+static void as_read_block(QTestState *qts, uint8_t *blk)
+{
+    uint32_t i;
+
+    for (i = 0; i < ROTB_BLOCK_WORDS; i++) {
+        stl_be_p(blk + 4 * i, qtest_readl(qts, ROTB_WINDOW + 4u * i));
+    }
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+}
+
+/* row r, diode d of a block */
+static uint16_t as_row_word(const uint8_t *blk, uint32_t r, uint32_t d)
+{
+    return lduw_be_p(blk + AS_DATA_OFF + 8u * r + 2u * d);
+}
+
+/* the LongTimer a (coarse_reg, fine) pair stands for, in ns; the
+ * UNSYNCED status bit (bit 31) is masked */
+static int64_t as_scet_ns(uint32_t coarse_reg, uint16_t fine)
+{
+    return (int64_t)(coarse_reg & 0x7fffffffu) * 1000000000LL +
+           (int64_t)fine * 1000000000LL / 65536;
+}
+
+/*
+ * as-block-format: one flip of the N=1 generator is exactly one 512 B
+ * block: descriptor 0x4000, the timestamp equal to the LongTimer at the
+ * flip (the clock stops on the flip deadline), row r at 8r in A0/A1/B0/
+ * B1 order, the ramp encoding block_seq, row and diode (D-ASc); the sun
+ * offset adds into every diode and saturates at 12 bits; consecutive
+ * blocks have strictly increasing timestamps.
+ * RED on the AS-1 binary: no generator, the ring stays empty.
+ */
+static void test_as_block_format(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    uint8_t blk[AS_BLOCK_BYTES];
+    int64_t t1 = 0, t2;
+    uint32_t r, i;
+
+    rotb_cfg(qts, true, false);
+    as_power(qts, 3, 0);                /* both channels, N = 1 */
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, blk);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    /* descriptor: aspect type, block number 0, reserved bits 0 */
+    g_assert_cmphex(lduw_be_p(blk), ==, AS_DESC_ASPECT);
+
+    /* the timestamp is the LongTimer at the flip */
+    g_assert_cmphex(ldl_be_p(blk + 2), ==,
+                    ctrl_read(qts, CTRL_LONGTIMERSEC) & 0x7fffffffu);
+    g_assert_cmphex(lduw_be_p(blk + 6), ==,
+                    ctrl_read(qts, CTRL_LONGTIMERSUBSEC) & 0xffffu);
+
+    /* 504 data bytes, row r at 8r, A0/A1/B0/B1, ramp with block_seq 0 */
+    for (r = 0; r < AS_ROWS; r++) {
+        g_assert_cmpuint(as_row_word(blk, r, 0), ==, r);
+        g_assert_cmpuint(as_row_word(blk, r, 1), ==, 0x100u + r);
+        g_assert_cmpuint(as_row_word(blk, r, 2), ==, 0x200u + r);
+        g_assert_cmpuint(as_row_word(blk, r, 3), ==, 0x300u + r);
+    }
+    t1 = as_scet_ns(ldl_be_p(blk + 2), lduw_be_p(blk + 6));
+
+    /* the next block: block_seq 1 in the ramp, timestamp monotonic */
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, blk);
+    g_assert_cmphex(lduw_be_p(blk), ==, AS_DESC_ASPECT);
+    g_assert_cmpuint(as_row_word(blk, 0, 0), ==, AS_RAMP(0, 1, 0));
+    g_assert_cmpuint(as_row_word(blk, 62, 3), ==, AS_RAMP(3, 1, 62));
+    t2 = as_scet_ns(ldl_be_p(blk + 2), lduw_be_p(blk + 6));
+    g_assert_cmpint(t2, >, t1);
+
+    /* the sun offset adds into every diode (applied at the next tick) */
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-sun", 16));
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, blk);
+    g_assert_cmpuint(as_row_word(blk, 0, 0), ==, AS_RAMP(0, 2, 0) + 16);
+    g_assert_cmpuint(as_row_word(blk, 62, 3), ==, AS_RAMP(3, 2, 62) + 16);
+
+    /* ... and saturates at 12 bits before the sum */
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-sun", 0xFFFu));
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, blk);
+    g_assert_cmphex(lduw_be_p(blk), ==, AS_DESC_ASPECT);
+    for (r = 0; r < AS_ROWS; r++) {
+        for (i = 0; i < 4; i++) {
+            g_assert_cmpuint(as_row_word(blk, r, i), ==, 0xFFFu);
+        }
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-timing: for AVGSIZE 0..4 (N = 1, 2, 4, 8, 16) the LongTimer delta
+ * between consecutive flips is 63*N ms; as-rate-ppm=5000 (the D-ASd
+ * bound; the plan's 1000000 example is past the setter's +-5000) makes
+ * it 63*N*1.005 ms. The ticks run on QEMU_CLOCK_VIRTUAL with absolute
+ * deadlines, the LongTimer stays 1 s per 1e9 ns.
+ * RED on the AS-1 binary: no flips at all.
+ */
+static void test_as_timing(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    static const uint32_t avgsize[5] = { 0, 1, 2, 3, 4 };
+    uint8_t b1[AS_BLOCK_BYTES], b2[AS_BLOCK_BYTES];
+    int64_t t1, t2;
+    unsigned i;
+
+    rotb_cfg(qts, true, false);
+    for (i = 0; i < 5; i++) {
+        uint32_t n = 1u << avgsize[i];
+
+        qtest_system_reset(qts);        /* state cleared, scene kept */
+        as_power(qts, 3, avgsize[i]);
+        qtest_clock_step(qts, 2 * 63 * n * AS_TICK_NS);
+        g_assert_cmpuint(rotb_count(qts), ==, 2);
+        as_read_block(qts, b1);         /* FIFO: the older block first */
+        as_read_block(qts, b2);
+        g_assert_cmphex(lduw_be_p(b1), ==, AS_DESC_ASPECT);
+        g_assert_cmphex(lduw_be_p(b2), ==, AS_DESC_ASPECT);
+        /* the second flip's timestamp is the LongTimer at the flip */
+        g_assert_cmphex(ldl_be_p(b2 + 2), ==,
+                        ctrl_read(qts, CTRL_LONGTIMERSEC) & 0x7fffffffu);
+        g_assert_cmphex(lduw_be_p(b2 + 6), ==,
+                        ctrl_read(qts, CTRL_LONGTIMERSUBSEC) & 0xffffu);
+        t1 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+        t2 = as_scet_ns(ldl_be_p(b2 + 2), lduw_be_p(b2 + 6));
+        g_assert_cmpint(t2, >, t1);
+        /* 63*N ms apart, within one SCET fine unit per timestamp
+         * (1/65536 s = 15258.8 ns) */
+        g_assert_cmpint(llabs(t2 - t1 - 63 * n * AS_TICK_NS), <=, 20000);
+    }
+
+    /* the rate: the tick period carries the ppm exactly (N = 16) */
+    qtest_system_reset(qts);
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-rate-ppm", 5000));
+    as_power(qts, 3, 4);
+    qtest_clock_step(qts, 2 * 63 * 16 * (AS_TICK_NS + 5000));
+    g_assert_cmpuint(rotb_count(qts), ==, 2);
+    as_read_block(qts, b1);
+    as_read_block(qts, b2);
+    t1 = as_scet_ns(ldl_be_p(b1 + 2), lduw_be_p(b1 + 6));
+    t2 = as_scet_ns(ldl_be_p(b2 + 2), lduw_be_p(b2 + 6));
+    g_assert_cmpint(llabs(t2 - t1 - 63 * 16 * (AS_TICK_NS + 5000)), <=,
+                    20000);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-avgsize-latch: AVGSIZE is latched at the row start, so a mid-row
+ * change applies from the next row (the QlIntTime rule, D-Dd): the open
+ * row still completes at its latched 16 samples, the following rows
+ * take 1 ms each, and the one block mixes 16-sample and 1-sample rows.
+ * RED on the AS-1 binary: the QL words never update.
+ */
+static void test_as_avgsize_latch(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    uint8_t blk[AS_BLOCK_BYTES];
+
+    rotb_cfg(qts, true, false);
+    as_power(qts, 3, 4);                /* N = 16 */
+    qtest_clock_step(qts, 16 * AS_TICK_NS);
+    /* row 0 done: asQlData holds the last completed N-sum (D-ASe) */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA), ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + 4), ==, 0x1000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + 8), ==, 0x2000u);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + 12), ==, 0x3000u);
+
+    /* mid-row-1 change to N = 1: row 1 keeps its latched 16 samples */
+    qtest_clock_step(qts, 5 * AS_TICK_NS);
+    as_power(qts, 3, 0);
+    qtest_clock_step(qts, 1 * AS_TICK_NS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA), ==, 0);
+    qtest_clock_step(qts, 10 * AS_TICK_NS);     /* row 1 completes at 32 */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA), ==, 16);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + 4), ==, 0x1000u + 16);
+
+    /* rows 2..62 take 1 ms now: the flip lands at 93 ms, not 1008 */
+    qtest_clock_step(qts, 60 * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+    qtest_clock_step(qts, 1 * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, blk);
+    g_assert_cmphex(lduw_be_p(blk), ==, AS_DESC_ASPECT);
+    g_assert_cmpuint(as_row_word(blk, 0, 0), ==, 0);
+    g_assert_cmpuint(as_row_word(blk, 0, 3), ==, 0x3000u);  /* a 16-sum */
+    g_assert_cmpuint(as_row_word(blk, 1, 0), ==, 16);
+    g_assert_cmpuint(as_row_word(blk, 1, 1), ==, 0x1000u + 16);
+    g_assert_cmpuint(as_row_word(blk, 2, 0), ==, 2);
+    g_assert_cmpuint(as_row_word(blk, 2, 1), ==, 0x100u + 2);
+    g_assert_cmpuint(as_row_word(blk, 62, 3), ==, 0x300u + 62);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-channel-off: a channel that is off writes 0 for its two diodes
+ * while the other pair stays patterned, and with both channels off the
+ * blocks keep coming, all-zero (D-ASb: the readout follows the supply
+ * once started; a power-off does not stop it).
+ * RED on the AS-1 binary: no blocks.
+ */
+static void test_as_channel_off(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    uint8_t blk[AS_BLOCK_BYTES];
+    uint32_t r;
+
+    rotb_cfg(qts, true, false);
+    as_power(qts, 1, 0);                /* channel A only */
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, blk);
+    for (r = 0; r < AS_ROWS; r++) {
+        g_assert_cmpuint(as_row_word(blk, r, 0), ==, r);
+        g_assert_cmpuint(as_row_word(blk, r, 1), ==, 0x100u + r);
+        g_assert_cmpuint(as_row_word(blk, r, 2), ==, 0);
+        g_assert_cmpuint(as_row_word(blk, r, 3), ==, 0);
+    }
+    /* the QL words follow: A patterned, B zero */
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA), ==, AS_ROWS - 1);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + 8), ==, 0);
+
+    /* both channels off: zeros, but the block is still produced */
+    ctrl_write(qts, CTRL_ASCMDSTA, 0);
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+    as_read_block(qts, blk);
+    g_assert_cmphex(lduw_be_p(blk), ==, AS_DESC_ASPECT);
+    for (r = 0; r < AS_ROWS; r++) {
+        g_assert_cmpuint(as_row_word(blk, r, 0), ==, 0);
+        g_assert_cmpuint(as_row_word(blk, r, 3), ==, 0);
+    }
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA), ==, 0);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-ql-data: asQlData[0..3] hold the very last accumulation per diode
+ * (the last completed N-sum, D-ASe), updated at every row end.
+ * RED on the AS-1 binary: the words never move.
+ */
+static void test_as_ql_data(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    uint32_t off;
+
+    as_power(qts, 3, 0);                /* N = 1: one row per ms */
+    qtest_clock_step(qts, 5 * AS_TICK_NS);
+    for (off = 0; off < 16; off += 4) {
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==,
+                        off * 0x40u + 4);
+    }
+    qtest_clock_step(qts, 1 * AS_TICK_NS);
+    for (off = 0; off < 16; off += 4) {
+        g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA + off), ==,
+                        off * 0x40u + 5);
+    }
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-push-gating: the block push goes through stixctrl_rotb_append, so
+ * with rotbConfig TESTMODE=1 or ENABLE=0 nothing lands in the ring —
+ * but the page still flips (block_seq moves, dropped counts the block).
+ * RED on the AS-1 binary: block_seq stays 0.
+ */
+static void test_as_push_gating(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    QDict *st, *as;
+
+    /* TESTMODE = 1 */
+    rotb_cfg(qts, true, true);
+    as_power(qts, 3, 0);
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "rotb_full"), ==, 0);
+    qobject_unref(st);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    /* ENABLE = 0 (a reset per leg: it clears the counters) */
+    qtest_system_reset(qts);
+    rotb_cfg(qts, false, false);
+    as_power(qts, 3, 0);
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "rotb_full"), ==, 0);
+    qobject_unref(st);
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    /* ENABLE = 1, TESTMODE = 0: the next flip pushes */
+    rotb_cfg(qts, true, false);
+    qtest_clock_step(qts, AS_ROWS * AS_TICK_NS);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 2);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped"), ==, 1);
+    qobject_unref(st);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-hw-state: the "as" section of the controller's hw-state JSON
+ * (D-ASg, schema 3 -> 4), fed by stix_aspect_hw_state: the channels,
+ * AVGSIZE raw + latched N, the scene knobs, the tick state, block_seq,
+ * the open page's rows, the counters, the last flip SCET and the QL
+ * words; the setters validate and refuse (the adc-inject pattern).
+ * RED on the AS-1 binary: no "as" section, schema 3.
+ */
+static void test_as_hw_state(void)
+{
+    QTestState *qts = stix_qtest_new();
+    QDict *st, *as, *model;
+    QList *ql;
+    int i;
+
+    st = plat_hw_state(qts, AS_CTRL);
+    g_assert_cmpuint(qdict_get_uint(st, "schema"), ==, 4);
+    as = plat_dict(st, "as");
+    g_assert_false(qdict_get_bool(as, "asaon"));
+    g_assert_false(qdict_get_bool(as, "asbon"));
+    g_assert_cmpuint(qdict_get_uint(as, "avgsize"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "n"), ==, 1);
+    g_assert_cmpstr(qdict_get_str(as, "pattern"), ==, "ramp");
+    g_assert_cmpuint(qdict_get_uint(as, "sun"), ==, 0);
+    g_assert_cmpint(qdict_get_int(as, "rate_ppm"), ==, 0);
+    g_assert_true(qdict_get_bool(as, "enable"));
+    g_assert_false(qdict_get_bool(as, "tick"));
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "rows"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "rotb_full"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "flip_coarse"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "flip_fine"), ==, 0);
+    ql = qdict_get_qlist(as, "ql");
+    for (i = 0; i < 4; i++) {
+        g_assert_cmpuint(qnum_get_uint(qobject_to(QNum, plat_list_nth(ql, i))),
+                         ==, 0);
+    }
+    model = plat_dict(st, "model");
+    g_assert_true(qdict_get_bool(model, "as_model"));
+    qobject_unref(st);
+
+    /* the scene knobs apply at the next tick (D-ASd); the tick period
+     * carries the rate, so the steps use it */
+    g_assert_true(stix_qom_set_str(qts, AS_CTRL, "as-pattern", "zero"));
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-sun", 7));
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-rate-ppm", 1000));
+    rotb_cfg(qts, true, false);         /* the flip must push */
+    as_power(qts, 1, 0);                /* A on, B off, N = 1 */
+    qtest_clock_step(qts, 3 * (AS_TICK_NS + 1000));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_true(qdict_get_bool(as, "asaon"));
+    g_assert_false(qdict_get_bool(as, "asbon"));
+    g_assert_cmpstr(qdict_get_str(as, "pattern"), ==, "zero");
+    g_assert_cmpuint(qdict_get_uint(as, "sun"), ==, 7);
+    g_assert_cmpint(qdict_get_int(as, "rate_ppm"), ==, 1000);
+    g_assert_true(qdict_get_bool(as, "tick"));
+    g_assert_cmpuint(qdict_get_uint(as, "rows"), ==, 3);
+    ql = qdict_get_qlist(as, "ql");
+    for (i = 0; i < 4; i++) {
+        /* zero pattern + sun on A0/A1; B is off, so B0/B1 read 0 */
+        g_assert_cmpuint(qnum_get_uint(qobject_to(QNum, plat_list_nth(ql, i))),
+                         ==, i < 2 ? 7 : 0);
+    }
+    qobject_unref(st);
+
+    /* one flip later: the counters and the last flip SCET */
+    qtest_clock_step(qts, 60 * (AS_TICK_NS + 1000));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "rows"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "flip_coarse"), ==,
+                     ctrl_read(qts, CTRL_LONGTIMERSEC) & 0x7fffffffu);
+    g_assert_cmpuint(qdict_get_uint(as, "flip_fine"), ==,
+                     ctrl_read(qts, CTRL_LONGTIMERSUBSEC) & 0xffffu);
+    qobject_unref(st);
+
+    /* the setters refuse and leave the state unchanged */
+    g_assert_false(stix_qom_set_str(qts, AS_CTRL, "as-pattern", "sunspot"));
+    g_assert_false(as_qom_set_int(qts, "as-rate-ppm", -1));
+    g_assert_false(stix_qom_set_u64(qts, AS_CTRL, "as-sun", 0x10000));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpstr(qdict_get_str(as, "pattern"), ==, "zero");
+    g_assert_cmpint(qdict_get_int(as, "rate_ppm"), ==, 1000);
+    g_assert_cmpuint(qdict_get_uint(as, "sun"), ==, 7);
+    qobject_unref(st);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * as-reset: a device reset stops the tick (D-ASf), clears the row and
+ * buffer state, the counters, asCmdSta and asQlData, and keeps the
+ * scene knobs; the FSW's next channel power-on restarts the readout.
+ * RED on the AS-1 binary: the registers reset but there is no tick to
+ * stop or restart.
+ */
+static void test_as_reset(void)
+{
+    QTestState *qts = rotb_qtest_new(8);
+    QDict *st, *as;
+
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-sun", 0x22));
+    g_assert_true(stix_qom_set_u64(qts, AS_CTRL, "as-rate-ppm", 500));
+    rotb_cfg(qts, true, false);
+    as_power(qts, 3, 0);
+    /* the tick period carries the rate: 63 ticks of 1.0005 ms */
+    qtest_clock_step(qts, AS_ROWS * (AS_TICK_NS + 500));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 1);
+    qobject_unref(st);
+    g_assert_cmpuint(ctrl_read(qts, CTRL_ASQLDATA), !=, 0);
+
+    qtest_system_reset(qts);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASCMDSTA), ==, 0);
+    g_assert_cmphex(ctrl_read(qts, CTRL_ASQLDATA), ==, 0);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_false(qdict_get_bool(as, "tick"));
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "rows"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "dropped"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "rotb_full"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "flip_coarse"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "flip_fine"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "n"), ==, 1);
+    /* the scene knobs survive (they describe the Sun, D-ASf) */
+    g_assert_cmpstr(qdict_get_str(as, "pattern"), ==, "ramp");
+    g_assert_cmpuint(qdict_get_uint(as, "sun"), ==, 0x22);
+    g_assert_cmpint(qdict_get_int(as, "rate_ppm"), ==, 500);
+    g_assert_true(qdict_get_bool(as, "enable"));
+    qobject_unref(st);
+
+    /* the tick is stopped: nothing accumulates */
+    qtest_clock_step(qts, 200 * AS_TICK_NS);
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 0);
+    g_assert_cmpuint(qdict_get_uint(as, "rows"), ==, 0);
+    qobject_unref(st);
+
+    /* the FSW's power-on restarts the readout (the scene rate kept) */
+    as_power(qts, 3, 0);
+    qtest_clock_step(qts, AS_ROWS * (AS_TICK_NS + 500));
+    st = plat_hw_state(qts, AS_CTRL);
+    as = plat_dict(st, "as");
+    g_assert_cmpuint(qdict_get_uint(as, "block_seq"), ==, 1);
+    g_assert_cmpuint(qdict_get_uint(as, "pushed"), ==, 1);
+    qobject_unref(st);
+    g_assert_cmpuint(rotb_count(qts), ==, 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_aspect_register(void)
 {
     qtest_add_func("/sparc/stix/as-reg-reset", test_as_reg_reset);
     qtest_add_func("/sparc/stix/as-rw", test_as_rw);
     qtest_add_func("/sparc/stix/as-ql-mask", test_as_ql_mask);
     qtest_add_func("/sparc/stix/as-model-off", test_as_model_off);
+    /* AS-2: the generator core */
+    qtest_add_func("/sparc/stix/as-block-format", test_as_block_format);
+    qtest_add_func("/sparc/stix/as-timing", test_as_timing);
+    qtest_add_func("/sparc/stix/as-avgsize-latch", test_as_avgsize_latch);
+    qtest_add_func("/sparc/stix/as-channel-off", test_as_channel_off);
+    qtest_add_func("/sparc/stix/as-ql-data", test_as_ql_data);
+    qtest_add_func("/sparc/stix/as-push-gating", test_as_push_gating);
+    qtest_add_func("/sparc/stix/as-hw-state", test_as_hw_state);
+    qtest_add_func("/sparc/stix/as-reset", test_as_reset);
 }
 
 static void stix_edac_register(void)

@@ -1297,8 +1297,8 @@ static void grlib_stixctrl_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    /* AS-1 (D-ASa): the aspect unit binds the register file (the tick
-     * and the rows come with the AS-2 generator) */
+    /* AS-2 (D-ASb): the aspect unit binds the register file and owns
+     * its 1 ms diode tick (armed by the first channel power-on) */
     stix_aspect_realize(&STIXCTRL->as, STIXCTRL, &STIXCTRL->reg);
 
     //STIXCTRL->reference_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
@@ -1409,6 +1409,7 @@ static void grlib_stixctrl_unrealize(DeviceState *dev)
     stixctrl->rotb_ring = NULL;
     stix_det_unrealize(&stixctrl->det);
     stix_att_unrealize(&stixctrl->att);
+    stix_aspect_unrealize(&stixctrl->as);
 }
 
 /*
@@ -1481,7 +1482,9 @@ static void stixctrl_hw_state_line(QDict *lines, const char *name,
  * names its space (ch = HK ADC channel, line = hkProtConfig selector,
  * quarter = idefxConfig bit). Since M-6a the edac section carries the
  * memory-upset state (D-Ug), which bumped the schema to 2; the watchdog
- * section gained "enabled" (the ENABLE/DISABLE command state, §10) at 3.
+ * section gained "enabled" (the ENABLE/DISABLE command state, §10) at 3;
+ * the aspect section joined at 4 (D-ASg; the platform track's PL-11c
+ * also claims 3 -> 4, so the second merger takes 5).
  */
 static char *stixctrl_get_hw_state(Object *obj, Error **errp)
 {
@@ -1490,14 +1493,15 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     QDict *sup = qdict_new(), *lines = qdict_new();
     QDict *adc = qdict_new(), *prot = qdict_new(), *wdg = qdict_new();
     QDict *scet = qdict_new(), *det = qdict_new(), *model = qdict_new();
-    QDict *edac = qdict_new();
+    QDict *edac = qdict_new(), *as = qdict_new();
     QList *plines = qlist_new(), *qon = qlist_new();
     uint32_t cmdsta = stixctrl_hkcmdsta(s);
     uint32_t enables, good, sta, ch, line, q, coarse;
     uint16_t fine;
     GString *json;
 
-    qdict_put_int(root, "schema", 3);   /* M-6a edac, §10 watchdog.enabled */
+    qdict_put_int(root, "schema", 4);   /* M-6a edac, §10 watchdog.enabled,
+                                         * D-ASg aspect */
     qdict_put_int(root, "vclock_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 
     qdict_put_bool(model, "hk_adc", s->hk_adc);
@@ -1505,6 +1509,7 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     qdict_put_bool(model, "hk_prot", s->hk_prot);
     qdict_put_bool(model, "det_model", s->det.model);
     qdict_put_bool(model, "att_model", s->att.cfg.model);
+    qdict_put_bool(model, "as_model", s->as.model);
     qdict_put(root, "model", model);
 
     /* hkCmdSta bits 4:0 (LV, HV01, HV17, SPW0, SPW1) and POWERSTAT 9:5 */
@@ -1604,6 +1609,10 @@ static char *stixctrl_get_hw_state(Object *obj, Error **errp)
     stix_edac_hw_state(&s->edac, edac);
     qdict_put(root, "edac", edac);
 
+    /* AS-2 (D-ASg): the aspect generator state */
+    stix_aspect_hw_state(&s->as, as);
+    qdict_put(root, "as", as);
+
     json = qobject_to_json(QOBJECT(root));
     return g_string_free(json, false);
 }
@@ -1665,6 +1674,7 @@ static void grlib_stixctrl_instance_init(Object *obj)
                             TYPE_STIX_EDAC);
     stixctrl_adc_inject_clear(GRLIB_STIXCTRL(obj));
     stix_det_instance_init(&GRLIB_STIXCTRL(obj)->det);
+    stix_aspect_instance_init(&GRLIB_STIXCTRL(obj)->as);
     stixctrl_hk_last_clear(GRLIB_STIXCTRL(obj));
     /* A-1 (D-Aa): the QOM face, /machine/stixctrl/attenuator */
     object_initialize_child(obj, "attenuator", &GRLIB_STIXCTRL(obj)->att,
@@ -1695,6 +1705,8 @@ static void grlib_stixctrl_class_init(ObjectClass *klass, const void *data)
     }
     /* D-4: det-source, det-flare, det-quiet-cps, det-flare-cps */
     stix_det_class_init(klass, offsetof(STIXCTRL, det));
+    /* AS-2 (D-ASc/D-ASd): as-pattern, as-sun, as-rate-ppm, as-enable */
+    stix_aspect_class_init(klass, offsetof(STIXCTRL, as));
 }
 
 static const TypeInfo grlib_stixctrl_info = {

@@ -5362,3 +5362,105 @@ attach.
 - **Debugger note:** GDB's `kill` (Visual Studio "Stop Debugging", the
   end of a `-batch` run) makes QEMU exit ("Terminated via GDBstub");
   detach instead to keep the bench running.
+
+## 48. Aspect ROTB blocks: the generator core (baseline: no aspect ROTB blocks, §38)
+
+Plan: `2026-11-13-aspect-plan.md` (commits AS-1..AS-6). The plan
+numbers this section §46; §46 and §47 were taken by the `tm-hold` and
+`gdb-legacy` tracks before the aspect track merged, so the aspect
+diffs live here, at §48, and the plan's later "§46" references read as
+this section.
+
+**Baseline:** no aspect data path. `asCmdSta` (0x68) and `asQlData`
+(0x6C-0x7B) were plain storage (§38: "no aspect ROTB blocks"); the
+ROTB ring only ever saw 0x8000 detector chunks (§35), so the FSW's
+aspect archive stayed empty and every aspect-burst request answered
+"no BSD data found" (EID 0x543F).
+
+- **The generator (AS-2, D-ASb).** `hw/sparc/stix_aspect.[ch]` owns a
+  1 ms `QEMU_CLOCK_VIRTUAL` diode tick (absolute deadlines, the
+  stix_det pattern): every tick each enabled channel (`asCmdSta`
+  ASAON/ASBON, bits 0/1) draws one 12-bit sample; N consecutive samples
+  are summed mod 65536 into a row, with AVGSIZE (bits 10:8) latched at
+  the row start so a mid-row change applies from the next row (the
+  QlIntTime rule, D-Dd). After every 63rd row the double buffer flips:
+  the full page becomes ONE 512 B block — u16 descriptor 0x4000 (block
+  number 0), the SCET as the 0xC8/0xCC read at the flip (the
+  integration end, UNSYNCED in bit 31 like the detector chunks), 63
+  rows x 4 u16 BE (A0, A1, B0, B1) — pushed with
+  `stixctrl_rotb_append(…, 1, …)`, so the rotbConfig
+  ENABLE /\ !TESTMODE gating and the drop-new ring rule apply unchanged
+  and an aspect block can never interleave inside a detector chunk
+  (BQL-serialized timer callbacks, D-Dj). Not modelled: the [F]
+  power-on delay of up to 1 ms to turn a channel on plus 1 ms before
+  readout — invisible at the 63·N ms block granularity.
+- **The tick rate (D-ASd).** `as-rate-ppm` makes the tick period
+  (1 + ppm·1e-6) ms of virtual time, so the block period in LongTimer
+  time is 63·N·(1+ppm·1e-6) ms and the ppm is carried exactly (the
+  period is an integer ns count, 1e6 + ppm). Positive = the blocks come
+  too late, negative = too early — the D-ASh trip points (−2000 ppm at
+  N=16 → pair delta 1005..1006 → inc 15 → a ~61 ms residual gap at
+  every block) are pinned on this arithmetic. The setter is bounded to
+  ±5000 and N-aware against the latched AVGSIZE: every possible
+  whole-ms estimate-pair delta must keep the FSW's increment estimate
+  (AspectCtrl.c:219-230) inside 1..16, which rejects any ppm < 0 while
+  N = 1 is latched (the pair delta would truncate to 62 → inc 0 →
+  ASSERT). The FSW's `ASPECT_SAMPLE_RATE 1024 // hardware default`
+  comment (AspectCtrl.h:12) disagrees with the [F] 1 kHz tick; the
+  model keeps 1 ms — the comment is unused by the FSW code (it never
+  divides by it).
+- **The tick lifecycle [I].** The tick arms on the first `asCmdSta`
+  write that sets a channel-enable bit (readout follows the channel
+  supply, the [F] power-on fact; the FSW powers the channels at every
+  boot/SAFE/NOMINAL entry, OpModeMgmt.c:1066-1068/:229-230/:680), and
+  the device reset stops it (D-ASf). Between resets it never stops: a
+  power-off does not stop the readout, an off channel writes zeros and
+  the block is still produced (D-ASb, the plan's open question 1 —
+  user decision still wanted on whether the real FPGA gates the readout
+  on channel power entirely; only the `as-enable` knob's meaning would
+  change).
+- **The scene knobs (D-ASc/D-ASd).** Runtime class properties on
+  `/machine/stixctrl` (the det-* pattern), surviving a device reset,
+  applied at the next tick: `as-pattern` (`zero` | `ramp`; ramp sample
+  = `base[d] + ((block_seq & 0x3F) << 6 | row) & 0xFFF` with per-diode
+  bases 0x000/0x100/0x200/0x300, so block sequence, row and diode are
+  decodable from two rows), `as-sun` (0..65535, added to every diode
+  and clamped into 12 bits before the N-sum — a saturating ADC),
+  `as-rate-ppm` (above) and `as-enable` (false = no samples, no rows,
+  no blocks at all; the negative leg). Raw AVGSIZE writes of 5..7 (the
+  FSW validates 0..4, Aspect.c:108-118) are stored (AS-1 masking) and
+  give N = 32..128 rows — out of contract, deterministic. `as-rate-ppm`
+  is not bounded for these latched N > 16, so such a guest with a fast
+  rate can drive the FSW's inc > 16 ASSERT (AspectCtrl.c:229-230), i.e.
+  a hang, when a burst request runs; that is the FSW's own behaviour.
+- **Observability (D-ASg).** `asQlData[0..3]` update at every row end
+  with the last completed N-sum (the D-ASe "very last accumulation per
+  diode"); traces only from actions: `stixasp_scene` (a knob set),
+  `stixasp_tick_arm`, `stixasp_flip` (block_seq, N, SCET),
+  `stixasp_push` (block_seq, result, rotb_count), `stixasp_drop`
+  (block_seq, reason — rotb-full until AS-3 adds the knob drops); the
+  controller hw-state gained an `as` section
+  (`stix_aspect_hw_state`: channels, AVGSIZE raw + latched N, the
+  scene knobs, tick state, block_seq, open-page rows, counters
+  pushed/dropped/rotb-full, last flip SCET, QL words) and the schema
+  bumped 3 → 4 (the plan's D-ASg; PL-11c also claims 3 → 4, so
+  whichever track merges second takes 5).
+- **Gate impact.** Uninjected gates that reach NOMINAL now print the
+  FSW's `Skipped first Aspect data chunk` TRACE_ERROR once per archive
+  epoch (the first block after a flush is skipped because the row
+  period is unknown, ArchiveManager.c:217-223 — a DEBUG_PRINT build
+  prints it, Correction 4); `detector-smoke.sh`'s `uart-chunk` check
+  whitelists exactly that line and counts it (one per flush cycle that
+  carried aspect blocks), still failing on every other `*E`. In SAFE
+  the blocks pile into the ring (the FSW drains only in NOMINAL,
+  RotAccumulator.c:69-72); the UART goldens are untouched.
+- **Tests.** `stix_aspect_register()`: the AS-2 block `as-block-format`
+  (byte-for-byte: 512 B, descriptor bits, the timestamp equal to the
+  LongTimer at the flip, row order, ramp + sun + saturation),
+  `as-timing` (63·N ms for N = 1..16, +5000 ppm scaling), 
+  `as-avgsize-latch`, `as-channel-off`, `as-ql-data`, `as-push-gating`,
+  `as-hw-state` (schema 4, the section, setter refusals) and
+  `as-reset` (tick stops, state clears, scene survives, power-on
+  restarts) — all red on the AS-1 binary (no generator, no `as`
+  section, unknown properties).
+
