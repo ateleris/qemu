@@ -201,6 +201,18 @@ int64_t qemu_clock_deadline_ns_all(QEMUClockType type, int attr_mask);
 void qemu_clock_notify(QEMUClockType type);
 
 /**
+ * qemu_clock_notify_expired:
+ * @type: the clock type
+ *
+ * Like qemu_clock_notify(), but only for the timer lists of the clock
+ * that have an expired timer.  A list without one has nothing to run,
+ * so waking its AioContext is a spurious wakeup.
+ *
+ * Caller should hold BQL (as for qemu_clock_notify()).
+ */
+void qemu_clock_notify_expired(QEMUClockType type);
+
+/**
  * qemu_clock_enable:
  * @type: the clock type
  * @enabled: true to enable, false to disable

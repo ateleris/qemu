@@ -68,8 +68,13 @@ static int64_t icount_get_limit(void)
 
 static void icount_notify_aio_contexts(void)
 {
-    /* Wake up other AioContexts.  */
-    qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    /*
+     * Wake up the other AioContexts that have an expired virtual timer
+     * (under icount their poll does not wait on the virtual clock).  The
+     * main loop's list is run right below in this thread; waking every
+     * context on every deadline costs an eventfd write each (STIX).
+     */
+    qemu_clock_notify_expired(QEMU_CLOCK_VIRTUAL);
     qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
 }
 

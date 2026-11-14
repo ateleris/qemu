@@ -5805,3 +5805,48 @@ global deadline and its owner is not woken by these warps (in-tree
 EXTERNAL virtual timers, slirp and input, attach to the main loop). A
 notify per batch would restore upstream's guarantee but costs about
 as much as the per-warp notify (a batch is usually one warp).
+
+## 50. icount deadline: notify only the timer lists that expired (baseline/upstream: every list of the clock)
+
+**What:** `icount_notify_aio_contexts` (accel/tcg/tcg-accel-ops-icount.c),
+which the round-robin vCPU loop calls through `icount_handle_deadline`
+whenever a QEMU_CLOCK_VIRTUAL deadline reaches 0 (and through
+`icount_prepare_for_run` when the budget is 0), now calls the new
+`qemu_clock_notify_expired()` (util/qemu-timer.c) instead of
+`qemu_clock_notify()`: it notifies only the clock's timer lists whose
+earliest timer has expired (`timerlist_expired`), instead of every
+list. It still runs the main loop's list right after, in the vCPU
+thread, as upstream does.
+
+**Why:** under icount an AioContext's poll does not wait on the virtual
+clock (`qemu_clock_use_for_deadline` is false for it), so this notify
+is how its virtual timers get run. Upstream wakes every AioContext
+(the main loop's `qemu_aio_context`, the monitor iothread, ...) on
+every expired virtual deadline, whether or not it owns the expired
+timer: an `aio_notify` -> eventfd write per context in poll, then a
+futex/ppoll round trip. In the busy STIX case (prof ELF, icount 7,
+20000 cps, 0.1 s integration, `--pace fast`) that was ~2300 eventfd
+writes per guest second, 81 % of them from this call (LD_PRELOAD
+backtrace sampling), with the vCPU thread ~39 % in the kernel.
+Measured A/B on the same tree: 0.201 -> 0.064 wall s per guest s
+(one guest hour 12 -> 4 min). Guest behaviour equal within run-to-run
+jitter: same inflow 490 blocks/s, drain 488.8 vs 488.3 blocks/s, ROTB
+peak 2.0 % vs 2.0 %, no skips or drops, flash 24.6 ops/s each; the
+0.5 s difference in the NOMINAL start is the drive's wall-clock TC
+injection.
+
+**Risk:** a list is still notified whenever it owns an expired timer,
+so no virtual timer runs later than upstream; only wakeups of contexts
+with nothing to run are dropped. One of those is the main loop's own
+list: its notify callback (`qemu_timer_notify_cb`) did a `cpu_exit`
+of the running vCPU, one wasted round-robin pass per deadline; the
+deadline is recomputed right after the timers run anyway. The one
+in-tree virtual timer on a possibly non-main AioContext (block/qed.c,
+a BDS in an iothread) is still woken at its own expiry;
+`timerlist_expired` must stay attribute-blind for that to hold. Nothing in tree relies on those as a
+side effect (the main loop's own fds wake it). Applies to every icount
+run (sleep=on and off, the AX gates included), not only `--pace fast`.
+`timerlist_expired` takes each list's `active_timers_lock` once per
+deadline, which is cheaper than the eventfd write it replaces. The
+`qemu_clock_notify` iteration over `clock->timerlists` without a lock
+is upstream's, unchanged. Upstreamable as is.
