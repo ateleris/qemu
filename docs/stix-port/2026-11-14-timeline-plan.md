@@ -175,7 +175,7 @@ ring append, outside nothing else — keep it cheap), `selftest.py`.
   `series_enum_steps` (verdict none->ok->late_apply -> v [0,1,2],
   labels), `series_markers` (fault inject + tc 237,18 -> marker labels),
   `series_cap` (cap 1000, feed 1500 -> 1000 kept, truncated_before set),
-  `series_api_bad_input` (max_points 0 -> 400).
+  `series_api_bad_input` (max_points 0 -> 400), `series_api_ids_repeat` (two `ids=` params -> both served; api `_csv` is not used for ids).
 
 ### Task A5: views
 
