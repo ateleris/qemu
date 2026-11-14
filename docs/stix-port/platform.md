@@ -738,8 +738,10 @@ leaves as a state table, and the burst control. Setup is read-only:
 the launch configuration from `status()["setup"]` (`binary`, `elf`,
 `elf_sha256`, `icount_shift`, `pace`, `memory`, `timecode_source`,
 `obt_continuity`, `on_guest_reset`, `sample_s`) in plain words, the
-measured speeds (icount 7: 0.28 wall s per guest s at 0.1 s frames,
-0.05 with `pace = fast` at 1 s frames) and the skip-ahead controls
+measured speeds (icount 7, prof ELF, 20000 cps, min = max
+integration, 2026-11-14 after accepted-diffs §50: 0.1 s frames 0.51
+wall s per guest s at `pace = wall`, 0.064 at `pace = fast`; 1 s
+frames 1.16 and 0.014) and the skip-ahead controls
 (`det.rotb.burst`, the flash library save/load/list). Timeline plots
 the series and markers (see Timeline above).
 
