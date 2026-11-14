@@ -22,12 +22,16 @@
   --line: #d9dde5; --accent: #2457c5; --ok: #1d7a46; --warn: #a86400;
   --bad: #b3261e; --chip: #eef1f6; --mono: ui-monospace, "SF Mono",
   "Cascadia Mono", Menlo, Consolas, monospace;
+  --tl1: #2457c5; --tl2: #1d7a46; --tl3: #a86400; --tl4: #b3261e;
+  --tl5: #6a3fa0; --tl6: #0f7c8c; --tl7: #8a5a44; --tl8: #5d6677;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #12151b; --panel: #1a1e26; --ink: #e3e7ef; --muted: #98a1b3;
     --line: #2c3340; --accent: #7aa2ff; --ok: #4cc47f; --warn: #e0a339;
     --bad: #ff6b60; --chip: #232936;
+    --tl1: #7aa2ff; --tl2: #4cc47f; --tl3: #e0a339; --tl4: #ff6b60;
+    --tl5: #c9a6ff; --tl6: #62d0e0; --tl7: #d9a184; --tl8: #98a1b3;
   }
 }
 * { box-sizing: border-box; }
@@ -112,6 +116,24 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
 .desc { color: var(--muted); font-size: 12px; margin: 2px 0 6px; }
 .row { border-top: 1px solid var(--line); padding: 6px 0; }
 .row:first-child { border-top: 0; }
+#tl-plot { border: 1px solid var(--line); background: var(--panel); }
+#tl-plot canvas { display: block; width: 100%; height: auto; }
+.tl-panel { display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+  border-top: 1px solid var(--line); padding: 4px 0; }
+.tl-panel.active .tl-title { border-color: var(--accent);
+  color: var(--accent); font-weight: 600; }
+.tl-chip { font: 12px var(--mono); }
+.tl-sw { display: inline-block; width: 10px; height: 10px;
+  margin-right: 5px; border-radius: 2px; }
+.tl-sw0 { background: var(--tl1); }
+.tl-sw1 { background: var(--tl2); }
+.tl-sw2 { background: var(--tl3); }
+.tl-sw3 { background: var(--tl4); }
+.tl-sw4 { background: var(--tl5); }
+.tl-sw5 { background: var(--tl6); }
+.tl-sw6 { background: var(--tl7); }
+.tl-sw7 { background: var(--tl8); }
+#tl-hover { min-height: 1.4em; max-height: 7em; overflow: auto; }
 </style>
 </head>
 <body>
@@ -381,6 +403,7 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
       <label><input type="checkbox" class="topic" value="fault" checked> fault</label>
       <label><input type="checkbox" class="topic" value="expect" checked> expect</label>
       <label><input type="checkbox" class="topic" value="log"> log</label>
+      <label><input type="checkbox" class="topic" value="sample"> sample</label>
       <label><input type="checkbox" id="follow" checked> follow</label>
     </span>
   </h2>
@@ -462,9 +485,42 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
 </div>
 
 <div class="tab" data-tab-panel="timeline" hidden>
-<section>
+<section class="wide">
   <h2>Timeline</h2>
-  <div class="desc">Timeline: coming with Track C.</div>
+  <div class="ctl">
+    <span class="lbl">view</span>
+    <select id="tl-view"></select>
+    <span class="lbl">window</span>
+    <select id="tl-window">
+      <option value="live">live</option>
+      <option value="1m">1 min</option>
+      <option value="10m">10 min</option>
+      <option value="60m">60 min</option>
+      <option value="run">whole run</option>
+    </select>
+    <button type="button" id="tl-reload">reload</button>
+    <button type="button" id="tl-add-panel">add panel</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">series</span>
+    <input id="tl-search" class="wide" placeholder="search the catalogue">
+    <select id="tl-hits"></select>
+    <button type="button" id="tl-add">add to panel</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">save view</span>
+    <input id="tl-save-name" placeholder="view name">
+    <button type="button" id="tl-save">save</button>
+    <button type="button" id="tl-delete" class="danger">delete shown</button>
+  </div>
+  <div id="tl-note" class="desc"></div>
+  <div id="tl-panels"></div>
+  <div id="tl-hover" class="log"></div>
+  <div id="tl-plot"><canvas id="tl-canvas"></canvas></div>
+  <div class="desc">Drag on the plot to zoom, double-click to reset.
+    Panels: click a title to expand its series and make it the
+    "add to panel" target (one at a time), a series chip or "remove
+    panel" to drop it.</div>
 </section>
 </div>
 </main>
@@ -574,9 +630,12 @@ function showTab(id) {
     // Setup visit
     loadFlash().then((ok) => { flashLoaded = ok; });
   }
+  if (id === "timeline") tlDraw();
 }
 function tabFromHash() {
-  const id = location.hash.slice(1);
+  // the tab is the hash head; the timeline's view choice rides after it
+  // as /v=<name> (kept across tabs and reloads)
+  const id = location.hash.slice(1).split("/")[0];
   for (const p of document.querySelectorAll("[data-tab-panel]"))
     if (p.dataset.tabPanel === id) return id;
   return "overview";
@@ -584,8 +643,10 @@ function tabFromHash() {
 document.addEventListener("click", (ev) => {
   const b = ev.target.closest("[data-tab]");
   if (!b) return;
-  if (location.hash === "#" + b.dataset.tab) showTab(b.dataset.tab);
-  else location.hash = b.dataset.tab;
+  const h = b.dataset.tab +
+    (TL.view ? "/v=" + encodeURIComponent(TL.view) : "");
+  if (location.hash === "#" + h) showTab(b.dataset.tab);
+  else location.hash = h;
 });
 window.addEventListener("hashchange", () => showTab(tabFromHash()));
 
@@ -652,6 +713,7 @@ async function refresh() {
   let st;
   try { st = await getJSON("status"); } catch (e) { toast(String(e), true); return; }
   const p = st.platform || {};
+  TL.now = st.time ? st.time.sim_time : TL.now;
   chip("s-power", st.power);
   chip("s-boot", st.boot_id, "");
   chip("s-sim", fmtS(st.time && st.time.sim_time), "");
@@ -978,6 +1040,869 @@ function scenarioChanged() {
 }
 $("scn-file").addEventListener("change", scenarioChanged);
 
+/* ---- Timeline tab (C1): panels of series on one bench clock, drawn
+   on a canvas by our own code; data from /series and /views, live
+   appends from the SSE records (the same rules as series.py) ---- */
+const TL_MAX_POINTS = 2000;
+const TL_LIVE_NS = 600e9;         // the live window trails 10 min
+const TL_PANEL_H = 170;           // one panel, before its legend rows
+const TL_LEGEND_H = 13;           // one legend row
+const TL_AXIS_H = 36;             // the time axis + the marker legend line
+const TL_TOP = 16;                // per-panel title strip
+const TL_PAD_L = 62, TL_PAD_R = 62, TL_GAP = 6;
+const TL_MIN_H = 300;             // the canvas is never shorter
+const TL_PAL = ["--tl1", "--tl2", "--tl3", "--tl4", "--tl5", "--tl6",
+                "--tl7", "--tl8"];
+const TL_MARKERS = ["fault", "force", "tc", "event", "mode", "power",
+                    "scenario"];
+const TL_KIND_VAR = { fault: "--bad", force: "--warn", tc: "--accent",
+  event: "--ok", mode: "--tl5", power: "--tl6", scenario: "--tl8" };
+const TL_STARTERS = ["rotb-fill-vs-faults", "cpu-and-hk",
+                     "memory-upsets", "power-and-link"];
+const TL = {
+  cat: [], catById: new Map(), aliasOf: new Map(),   // hk label -> alias ids
+  kindNew: new Map(), bufEnum: new Map(),            // ids seen live
+  panels: [], markers: [...TL_MARKERS], window: "live", zoom: null,
+  data: new Map(), buf: new Map(), panelIds: new Set(),
+  active: -1, now: null, queryTo: null, unknown: [],
+  view: null, viewNames: [],
+  hoverX: null, drag: null, dirty: false,
+};
+
+function tlVar(n) {
+  return getComputedStyle(document.documentElement)
+    .getPropertyValue(n).trim() || "#888";
+}
+function tlNow() { return TL.now == null ? 0 : TL.now; }
+function tlIds() {
+  const ids = [];
+  for (const p of TL.panels)
+    for (const s of p.series) if (!ids.includes(s)) ids.push(s);
+  for (const m of TL.markers) if (!ids.includes(m)) ids.push(m);
+  return ids;
+}
+function tlNote() {
+  const msgs = [];
+  if (TL.unknown.length)
+    msgs.push("unknown view ids: " + TL.unknown.join(", "));
+  if (!TL.cat.some((e) => e.id.startsWith("hk")))
+    msgs.push("HK series need the IDB JSON");
+  text($("tl-note"), msgs.join(" · "));
+}
+
+async function tlCatalogue() {
+  try { TL.cat = await getJSON("series/catalogue"); } catch (e) { TL.cat = []; }
+  TL.catById = new Map(TL.cat.map((e) => [e.id, e]));
+  TL.aliasOf = new Map();       // an hk label -> the alias ids (hk.*) it feeds
+  for (const e of TL.cat) {
+    if (/^hk\./.test(e.id)) {
+      if (!TL.aliasOf.has(e.label)) TL.aliasOf.set(e.label, []);
+      TL.aliasOf.get(e.label).push(e.id);
+    }
+  }
+  tlPick();
+  tlNote();
+}
+
+function tlStoredView() {
+  // the last choice: the view name after "/v=" in the location hash
+  const i = location.hash.indexOf("/v=");
+  if (i < 0) return null;
+  try { return decodeURIComponent(location.hash.slice(i + 3)); }
+  catch (e) { return null; }      // a broken hash: the default applies
+}
+function tlStoreView(name) {
+  TL.view = name;
+  try {   // in the hash after the tab (#tab/v=name), survives a reload
+    location.hash = tabFromHash() + "/v=" + encodeURIComponent(name);
+  } catch (e) { /* the hash is best effort */ }
+}
+function tlInitialView() {
+  // the user's last choice if it still exists, else the first starter
+  // view in /views order (rotb-fill-vs-faults preferred)
+  const stored = tlStoredView();
+  if (stored && (stored === "everything" || TL.viewNames.includes(stored)))
+    return stored;
+  return TL_STARTERS.find((n) => TL.viewNames.includes(n)) ||
+    "everything";
+}
+async function tlViews() {
+  try {
+    const r = await getJSON("views");
+    TL.viewNames = r.views || [];
+    const sel = $("tl-view");
+    const keep = sel.value;
+    const names = ["everything"].concat(TL.viewNames);
+    sel.replaceChildren(...names.map((n) => new Option(n, n)));
+    if (names.includes(keep)) sel.value = keep;
+  } catch (e) { toast(String(e.message || e), true); }
+}
+
+async function tlLoadView(name) {
+  try {
+    const v = name === "everything"
+      ? await getJSON("views/everything")
+      : await getJSON("views/" + encodeURIComponent(name));
+    TL.panels = (v.panels || []).map((p) =>
+      ({ title: p.title, series: [...p.series] }));
+    TL.markers = [...(v.markers || [])];
+    TL.zoom = null;
+    TL.window = v.window;
+    $("tl-window").value = v.window;
+    $("tl-view").value = name;
+    TL.active = -1;               // the panels start collapsed
+    tlStoreView(name);
+    tlApply();
+  } catch (e) { toast(String(e.message || e), true); }
+}
+
+function tlApply() {
+  TL.panelIds = new Set(tlIds());
+  tlPanelsDom();
+  tlQuery();
+}
+
+function tlPick() {
+  const q = $("tl-search").value.trim().toLowerCase();
+  const hits = TL.cat.filter((e) => !q ||
+    e.id.toLowerCase().includes(q) || e.label.toLowerCase().includes(q))
+    .slice(0, 200);
+  $("tl-hits").replaceChildren(...hits.map((e) =>
+    new Option(e.label + " · " + e.id, e.id)));
+}
+
+let TL_QUERY = 0;
+async function tlQuery() {
+  const q = ++TL_QUERY;
+  TL.panelIds = new Set(tlIds());
+  const ids = tlIds();
+  if (!ids.length) {
+    TL.data = new Map();
+    TL.unknown = [];
+    tlNote();
+    tlDraw();
+    return;
+  }
+  const r = tlRange();
+  let url = "series?" +
+    ids.map((s) => "ids=" + encodeURIComponent(s)).join("&") +
+    "&max_points=" + TL_MAX_POINTS;
+  if (r.from != null) url += "&from=" + Math.floor(r.from);
+  if (r.to != null) url += "&to=" + Math.ceil(r.to);
+  let res;
+  try { res = await getJSON(url); }
+  catch (e) { toast(String(e.message || e), true); return; }
+  if (q !== TL_QUERY) return;   // a newer query superseded this one
+  TL.queryTo = r.to == null ? tlNow() : r.to;
+  TL.data = new Map();
+  TL.buf = new Map();
+  TL.bufEnum = new Map();
+  for (const id of ids) TL.data.set(id, res[id] || { t: [], v: [] });
+  // a marker kind with no points yet is "unknown" too: not a view error
+  TL.unknown = (res.unknown || []).filter((u) => !TL_MARKERS.includes(u));
+  tlNote();
+  tlDraw();
+}
+
+function tlRange() {
+  if (TL.zoom) return { from: TL.zoom[0], to: TL.zoom[1] };
+  if (TL.window === "run") return { from: null, to: null };
+  if (TL.window === "live")
+    return { from: Math.max(0, tlNow() - TL_LIVE_NS), to: tlNow() };
+  const w = { "1m": 60, "10m": 600, "60m": 3600 }[TL.window] * 1e9;
+  return { from: Math.max(0, tlNow() - w), to: null };
+}
+
+/* ---- live appends: the client side of series.py's feed rules ---- */
+function tlTrimData() {         // the queried history trails too (live)
+  const cutoff = tlNow() - TL_LIVE_NS;
+  for (const d of TL.data.values()) {
+    let i = 0;
+    while (i < d.t.length && d.t[i] < cutoff) i++;
+    if (!i) continue;
+    d.t = d.t.slice(i);
+    d.v = d.v.slice(i);
+    if (d.min) d.min = d.min.slice(i);
+    if (d.max) d.max = d.max.slice(i);
+  }
+}
+function tlValKind(v) {
+  if (typeof v === "boolean") return "bool";
+  if (typeof v === "number" && isFinite(v)) return "number";
+  if (typeof v === "string") return "enum";
+  return null;
+}
+function tlBufOf(id) {
+  let b = TL.buf.get(id);
+  if (!b) { b = []; TL.buf.set(id, b); }
+  return b;
+}
+function tlTrim(b, t) {
+  const cutoff = Math.max(t, tlNow()) - TL_LIVE_NS;
+  while (b.length && b[0][0] < cutoff) b.shift();
+  if (b.length > 4000) b.splice(0, b.length - 4000);
+}
+function tlAppendPt(id, t, v) {
+  const kind = tlValKind(v);
+  if (kind === null || !TL.panelIds.has(id)) return;
+  const e = TL.catById.get(id);
+  const have = e ? e.kind : (TL.kindNew.get(id) || kind);
+  if (have !== kind) return;    // one kind per series (series.py)
+  if (!e && !TL.kindNew.has(id)) TL.kindNew.set(id, kind);
+  if (kind === "enum") {        // the value is its index in first-seen order
+    let vals = TL.bufEnum.get(id);
+    if (!vals) {
+      vals = e && e.values ? [...e.values] : [];
+      TL.bufEnum.set(id, vals);
+    }
+    let i = vals.indexOf(v);
+    if (i < 0) { vals.push(v); i = vals.length - 1; }
+    v = i;
+  } else if (kind === "bool") v = v ? 1 : 0;
+  const b = tlBufOf(id);
+  b.push([t, v]);
+  tlTrim(b, t);
+}
+function tlAppendMark(id, t, label) {
+  if (!TL.panelIds.has(id)) return;
+  const b = tlBufOf(id);
+  b.push([t, label]);
+  tlTrim(b, t);
+}
+function tlTm(t, d) {
+  const dec = d.decoded || {};
+  const hk = d.hk;
+  if (hk && typeof hk === "object" && (dec.sid === 1 || dec.sid === 2)) {
+    for (const [code, v] of Object.entries(hk)) {
+      if (typeof v !== "number" || !isFinite(v)) continue;
+      const base = "hk:" + dec.sid + ":" + code;
+      tlAppendPt(base, t, v);
+      const label = (TL.catById.get(base) || {}).label;
+      for (const a of (label && TL.aliasOf.get(label)) || [])
+        tlAppendPt(a, t, v);
+    }
+  }
+  if (dec.type === 5 && dec.eid != null) {
+    let label = "EID 0x" +
+      Number(dec.eid).toString(16).toUpperCase().padStart(4, "0");
+    if (dec.eid_name) label += " " + dec.eid_name;
+    tlAppendMark("event", t, label);
+    if (dec.eid === 0x21) tlAppendMark("mode", t, label);
+  }
+}
+function tlMarkerRec(kind, t, r, d) {
+  const path = String(r.path || "");
+  let label;
+  if (kind === "fault") {
+    const short = path.startsWith("fault.") ? path.slice(6) : path;
+    label = "fault " + (d.action || "?") + " " + (short || path);
+  } else if (kind === "force") {
+    const act = d.action || "force";
+    label = "force " + act + " " + path;
+    if (act === "set" && "value" in d) label += " = " + d.value;
+  } else if (kind === "tc") {
+    label = "TC(" + d.service + "," + d.subtype + ")";
+    const p = d.param;
+    if (p && typeof p === "object" && "index" in p)
+      label += " param " + p.index + " = " + p.value;
+  } else {
+    label = "power " + (d.event || "?") + " (" + (d.state || "?") + ")";
+  }
+  tlAppendMark(kind, t, label);
+}
+function tlRecord(r) {
+  if (TL.window !== "live" || TL.zoom) return;
+  const t = r.sim_time;
+  if (t == null) return;
+  if (TL.queryTo != null && t <= TL.queryTo) return;  // in the query already
+  if (TL.now == null || t > TL.now) TL.now = t;
+  const d = r.data || {};
+  const k = r.kind;
+  if (k === "sample") {
+    for (const [p, v] of Object.entries(d)) {
+      if (p.endsWith("@presented"))
+        tlAppendPt("presented:" + p.slice(0, -10), t, v);
+      else tlAppendPt("truth:" + p, t, v);
+    }
+  } else if (k === "state") {
+    if (d.snapshot && d.leaves) {
+      for (const [p, lf] of Object.entries(d.leaves)) {
+        if (!lf || typeof lf !== "object") continue;
+        tlAppendPt("truth:" + p, t, lf.truth);
+        if (lf.presented !== lf.truth)
+          tlAppendPt("presented:" + p, t, lf.presented);
+      }
+    } else if (d.new && typeof d.new === "object") {
+      const lf = d.new, p = String(r.path || "");
+      tlAppendPt("truth:" + p, t, lf.truth);
+      if (lf.presented !== lf.truth)
+        tlAppendPt("presented:" + p, t, lf.presented);
+    }
+  } else if (k === "tm") tlTm(t, d);
+  else if (k === "tc" && r.path === "platform.keepalive") {
+    /* keep-alive summaries: noise, as in series.py */
+  } else if (k === "fault" || k === "force" || k === "tc" || k === "power")
+    tlMarkerRec(k, t, r, d);
+  else if ((k === "log" || k === "expect") &&
+           String(r.path || "").startsWith("scenario.")) {
+    let label = String(r.path);
+    if (typeof d.verdict === "string") label += " " + d.verdict;
+    tlAppendMark("scenario", t, label);
+  }
+  TL.dirty = true;              // redraw at most ~4 Hz
+}
+
+/* ---- the drawing: one canvas, panels stacked on a shared time axis ---- */
+function tlDomain() {
+  if (TL.zoom) return [...TL.zoom];
+  let lo = Infinity, hi = -Infinity;
+  for (const id of TL.panelIds) {
+    const d = TL.data.get(id);
+    if (!d || !d.t.length) continue;
+    if (d.t[0] < lo) lo = d.t[0];
+    if (d.t[d.t.length - 1] > hi) hi = d.t[d.t.length - 1];
+  }
+  if (!isFinite(lo)) return [0, 1];
+  if (TL.window === "live" && TL.now != null && TL.now > hi) hi = TL.now;
+  if (hi - lo < 1e9) hi = lo + 1e9;
+  return [lo, hi];
+}
+function tlMarks(t0, t1) {
+  const out = [];
+  for (const m of TL.markers) {
+    const d = TL.data.get(m);
+    if (d) {
+      for (let i = 0; i < d.t.length; i++) {
+        if (d.t[i] < t0 || d.t[i] > t1) continue;
+        out.push([d.t[i], m, (d.labels || [])[i] || ""]);
+      }
+    }
+    for (const [bt, bl] of TL.buf.get(m) || []) {
+      if (bt < t0 || bt > t1) continue;
+      out.push([bt, m, bl]);
+    }
+  }
+  out.sort((a, b) => a[0] - b[0]);
+  return out;
+}
+function tlSearch(ts, t) {
+  let lo = 0, hi = ts.length - 1;
+  while (lo < hi) {
+    const m = (lo + hi + 1) >> 1;
+    if (ts[m] <= t) lo = m; else hi = m - 1;
+  }
+  return lo;
+}
+function tlAt(id, t) {
+  const d = TL.data.get(id);
+  if (d && d.t.length && d.t[0] <= t) {
+    const i = tlSearch(d.t, t);
+    return [d.t[i], d.v[i], d.min ? d.min[i] : null,
+            d.max ? d.max[i] : null, d.labels || null];
+  }
+  const b = TL.buf.get(id);
+  if (b && b.length && b[0][0] <= t) {
+    const p = b[tlSearch(b.map((q) => q[0]), t)];
+    return [p[0], p[1], null, null, TL.bufEnum.get(id) || null];
+  }
+  return null;
+}
+function tlNum(v, step) {
+  if (step != null && step < 1) return v.toFixed(2);
+  if (Math.abs(v) >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (Math.abs(v) >= 1e4) return (v / 1e3).toFixed(1) + "k";
+  return String(Math.round(v * 100) / 100);
+}
+function tlTicks(lo, hi) {
+  const step0 = (hi - lo) / 4;
+  const mag = Math.pow(10, Math.floor(Math.log(step0) / Math.LN10));
+  let step = mag * 10;
+  for (const m of [1, 2, 5]) {
+    if (step0 <= m * mag) { step = m * mag; break; }
+  }
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step)
+    out.push(v);
+  return [out, step];
+}
+function tlPanelEntries(p) {
+  const units = new Map();      // unit -> "L" (first) or "R" (the second)
+  return p.series.map((id) => {
+    const e = TL.catById.get(id);
+    const unit = (e && e.unit) || "";
+    if (!units.has(unit)) units.set(unit, units.size ? "R" : "L");
+    return { id, e, unit, axis: units.get(unit),
+             kind: e ? e.kind : (TL.kindNew.get(id) || "number") };
+  });
+}
+function tlScaleOf(entries, axis, t0, t1) {
+  const es = entries.filter((x) => x.axis === axis);
+  if (!es.length) return null;
+  let lo = Infinity, hi = -Infinity;
+  let bools = 0, enums = 0, top = 0, labels = null;
+  const vals = (id) => {
+    const d = TL.data.get(id);
+    if (d) {
+      for (let i = 0; i < d.t.length; i++) {
+        if (d.t[i] < t0 || d.t[i] > t1) continue;
+        if (typeof d.v[i] === "number" && isFinite(d.v[i])) {
+          if (d.v[i] < lo) lo = d.v[i];
+          if (d.v[i] > hi) hi = d.v[i];
+        }
+        if (d.min && d.min[i] < lo) lo = d.min[i];
+        if (d.max && d.max[i] > hi) hi = d.max[i];
+      }
+    }
+    for (const [bt, bv] of TL.buf.get(id) || []) {
+      if (bt < t0 || bt > t1 || typeof bv !== "number" || !isFinite(bv))
+        continue;
+      if (bv < lo) lo = bv;
+      if (bv > hi) hi = bv;
+    }
+  };
+  for (const x of es) {
+    vals(x.id);
+    if (x.kind === "bool") bools++;
+    if (x.kind === "enum") {
+      enums++;
+      const ls = (TL.data.get(x.id) || {}).labels ||
+        TL.bufEnum.get(x.id) || [];
+      if (ls.length - 1 > top) { top = ls.length - 1; labels = ls; }
+    }
+  }
+  if (bools === es.length)
+    return { lo: -0.08, hi: 1.08, ticks: [[0, "0"], [1, "1"]], axis };
+  if (enums === es.length && isFinite(lo))
+    return { lo: -0.4, hi: Math.max(top, hi) + 0.4,
+             ticks: Array.from({ length: Math.round(Math.max(top, hi)) + 1 },
+               (_, i) => [i, (labels && labels[i]) != null ?
+                           labels[i] : String(i)]), axis };
+  if (!isFinite(lo)) return { lo: 0, hi: 1, ticks: [], axis };
+  if (hi - lo < 1e-9) { lo -= 1; hi += 1; }
+  const pad = (hi - lo) * 0.06;
+  return { lo: lo - pad, hi: hi + pad, ticks: [], axis };
+}
+function tlAxis(ctx, sc, top, bot, plotW, right) {
+  // the tick labels sit in the reserved margins, outside the plot area
+  const px = right ? TL_PAD_L + plotW + 6 : TL_PAD_L - 6;
+  ctx.fillStyle = tlVar("--muted");
+  ctx.strokeStyle = tlVar("--line");
+  ctx.font = "10px monospace";
+  ctx.textBaseline = "middle";
+  let ticks = sc.ticks;
+  if (!ticks.length) {
+    const [vals, step] = tlTicks(sc.lo, sc.hi);
+    ticks = vals.map((v) => [v, tlNum(v, step)]);
+  }
+  for (const [v, lab] of ticks) {
+    const y = bot - ((v - sc.lo) / (sc.hi - sc.lo)) * (bot - top);
+    if (y < top - 1 || y > bot + 1) continue;
+    ctx.textAlign = right ? "left" : "right";
+    ctx.fillText(lab, px, y);
+    ctx.globalAlpha = 0.4;
+    ctx.beginPath();
+    ctx.moveTo(TL_PAD_L, y);
+    ctx.lineTo(TL_PAD_L + plotW, y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+}
+function tlSeries(ctx, en, x, t0, t1, top, bot, L, R, col) {
+  const sc = en.axis === "R" ? R : L;
+  if (!sc) return;
+  const y = (v) => bot - ((v - sc.lo) / (sc.hi - sc.lo)) * (bot - top);
+  const d = TL.data.get(en.id);
+  const step = en.kind === "bool" || en.kind === "enum";
+  if (d && d.min && d.max && d.min.length) {   // the decimation band
+    ctx.globalAlpha = 0.16;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    for (let i = 0; i < d.t.length; i++)
+      ctx.lineTo(x(d.t[i]), y(d.max[i]));
+    for (let i = d.t.length - 1; i >= 0; i--)
+      ctx.lineTo(x(d.t[i]), y(d.min[i]));
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  ctx.strokeStyle = col;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  let started = false, lastV = null;
+  const point = (t, v) => {
+    if (typeof v !== "number" || !isFinite(v)) return;
+    const xi = x(t);
+    if (!started) { ctx.moveTo(xi, y(v)); started = true; }
+    else if (step) ctx.lineTo(xi, y(lastV));
+    ctx.lineTo(xi, y(v));
+    lastV = v;
+  };
+  if (d) for (let i = 0; i < d.t.length; i++) point(d.t[i], d.v[i]);
+  for (const [bt, bv] of TL.buf.get(en.id) || []) point(bt, bv);
+  if (step && started && lastV != null)       // the level holds to the edge
+    ctx.lineTo(x(t1), y(lastV));
+  ctx.stroke();
+  ctx.lineWidth = 1;
+}
+function tlLegend(ctx, p, plotW, pal) {
+  // the swatch + label rows at the top of a panel, wrapped at plotW
+  const rows = [];
+  let row = [], x = 0;
+  p.series.forEach((s, si) => {
+    const e = TL.catById.get(s);
+    const lab = e && e.label !== s ? e.label : s;
+    const w = 13 + ctx.measureText(lab).width + 8;
+    if (x + w > plotW && row.length) { rows.push(row); row = []; x = 0; }
+    row.push({ col: pal[si % pal.length], lab, w });
+    x += w;
+  });
+  if (row.length) rows.push(row);
+  return rows;
+}
+function tlLayout(ctx, w, pal) {
+  // per panel: top, plot bounds and legend rows; the canvas height
+  // grows with the panel count and the legend rows they need
+  const plotW = w - TL_PAD_L - TL_PAD_R;
+  let top = 0;
+  const panels = TL.panels.map((p) => {
+    const rows = tlLegend(ctx, p, plotW, pal);
+    const lh = rows.length * TL_LEGEND_H;
+    const o = { top, rows,
+                plotTop: top + TL_TOP + lh + 4,
+                plotBot: top + TL_PANEL_H + lh - TL_GAP };
+    top += TL_PANEL_H + lh;
+    return o;
+  });
+  return { panels, plotW, axisY: top + 8, h: top + TL_AXIS_H };
+}
+function tlDraw() {
+  const cv = $("tl-canvas");
+  const box = $("tl-plot");
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(320, box.clientWidth);
+  const ctx = cv.getContext("2d");
+  const pal = TL_PAL.map(tlVar);
+  ctx.font = "10px monospace";    // the legends are measured at this size
+  const lay = tlLayout(ctx, w, pal);
+  const h = Math.max(TL_MIN_H, lay.h);
+  cv.width = Math.round(w * dpr);   // sized via the properties; the CSS
+  cv.height = Math.round(h * dpr);  // keeps the aspect (width 100%)
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = tlVar("--panel");
+  ctx.fillRect(0, 0, w, h);
+  if (!TL.panels.length) {
+    ctx.fillStyle = tlVar("--muted");
+    ctx.font = "12px monospace";
+    ctx.fillText("no panels: load a view or add series", 12, 22);
+    return;
+  }
+  const [t0, t1] = tlDomain();
+  const plotW = lay.plotW;
+  const x = (t) => TL_PAD_L + ((t - t0) / (t1 - t0)) * plotW;
+  const first = lay.panels[0].plotTop;
+  const last = lay.panels[lay.panels.length - 1].plotBot;
+  TL.panels.forEach((p, pi) => {
+    const o = lay.panels[pi];
+    const entries = tlPanelEntries(p);
+    const L = tlScaleOf(entries, "L", t0, t1);
+    const R = tlScaleOf(entries, "R", t0, t1);
+    ctx.strokeStyle = tlVar("--line");
+    ctx.strokeRect(TL_PAD_L + 0.5, o.plotTop + 0.5, plotW - 1,
+                   o.plotBot - o.plotTop - 1);
+    ctx.fillStyle = tlVar("--muted");
+    ctx.font = "11px monospace";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(p.title, TL_PAD_L + 4, o.top + 12);
+    ctx.font = "10px monospace";    // the legend rows under the title
+    let ly = o.top + TL_TOP + 9;
+    for (const row of o.rows) {
+      let lx = TL_PAD_L + 2;
+      for (const it of row) {
+        ctx.fillStyle = it.col;
+        ctx.fillRect(lx, ly - 9, 10, 10);
+        ctx.fillStyle = tlVar("--muted");
+        ctx.fillText(it.lab, lx + 13, ly);
+        lx += it.w;
+      }
+      ly += TL_LEGEND_H;
+    }
+    tlAxis(ctx, L, o.plotTop, o.plotBot, plotW, false);
+    if (R) tlAxis(ctx, R, o.plotTop, o.plotBot, plotW, true);
+    entries.forEach((en, si) =>
+      tlSeries(ctx, en, x, t0, t1, o.plotTop, o.plotBot, L, R,
+               pal[si % pal.length]));
+  });
+  for (const [mt, mk] of tlMarks(t0, t1)) {    // across all panels
+    ctx.strokeStyle = tlVar(TL_KIND_VAR[mk] || "--muted");
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    ctx.moveTo(x(mt), first);
+    ctx.lineTo(x(mt), last);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  const ay = lay.axisY;             // the shared time axis
+  ctx.strokeStyle = tlVar("--line");
+  ctx.beginPath();
+  ctx.moveTo(TL_PAD_L, ay - 4);
+  ctx.lineTo(TL_PAD_L + plotW, ay - 4);
+  ctx.stroke();
+  ctx.fillStyle = tlVar("--ink");
+  ctx.font = "10px monospace";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const [vals] = tlTicks(t0, t1);
+  for (const t of vals) {
+    ctx.fillText(fmtS(t), x(t), ay);
+    ctx.beginPath();
+    ctx.moveTo(x(t), ay - 4);
+    ctx.lineTo(x(t), ay);
+    ctx.stroke();
+  }
+  // under the axis, one line: the marker kinds present, in their colours
+  ctx.textAlign = "left";
+  let mx = TL_PAD_L;
+  for (const m of TL.markers) {
+    const d = TL.data.get(m);
+    const inQ = !!d && d.t.length > 0 &&
+      d.t[0] <= t1 && d.t[d.t.length - 1] >= t0;
+    const inB = (TL.buf.get(m) || []).some(([bt]) => bt >= t0 && bt <= t1);
+    if (!inQ && !inB) continue;
+    if (mx > w - 40) break;         // one line only
+    ctx.strokeStyle = tlVar(TL_KIND_VAR[m] || "--muted");
+    ctx.beginPath();
+    ctx.moveTo(mx + 1, ay + 13);
+    ctx.lineTo(mx + 1, ay + 25);
+    ctx.stroke();
+    ctx.fillStyle = tlVar("--muted");
+    ctx.fillText(m, mx + 7, ay + 13);
+    mx += 13 + ctx.measureText(m).width + 14;
+  }
+  if (TL.hoverX != null && TL.hoverX >= TL_PAD_L &&
+      TL.hoverX <= TL_PAD_L + plotW) {
+    ctx.strokeStyle = tlVar("--muted");
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(TL.hoverX, first);
+    ctx.lineTo(TL.hoverX, last);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  if (TL.drag && TL.drag.x1 != null) {
+    const a = Math.min(TL.drag.x0, TL.drag.x1);
+    const b = Math.max(TL.drag.x0, TL.drag.x1);
+    ctx.fillStyle = tlVar("--accent");
+    ctx.globalAlpha = 0.15;
+    ctx.fillRect(a, first, b - a, last - first);
+    ctx.globalAlpha = 1;
+  }
+}
+function tlHoverLines(t) {
+  const out = [{ sw: null, s: "t = " + fmtS(t) }];
+  for (const p of TL.panels) {
+    tlPanelEntries(p).forEach((en, si) => {
+      const hit = tlAt(en.id, t);
+      if (!hit) return;
+      const [ht, v, lo, hi, labels] = hit;
+      let s = (en.e && en.e.label !== en.id ? en.e.label : en.id) + " = ";
+      if (en.kind === "enum") {
+        const lv = labels ? labels[v] : undefined;
+        s += lv == null ? String(v) : lv;
+      } else if (en.kind === "bool") s += v ? "true" : "false";
+      else {
+        s += tlNum(v, null);
+        if (lo != null && hi != null && (lo !== v || hi !== v))
+          s += " [" + tlNum(lo, null) + ".." + tlNum(hi, null) + "]";
+      }
+      if (en.e && en.e.unit) s += " " + en.e.unit;
+      out.push({ sw: si % TL_PAL.length, s });
+    });
+  }
+  const [t0, t1] = tlDomain();
+  const w = Math.max(320, $("tl-plot").clientWidth);
+  const eps = (t1 - t0) / Math.max(1, w - TL_PAD_L - TL_PAD_R) * 4;
+  for (const [mt, mk, ml] of tlMarks(t0, t1))
+    if (Math.abs(mt - t) <= eps)
+      out.push({ sw: null, s: mk + ": " + ml + " @ " + fmtS(mt) });
+  return out;
+}
+function tlHoverDom() {
+  const box = $("tl-hover");
+  if (TL.hoverX == null || !TL.panels.length) { box.replaceChildren(); return; }
+  const [t0, t1] = tlDomain();
+  const w = Math.max(320, $("tl-plot").clientWidth);
+  const plotW = w - TL_PAD_L - TL_PAD_R;
+  const t = t0 + ((TL.hoverX - TL_PAD_L) / plotW) * (t1 - t0);
+  box.replaceChildren(...tlHoverLines(t).map((l) => {
+    const el = document.createElement("div");
+    if (l.sw != null) {           // the series' colour swatch
+      const sw = document.createElement("span");
+      cls(sw, "tl-sw tl-sw" + l.sw);
+      el.append(sw);
+    }
+    const tx = document.createElement("span");
+    text(tx, l.s);
+    el.append(tx);
+    return el;
+  }));
+}
+
+/* ---- the timeline controls ---- */
+function tlPanelsDom() {
+  // one line per panel (title + series count + remove); the expanded
+  // panel's series chips show after its title, one panel at a time
+  const box = $("tl-panels");
+  const rows = [];
+  TL.panels.forEach((p, i) => {
+    const row = document.createElement("div");
+    cls(row, "tl-panel" + (i === TL.active ? " active" : ""));
+    const title = document.createElement("button");
+    title.type = "button";
+    cls(title, "tl-title");
+    title.textContent = p.title + " (" + p.series.length + ")";
+    title.addEventListener("click", () => {
+      TL.active = TL.active === i ? -1 : i;
+      tlPanelsDom();
+    });
+    row.append(title);
+    if (i === TL.active) {
+      for (const s of p.series) {
+        const b = document.createElement("button");
+        b.type = "button";
+        cls(b, "tl-chip");
+        const e = TL.catById.get(s);
+        b.textContent = e && e.label !== s ? e.label : s;
+        b.title = s + " — click to remove";
+        b.addEventListener("click", () => {
+          p.series = p.series.filter((x) => x !== s);
+          tlApply();
+        });
+        row.append(b);
+      }
+    }
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.textContent = "remove panel";
+    rm.addEventListener("click", () => {
+      TL.panels.splice(i, 1);
+      if (TL.active === i) TL.active = -1;
+      else if (TL.active > i) TL.active--;
+      tlApply();
+    });
+    row.append(rm);
+    rows.push(row);
+  });
+  box.replaceChildren(...rows);
+}
+function tlAddSeries() {
+  const id = $("tl-hits").value;
+  if (!id) { toast("search and pick a series first", true); return; }
+  if (TL.active < 0 || !TL.panels[TL.active]) {
+    toast("click a panel title to expand it first", true);
+    return;
+  }
+  const p = TL.panels[TL.active];
+  if (!p.series.includes(id)) p.series.push(id);
+  tlApply();
+}
+async function tlSave() {
+  const name = $("tl-save-name").value.trim();
+  if (!name) { toast("a view name is needed to save", true); return; }
+  const view = { name, window: TL.window, markers: [...TL.markers],
+    panels: TL.panels.map((p) =>
+      ({ title: p.title, series: [...p.series] })) };
+  try {
+    await post("view.save", { name, view });
+    toast("view.save ok " + name);
+    await tlViews();
+    $("tl-view").value = name;
+    tlStoreView(name);
+  } catch (e) { toast(String(e.message || e), true); }
+}
+async function tlDelete() {
+  const name = $("tl-view").value;
+  if (!window.confirm("delete view " + name + "?")) return;
+  try {
+    await post("view.delete", { name });
+    toast("view.delete ok " + name);
+    await tlViews();
+  } catch (e) { toast(String(e.message || e), true); }
+}
+async function loadTimeline() {
+  $("tl-search").addEventListener("input", tlPick);
+  $("tl-view").addEventListener("change",
+    () => tlLoadView($("tl-view").value));
+  $("tl-window").addEventListener("change", () => {
+    TL.window = $("tl-window").value;
+    TL.zoom = null;
+    tlApply();
+  });
+  $("tl-reload").addEventListener("click", async () => {
+    await tlCatalogue();
+    tlQuery();
+  });
+  $("tl-add-panel").addEventListener("click", () => {
+    TL.panels.push({ title: "panel " + (TL.panels.length + 1), series: [] });
+    TL.active = TL.panels.length - 1;
+    tlPanelsDom();
+    tlDraw();
+  });
+  $("tl-add").addEventListener("click", tlAddSeries);
+  $("tl-save").addEventListener("click", tlSave);
+  $("tl-delete").addEventListener("click", tlDelete);
+  window.addEventListener("resize", () => tlDraw());
+  setInterval(() => {           // the live redraw, at most ~4 Hz
+    if (!TL.dirty) return;
+    TL.dirty = false;
+    if (TL.window === "live") {
+      tlTrimData();
+      tlDraw();
+    }
+  }, 250);
+  await Promise.allSettled([tlCatalogue(), tlViews()]);
+  try {
+    const t = await getJSON("time");
+    if (TL.now == null) TL.now = t.sim_time;
+  } catch (e) { /* the status poll fills it in */ }
+  await tlLoadView(tlInitialView());
+}
+const tlCanvas = $("tl-canvas");
+tlCanvas.addEventListener("pointerdown",
+  (ev) => { TL.drag = { x0: ev.offsetX, x1: null }; });
+tlCanvas.addEventListener("pointermove", (ev) => {
+  TL.hoverX = ev.offsetX;
+  if (TL.drag) TL.drag.x1 = ev.offsetX;
+  tlDraw();
+  tlHoverDom();
+});
+tlCanvas.addEventListener("pointerup", (ev) => {
+  const d = TL.drag;
+  TL.drag = null;
+  if (!d) return;
+  const dx = Math.abs(ev.offsetX - d.x0);
+  if (dx > 4) {
+    const [t0, t1] = tlDomain();
+    const plotW = Math.max(320, $("tl-plot").clientWidth) -
+      TL_PAD_L - TL_PAD_R;
+    const tAt = (px) => t0 + ((px - TL_PAD_L) / plotW) * (t1 - t0);
+    const a = tAt(Math.min(d.x0, ev.offsetX));
+    const b = tAt(Math.max(d.x0, ev.offsetX));
+    if (b - a > 1e6) { TL.zoom = [a, b]; tlQuery(); return; }
+  }
+  tlDraw();
+});
+tlCanvas.addEventListener("pointerleave", () => {
+  TL.hoverX = null;
+  TL.drag = null;
+  tlDraw();
+  tlHoverDom();
+});
+tlCanvas.addEventListener("dblclick", () => {
+  TL.zoom = null;
+  tlQuery();
+});
+
 /* ---- the event log and the UART tail, from /log then the stream ---- */
 function trim(box) {
   while (box.childElementCount > MAX_LINES) box.firstElementChild.remove();
@@ -1040,6 +1965,7 @@ function onRecord(r) {
     renderEv5();
   }
   if (r.kind === "state") applyStateRec(r);
+  tlRecord(r);
   const box = $("events");
   const [c, s] = summary(r);
   const line = document.createElement("div");
@@ -1055,7 +1981,8 @@ function onRecord(r) {
 }
 
 const TOPIC = { cmd: "cmd", result: "cmd", state: "state", power: "state",
-                fault: "fault", force: "fault", debug: "log" };
+                fault: "fault", force: "fault", debug: "log",
+                sample: "sample" };
 function topicOf(kind) { return TOPIC[kind] || kind; }
 
 for (const t of document.querySelectorAll(".topic")) {
@@ -1073,7 +2000,7 @@ async function backfill(seq) {
 
 function stream() {
   const es = new EventSource(API + "stream?since=" + lastSeq);
-  const topics = ["cmd", "state", "tm", "tc", "fault", "expect", "mismatch", "uart", "log"];
+  const topics = ["cmd", "state", "tm", "tc", "fault", "expect", "mismatch", "uart", "log", "sample"];
   for (const t of topics) {
     es.addEventListener(t, (ev) => onRecord(JSON.parse(ev.data)));
   }
@@ -1093,7 +2020,7 @@ async function main() {
   try { await backfill(st.seq || 0); } catch (e) { toast(String(e), true); }
   stream();
   await Promise.allSettled([refresh(), loadVerbs(), loadFaults(),
-                            loadScenarios(), loadState()]);
+                            loadScenarios(), loadState(), loadTimeline()]);
   setInterval(refresh, 1000);
   setInterval(loadState, 2000);
   setInterval(loadScenarios, 10000);

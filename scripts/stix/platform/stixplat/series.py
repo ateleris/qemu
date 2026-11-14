@@ -110,6 +110,8 @@ class SeriesIndex:
                         self._leaf(path, True, t, new.get("presented"), u)
         elif kind == "tm":
             self._tm(t, data)
+        elif kind == "tc" and obj.get("path") == "platform.keepalive":
+            pass    # the TC(20,128) summaries every 10 s: noise, not events
         elif kind in ("fault", "force", "tc", "power"):
             self._marker(kind, t, obj, data)
         elif kind in ("log", "expect") and \

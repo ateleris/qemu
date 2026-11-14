@@ -3153,7 +3153,12 @@ UI_VERBS_ADDED = {"tc.gs.send", "det.rotb.burst", "platform.flash.save",
 UI_TABS = ("overview", "platform", "idpu", "detectors", "faults",
            "scenarios", "logs", "state", "setup", "timeline")
 UI_ENDPOINTS = {"status", "time", "faults", "verbs", "state", "log",
-                "stream", "scenarios", "cmd"}
+                "stream", "scenarios", "cmd", "series", "views"}
+# timeline plan C1: the ids the plotter panel must have
+UI_TIMELINE_IDS = {"tl-view", "tl-window", "tl-search", "tl-hits",
+                   "tl-add", "tl-save", "tl-save-name", "tl-delete",
+                   "tl-note", "tl-panels", "tl-hover", "tl-plot",
+                   "tl-canvas", "tl-reload", "tl-add-panel"}
 
 
 def _csp_hashes(page, tag):
@@ -3382,6 +3387,41 @@ def t_ui_tabs(env):
           % (UI_VERBS - used))
     check(UI_VERBS_ADDED <= used, "the new data-verbs missing %r"
           % (UI_VERBS_ADDED - used))
+
+
+def t_ui_timeline(env):
+    """Timeline plan C1: the timeline panel is the plotter, not the
+    placeholder: the canvas container and the control ids are there,
+    the script reads /series and /views, and the page rules still hold
+    (no style attribute, no inline handler, no innerHTML)."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    page = body.decode()
+    check("Track C" not in page, "the placeholder is still there")
+    p = _UiParser()
+    p.feed(page)
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check(UI_TIMELINE_IDS <= ids, "timeline ids missing %r"
+          % sorted(UI_TIMELINE_IDS - ids))
+    plot = re.search(r'id="tl-plot"[^>]*>\s*<canvas id="tl-canvas"',
+                     page)
+    check(plot is not None, "the canvas is not in the plot container")
+    js = "\n".join(p.scripts)
+    paths = set(re.findall(r"""(?:getJSON\(|API \+ )["']([a-z]+)""", js))
+    check({"series", "views"} <= paths, "the script reads %r" % paths)
+    for tag, a in p.attrs:
+        check("style" not in a and not [k for k in a if k.startswith("on")],
+              "<%s %r>: style attribute or inline handler" % (tag, a))
+    for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
+        check(bad not in page.lower(), "the page uses %s" % bad)
 
 
 SETUP_KEYS = {"binary", "elf", "elf_sha256", "icount_shift", "pace",
@@ -3847,6 +3887,15 @@ def t_series_markers(env):
     finally:
         snd.close()
         ctl.shutdown()
+    # keep-alive summaries (tc records on platform.keepalive, every 10 s)
+    # are not TC markers; a real TC is
+    si = series_mod.SeriesIndex()
+    si.feed(_srec("tc", 1000, "platform.keepalive",
+                  {"service": 20, "subtype": 128}))
+    si.feed(_srec("tc", 2000, "platform.timesync",
+                  {"service": 9, "subtype": 129}))
+    q = si.query(["tc"], max_points=100)
+    check(q["tc"]["t"] == [2000], "keep-alive is no TC marker: %r" % q["tc"])
 
 
 def t_series_cap(env):
@@ -4259,6 +4308,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: served at /, CSP, scenarios", t_ui_server),
          ("UI: the page (no browser)", t_ui_page),
          ("UI: tabs (timeline B1)", t_ui_tabs),
+         ("UI: timeline (C1)", t_ui_timeline),
          ("setup status (timeline B2)", t_setup_status),
          ("UI: the live check (smokes)", t_ui_check)]
 
