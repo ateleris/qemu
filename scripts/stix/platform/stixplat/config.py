@@ -33,6 +33,8 @@ DEFAULTS = {
         "obt_epoch": 0x10000000 << 16,
         "obt_continuity": "aligned",  # "aligned" | "exact"
         "on_guest_reset": "warm",    # "warm" | "cold" | "halt"
+        "icount_shift": 0,           # 0 = no icount (today's behaviour)
+        "pace": "wall",              # "wall" | "fast" (-icount sleep=off)
         "memory": "64M",
         "extra_args": [],
         "traces": ["stixspw_timecode_emit", "stixspw_rx_deliver",
@@ -91,6 +93,7 @@ CHOICES = {
     ("qemu", "timecode_source"): ("obt", "scet"),
     ("qemu", "obt_continuity"): ("aligned", "exact"),
     ("qemu", "on_guest_reset"): ("warm", "cold", "halt"),
+    ("qemu", "pace"): ("wall", "fast"),
     ("retention", "keep_flash"): ("failed", "never", "always"),
     ("gs", "tc_during_link_down"): ("drop", "hold"),
     ("gs", "emulation"): ("auto", "on", "off"),
@@ -158,6 +161,11 @@ def _check(cfg):
     if cfg["qemu"]["obt_epoch"] >> 47:
         raise ConfigError("qemu.obt_epoch sets coarse bit 31, the CUC's "
                           "\"unsynchronised\" flag")
+    if not 0 <= cfg["qemu"]["icount_shift"] <= 15:
+        raise ConfigError("qemu.icount_shift is 0..15 (0 = no icount)")
+    if cfg["qemu"]["pace"] == "fast" and cfg["qemu"]["icount_shift"] == 0:
+        raise ConfigError("qemu.pace = \"fast\" needs qemu.icount_shift "
+                          "> 0 (sleep=off is an icount option)")
     # SF6: the GS side has no authentication either (D-PLj)
     open_ok = cfg["api"]["container"]
     for d in cfg["gs"]["tm_dests"]:

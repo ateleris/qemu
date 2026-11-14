@@ -11,8 +11,9 @@ leon3: cont/stop/quit, the RESUME/STOP/SHUTDOWN/RESET events, qom-get
 vclock-ns, obt and both hw-state JSONs (the ctrl one carries the
 attenuator, edac, det and rotb sections, PL-11b/PL-11c), qom-set obt,
 the upset verbs on the EDAC (they move the hw-state's poisons and
-counters), and the test-only x-fake-guest-reset, which behaves per
--no-reboot / -action like QEMU.
+counters), the det-rotb-burst pair (the FF plan's burst), and the
+test-only x-fake-guest-reset, which behaves per -no-reboot / -action
+like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
 `noqmp` accepts the QMP connection and never answers; `badstate`
 serves a hw-state without its keys.
@@ -95,6 +96,12 @@ class Fake:
         self.qmp_path = None
         self.uart_append = False
         self.props = {}
+        # det-rotb-burst (FF plan): the fake answers like the device's
+        # runtime QOM on an empty ring (Task 2's qtest covers the real
+        # one); the status starts "requested=0" before any burst
+        self.props[("/machine/stixctrl", "det-rotb-burst-status")] = \
+            "requested=0,appended=0,stop=done,rotb_count=0"
+        self.rotb_blocks = 0
         self.set_log = []
         # the EDAC state the hw-state section shows (stix_edac.c:
         # 714-759): no poisons armed, the counters at zero. The bram
@@ -339,6 +346,18 @@ class Fake:
             if prop == "obt":
                 self.obt_base = a["value"]
                 self.obt_vbase = self.vclock()
+                return {}
+            if prop == "det-rotb-burst":
+                n = a["value"]
+                if not isinstance(n, int) or n < 1 or n > 2131:
+                    raise KeyError("det-rotb-burst needs 1..2131 frames, "
+                                   "got %r" % n)
+                self.rotb_blocks += n * 49
+                self.props[(a["path"], prop)] = n
+                self.props[(a["path"], "det-rotb-burst-status")] = \
+                    "requested=%d,appended=%d,stop=done,rotb_count=%d" \
+                    % (n, n, self.rotb_blocks)
+                self.set_log.append((a["path"], prop, n))
                 return {}
             if prop in SETTABLE:
                 if a["path"] == EDAC and prop == "upset-inject":

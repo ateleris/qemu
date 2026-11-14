@@ -157,6 +157,19 @@ def t_config(env):
            run_dir=os.path.join(env.tmp, "x,y"))
     c = config_mod.load(text="[power]\noff_time_s = 3\n")
     check(c["power"]["off_time_s"] == 3.0, "int for a float key")
+    # FF plan Task 3: the pacing keys (0/wall = today's behaviour;
+    # fast is sleep=off, so it needs icount > 0)
+    c = config_mod.load()
+    check(c["qemu"]["icount_shift"] == 0 and c["qemu"]["pace"] == "wall",
+          "no icount by default")
+    for bad in ('[qemu]\nicount_shift = 16\n',
+                '[qemu]\nicount_shift = -1\n',
+                '[qemu]\npace = "slow"\n',
+                '[qemu]\nicount_shift = 0\npace = "fast"\n'):
+        raises(config_mod.ConfigError, config_mod.load, text=bad)
+    c = config_mod.load(text='[qemu]\nicount_shift = 7\npace = "fast"\n')
+    check(c["qemu"]["icount_shift"] == 7 and c["qemu"]["pace"] == "fast",
+          "a fast profile needs icount > 0")
 
 
 ARGV_GOLDEN = [
@@ -190,6 +203,17 @@ def t_argv(env):
     check(qemu_mod.reset_args("cold") == ["-no-reboot"], "cold args")
     check(qemu_mod.reset_args("halt") ==
           ["-action", "reboot=shutdown,shutdown=pause"], "halt args")
+    # the pacing keys (FF plan Task 3): -icount only when shift > 0,
+    # +sleep=off for fast
+    for icount, pace, want in ((0, "wall", None), (7, "wall", "shift=7"),
+                               (7, "fast", "shift=7,sleep=off")):
+        c = config_mod.load(overrides={"qemu": {
+            "binary": "/q/qemu-system-sparc", "elf": "/e/asw.elf",
+            "icount_shift": icount, "pace": pace}})
+        argv = qemu_mod.build_argv(c, "/r")
+        got = [argv[i + 1] for i, a in enumerate(argv) if a == "-icount"]
+        check(got == ([] if want is None else [want]),
+              "icount %d %s: %r" % (icount, pace, got))
 
 
 class FakeFs(rundir.RealFs):
@@ -2610,6 +2634,30 @@ def t_det_rotb_leaves(env):
         ctl.shutdown()
 
 
+def t_det_burst(env):
+    """FF plan Task 3: the det.rotb.burst verb over the fake's
+    det-rotb-burst QOM pair: power off refuses, the device's refusal
+    text becomes the 409, the status string is parsed."""
+    from . import verbs as verbs_mod
+    check("det.rotb.burst" in verbs_mod.VERBS, "in the registry")
+    ctl = env.controller()
+    try:
+        check("det.rotb.burst" in ctl.dispatcher.verbs, "registered")
+        e = raises(VerbError, ctl.command, "det.rotb.burst", {"frames": 5})
+        check(e.status == 409 and "off" in str(e), "power must be on: %s"
+              % e)
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        e = raises(VerbError, ctl.command, "det.rotb.burst", {"frames": 0})
+        check(e.status == 409 and "det-rotb-burst" in str(e),
+              "the device's refusal: %s" % e)
+        r = ctl.command("det.rotb.burst", {"frames": 10})
+        check(r == {"requested": 10, "appended": 10, "stop": "done",
+                    "rotb_count": 490}, "the parsed status: %r" % r)
+    finally:
+        ctl.shutdown()
+
+
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
@@ -3265,6 +3313,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
          ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
          ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
+         ("detector burst verb (FF)", t_det_burst),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),

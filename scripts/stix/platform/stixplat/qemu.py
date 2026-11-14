@@ -59,6 +59,13 @@ def build_argv(cfg, run_dir, binary=None):
             "-global", spw + "timecode-source=%s" % q["timecode_source"],
             "-global", spw + "obt-epoch=%d" % q["obt_epoch"]]
     argv += reset_args(q["on_guest_reset"])
+    # pacing (FF plan): -icount shift=N; fast skips the guest's idle
+    # time (sleep=off is an icount option, so it needs shift > 0)
+    if q["icount_shift"] > 0:
+        icount = "shift=%d" % q["icount_shift"]
+        if q["pace"] == "fast":
+            icount += ",sleep=off"
+        argv += ["-icount", icount]
     for t in q["traces"]:
         argv += ["-trace", t]
     argv += ["-kernel", q["elf"]]

@@ -22,6 +22,7 @@ from .relay import Relay
 from .timesync import TimeSync
 
 STIXSPW = "/machine/stixspw"
+STIXCTRL = "/machine/stixctrl"
 
 
 class Platform:
@@ -64,9 +65,9 @@ class Platform:
             raise VerbError(409, "STIX is off")
         return q
 
-    def _qom_set(self, prop, value):
+    def _qom_set(self, prop, value, path=STIXSPW):
         try:
-            self._q().qom_set(STIXSPW, prop, value)
+            self._q().qom_set(path, prop, value)
         except QmpError as e:
             raise VerbError(409, "%s: %s" % (prop, e))
 
@@ -185,6 +186,12 @@ class Platform:
         d.add("force.clear", self.v_force_clear,
               args={"path": {"type": "string", "required": True}},
               doc="clear a forcing")
+        d.add("det.rotb.burst", self.v_det_rotb_burst,
+              args={"frames": {"type": "integer", "required": True}},
+              doc="append that many copies of the last live detector "
+                  "frame into the ROTB ring now; returns the parsed "
+                  "burst status (409 while STIX is off or the device "
+                  "refuses: no live chunk, 0 or over the chunk count)")
         d.add("fault.inject", self.faults.inject,
               args={"id": {"type": "string", "required": True},
                     "params": {"type": "object"},
@@ -254,6 +261,29 @@ class Platform:
 
     def v_force_clear(self, path):
         return self.forcing.clear(path)
+
+    def v_det_rotb_burst(self, frames):
+        """FF plan: the det-rotb-burst runtime QOM write (on
+        /machine/stixctrl): append @frames copies of the last live
+        chunk now. The device's error text (0, an oversize count, no
+        live chunk since reset) becomes the 409; the status string is
+        the answer."""
+        self._qom_set("det-rotb-burst", frames, STIXCTRL)
+        try:
+            status = self._q().qom_get(STIXCTRL, "det-rotb-burst-status")
+        except QmpError as e:
+            raise VerbError(409, "det-rotb-burst-status: %s" % e)
+        out = {}
+        for kv in status.split(","):
+            k, _, v = kv.partition("=")
+            out[k.strip()] = v.strip()
+        try:
+            return {"requested": int(out["requested"]),
+                    "appended": int(out["appended"]),
+                    "stop": out["stop"],
+                    "rotb_count": int(out["rotb_count"])}
+        except (KeyError, ValueError):
+            raise VerbError(500, "det-rotb-burst-status %r" % status)
 
     def v_tc_platform(self, hex):
         try:

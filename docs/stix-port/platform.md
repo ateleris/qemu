@@ -180,6 +180,7 @@ lists exactly these verbs and arguments.
 | `platform.keepalive.set` | `enabled`, `period_s` | the TC(20,128) keep-alive, paced on bench time |
 | `force.set` | `path`, `value` | force a presented value: `instrument.hk_adc.<ch>` (adc-inject) |
 | `force.clear` | `path` | clear a forcing |
+| `det.rotb.burst` | `frames` | append that many copies of the last live detector frame into the ROTB ring now; the answer is the parsed burst status `{requested, appended, stop, rotb_count}`; 409 while STIX is off or the device refuses (no live chunk since reset, 0 or over the ring's chunk count) |
 | `fault.inject` | `id`, `params`, `trigger`, `seed` | a catalogue fault (`GET /faults`); logged as `fault` with its params and seed |
 | `fault.clear` | `id` | clear an active, reversible fault, or disarm an armed one |
 | `tc.platform.send` | `hex` | a raw platform TC space packet: source 14, services 9 and 20 only (403 otherwise); TC(9,129) gets 409 while a sync is pending |
@@ -249,6 +250,7 @@ over the gate scenarios). The keys most often set:
 | `qemu.timecode_source` | `"obt"` | `obt` (D-PLb) or `scet` (the pre-PL-1 behaviour, goldens unchanged) |
 | `qemu.obt_epoch`, `.obt_continuity` | `0x10000000 << 16`, `"aligned"` | the OBT start (CUC 48-bit) and the cold-cycle alignment |
 | `qemu.on_guest_reset` | `"warm"` | `warm` (in-process, BRAM kept) / `cold` / `halt` |
+| `qemu.icount_shift`, `.pace` | 0, `"wall"` | `-icount shift=N` (0 = no icount, today's behaviour); `pace = "fast"` adds `,sleep=off` and needs shift > 0 |
 | `ports` | 8080, 21511, 21512, 21502 | api, qemu_tm, qemu_tc, gs_tc |
 | `gs.tm_dests`, `.bind` | `["127.0.0.1:21501"]`, `"127.0.0.1"` | the relay's TM destinations and the TC-proxy bind (loopback, or `container = true`) |
 | `gs.tc_during_link_down` | `"drop"` | or `"hold"` (at most `hold_max` = 32, the FSW queues 64) |
@@ -424,6 +426,36 @@ device's own `upset-clear` is the undo).
   most 63 s, logged); `"exact"` keeps the true continuation, and a
   mismatched code is ignored by the FSW until a TC(9,129) (a shift of
   4 s or more is never corrected).
+
+## Fast-forward: pacing and the ROTB burst
+
+Two knobs get to "an hour of observation" without waiting it out
+(`2026-11-14-fast-forward-plan.md`); the FSW does not change.
+
+- **Pacing**: `qemu.icount_shift` (0..15) adds `-icount shift=N`;
+  `qemu.pace = "fast"` adds `,sleep=off`, which skips the guest's idle
+  time instead of waiting for it. `fast` with shift 0 is refused at
+  config load (`sleep=off` is an icount option). The guest's own
+  timing is unchanged: vclock, OBT and FSW behaviour are the same,
+  only the waiting disappears.
+- **`det.rotb.burst {frames}`**: one runtime QOM write
+  (`det-rotb-burst` on `/machine/stixctrl`) that appends that many
+  copies of the *last live detector frame* to the ROTB ring at once —
+  real detector-model output (the sky PRNG and the integration banks
+  are not touched), its SCETs spread between that frame's and now, so
+  the ring's SCETs stay monotonic and the next live frame is later
+  than every burst frame. If the time since the last frame is zero
+  (the sim is paused), every burst frame carries the last frame's
+  SCET. The answer is the parsed status
+  `{requested, appended, stop, rotb_count}`; `stop` says why it ended
+  (`done`, `ring-full`, `rotb-disabled`, …). Caveats:
+  - burst frames get near-zero archived durations (a chunk's archived
+    duration is its SCET end minus the previous chunk's,
+    ArchiveManager.c:168), so they fill the ring without advancing the
+    archive's time axis;
+  - under `rotb-overflow=overwrite-oldest` an append never returns
+    FULL, so a burst overwrites the oldest blocks instead of stopping;
+    with `drop-new` it stops at the first chunk that does not fit.
 
 ## Security
 
