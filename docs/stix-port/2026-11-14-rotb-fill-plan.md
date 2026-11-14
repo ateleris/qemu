@@ -604,3 +604,28 @@ the runtime `det-rotb-burst` / `det-rotb-burst-status` on
 between the last live chunk and now), and the platform's
 `qemu.icount_shift` / `qemu.pace` config, `det.rotb.burst` and the
 flash library (`platform.flash.save|load|list`).
+
+### Amendment C.8 (2026-11-14): count-rate sweep, debug ELF at 0.1 s
+
+ASW_em_baseline.elf (DEBUG_PRINT), --ticks 0 --max-ticks 0 --rcr off
+--icount 7 --pace fast, 1800 guest s (rf-cps-b-i7-c{2000,5000,10000};
+20000 = rf-cal-b-i7-s3). Bytes/frame = stixflash cmd=3 page programs x
+4096 / processed frames.
+
+| cps (per fpga_det) | peak fill | skips | processed fr/s | B/frame |
+|---|---|---|---|---|
+| 2000 | 0.02 | 0 | 10.00 | 8212 |
+| 5000 | 0.15 | 0 | 9.83 | 13813 |
+| 10000 | 1.00 | 2 | 8.26 | 18466 |
+| 20000 | 1.00 | 5 | 6.99 | 22809 |
+
+A debug build at 0.1 s keeps up below ~5000-10000 cps and overruns
+above, so whether a test overruns depends on the source rate. The two
+saturated points give the emulator's cost ≈ 27 ms/frame + 5.1 µs per
+compacted byte (debug ELF, icount 7); the 2022 AX fit
+([[reference-ax-rotb-tests]] in the session notes) was ≈ 94 ms + 8.5
+µs/B on a 2022 build with 25-49 KB frames. The icount 7 match to the
+AX (234 s cycle, C.6) therefore holds for that one load point; the
+fixed vs per-byte split is not confirmed (the live run's bytes/frame
+are unknown). Emulator shows FSW behaviour for our input; supports a
+mechanism, does not prove the flight cause.
