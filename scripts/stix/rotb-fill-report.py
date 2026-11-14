@@ -47,8 +47,15 @@ Metric definitions (the same text ships inside summary.json "defs"):
            pointer also advances per evicted block (grlib_stixctrl.c),
            so the drain then counts evictions + GETBLOCKs; the deficit
            stays consistent because inflow contains those blocks too.
+           The advance includes the FDIR-051 overrun skip
+           (RotAccumulator.c:116-133); processed_* excludes it.
+  skips    a skip interval is one whose drain blocks exceed
+           threshold * min(dt, 1 s) with threshold = max(SKIP_RATE_BPS,
+           10 * median processing rate of the unflagged intervals);
+           adjacent skip intervals coalesce into one skip event.
   deficit  inflow - drain, per fill.csv interval (blocks) and as means
-           over the window (blocks/s).
+           over the window (blocks/s); processed_mean_blocks_per_s uses
+           the processed (skip-free) drain.
   fill     peak = max fill.csv count / capacity; first_full_s = first
            sample with count >= capacity (or full set).
   overflow stixctrl_rotb_overflow / stixctrl_rotb_overwrite carry no
@@ -79,12 +86,14 @@ import json
 import os
 import re
 import shutil
+import statistics
 import sys
 import tempfile
 import time
 
 NS = 1_000_000_000
 CHUNK_BLOCKS = 49          # STIX_DET_CHUNK_BLOCKS (stix_det.c:1716)
+SKIP_RATE_BPS = 5000       # skip-interval drain threshold (blocks/s, RF-9)
 TRACE_TS = r"^\S+ "        # the host stamp, never used as a metric
 
 CHUNK = re.compile(TRACE_TS + r"stixdet_chunk chunk: nom_bank (\d+), "
@@ -126,9 +135,25 @@ DEFS = {
               "line already includes them under overwrite-oldest)",
     "drain": "(rd1-rd0+capacity)%capacity per fill.csv sample interval; "
              "under overwrite-oldest rd also advances per eviction, so "
-             "drain = GETBLOCKs + evictions then",
+             "drain = GETBLOCKs + evictions then; the advance includes "
+             "the FDIR-051 overrun skip (RotAccumulator.c:116-133), "
+             "processed_* excludes it",
     "deficit": "inflow - drain per fill.csv interval, and means over "
-               "the window in blocks/s",
+               "the window in blocks/s; processed_mean_blocks_per_s is "
+               "the same mean against the processed (skip-free) drain",
+    "skips": "a fill.csv interval is a skip when blocks > threshold * "
+             "min(dt, 1 s); threshold = max(SKIP_RATE_BPS=5000, 10 * "
+             "median processing rate of the unflagged intervals); "
+             "adjacent skip intervals coalesce into one event; "
+             "fragments below the threshold count as processing (the "
+             "processing inside a skip interval is lost); a skip >= "
+             "capacity is invisible to rd deltas (the UART cross-check "
+             "notes a mismatch); under overwrite-oldest "
+             "processed_total_blocks also subtracts the "
+             "stixctrl_rotb_overwrite count; events carry start_s/end_s "
+             "(bracketing fill.csv samples), blocks, data_s = blocks / "
+             "mean inflow, count_before/count_after, and refill_s = "
+             "end of the event to start of the next (null on the last)",
     "fill": "peak = max(fill.csv count)/capacity; first_full_s = first "
             "sample with count >= capacity or full set",
     "overflow": "rotb_overflow/rotb_overwrite traces carry no vclock: "
@@ -370,7 +395,7 @@ def _bracket_secs(e):
     return {"vclock_s": mid, "bracket_s": [lo, hi]}
 
 
-def compute(td, fill, uart, events, n_files):
+def compute(td, fill, uart, events, n_files, overflow_policy=None):
     """All metrics: the summary dict minus notes/defs/params."""
     # ---- the NOMINAL window: first chunk/drop vclock to the end
     vc_all = [e["vc"] for e in td if e["k"] in ("chunk", "drop")]
@@ -415,11 +440,11 @@ def compute(td, fill, uart, events, n_files):
                      for s in range(window[0] // NS, -(-window[1] // NS))]
     inflow_mean = None if window_s is None else inflow_total / window_s
 
-    # ---- drain and deficit per fill.csv sample interval
-    drain_series = []
-    deficit_series = []
-    drain_total = 0               # blocks, all intervals
-    drain_window_blocks = 0.0     # overlap-fraction weighted, for the mean
+    # ---- drain and deficit per fill.csv sample interval; the skip
+    # threshold needs the median processing rate of the unflagged
+    # intervals, so collect the intervals raw first (two passes: flag
+    # with SKIP_RATE_BPS, then with the final threshold)
+    intervals = []
     j = 0                         # pointer into cd
     for a, b in zip(fill, fill[1:]):
         dt = b["vclock_ns"] - a["vclock_ns"]
@@ -427,26 +452,80 @@ def compute(td, fill, uart, events, n_files):
         if dt <= 0 or not cap:
             continue
         d = (b["rd"] - a["rd"] + cap) % cap
-        t0, t1 = a["vclock_ns"], b["vclock_ns"]
+        infl = 0
+        while j < len(cd) and cd[j][0] < b["vclock_ns"]:
+            if cd[j][0] >= a["vclock_ns"]:
+                infl += cd[j][1]
+            j += 1
+        intervals.append({"t0": a["vclock_ns"], "t1": b["vclock_ns"],
+                          "dt": dt, "blocks": d, "inflow": infl,
+                          "count0": a["count"], "count1": b["count"]})
+
+    def _is_skip(iv, thr_bps):
+        return iv["blocks"] > thr_bps * min(iv["dt"] / NS, 1.0)
+
+    thr = SKIP_RATE_BPS
+    rates = [iv["blocks"] / (iv["dt"] / NS) for iv in intervals
+             if not _is_skip(iv, thr)]
+    if rates:
+        thr = max(SKIP_RATE_BPS, 10 * statistics.median(rates))
+    skip_idx = {i for i, iv in enumerate(intervals) if _is_skip(iv, thr)}
+
+    # adjacent skip intervals (one ends where the next starts) coalesce
+    skip_events = []
+    for i in sorted(skip_idx):
+        iv = intervals[i]
+        if skip_events and iv["t0"] == skip_events[-1]["_t1"]:
+            ev = skip_events[-1]
+            ev["blocks"] += iv["blocks"]
+            ev["end_s"] = iv["t1"] / NS
+            ev["count_after"] = iv["count1"]
+        else:
+            skip_events.append({"start_s": iv["t0"] / NS,
+                                "end_s": iv["t1"] / NS,
+                                "blocks": iv["blocks"], "data_s": None,
+                                "count_before": iv["count0"],
+                                "count_after": iv["count1"],
+                                "_t1": iv["t1"]})
+        skip_events[-1]["_t1"] = iv["t1"]
+    for k, ev in enumerate(skip_events):
+        ev["refill_s"] = ([ev["end_s"], skip_events[k + 1]["start_s"]]
+                          if k + 1 < len(skip_events) else None)
+        if inflow_mean is not None:
+            ev["data_s"] = ev["blocks"] / inflow_mean
+        del ev["_t1"]
+    skip_total = sum(ev["blocks"] for ev in skip_events)
+
+    drain_series = []
+    deficit_series = []
+    drain_total = 0               # blocks, all intervals
+    drain_window_blocks = 0.0     # overlap-fraction weighted, for the mean
+    skip_window_blocks = 0.0      # skip blocks, same weighting
+    for i, iv in enumerate(intervals):
+        t0, t1, dt, d = iv["t0"], iv["t1"], iv["dt"], iv["blocks"]
         drain_total += d
         drain_series.append({"s": t0 / NS, "dt_s": dt / NS, "blocks": d,
                              "rate_blocks_per_s": d / (dt / NS)})
-        infl = 0
-        while j < len(cd) and cd[j][0] < t1:
-            if cd[j][0] >= t0:
-                infl += cd[j][1]
-            j += 1
         deficit_series.append({"s": t0 / NS, "dt_s": dt / NS,
-                               "inflow_blocks": infl, "drained_blocks": d,
-                               "deficit_blocks": infl - d})
+                               "inflow_blocks": iv["inflow"],
+                               "drained_blocks": d,
+                               "deficit_blocks": iv["inflow"] - d})
         if window is not None:
             ov = min(t1, window[1]) - max(t0, window[0])
             if ov > 0:
-                drain_window_blocks += d * ov / dt
+                w = ov / dt
+                drain_window_blocks += d * w
+                if i in skip_idx:
+                    skip_window_blocks += d * w
     drain_mean = None if window_s is None \
         else drain_window_blocks / window_s
+    processed_mean = None if window_s is None \
+        else (drain_window_blocks - skip_window_blocks) / window_s
     deficit_mean = None if (inflow_mean is None or drain_mean is None) \
         else inflow_mean - drain_mean
+    deficit_processed_mean = None \
+        if (inflow_mean is None or processed_mean is None) \
+        else inflow_mean - processed_mean
 
     # ---- fill level and overflow events
     cap = next((r["capacity"] for r in fill if r["capacity"] > 0), None)
@@ -464,6 +543,11 @@ def compute(td, fill, uart, events, n_files):
                 first_full = r["vclock_ns"] / NS
     ovf = [e for e in td if e["k"] == "overflow"]
     ovw = [e for e in td if e["k"] == "overwrite"]
+    # under overwrite-oldest rd also advances per evicted block: take
+    # the evictions out of the processed total (see DEFS["skips"])
+    processed_total = drain_total - skip_total
+    if overflow_policy == "overwrite-oldest":
+        processed_total -= len(ovw)
 
     # ---- flash ops (each op_start at its bracket midpoint)
     kinds = {}
@@ -509,9 +593,20 @@ def compute(td, fill, uart, events, n_files):
                    "series": inflow_ts},
         "drain": {"mean_blocks_per_s": drain_mean,
                   "total_blocks": drain_total,
+                  "processed_mean_blocks_per_s": processed_mean,
+                  "processed_total_blocks": processed_total,
                   "series": drain_series},
         "deficit": {"mean_blocks_per_s": deficit_mean,
+                    "processed_mean_blocks_per_s": deficit_processed_mean,
                     "series": deficit_series},
+        "skips": {"threshold_bps": thr,
+                  "count": len(skip_events),
+                  "events": skip_events,
+                  "total_blocks": skip_total,
+                  "first_s": skip_events[0]["start_s"]
+                  if skip_events else None,
+                  "refill_s": [ev["refill_s"] for ev in skip_events
+                               if ev["refill_s"] is not None]},
         "fill": {"peak": peak, "first_full_s": first_full,
                  "full_samples": full_samples,
                  "capacity_blocks": cap,
@@ -678,7 +773,14 @@ def report(run_dir, plot=True):
         td = parse_trace(trace)
     except OSError as e:
         raise ReportError("cannot read %s: %s" % (trace, e))
-    sm = compute(td, fill, uart, events, n_files)
+    sm = compute(td, fill, uart, events, n_files,
+                 params.get("rotb_overflow"))
+    n_uart_overrun = 0
+    if uart:
+        n_uart_overrun = uart["counts"]["RotBuf overrun occured"]["count"]
+    if n_uart_overrun > 0 and n_uart_overrun != sm["skips"]["count"]:
+        notes.append("UART 'RotBuf overrun occured' x%d but %d skip "
+                     "events" % (n_uart_overrun, sm["skips"]["count"]))
     sm["run"] = os.path.basename(os.path.normpath(run_dir)) or run_dir
     sm["params"] = {k: params[k] for k in RUN_PARAM_KEYS if k in params}
     sm["params"].update({k: v for k, v in params.items()
@@ -756,12 +858,14 @@ def _matrix_row(d, sm):
     peak = sm.get("fill", {}).get("peak")
     ovf = sm.get("overflow", {}).get("first_rotb_overflow")
     icnt = p.get("icount_shift", p.get("icount"))
-    icnt = "-" if icnt is None else str(icnt)
+    icnt = "-" if icnt is None else str(icnt).replace("shift=", "")
     fops = sm.get("flash", {}).get("ops_per_s_in_window_by_kind")
     fops = sum(fops.values()) if fops else None
+    prc = sm.get("drain", {}).get("processed_mean_blocks_per_s")
+    prc = None if prc is None else prc / CHUNK_BLOCKS
     return ("%-22s %-4s %-5s %-6s %-4s %-4s | %-5s %-8s %-8s | %-8s %-8s "
-            "%-8s | %-5s %-4s | %-7s %-7s"
-            % (d[:22] or ".",
+            "%-8s %-8s %-5s | %-5s %-4s | %-7s %-7s"
+            % ((os.path.basename(os.path.normpath(d)) or d)[:22],
                str(p.get("cell", "-"))[:4],
                _pnum(p.get("ticks"), 0) if p.get("ticks") is not None
                else "-",
@@ -773,6 +877,8 @@ def _matrix_row(d, sm):
                _pnum(sm.get("inflow", {}).get("mean_blocks_per_s")),
                _pnum(sm.get("drain", {}).get("mean_blocks_per_s")),
                _pnum(sm.get("deficit", {}).get("mean_blocks_per_s")),
+               _pnum(prc),
+               str(sm.get("skips", {}).get("count", "-")),
                str(sm.get("overflow", {}).get("chunk_drop_count", "-")),
                str(sm.get("overflow", {}).get("overwrite_count", "-")),
                _pnum(fops, 2),
@@ -780,10 +886,11 @@ def _matrix_row(d, sm):
 
 
 _MATRIX_HDR = ("%-22s %-4s %-5s %-6s %-4s %-4s | %-5s %-8s %-8s | %-8s "
-               "%-8s %-8s | %-5s %-4s | %-7s %-7s"
+               "%-8s %-8s %-8s %-5s | %-5s %-4s | %-7s %-7s"
                % ("run", "cell", "tick", "cps", "icnt", "lat",
                   "peak", "full_s", "ovf_s", "in_b/s", "dr_b/s",
-                  "df_b/s", "drop", "ovw", "fop/s", "file/s"))
+                  "df_b/s", "pr_fr/s", "skip", "drop", "ovw", "fop/s",
+                  "file/s"))
 
 
 def matrix(run_dirs):
@@ -796,7 +903,7 @@ def matrix(run_dirs):
             with open(path) as fh:
                 sm = json.load(fh)
         except (OSError, ValueError) as e:
-            print("%-22s no/bad summary.json (%s)" % (d[:22], e),
+            print("%s: no/bad summary.json (%s)" % (d, e),
                   file=sys.stderr)
             rc = 1
             continue
@@ -820,6 +927,11 @@ def self_test():
     bracket); an erase op before the first chunk and read/prog ops
     inside the window; fill.csv samples at s=100..110 with rd advancing
     30 blocks/s and wrapping twice; UART with all three marks.
+
+    A second scenario checks the RF-9 skip split (Amendment C.2):
+    capacity 104448, 49-block chunks at 10/s (490 blocks/s in), ~364
+    blocks/s processed, two ~29400-block skips (one split over two
+    samples), overwrite-oldest with 3 overwrite lines.
     """
     ts = "2026-11-13T10:00:00.000000Z"
 
@@ -892,6 +1004,7 @@ def self_test():
                            "seconds": 600, "rotb_overflow": "drop-new"})
 
     tmp = tempfile.mkdtemp(prefix="stix-rotb-fill-report-selftest-")
+    tmp2 = tempfile.mkdtemp(prefix="stix-rotb-fill-report-selftest-skip-")
     try:
         _st_write(os.path.join(tmp, "trace.log"), trace)
         _st_write(os.path.join(tmp, "fill.csv"), fill_csv)
@@ -999,15 +1112,104 @@ def self_test():
             rb_level_of(14937, 104448) == 0 and
             rb_level_of(15669, 104448) == 1 and
             rb_level_of(104448, 104448) == 6, "rb_level_of bins")
+        chk(sm["skips"] == {"threshold_bps": 5000, "count": 0,
+                            "events": [], "total_blocks": 0,
+                            "first_s": None, "refill_s": []},
+            "skips (no skip at 30 b/s) %r" % sm["skips"])
+        chk(dr["processed_total_blocks"] == 300
+            and dr["processed_mean_blocks_per_s"] == 30.0,
+            "drain processed %r" % ((dr["processed_total_blocks"],
+                                     dr["processed_mean_blocks_per_s"]),))
+        chk(sm["deficit"]["processed_mean_blocks_per_s"] == 19.0,
+            "deficit processed %r"
+            % sm["deficit"]["processed_mean_blocks_per_s"])
+        chk(any("RotBuf overrun occured" in n for n in sm["notes"]),
+            "UART/skip cross-check note %r" % sm["notes"])
         with open(os.path.join(tmp, "summary.json")) as fh:
             sm2 = json.load(fh)
         chk(sm2["inflow"]["mean_blocks_per_s"] == 49.0
             and sm2["defs"] == DEFS and sm2["plot"] == "not requested",
             "summary.json round-trip")
+
+        # ---- second scenario: the RF-9 skip split (Amendment C.2)
+        cap2 = 104448
+        chunks2 = []
+        for s in range(100, 400):
+            for k in range(10):
+                chunks2.append(
+                    "%s stixdet_chunk chunk: nom_bank 0, 49 blocks, "
+                    "scet 0x000186a0:0x0000, int_ticks=0 eacc_events=1800 "
+                    "rotb_count=%d at vclock_ns=%d\n"
+                    % (ts, 49 * (k + 1), s * NS + k * (NS // 10)))
+        trace2 = "".join(chunks2) + "".join(
+            "%s stixctrl_rotb_overwrite rotb overwrite: dropped block "
+            "rd=7 count=%d\n" % (ts, cap2) for _ in range(3))
+        extra = {150: 14700, 151: 14700, 300: 29400}
+        rows2 = []
+        rd_true = 0
+        for i, s in enumerate(range(100, 401)):
+            cnt = min(126 * (s - 100), cap2)
+            rd_csv = rd_true % cap2
+            rows2.append("%d,%d,%d,%d,%d,%d,%d"
+                         % (i, s * NS, cnt, 0, rd_csv,
+                            (rd_csv + cnt) % cap2, cap2))
+            rd_true += extra.get(s, 364)
+        fill_csv2 = ("wall_mono,vclock_ns,count,full,rd,wr,capacity\n"
+                     + "\n".join(rows2) + "\n")
+        uart2 = ("00:10:00.0  RotAccumulator   *E RotBuf overrun occured\n"
+                 "00:12:00.0  RotAccumulator   *E RotBuf overrun occured\n")
+        run_json2 = json.dumps({"cell": "cal-p-i7", "ticks": 0,
+                                "cps": 20000, "icount_shift": 7,
+                                "latency": True,
+                                "rotb_overflow": "overwrite-oldest"})
+        _st_write(os.path.join(tmp2, "trace.log"), trace2)
+        _st_write(os.path.join(tmp2, "fill.csv"), fill_csv2)
+        _st_write(os.path.join(tmp2, "uart.raw"), uart2)
+        _st_write(os.path.join(tmp2, "run.json"), run_json2)
+        smk = report(tmp2, plot=False)
+
+        sk = smk["skips"]
+        chk(sk["threshold_bps"] == 5000, "skip threshold %r" % sk)
+        chk(sk["count"] == 2, "skip count %r" % sk)
+        chk(abs(sk["total_blocks"] - 58800) < 588.0,
+            "skip total %r" % sk["total_blocks"])
+        e1, e2 = sk["events"]
+        chk(e1["start_s"] == 150.0 and e1["end_s"] == 152.0
+            and e1["blocks"] == 29400 and e1["data_s"] == 60.0
+            and e1["count_before"] == 6300 and e1["count_after"] == 6552
+            and e1["refill_s"] == [152.0, 300.0],
+            "skip event 1 (coalesced) %r" % e1)
+        chk(e2["start_s"] == 300.0 and e2["end_s"] == 301.0
+            and e2["blocks"] == 29400 and e2["refill_s"] is None,
+            "skip event 2 %r" % e2)
+        chk(sk["first_s"] == 150.0 and len(sk["refill_s"]) == 1
+            and sk["refill_s"][0] == [152.0, 300.0],
+            "skips summary %r" % sk)
+        drk = smk["drain"]
+        chk(drk["total_blocks"] == 166908
+            and abs(drk["mean_blocks_per_s"] - 166908 / 300.0) < 1e-6,
+            "drain 2 %r" % ((drk["total_blocks"],
+                             drk["mean_blocks_per_s"]),))
+        # overwrite-oldest: the 3 overwrite lines come off the total
+        chk(drk["processed_total_blocks"] == 108108 - 3
+            and abs(drk["processed_mean_blocks_per_s"] - 108108 / 300.0)
+            < 1e-6,
+            "processed 2 %r" % ((drk["processed_total_blocks"],
+                                 drk["processed_mean_blocks_per_s"]),))
+        chk(abs(drk["processed_mean_blocks_per_s"] - 364.0) < 5.0,
+            "processed mean close to the synthetic rate")
+        chk(abs(smk["deficit"]["processed_mean_blocks_per_s"]
+                - (490.0 - 108108 / 300.0)) < 1e-6, "deficit processed 2")
+        chk(not any("skip" in n for n in smk["notes"]),
+            "no skip note when the UART matches %r" % smk["notes"])
+        fld = _matrix_row("skip-run", smk).split()
+        chk("7.4" in fld and "2" in fld, "matrix row %r" % fld)
+
         print("ROTB-FILL-REPORT SELF-TEST: PASS (%d checks)" % ok)
         return 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(tmp2, ignore_errors=True)
 
 
 def main(argv=None):

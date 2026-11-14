@@ -6,7 +6,12 @@ Two rotb-fill-run.sh runs of the same cell that differ only in
 --guest-seconds, each with the hotblocks TCG plugin:
 
   STIX_ROTB_QEMU_EXTRA="-plugin <build>/contrib/plugins/libhotblocks.so,\
-limit=0,inline=on -d plugin -D <out>/hotblocks.log"
+limit=0,inline=on -d plugin"
+
+The run's -trace file= also sets the QEMU log file, so the plugin rows
+land in <out>/trace.log next to the trace events (a -D in the extra
+args loses to it).  The rows are picked out by pattern; a separate
+<out>/hotblocks.log is used instead when one exists.
 
 Boot, CONF and NOMINAL entry are identical in both, so the difference
 long - short is the steady NOMINAL window alone.  Per translation block
@@ -116,12 +121,11 @@ def count_trace(path):
 
 
 def run_files(d):
-    hb = os.path.join(d, "hotblocks.log")
     tr = os.path.join(d, "trace.log")
-    for p in (hb, tr):
-        if not os.path.isfile(p):
-            raise ProfileError("%s missing" % p)
-    return hb, tr
+    if not os.path.isfile(tr):
+        raise ProfileError("%s missing" % tr)
+    hb = os.path.join(d, "hotblocks.log")
+    return (hb if os.path.isfile(hb) else tr), tr
 
 
 def attribute(pc_insns, syms):

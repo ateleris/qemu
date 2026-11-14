@@ -441,3 +441,155 @@ chunk's block 38; `det-chunk-full` pins drop-new's whole-chunk drop);
 minors fixed: the overwrite trace carries the dropped block's rd, IRQMP
 latching noted (per-block count only in the trace). Suite 196/196; the
 overwrite tests are red on the pre-RF-0 binary.
+
+## Amendment C (2026-11-14): AX calibration, skip accounting, knobs
+
+### C.1 AX reference run (owner, 2026-11-14)
+
+The owner ran the AX (LEON3FT 20 MHz, 1 kB I/D caches) with an
+optimized master build (`128f30b0`, no `DEBUG_PRINT`, watchdog off; our
+copy `~/dev/stix-elf/ASW_em_prof.elf`), DSS high load (HK trigger
+median ~159k per QL accumulation), MIN = MAX = 0 (0.1 s), RCR off.
+
+| time | HK RB level | note |
+|---|---|---|
+| 10:09 | – | NOMINAL, GRMON attached (profile off) |
+| 10:26 | 5 | |
+| 10:32 | 6 | then 5/6 for ~20 min, CPU 92 % |
+| 10:53 | 5 | GRMON detached |
+| 10:55:40 | 7 | first overrun (no TM(5,x): the FSW emits none) |
+| 10:57:45 | 6 | |
+| 10:59:34 | 7 | second overrun |
+| 11:00:39 | 5 | |
+| 11:01:38 | 6 | |
+
+Reading: GRMON was not the cause. Two overruns 234 s apart with a
+60 s skip (~29,400 blocks at 490 b/s) in between give a net deficit of
+~126 b/s, i.e. ~364 b/s processed, **~7.4 frames/s**. The 20 min hover
+before suggests the DSS load is not constant; treat 7.4 fr/s as
+±15 %. GRMON profiles (same build, 0.1 s): idle 28 %, compaction 20 %,
+`encode_bch` 19 %, memcpy 7 %.
+
+### C.2 Correction: the report's drain counts the skip
+
+`drain` is the rd-pointer advance per `fill.csv` interval, and the
+overrun skip (`RotAccumulator.c:116-133`) advances rd by GETBLOCK
+without processing. In `rf-i8-t0-drop` (icount 8, gate ELF, 0.1 s)
+the 18 skips account for ~530k of the 715k "drained" blocks: the
+reported 431 b/s drain is mostly skipped data. The processed drain
+before the first overrun is ~164 b/s (the 104,448-block ring filled in
+320 s at 490 b/s inflow), ~3.3 fr/s. The fill traces show full-size skips
+(29.0k–29.7k blocks, sometimes split over two samples), i.e. the skip
+works as coded.
+
+**RF-9 (report).** `rotb-fill-report.py` splits the drain:
+- a **skip interval** is a `fill.csv` interval whose drain rate exceeds
+  `SKIP_RATE_BPS` (default 5000 b/s, ~10× the max inflow); adjacent
+  skip intervals coalesce into one **skip event**;
+- per event: start s, blocks, equivalent seconds of data
+  (blocks / mean inflow), count before and after;
+- `drain.processed_*` = drain minus skip-event blocks (the bit of
+  processing inside a skip interval is lost; documented in DEFS);
+- `skips.refill_s`: from each event's end to the next event's start;
+  `skips.first_s`: first event;
+- the old `drain.*` keys keep their meaning (rd advance); `deficit`
+  gets a `processed` variant.
+Self-test: a synthetic fill.csv with two skips (one split over two
+samples) checks the counts and the coalescing.
+
+### C.3 Calibration matrix RF-10 (all 0.1 s fixed, RCR off, cps 20000, 1800 guest s)
+
+| cell | ELF | icount | flash | question |
+|---|---|---|---|---|
+| cal-p-i7 | prof | 7 | fresh | does 128 ns/insn match the AX 7.4 fr/s? |
+| cal-p-i8 | prof | 8 | fresh | bracket |
+| cal-b-i7 | gate (DEBUG_PRINT) | 7 | fresh | cost of the debug build (owner: the level never fell in debug-build tests) |
+| cal-p-i7-aged | prof | 7 | aged (RF-2b) | archive full: deletes + erases |
+
+Prediction from RF-8 (1.04 M insns/frame, prof ELF, 0.1 s, cps 20000):
+icount 7 -> ~7.5 fr/s, icount 8 -> ~3.8 fr/s, before flash waits.
+
+### C.4 Knobs: what exists, what each calibrates, what is missing
+
+Emulator (exists):
+
+| knob | where | calibrates |
+|---|---|---|
+| `-icount shift=N` | run `--icount` | CPU speed (2^N ns/insn); the AX has cache-miss-heavy OS paths, so one shift fits one workload |
+| `tread-us`/`tprog-us`/`tbers-us` | `grlib-stixflash`, run `--latency-scale` | chip busy times (130/300/1500 µs, datasheet family [A]) |
+| `latency` | `grlib-stixflash` | flash async completion on/off |
+| `rotb-overflow` | `grlib-stixctrl` | drop-new / overwrite-oldest (Amendment B) |
+| start flash | run `--flash` | archive state (fresh vs aged/full) |
+| `det-flare-cps` | QMP | load |
+
+FSW references for the flash side (i4Ds/STIX-FSW issues, AX, 2019):
+#700 (Release build, no BCH: 0.1 s 100 % CPU, 0.2 s 80 %, 0.3 s 60 %,
+0.4 s 48 %; at 92 % CPU a 256 KiB archive file write takes 22–23 s and
+write + 32 erases 45 s; BCH adds 1.2 s per 256 KiB file), #626 (FS init
+0.29 s per control block), #288 (0.6 s per integration at 0.1 s, 2019,
+flash-bound). These are FSW-level durations (CPU + flash), not chip
+timings: they are acceptance targets for the emulator at a given
+icount, not new device parameters. Chip timings stay as they are unless
+a run shows the flash, not the CPU, sets the pace.
+
+Missing in the emulator, candidates (only if a run needs them):
+- a per-op extra flash delay (controller overhead) — no evidence yet;
+- a DSS load schedule (cps over time) to reproduce a non-constant load
+  like the AX hover — `det-flare-cps` can already be stepped by QMP.
+
+FSW behaviour that could be parameters (proposal for the owner, no FSW
+edits): the overrun skip length is hard-coded to 60 s
+(`RotAccumulator.c:117`, the code cites STIX-FDIR-REQ 051, which allows
+a user parameter); the drain task wakes every 1000 ms
+(`RTEMSExtra/TaskManager.c:86-89`, `ROTB_TIMER_PERIOD_MS`); an overrun raises no TM(5,x) event, only the
+latched HK RB level 7 (`HKAcquire.c:323`). The emulator can show what
+each change would do once the owner wants it tried.
+
+### C.5 Review of Amendment C (GLM, 2026-11-14) — resolutions
+
+- **M1 threshold vs processing rate** (at icount 3 processing reaches
+  ~5.9k b/s): the threshold is `max(SKIP_RATE_BPS, 10 × median
+  processing rate of the unflagged intervals)`, and the skip-event count
+  is cross-checked against the UART "RotBuf overrun occured" count (when
+  the ELF prints it) and the overflow trace; a mismatch is a note.
+- **M2 dilution by long intervals**: flag on
+  `blocks > threshold × min(dt, 1 s)`.
+- m3 split fragments below the threshold count as processing; m4
+  `processed_*` is clean under drop-new only (overwrite-oldest also
+  subtracts the `stixctrl_rotb_overwrite` count); m5 a skip ≥ capacity
+  is invisible to rd deltas (cross-check catches it): all three go into
+  DEFS.
+- m6 the processed mean uses the same overlap weighting as the drain
+  mean (skip blocks accumulated in the interval loop).
+- m8/m10 wording and line numbers fixed above; skip events carry their
+  bracketing sample times; the last event's `refill_s` is null.
+- The self-test needs a capacity ≥ 10^4 (or an injectable threshold):
+  the synthetic ring grows to 104448.
+
+### C.6 RF-10 results (2026-11-14, 1800 guest s each, drop-new)
+
+Processed drain from fill.csv (skips removed with the C.5 rule; script
+in the session scratchpad, RF-9 makes it the report's):
+
+| cell | first full | processed before / after | skips (blocks each) | refill |
+|---|---|---|---|---|
+| cal-p-i7 | 780 s | 7.3 / 7.4 fr/s | 4 (29.8k–30.0k) | 228–233 s |
+| cal-p-i8 | 329 s | 3.5 / 3.6 fr/s | 15 (27.9k–29.7k) | 89–95 s |
+| cal-b-i7 | 697 s | 6.9 / 7.0 fr/s | 5 (29.6k–30.0k) | 203–206 s |
+| cal-p-i7-aged | 766 s | 7.2 / 7.3 fr/s | 5 (27.8k–30.0k) | 222–226 s |
+| AX (C.1) | – | ~7.4 fr/s | – | 234 s |
+
+- **icount 7 with the prof ELF matches the AX**: refill 228–233 s vs
+  the AX's 234 s. icount 8 is 2× too slow (the RF-8 instruction model
+  predicted both: 7.5 and 3.8 fr/s).
+- **The debug build costs ~5 %** (6.9 vs 7.3 fr/s at icount 7). In the
+  emulator that is not enough to explain a level that never falls;
+  the owner's 2022 builds differ in more than `DEBUG_PRINT`.
+- **The aged archive costs ~1 %** although it ran 1,122 block erases
+  (vs 2 on fresh flash): at 1.5 ms chip time each the erases are not
+  what limits the drain. #700's 45 s "write + 32 erases" is FSW time in
+  the archive path, which the emulator executes as code; it does not
+  show up in the ROTB drain at this load.
+- The skip removes the full 60 s (~29.4k blocks at 490 b/s) every
+  time; the FSW then refills at the same processed rate, so at 0.1 s
+  the system overruns in a stable cycle (AX and emulator alike).
