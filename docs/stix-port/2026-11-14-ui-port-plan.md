@@ -60,3 +60,29 @@ beyond what data.hk gives.
 - Reviewer: browser pass on the real ASW (schedule a fault +10 s, see
   it armed then active, clear all; logs search; state only-differences
   with a forcing; click-to-timeline).
+
+## Plan review (GLM, 2026-11-14) — applied
+
+- Categories from the real id prefixes (faults-v1.json): spw,
+  timecode, obt, keepalive -> "Link & time"; power, thermal, hk_prot
+  -> "Supplies & HK"; attenuator -> "Attenuator"; memory -> "Memory";
+  anything else -> "Other". D2's "Faults here" = "Link & time" and
+  "Supplies & HK".
+- Active-since: faults.status() gains `since_sim` (ns, the guest time
+  the fault became active; additive) set where a lasting fault turns
+  active (now or when an armed one fires). Armed rows read "fires at
+  <trigger.sim_time>".
+- Changed: StateTree leaves gain `t_changed` (additive): the t_sim of
+  the last truth/presented change (set in _update when the value
+  changes, kept otherwise); the State tab shows it.
+- Reported in TM: the page maps a few leaves to HK aliases
+  (instrument.rotb.count -> hk.rb_level) and reads the latest point
+  via /series (calibrated label when the HKC work has landed); "–"
+  without an IDB.
+- "Only faulted" = fault_ids non-empty (status is always "ok" today).
+- Clear all: fault.clear per active/armed fault, reporting the 409s
+  (one-shot or pending) per row, never aborting.
+- Logs chips: tm, heartbeat, tc, cmd, fault, state, expect, mismatch,
+  sample, log (UART stays in its own panel); sample and heartbeat off.
+- Click-to-timeline: a just-added truth:<path> may be listed as
+  skipped until its first point; acceptable.
