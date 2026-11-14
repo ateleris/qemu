@@ -7,6 +7,7 @@ and clocks for the rest. Every case prints one line; the last line is
 """
 
 import gzip
+import hashlib
 import http.client
 import json
 import os
@@ -3125,6 +3126,11 @@ UI_VERBS = {"platform.power.on", "platform.power.boot", "platform.power.off",
             "platform.timesync.send", "platform.keepalive.set",
             "platform.obt.set", "fault.inject", "fault.clear", "force.set",
             "force.clear", "scenario.run", "scenario.abort"}
+# the verbs the tabbed page (timeline plan B1/B2) adds to UI_VERBS
+UI_VERBS_ADDED = {"tc.gs.send", "det.rotb.burst", "platform.flash.save",
+                  "platform.flash.load", "platform.flash.list"}
+UI_TABS = ("overview", "platform", "idpu", "detectors", "faults",
+           "scenarios", "logs", "state", "setup", "timeline")
 UI_ENDPOINTS = {"status", "time", "faults", "verbs", "state", "log",
                 "stream", "scenarios", "cmd"}
 
@@ -3193,6 +3199,9 @@ class _UiParser(__import__("html.parser").parser.HTMLParser):
         self.verbs = []
         self.attrs = []
         self.scripts = []
+        self.tabs = []          # data-tab inside #tabbar
+        self.panels = []
+        self._bar = False
         self._in = None
         self.rows = []          # (verb, input names) of each ctl button
         self._ctl = []          # [depth, names, buttons] of open .ctl
@@ -3201,6 +3210,12 @@ class _UiParser(__import__("html.parser").parser.HTMLParser):
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
         self.attrs.append((tag, a))
+        if tag == "nav" and a.get("id") == "tabbar":
+            self._bar = True
+        if self._bar and "data-tab" in a:
+            self.tabs.append(a["data-tab"])
+        if "data-tab-panel" in a:
+            self.panels.append(a["data-tab-panel"])
         if tag == "div":
             self._depth += 1
             if "ctl" in (a.get("class") or "").split():
@@ -3216,6 +3231,8 @@ class _UiParser(__import__("html.parser").parser.HTMLParser):
 
     def handle_endtag(self, tag):
         self._in = None
+        if tag == "nav":
+            self._bar = False
         if tag == "div":
             if self._ctl and self._ctl[-1][0] == self._depth:
                 _, names, buttons = self._ctl.pop()
@@ -3237,7 +3254,8 @@ def t_ui_page(env):
     panels cover the plan's verbs; no browser storage, no external URL,
     no inline handlers or style attributes (the CSP would block them),
     no innerHTML (TM and UART text is untrusted); every API path the
-    script names is a served endpoint."""
+    script names is a served endpoint; every literal $(...) in the
+    script is a defined id."""
     ctl = env.controller()
     srv = api_mod.make_server(ctl, "127.0.0.1", 0)
     port = srv.server_address[1]
@@ -3312,6 +3330,74 @@ def t_ui_page(env):
     check(paths and paths <= UI_ENDPOINTS and
           {"status", "stream", "cmd", "verbs", "faults", "scenarios",
            "state"} <= paths, "API paths %r" % paths)
+    # every literal $() names an id defined in the page
+    refs = set(re.findall(r"""\$\(["']([^"']+)["']\)""", js))
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check(refs and refs <= ids, "$() ids %r, page ids %r"
+          % (sorted(refs), sorted(ids)))
+
+
+def t_ui_tabs(env):
+    """Timeline plan B1: the page is a tab bar over data-tab-panel
+    sections (state in the location hash, default #overview): the tab
+    bar's tabs and the panels match one to one, the pre-tab data-verb
+    set is still all there, and the new verbs are used."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    p = _UiParser()
+    p.feed(body.decode())
+    check(sorted(p.tabs) == sorted(UI_TABS), "tabs %r" % sorted(p.tabs))
+    check(sorted(p.panels) == sorted(UI_TABS), "panels %r" % sorted(p.panels))
+    used = {v for v, _ in p.verbs}
+    check(UI_VERBS <= used, "the pre-tab data-verbs lost %r"
+          % (UI_VERBS - used))
+    check(UI_VERBS_ADDED <= used, "the new data-verbs missing %r"
+          % (UI_VERBS_ADDED - used))
+
+
+SETUP_KEYS = {"binary", "elf", "elf_sha256", "icount_shift", "pace",
+              "memory", "timecode_source", "obt_continuity",
+              "on_guest_reset", "sample_s"}
+
+
+def t_setup_status(env):
+    """Timeline plan B2: status()["setup"] lists the launch
+    configuration (additive, read-only); elf_sha256 is the ELF's
+    digest, or None when unreadable."""
+    ctl = env.controller(qemu={"icount_shift": 7, "pace": "fast"})
+    try:
+        s = ctl.status()["setup"]
+        check(set(s) == SETUP_KEYS, "setup keys %r" % sorted(s))
+        check(s["icount_shift"] == 7 and s["pace"] == "fast",
+              "setup mirrors the qemu config: %r" % s)
+        check(s["elf_sha256"] == hashlib.sha256(b"").hexdigest(),
+              "elf_sha256 of the /dev/null ELF")
+        q = ctl.cfg["qemu"]
+        check(s["binary"] == q["binary"] and s["elf"] == q["elf"] and
+              s["memory"] == q["memory"] and
+              s["timecode_source"] == q["timecode_source"] and
+              s["obt_continuity"] == q["obt_continuity"] and
+              s["on_guest_reset"] == q["on_guest_reset"],
+              "setup == the qemu config: %r" % s)
+        # None until Track A's [timeline] config lands (then -1.0)
+        check(s["sample_s"] is None or s["sample_s"] == -1.0,
+              "sample_s %r" % s["sample_s"])
+    finally:
+        ctl.shutdown()
+    ctl = env.controller(qemu={"elf": "/nonexistent/no-such.elf"})
+    try:
+        check(ctl.status()["setup"]["elf_sha256"] is None,
+              "elf_sha256 None when unreadable")
+    finally:
+        ctl.shutdown()
 
 
 def t_ui_check(env):
@@ -3407,6 +3493,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("gate ports from the slot band", t_gate_slots),
          ("UI: served at /, CSP, scenarios", t_ui_server),
          ("UI: the page (no browser)", t_ui_page),
+         ("UI: tabs (timeline B1)", t_ui_tabs),
+         ("setup status (timeline B2)", t_setup_status),
          ("UI: the live check (smokes)", t_ui_check)]
 
 

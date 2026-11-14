@@ -49,10 +49,21 @@ header h1 { font-size: 15px; margin: 0 8px 0 0; }
 .on, .up, .ok, .running { color: var(--ok); }
 .off, .down, .fail, .halted { color: var(--bad); }
 .frozen, .paused, .pending, .warn { color: var(--warn); }
-main {
-  display: grid; gap: 12px; padding: 12px 16px;
+#tabbar {
+  display: flex; flex-wrap: wrap; gap: 4px; padding: 10px 16px 0;
+}
+#tabbar button { border-radius: 4px 4px 0 0; }
+#tabbar button.active {
+  border-color: var(--accent); color: var(--accent); font-weight: 600;
+  background: var(--panel);
+}
+main { padding: 12px 16px; }
+.tab {
+  display: grid; gap: 12px;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
 }
+.tab[hidden] { display: none; }
+.bar { width: 100%; height: 1.2em; }
 section {
   background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; padding: 10px 12px; min-width: 0;
@@ -119,7 +130,51 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
   <span class="chip">mode <b id="s-mode">?</b></span>
   <span id="toast" class="muted"></span>
 </header>
+<nav id="tabbar">
+  <button type="button" data-tab="overview">Overview</button>
+  <button type="button" data-tab="platform">Platform</button>
+  <button type="button" data-tab="idpu">IDPU &amp; FSW</button>
+  <button type="button" data-tab="detectors">Detectors</button>
+  <button type="button" data-tab="faults">Faults &amp; forcings</button>
+  <button type="button" data-tab="scenarios">Scenarios</button>
+  <button type="button" data-tab="logs">Logs</button>
+  <button type="button" data-tab="state">State</button>
+  <button type="button" data-tab="setup">Setup</button>
+  <button type="button" data-tab="timeline">Timeline</button>
+</nav>
 <main>
+<div class="tab" data-tab-panel="overview">
+<section>
+  <h2>Platform</h2>
+  <div class="desc" id="ov-platform">?</div>
+  <div class="ctl"><button data-tab="platform">open</button></div>
+</section>
+
+<section>
+  <h2>IDPU &amp; FSW</h2>
+  <div class="desc" id="ov-idpu">?</div>
+  <div class="ctl"><button data-tab="idpu">open</button></div>
+</section>
+
+<section>
+  <h2>Detectors</h2>
+  <div class="desc" id="ov-detectors">?</div>
+  <div class="ctl"><button data-tab="detectors">open</button></div>
+</section>
+
+<section>
+  <h2>Faults</h2>
+  <div class="desc" id="ov-faults">?</div>
+  <div class="ctl"><button data-tab="faults">open</button></div>
+</section>
+
+<section class="wide">
+  <h2>Events (TM(5,x))</h2>
+  <div id="ov-events" class="log scroll"></div>
+</section>
+</div>
+
+<div class="tab" data-tab-panel="platform" hidden>
 <section>
   <h2>Power and simulation</h2>
   <div class="ctl">
@@ -200,7 +255,75 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
   </div>
   <div class="desc" id="ts-last"></div>
 </section>
+</div>
 
+<div class="tab" data-tab-panel="idpu" hidden>
+<section>
+  <h2>TC send (GS emulation)</h2>
+  <div class="desc">tc.gs.send: an operator TC from source 121; needs
+    [gs] emulation = "on" (on in run mode by default). The any-verb form
+    sends it too.</div>
+  <div class="ctl">
+    <span class="lbl">TC</span>
+    <input type="number" name="service" min="0" max="255" data-type="int"
+           title="service 0..255">
+    <input type="number" name="subtype" min="0" max="255" data-type="int"
+           title="subtype 0..255">
+    <input name="data" title="app data, hex">
+    <button data-verb="tc.gs.send">send</button>
+  </div>
+</section>
+
+<section>
+  <h2>Any verb</h2>
+  <div class="desc">Generated from GET /api/v1/verbs (the same
+    vocabulary and checks as the panels and scenarios).</div>
+  <div class="ctl">
+    <select id="any-verb" class="wide"></select>
+    <button id="any-send">send</button>
+  </div>
+  <div class="desc" id="any-doc"></div>
+  <div class="ctl" id="any-args"></div>
+</section>
+
+<section class="wide">
+  <h2>UART <label class="muted"><input type="checkbox" id="uart-follow"
+    checked> follow</label></h2>
+  <div id="uart" class="log scroll"></div>
+</section>
+</div>
+
+<div class="tab" data-tab-panel="detectors" hidden>
+<section>
+  <h2>ROTB ring</h2>
+  <div class="ctl">
+    <span class="lbl">fill</span>
+    <progress id="rotb-bar" class="bar" max="1" value="0"></progress>
+    <span id="rotb-fill" class="chip">?</span>
+  </div>
+  <div class="ctl">
+    <span class="lbl">burst</span>
+    <input type="number" name="frames" min="1" max="2131" value="100"
+           data-type="int" title="frames, 1..2131 (104448/49 chunks)">
+    <button data-verb="det.rotb.burst">append</button>
+  </div>
+</section>
+
+<section class="wide">
+  <h2>Detector state</h2>
+  <div class="desc">instrument.detector.* and instrument.rotb.* from
+    /state and the state stream.</div>
+  <div class="scroll tall">
+    <table>
+      <thead><tr><th>path</th><th>truth</th><th>presented</th>
+        <th>unit</th><th>status</th></tr></thead>
+      <tbody id="det-state"></tbody>
+    </table>
+  </div>
+</section>
+</div>
+
+<div class="tab" data-tab-panel="faults" hidden>
 <section>
   <h2>Faults</h2>
   <div id="faults" class="scroll"><span class="muted">loading…</span></div>
@@ -231,7 +354,9 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
   </div>
   <div id="forcings" class="desc"></div>
 </section>
+</div>
 
+<div class="tab" data-tab-panel="scenarios" hidden>
 <section>
   <h2>Scenarios</h2>
   <div class="ctl">
@@ -243,19 +368,9 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
   <div class="desc" id="scn-desc"></div>
   <div class="desc" id="scn-state"></div>
 </section>
+</div>
 
-<section>
-  <h2>Any verb</h2>
-  <div class="desc">Generated from GET /api/v1/verbs (the same
-    vocabulary and checks as the panels and scenarios).</div>
-  <div class="ctl">
-    <select id="any-verb" class="wide"></select>
-    <button id="any-send">send</button>
-  </div>
-  <div class="desc" id="any-doc"></div>
-  <div class="ctl" id="any-args"></div>
-</section>
-
+<div class="tab" data-tab-panel="logs" hidden>
 <section class="wide">
   <h2>Events
     <span class="muted">
@@ -271,13 +386,9 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
   </h2>
   <div id="events" class="log scroll tall"></div>
 </section>
+</div>
 
-<section class="wide">
-  <h2>UART <label class="muted"><input type="checkbox" id="uart-follow"
-    checked> follow</label></h2>
-  <div id="uart" class="log scroll"></div>
-</section>
-
+<div class="tab" data-tab-panel="state" hidden>
 <section class="wide">
   <h2>State <input id="state-filter" placeholder="filter, e.g. idpu.spw"
                    class="wide"></h2>
@@ -289,6 +400,73 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
     </table>
   </div>
 </section>
+</div>
+
+<div class="tab" data-tab-panel="setup" hidden>
+<section class="wide">
+  <h2>Launch configuration</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>key</th><th>value</th><th>what it means</th></tr></thead>
+      <tbody id="setup"></tbody>
+    </table>
+  </div>
+  <div class="desc">Read-only: changing these is a restart (next
+    launch) — edit the config file, not this page.</div>
+</section>
+
+<section>
+  <h2>Speed (measured, this host)</h2>
+  <table>
+    <thead><tr><th>profile (icount shift)</th><th>wall s / guest s</th></tr></thead>
+    <tbody>
+      <tr><td>3, fast functional</td><td>1.40</td></tr>
+      <tr><td>6</td><td>1.04</td></tr>
+      <tr><td>7, 0.1 s frames</td><td>0.28 wall · 0.26 fast</td></tr>
+      <tr><td>7, 1 s frames</td><td>0.37 wall · 0.05 fast (≈ 20x)</td></tr>
+      <tr><td>8, slower than the AX</td><td>0.27</td></tr>
+    </tbody>
+  </table>
+  <div class="desc">pace = fast adds -icount sleep=off: the guest's idle
+    time is skipped, its own timing is unchanged. Limit: at ~20x real
+    time the controller's 20 Hz timing misses time-sync windows
+    (late_apply) — timing-sensitive scenarios (time sync, keep-alive,
+    link faults) run with pace = wall.</div>
+</section>
+
+<section>
+  <h2>Skip ahead</h2>
+  <div class="ctl">
+    <span class="lbl">ROTB burst</span>
+    <input type="number" name="frames" min="1" max="2131" value="100"
+           data-type="int" title="frames, 1..2131 (104448/49 chunks)">
+    <button data-verb="det.rotb.burst">append</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">flash save</span>
+    <input name="name" class="wide" title="library name">
+    <button data-verb="platform.flash.save">save</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">flash load</span>
+    <input name="name" class="wide" title="library name">
+    <button data-verb="platform.flash.load" class="danger">load</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">library</span>
+    <button data-verb="platform.flash.list" data-only=""
+            data-into="flash-list">refresh</button>
+  </div>
+  <div id="flash-list"></div>
+</section>
+</div>
+
+<div class="tab" data-tab-panel="timeline" hidden>
+<section>
+  <h2>Timeline</h2>
+  <div class="desc">Timeline: coming with Track C.</div>
+</section>
+</div>
 </main>
 <script>
 "use strict";
@@ -373,6 +551,9 @@ document.addEventListener("click", async (ev) => {
     const args = argsOf(btn);
     const res = await post(verb, args);
     toast(verb + " ok " + JSON.stringify(res.result));
+    showResult(btn, res);
+    if (verb === "platform.flash.save" || verb === "platform.flash.load")
+      loadFlash();  // the library table shows the new state
   } catch (e) {
     toast(String(e.message || e), true);
   } finally {
@@ -380,6 +561,83 @@ document.addEventListener("click", async (ev) => {
     refresh();
   }
 });
+
+/* ---- tabs: data-tab buttons switch data-tab-panel sections; the
+   state is the location hash (default #overview) ---- */
+function showTab(id) {
+  for (const p of document.querySelectorAll("[data-tab-panel]"))
+    p.hidden = p.dataset.tabPanel !== id;
+  for (const b of document.querySelectorAll("#tabbar [data-tab]"))
+    cls(b, b.dataset.tab === id ? "active" : "");
+  if (id === "setup" && !flashLoaded) {
+    // set only on success: a failed first load retries on the next
+    // Setup visit
+    loadFlash().then((ok) => { flashLoaded = ok; });
+  }
+}
+function tabFromHash() {
+  const id = location.hash.slice(1);
+  for (const p of document.querySelectorAll("[data-tab-panel]"))
+    if (p.dataset.tabPanel === id) return id;
+  return "overview";
+}
+document.addEventListener("click", (ev) => {
+  const b = ev.target.closest("[data-tab]");
+  if (!b) return;
+  if (location.hash === "#" + b.dataset.tab) showTab(b.dataset.tab);
+  else location.hash = b.dataset.tab;
+});
+window.addEventListener("hashchange", () => showTab(tabFromHash()));
+
+/* ---- the flash library table (Setup tab) ---- */
+let flashLoaded = false;
+async function loadFlash() {
+  try {
+    const res = await post("platform.flash.list", {});
+    renderFlash($("flash-list"), res.result || {});
+    return true;
+  } catch (e) {
+    toast(String(e.message || e), true);
+    return false;
+  }
+}
+
+/* a control with data-into shows its result there (flash.list as a
+   table, the rest as JSON) */
+function showResult(btn, res) {
+  const id = btn.dataset.into;
+  if (!id) return;
+  const box = $(id);
+  if (btn.dataset.verb === "platform.flash.list")
+    renderFlash(box, res.result || {});
+  else text(box, JSON.stringify(res.result));
+}
+
+function renderFlash(box, r) {
+  const lib = r.library || [];
+  const head = document.createElement("div");
+  cls(head, "desc");
+  text(head, (r.dir || "") + " · " + lib.length +
+       (lib.length === 1 ? " entry" : " entries"));
+  const tb = document.createElement("table");
+  const trh = document.createElement("tr");
+  for (const k of ["name", "created_utc", "allocated_kib", "boot_id"]) {
+    const th = document.createElement("th");
+    text(th, k);
+    trh.append(th);
+  }
+  tb.append(trh);
+  for (const rec of lib) {
+    const tr = document.createElement("tr");
+    for (const k of ["name", "created_utc", "allocated_kib", "boot_id"]) {
+      const td = document.createElement("td");
+      text(td, rec[k] == null ? "" : String(rec[k]));
+      tr.append(td);
+    }
+    tb.append(tr);
+  }
+  box.replaceChildren(head, tb);
+}
 
 /* ---- status strip and the per-panel status ---- */
 function fmtS(ns) { return ns == null ? "?" : (ns / 1e9).toFixed(3) + " s"; }
@@ -400,7 +658,10 @@ async function refresh() {
   chip("s-obt", fmtObt(st.time && st.time.obt) +
        (st.time && st.time.obt_kind ? " (" + st.time.obt_kind + ")" : ""), "");
   chip("s-link", p.link);
-  chip("s-tc", p.timecodes ? "on" : "off");
+  // null = QEMU's default (on) until a verb or fault sets it
+  chip("s-tc", p.timecodes === false ? "off" :
+       p.timecodes == null ? "on (default)" : "on",
+       p.timecodes === false ? "off" : "on");
   const ka = p.keepalive || {};
   chip("s-ka", (ka.enabled ? "on" : "off") + " " + ka.period_s + " s, " +
        ka.sent + " sent", ka.enabled ? "on" : "off");
@@ -421,6 +682,63 @@ async function refresh() {
   text($("forcings"), Object.keys(f).length ?
        "active: " + Object.entries(f).map(([k, v]) => k + " = " +
          JSON.stringify(v)).join(", ") : "no forcing active");
+  const fa = Object.values(st.faults || {});
+  text($("ov-platform"), (st.power || "?") + " · link " + (p.link || "?"));
+  text($("ov-idpu"), (p.timecodes === false ? "time codes off" :
+       "time codes on") + " · controller " + (st.mode || "?"));
+  text($("ov-faults"), fa.filter((x) => !x.pending).length + " active");
+  renderSetup(st.setup || {});
+}
+
+/* ---- setup tab: the launch configuration, read-only ---- */
+const ICOUNT_WORD = {
+  0: "host speed, not timed",
+  3: "fast functional",
+  7: "AX-calibrated (ROTB 0.1 s overrun cycle ~230 s, matches the AX)",
+  8: "slower than the AX",
+};
+
+function renderSetup(s) {
+  const rows = [
+    ["binary", s.binary, "the QEMU binary"],
+    ["elf", s.elf, "the FSW ELF"],
+    ["elf_sha256", s.elf_sha256 == null ? "unreadable" : s.elf_sha256,
+     "of the ELF, computed at start"],
+    ["icount_shift", s.icount_shift,
+     ICOUNT_WORD[s.icount_shift] || "custom"],
+    ["pace", s.pace, s.pace === "fast" ?
+     "skip the guest's idle time (needs icount > 0)" :
+     "wait out the guest's idle time"],
+    ["memory", s.memory, "guest RAM"],
+    ["timecode_source", s.timecode_source,
+     s.timecode_source === "obt" ? "the OBT drives the time codes" :
+     "the SCET drives the time codes"],
+    ["obt_continuity", s.obt_continuity,
+     s.obt_continuity === "aligned" ?
+     "continue at the next SCET-matching OBT" :
+     "exact continuation across power cycles"],
+    ["on_guest_reset", s.on_guest_reset,
+     s.on_guest_reset === "warm" ? "in-process, BRAM kept" :
+     s.on_guest_reset === "cold" ? "a new QEMU process" :
+     "halt on guest reset"],
+    ["sample_s", s.sample_s == null ? "—" : String(s.sample_s),
+     s.sample_s == null ? "state sampling (not configured)" :
+     s.sample_s < 0 ? "by mode: 1 s interactive, off in run mode" :
+     s.sample_s === 0 ? "off" :
+     "sample every " + s.sample_s + " s of bench time"],
+  ];
+  const body = $("setup");
+  const trs = [];
+  for (const [k, v, word] of rows) {
+    const tr = document.createElement("tr");
+    for (const c of [k, v == null ? "?" : String(v), word]) {
+      const td = document.createElement("td");
+      text(td, c);
+      tr.append(td);
+    }
+    trs.push(tr);
+  }
+  body.replaceChildren(...trs);
 }
 
 /* ---- faults, generated from the catalogue ---- */
@@ -483,6 +801,7 @@ async function loadState() {
   try { tree = await getJSON("state"); } catch (e) { return; }
   stateRows = leaves(tree, "", []);
   renderState();
+  renderDet();
   const sel = $("force-path");
   const want = stateRows.map(([p]) => p).filter((p) => /^instrument\.hk_adc\.\d+$/.test(p));
   const have = [...sel.options].map((o) => o.value);
@@ -516,6 +835,65 @@ function renderState() {
   body.replaceChildren(...rows);
 }
 $("state-filter").addEventListener("input", renderState);
+
+/* ---- detectors tab: instrument.detector.* / instrument.rotb.* ---- */
+function renderDet() {
+  const body = $("det-state");
+  const rows = [];
+  let count = null, cap = null;
+  for (const [p, lf] of stateRows) {
+    if (!/^instrument\.(detector|rotb)\./.test(p)) continue;
+    if (p === "instrument.rotb.count") count = lf.truth;
+    if (p === "instrument.rotb.capacity") cap = lf.truth;
+    const tr = document.createElement("tr");
+    const cells = [p, show(lf.truth), show(lf.presented), lf.unit || "",
+                   lf.status];
+    cells.forEach((c, i) => {
+      const td = document.createElement("td");
+      text(td, c);
+      if (i === 2 && show(lf.truth) !== show(lf.presented)) cls(td, "diff");
+      if (i === 4) cls(td, lf.status);
+      tr.append(td);
+    });
+    rows.push(tr);
+  }
+  body.replaceChildren(...rows);
+  const bar = $("rotb-bar");
+  if (count != null && cap) {
+    bar.max = cap;
+    bar.value = count;
+  } else {
+    bar.max = 1;
+    bar.value = 0;
+  }
+  const fill = count == null || !cap ? "off" :
+    count + " / " + cap + " (" + Math.round(100 * count / cap) + "%)";
+  text($("rotb-fill"), fill);
+  text($("ov-detectors"), fill);
+}
+
+/* the tab also follows the SSE state topic: a change record or a
+   snapshot touching these prefixes updates the table at once (the poll
+   re-reads everything every 2 s) */
+function applyStateRec(r) {
+  const d = r.data || {};
+  const hits = [];
+  if (r.path && /^instrument\.(detector|rotb)\./.test(r.path))
+    hits.push([r.path, d.new]);
+  else if (d.leaves)
+    for (const [p, lf] of Object.entries(d.leaves))
+      if (/^instrument\.(detector|rotb)\./.test(p)) hits.push([p, lf]);
+  if (!hits.length) return;
+  for (const [p, lf] of hits) {
+    if (!lf) continue;
+    const row = stateRows.find(([q]) => q === p);
+    if (row) {
+      row[1].truth = lf.truth;
+      row[1].presented = lf.presented;
+    }
+  }
+  renderDet();
+}
 
 /* ---- the vocabulary: tooltips, disabled verbs, the any-verb form ---- */
 let vocab = [];
@@ -631,6 +1009,18 @@ function summary(r) {
   return ["k-" + r.kind, r.path + " " + show(d)];
 }
 
+/* the Overview events: the last 10 TM(5,x) */
+const ev5 = [];
+function renderEv5() {
+  const box = $("ov-events");
+  box.replaceChildren();
+  for (const [t, s] of ev5) {
+    const line = document.createElement("div");
+    text(line, t + "  " + s);
+    box.append(line);
+  }
+}
+
 function onRecord(r) {
   if (r.seq <= lastSeq) return;
   lastSeq = r.seq;
@@ -643,6 +1033,13 @@ function onRecord(r) {
     follow(box, "uart-follow");
     return;
   }
+  if (r.kind === "tm" && (r.data || {}).decoded &&
+      r.data.decoded.type === 5) {
+    ev5.push([fmtS(r.sim_time), r.data.text || r.data.hex || ""]);
+    if (ev5.length > 10) ev5.shift();
+    renderEv5();
+  }
+  if (r.kind === "state") applyStateRec(r);
   const box = $("events");
   const [c, s] = summary(r);
   const line = document.createElement("div");
@@ -701,6 +1098,7 @@ async function main() {
   setInterval(loadState, 2000);
   setInterval(loadScenarios, 10000);
 }
+showTab(tabFromHash());
 main();
 </script>
 </body>

@@ -4,6 +4,7 @@ model, the state tree, the dispatcher and the poller, wired together
 (platform plan PL-3).
 """
 
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,7 @@ class Controller:
     def __init__(self, cfg, run_dir=None, launcher=None, mono_fn=None,
                  sleep=time.sleep):
         self.cfg = cfg
+        self.elf_sha256 = self._elf_sha256()
         self.run_dir = rundir.guard(run_dir or cfg["run_dir"]["path"])
         os.makedirs(self.run_dir, exist_ok=True)
         self.lock_fd = rundir.lock(self.run_dir)
@@ -329,6 +331,32 @@ class Controller:
             self.poll_state()
 
     # -- read endpoints --
+    def _elf_sha256(self):
+        """The FSW ELF's digest, computed once at start (the Setup tab);
+        None if the file is unreadable."""
+        h = hashlib.sha256()
+        try:
+            with open(self.cfg["qemu"]["elf"], "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError:
+            return None
+        return h.hexdigest()
+
+    def setup(self):
+        """The launch configuration, read-only (a change is a restart);
+        status()["setup"] (timeline plan B2, additive)."""
+        q = self.cfg["qemu"]
+        # [timeline] sample_s comes with Track A; None until then
+        return {"binary": q["binary"], "elf": q["elf"],
+                "elf_sha256": self.elf_sha256,
+                "icount_shift": q["icount_shift"], "pace": q["pace"],
+                "memory": q["memory"],
+                "timecode_source": q["timecode_source"],
+                "obt_continuity": q["obt_continuity"],
+                "on_guest_reset": q["on_guest_reset"],
+                "sample_s": self.cfg.get("timeline", {}).get("sample_s")}
+
     def time_info(self):
         sim, boot_id, vclock, est = self.clock.now()
         obt = self.state.get("platform.obt")
@@ -354,6 +382,7 @@ class Controller:
                 {"min": q.rtt_min, "max": q.rtt_max, "last": q.rtt_last},
                 "debug_used": self.debug_used,
                 "platform": self.plat.status(),
+                "setup": self.setup(),
                 "faults": self.plat.faults.status(),
                 "forcings": self.plat.forcing.status(),
                 "scenario": None if self.runner is None else

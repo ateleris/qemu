@@ -128,7 +128,7 @@ The path prefix is `/api/v1`. Read endpoints:
 
 | Endpoint | Returns |
 |---|---|
-| `GET /status` | power, mode, boot_id, time, latest seq, the QMP round trips |
+| `GET /status` | power, mode, boot_id, time, latest seq, the QMP round trips, the setup summary |
 | `GET /time` | sim (bench) time, wall time, vclock, OBT, running/paused |
 | `GET /state`, `GET /state/<path>` | the state tree (D-PLo), or one subtree or leaf |
 | `GET /log?since=<seq>&kinds=a,b` | a JSONL slice of the record ring |
@@ -647,6 +647,21 @@ no CDN. It is only an API client:
   `/state` (every 2 s), and the event log and UART tail: first
   `GET /log` (the last 2000 records), then the SSE stream from that seq.
   So a reload loses nothing, and nothing lives only in the page.
+
+**Web UI tabs** (timeline plan B1/B2): the page is a tab bar (the state
+is the URL hash, default `#overview`): Overview, Platform, IDPU & FSW,
+Detectors, Faults & forcings, Scenarios, Logs, State, Setup, Timeline.
+Overview shows a health word per subsystem (power, link, mode, active
+faults, the ROTB fill) and the last TM(5,x) events. Detectors shows the
+ROTB fill as a bar, the `instrument.detector.*` and `instrument.rotb.*`
+leaves as a state table, and the burst control. Setup is read-only:
+the launch configuration from `status()["setup"]` (`binary`, `elf`,
+`elf_sha256`, `icount_shift`, `pace`, `memory`, `timecode_source`,
+`obt_continuity`, `on_guest_reset`, `sample_s`) in plain words, the
+measured speeds (icount 7: 0.28 wall s per guest s at 0.1 s frames,
+0.05 with `pace = fast` at 1 s frames) and the skip-ahead controls
+(`det.rotb.burst`, the flash library save/load/list). Timeline is a
+placeholder until Track C.
 
 The server sends it behind the same Host filter, with
 `Content-Security-Policy: default-src 'none'; script-src <hash>;
