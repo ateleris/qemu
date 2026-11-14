@@ -181,3 +181,37 @@ These override the tasks above where they differ.
 - A8 (Task 3 verb): det-* live on /machine/stixctrl; add a STIXCTRL path
   constant next to STIXSPW (plat.py:24) and reuse the `_q()`/`_qom_set`
   VerbError pattern (plat.py:61-71).
+
+## Results (2026-11-14)
+
+Implemented: Task 1 42f0b4921a, Task 2 e15c422d71, Task 3 8440c6475a,
+Task 4 0b73915f6e (+ b7212c5cc0: a bad library name is a 400 before
+the power-state check). Gate `ff` 7/7, suite all pass (with
+/sparc/sparc/stix/det-rotb-burst; note the qtest path carries the
+arch prefix, Amendment A3 had it without), platform self-test PASS.
+
+**Pacing A/B** (prof ELF, --ticks 0 --max-ticks 0 --cps 20000 --rcr off
+--icount 7, 1800 guest s; paced = rf-cal-p-i7-s1, fast =
+rf-ff-p-i7-fast-s1):
+
+| | paced | fast |
+|---|---|---|
+| processed frames/s | 7.32 | 7.40 |
+| overrun skips | 4 (first 892 s) | 4 (first 899 s) |
+| refill between skips | 232.7, 231.8, 227.6 s | 232.1, 233.2, 227.5 s |
+| wall s per guest s | 0.352 | 0.282 |
+
+Same behaviour (well inside the 3 % / ±1 / 5 s criteria), but only
+20 % faster, not the ≈ 0.1 wall s per guest s estimated from the
+icount 3 runs: at this load little guest time is idle. What else sets
+the pace (probably host-side device-model work per guest second) is
+not profiled yet; a host profile is the next speed lever.
+
+**Burst on the FSW** (prof ELF, --ticks 9 (1 s integration) --cps 20000
+--icount 7 --pace fast, 1200 guest s, rf-ff-burst-s2; burst via a second
+QMP socket at guest 302 s): `requested=2000,appended=2000,stop=done,
+rotb_count=98050`. HK RB level 0 → 6, then 5, 3, 2, 1, 0; no overrun.
+The FSW drained at ≈ 300-390 blocks/s while the backlog lasted (the
+same processing as at 0.1 s), then back to the 49 b/s inflow. The prof
+ELF prints nothing on the UART, so the "no new error lines" check is
+empty for it.

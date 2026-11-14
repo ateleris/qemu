@@ -593,3 +593,14 @@ in the session scratchpad, RF-9 makes it the report's):
 - The skip removes the full 60 s (~29.4k blocks at 490 b/s) every
   time; the FSW then refills at the same processed rate, so at 0.1 s
   the system overruns in a stable cycle (AX and emulator alike).
+
+### Amendment C.7 (2026-11-14): fast-forward knobs
+
+Added by the fast-forward plan (2026-11-14-fast-forward-plan.md):
+`rotb-fill-run --pace wall|fast` (icount sleep=off; same FSW behaviour,
+0.35 -> 0.28 wall s per guest s at icount 7 / 0.1 s / 20000 cps),
+the runtime `det-rotb-burst` / `det-rotb-burst-status` on
+/machine/stixctrl (N copies of the last live frame, SCETs spread
+between the last live chunk and now), and the platform's
+`qemu.icount_shift` / `qemu.pace` config, `det.rotb.burst` and the
+flash library (`platform.flash.save|load|list`).
