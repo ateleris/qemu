@@ -143,3 +143,41 @@ Semantics (decided):
 - The Setup tab UI itself: it waits for the UI mockup review and the timeline design; the config keys and verbs here are what it will call.
 - Writing archive files without the FSW (would need an FSW-format file-system writer with the word-swapped BCH ECC).
 - Full QEMU snapshots (only grlib-stixflash has vmstate).
+
+## Amendment A (plan review, GLM, 2026-11-14)
+
+These override the tasks above where they differ.
+
+- A1 (MAJOR, Task 2 SCET): mask UNSYNCED bit 31 off both coarse values
+  before the u48 (coarse << 16 | fine) arithmetic, then OR in the current
+  register's flag. If now <= last (the guest stepped SCET back via the
+  time correction, grlib_stixctrl.c:257-268, or the sim is paused so the
+  vclock did not move), delta = 0: every burst frame carries `last`.
+  The qtest asserts strictly increasing SCETs in the normal case and
+  non-decreasing in a paused-clock case (burst twice without stepping
+  the clock). The property description mentions the paused case.
+- A2 (Task 2 docs): under rotb-overflow=overwrite-oldest append never
+  returns FULL, so a burst overwrites the oldest blocks instead of
+  stopping; say so in the property description and platform.md.
+  Task 5 Step 3 runs with drop-new.
+- A3 (Task 2 test): model the qtest on test_det_chunk_format
+  (tests/qtest/stix.c:7724), not test_det_rotb_hw_state: rotb_qtest_new(N),
+  rotb_cfg(true, false), sky_start_nom, det_step_ticks, and read chunks
+  with nom_read_chunk (:7640). Add two small helpers: a qom-get returning
+  a string, and a qom-set returning the QMP error desc (pattern:
+  flash_dmg_set, :13098). Test path: `-p /sparc/stix/det-rotb-burst`.
+- A4 (Task 1 Step 2): the script needs the positional QEMU binary and
+  --ticks: `scripts/stix/rotb-fill-run.sh build/qemu-system-sparc --ticks 1
+  --icount 0 --pace fast --out /tmp/x` → exit 2 with the pace message.
+  The pace check goes in the :182-209 validation block.
+- A5 (Task 1 run.json): keep `"icount": "shift=N"` unchanged; sleep=off
+  lives only in the new `"pace"` key (the matrix truncates icount).
+- A6 (Task 4 sparse check): rundir.sparse_check is hard-wired to
+  run_dir/flash.bin; flashlib does its own allocated-blocks check
+  (os.stat st_blocks * 512) against cfg["power"]["sparse_limit_mb"].
+- A7 (Task 4 meta): ELF sha256 = hashlib over cfg["qemu"]["elf"];
+  sim_time = self.clock.exact_sim(); boot_id = self.clock.boot_id;
+  paused = self.power.state == "paused".
+- A8 (Task 3 verb): det-* live on /machine/stixctrl; add a STIXCTRL path
+  constant next to STIXSPW (plat.py:24) and reuse the `_q()`/`_qom_set`
+  VerbError pattern (plat.py:61-71).
