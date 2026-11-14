@@ -50,6 +50,12 @@
 #                       (defaults 130/300/1500)
 #   --overflow POLICY   drop-new (default) | overwrite-oldest (RF-0's
 #                       grlib-stixctrl.rotb-overflow)
+#   --rcr on|off        the FSW rate control (default on). off sets
+#                       RCR_ENABLED (index 273, AX ELF) to 0 before
+#                       NOMINAL; NOMINAL entry re-runs RateCtrl_init,
+#                       which reads it (OpModeMgmt.c:645 ->
+#                       QLAccuDblBuffs.c:103 -> RateCtrl.c:667), so the
+#                       ASIC reg 3 pixel masks stay at the RCR-0 config
 #   --guest-seconds N   the drive's end in guest seconds (default 1200)
 #   --flash FILE        sparse-copy this flash.bin as the start state
 #                       (cp --sparse=always, e.g. the RF-2b
@@ -76,7 +82,7 @@ set -euo pipefail
 
 usage="usage: rotb-fill-run.sh <qemu-binary> --ticks N [--max-ticks N] \
 [--cps N] [--icount SHIFT] [--latency on|off] [--latency-scale K] \
-[--overflow drop-new|overwrite-oldest] [--guest-seconds N] \
+[--overflow drop-new|overwrite-oldest] [--rcr on|off] [--guest-seconds N] \
 [--flash FILE] --out DIR [--dry-run]"
 
 QEMU_BIN_ARG="${1:?$usage}"
@@ -88,6 +94,7 @@ ICOUNT=3
 LATENCY=on
 LATENCY_SCALE=1
 OVERFLOW=drop-new
+RCR=on
 GUEST_SECONDS=1200
 FLASH=""
 OUT_DIR=""
@@ -117,6 +124,9 @@ while [ $# -gt 0 ]; do
         --overflow)
             [ $# -ge 2 ] || { echo "--overflow needs a value"; exit 2; }
             OVERFLOW="$2"; shift ;;
+        --rcr)
+            [ $# -ge 2 ] || { echo "--rcr needs a value"; exit 2; }
+            RCR="$2"; shift ;;
         --guest-seconds)
             [ $# -ge 2 ] || { echo "--guest-seconds needs a value"; exit 2; }
             GUEST_SECONDS="$2"; shift ;;
@@ -179,6 +189,9 @@ check_uint guest-seconds "$GUEST_SECONDS"
 [ "$ICOUNT" -le 15 ] || { echo "--icount shift must be 0..15"; exit 2; }
 case "$LATENCY" in on | off) ;; *)
     echo "--latency wants on|off (got: $LATENCY)"; exit 2 ;;
+esac
+case "$RCR" in on | off) ;; *)
+    echo "--rcr wants on|off (got: $RCR)"; exit 2 ;;
 esac
 case "$OVERFLOW" in drop-new | overwrite-oldest) ;; *)
     echo "--overflow wants drop-new|overwrite-oldest (got: $OVERFLOW)"
@@ -264,6 +277,16 @@ fi
 # the TM(237,20) read-back expectation hexes (index u16 BE + sub-id 00
 # + value i32 BE; aspect-smoke's gate 0x5A8:237:20:01DD0000000064)
 RB_MIN="$(printf '%04X00%08X' "$IDX_MIN" "$TICKS")"
+IDX_RCR=273                   # RCR_ENABLED (AX ELF)
+TC_SET_RCR=""
+TC_GET_RCR=""
+if [ "$RCR" = off ]; then
+    TC_SET_RCR="$(python3 -u "$DRIVE" --emit-param-set "$IDX_RCR" 0 8)" \
+        || exit 2
+    TC_GET_RCR="$(python3 -u "$DRIVE" --emit-param-get "$IDX_RCR" 9)" \
+        || exit 2
+fi
+RB_RCR="$(printf '%04X00%08X' "$IDX_RCR" 0)"
 RB_MAX=""
 [ -z "$MAX_TICKS" ] || RB_MAX="$(printf '%04X00%08X' "$IDX_MAX" \
     "$MAX_TICKS")"
@@ -292,6 +315,14 @@ if [ -n "$MAX_TICKS" ]; then
     add_expect "0x5A1:1:1:1DACC007"
     add_expect "0x5A1:1:7:1DACC007"
 fi
+# RCR_ENABLED=0 (set seq 8, read-back seq 9), only with --rcr off
+if [ "$RCR" = off ]; then
+    add_expect "0x5A1:1:1:1DACC008"
+    add_expect "0x5A1:1:7:1DACC008"
+    add_expect "0x5A8:237:20:$RB_RCR"
+    add_expect "0x5A1:1:1:1DACC009"
+    add_expect "0x5A1:1:7:1DACC009"
+fi
 # S20=0 (seq 2), NOMINAL (seq 3) and its entry event
 add_expect "0x5A1:1:1:1DACC002"
 add_expect "0x5A1:1:7:1DACC002"
@@ -318,6 +349,15 @@ if [ -n "$MAX_TICKS" ]; then
 ,
  {"t": 55, "tc": "$TC_SET_MAX"},
  {"t": 55, "tc": "$TC_GET_MAX"}
+EOF
+)"
+fi
+if [ "$RCR" = off ]; then
+    SCHEDULE_HEAD="$SCHEDULE_HEAD$(cat <<EOF
+,
+ {"t": 55, "mark": "RCR_ENABLED=0"},
+ {"t": 55, "tc": "$TC_SET_RCR"},
+ {"t": 55, "tc": "$TC_GET_RCR"}
 EOF
 )"
 fi
@@ -411,6 +451,7 @@ write_run_json() { # > $1
  "latency": "$LATENCY",
  "latency_scale": $LATENCY_SCALE,
  "overflow": "$OVERFLOW",
+ "rcr": "$RCR",
  "guest_seconds": $GUEST_SECONDS,
  "flash": "${FLASH_ABS:-fresh}",
  "out_dir": "$OUT_DIR",
