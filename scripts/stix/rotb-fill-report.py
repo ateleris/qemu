@@ -6,9 +6,10 @@ docs/stix-port/2026-11-14-rotb-fill-plan.md).
 Reads one run dir (rotb-fill-run.sh's layout):
 
   run.json         the cell parameters the wrapper recorded; tolerated
-                   keys: cell, ticks, cps, icount_shift, icount, latency,
-                   seconds, rotb_overflow, elf, capacity (unknown extras
-                   are kept verbatim; a missing file is tolerated)
+                   keys: cell, ticks, cps, icount_shift, icount, pace,
+                   latency, seconds, rotb_overflow, elf, capacity
+                   (unknown extras are kept verbatim; a missing file is
+                   tolerated)
   fill.csv         the wrapper's ROTB samples, header
                    wall_mono,vclock_ns,count,full,rd,wr,capacity
                    (vclock_ns is the guest's virtual clock; rd/wr/count
@@ -123,7 +124,8 @@ UART_MARKS = ("RotBuf overrun occured",     # RotAccumulator.c:107 (sic)
               "Partition of type")          # MemFilesystem.c:734
 
 RUN_PARAM_KEYS = ("cell", "ticks", "cps", "icount_shift", "icount",
-                  "latency", "seconds", "rotb_overflow", "elf", "capacity")
+                  "pace", "latency", "seconds", "rotb_overflow", "elf",
+                  "capacity")
 
 DEFS = {
     "window": "NOMINAL window = first stixdet_chunk/stixdet_chunk_drop "
@@ -863,14 +865,15 @@ def _matrix_row(d, sm):
     fops = sum(fops.values()) if fops else None
     prc = sm.get("drain", {}).get("processed_mean_blocks_per_s")
     prc = None if prc is None else prc / CHUNK_BLOCKS
-    return ("%-22s %-4s %-5s %-6s %-4s %-4s | %-5s %-8s %-8s | %-8s %-8s "
-            "%-8s %-8s %-5s | %-5s %-4s | %-7s %-7s"
+    return ("%-22s %-4s %-5s %-6s %-4s %-4s %-4s | %-5s %-8s %-8s | "
+            "%-8s %-8s %-8s %-8s %-5s | %-5s %-4s | %-7s %-7s"
             % ((os.path.basename(os.path.normpath(d)) or d)[:22],
                str(p.get("cell", "-"))[:4],
                _pnum(p.get("ticks"), 0) if p.get("ticks") is not None
                else "-",
                _pnum(p.get("cps"), 0) if p.get("cps") is not None else "-",
-               icnt[:4], _param_lat(p.get("latency")),
+               icnt[:4], str(p.get("pace", "-"))[:4],
+               _param_lat(p.get("latency")),
                _pnum(peak["frac"], 2) if peak else "-",
                _pnum(sm.get("fill", {}).get("first_full_s")),
                _pnum(ovf["vclock_s"]) if ovf else "-",
@@ -885,9 +888,9 @@ def _matrix_row(d, sm):
                _pnum(sm.get("files", {}).get("files_per_s"), 2)))
 
 
-_MATRIX_HDR = ("%-22s %-4s %-5s %-6s %-4s %-4s | %-5s %-8s %-8s | %-8s "
-               "%-8s %-8s %-8s %-5s | %-5s %-4s | %-7s %-7s"
-               % ("run", "cell", "tick", "cps", "icnt", "lat",
+_MATRIX_HDR = ("%-22s %-4s %-5s %-6s %-4s %-4s %-4s | %-5s %-8s %-8s | "
+               "%-8s %-8s %-8s %-8s %-5s | %-5s %-4s | %-7s %-7s"
+               % ("run", "cell", "tick", "cps", "icnt", "pace", "lat",
                   "peak", "full_s", "ovf_s", "in_b/s", "dr_b/s",
                   "df_b/s", "pr_fr/s", "skip", "drop", "ovw", "fop/s",
                   "file/s"))
@@ -1160,7 +1163,7 @@ def self_test():
                  "00:12:00.0  RotAccumulator   *E RotBuf overrun occured\n")
         run_json2 = json.dumps({"cell": "cal-p-i7", "ticks": 0,
                                 "cps": 20000, "icount_shift": 7,
-                                "latency": True,
+                                "pace": "fast", "latency": True,
                                 "rotb_overflow": "overwrite-oldest"})
         _st_write(os.path.join(tmp2, "trace.log"), trace2)
         _st_write(os.path.join(tmp2, "fill.csv"), fill_csv2)
@@ -1203,7 +1206,11 @@ def self_test():
         chk(not any("skip" in n for n in smk["notes"]),
             "no skip note when the UART matches %r" % smk["notes"])
         fld = _matrix_row("skip-run", smk).split()
-        chk("7.4" in fld and "2" in fld, "matrix row %r" % fld)
+        chk("7.4" in fld and "2" in fld and "fast" in fld,
+            "matrix row (pace column) %r" % fld)
+        # an old run without a pace key shows "-" in the pace column
+        fld0 = _matrix_row("old-run", sm).split()
+        chk(fld0[5] == "-", "matrix pace for an old run %r" % fld0)
 
         print("ROTB-FILL-REPORT SELF-TEST: PASS (%d checks)" % ok)
         return 0

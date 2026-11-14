@@ -33,10 +33,10 @@
 #   run.json (every parameter) and exits with the drive's rc.
 #
 # Usage: rotb-fill-run.sh <qemu-binary> --ticks N [--max-ticks N]
-#                         [--cps N] [--icount SHIFT] [--latency on|off]
-#                         [--latency-scale K] [--overflow POLICY]
-#                         [--guest-seconds N] [--flash FILE] --out DIR
-#                         [--dry-run]
+#                         [--cps N] [--icount SHIFT] [--pace wall|fast]
+#                         [--latency on|off] [--latency-scale K]
+#                         [--overflow POLICY] [--guest-seconds N]
+#                         [--flash FILE] --out DIR [--dry-run]
 #   --ticks N           the integration param written to
 #                       NOMINAL_ACCU_MIN_INTEGRATION (index 312; param
 #                       N = (N+1) x 0.1 s, so 0.1 s = 0, 0.5 s = 4)
@@ -45,6 +45,10 @@
 #   --cps N             det-flare-cps (default 2000, detector-smoke's)
 #   --icount SHIFT      -icount shift=SHIFT; 0 = no icount (default 3,
 #                       Amendment A: the "fast CPU" cell)
+#   --pace wall|fast    pacing (default wall); fast adds ,sleep=off to
+#                       the icount: guest idle time is skipped instead
+#                       of waited out, the guest's own timing is
+#                       unchanged (needs --icount > 0)
 #   --latency on|off    the flash latency model (default on)
 #   --latency-scale K   multiplies tread-us/tprog-us/tbers-us
 #                       (defaults 130/300/1500)
@@ -81,9 +85,9 @@
 set -euo pipefail
 
 usage="usage: rotb-fill-run.sh <qemu-binary> --ticks N [--max-ticks N] \
-[--cps N] [--icount SHIFT] [--latency on|off] [--latency-scale K] \
-[--overflow drop-new|overwrite-oldest] [--rcr on|off] [--guest-seconds N] \
-[--flash FILE] --out DIR [--dry-run]"
+[--cps N] [--icount SHIFT] [--pace wall|fast] [--latency on|off] \
+[--latency-scale K] [--overflow drop-new|overwrite-oldest] \
+[--rcr on|off] [--guest-seconds N] [--flash FILE] --out DIR [--dry-run]"
 
 QEMU_BIN_ARG="${1:?$usage}"
 shift
@@ -91,6 +95,7 @@ TICKS=""
 MAX_TICKS=""
 CPS=2000
 ICOUNT=3
+PACE=wall
 LATENCY=on
 LATENCY_SCALE=1
 OVERFLOW=drop-new
@@ -115,6 +120,9 @@ while [ $# -gt 0 ]; do
         --icount)
             [ $# -ge 2 ] || { echo "--icount needs a value"; exit 2; }
             ICOUNT="$2"; shift ;;
+        --pace)
+            [ $# -ge 2 ] || { echo "--pace needs a value"; exit 2; }
+            PACE="$2"; shift ;;
         --latency)
             [ $# -ge 2 ] || { echo "--latency needs a value"; exit 2; }
             LATENCY="$2"; shift ;;
@@ -187,6 +195,13 @@ check_uint guest-seconds "$GUEST_SECONDS"
 [ -z "$MAX_TICKS" ] || check_uint max-ticks "$MAX_TICKS"
 [ "$CPS" -gt 0 ] || { echo "--cps must be > 0"; exit 2; }
 [ "$ICOUNT" -le 15 ] || { echo "--icount shift must be 0..15"; exit 2; }
+case "$PACE" in wall | fast) ;; *)
+    echo "--pace wants wall|fast (got: $PACE)"; exit 2 ;;
+esac
+[ "$PACE" = wall ] || [ "$ICOUNT" -gt 0 ] || {
+    echo "--pace fast needs --icount > 0 (sleep=off is an icount option)"
+    exit 2
+}
 case "$LATENCY" in on | off) ;; *)
     echo "--latency wants on|off (got: $LATENCY)"; exit 2 ;;
 esac
@@ -399,7 +414,11 @@ QEMU_ARGS=(
     -trace "events=$OUT_DIR/trace.events,file=$OUT_DIR/trace.log"
 )
 if [ "$ICOUNT" -gt 0 ]; then
-    QEMU_ARGS+=(-icount "shift=$ICOUNT")
+    if [ "$PACE" = fast ]; then
+        QEMU_ARGS+=(-icount "shift=$ICOUNT,sleep=off")
+    else
+        QEMU_ARGS+=(-icount "shift=$ICOUNT")
+    fi
 fi
 if [ "$LATENCY" = off ]; then
     QEMU_ARGS+=(-global grlib-stixflash.latency=off)
@@ -448,6 +467,7 @@ write_run_json() { # > $1
  "max_ticks": ${MAX_TICKS:-null},
  "cps": $CPS,
  "icount": $ICOUNT_JSON,
+ "pace": "$PACE",
  "latency": "$LATENCY",
  "latency_scale": $LATENCY_SCALE,
  "overflow": "$OVERFLOW",
