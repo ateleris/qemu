@@ -5760,3 +5760,48 @@ aspect archive stayed empty and every aspect-burst request answered
   run (the TC(238,10) event path bypasses the 30 s tick) is noted for
   later, not a gate item.
 
+
+## 49. icount sleep=off: the idle warp runs in the vCPU thread (baseline/upstream: in the main loop)
+
+**What:** with `-icount shift=N,sleep=off` and every vCPU idle (the
+RTEMS idle task's power-down), `rr_cpu_thread_fn`
+(accel/tcg/tcg-accel-ops-rr.c) now calls the new
+`icount_warp_idle_vcpu()` (accel/tcg/icount-common.c) in a bounded loop
+(`RR_IDLE_WARPS_MAX` = 100): it adds the next QEMU_CLOCK_VIRTUAL
+deadline to the icount bias and runs the main loop's due virtual
+timers itself, with the BQL held, when that deadline is on the main
+loop's own timer list (otherwise the upstream path runs, whose clock
+notify wakes the owning AioContext; a notify per warp wakes the main
+loop and iothreads every time and cost ~70 % of the gain). Upstream instead
+notifies the main loop, sleeps on the halt condition, lets
+`icount_start_warp_timer` do the same bias step from the main loop and
+waits to be kicked back. The function returns false, and the upstream
+path runs unchanged, for sleep=on, record/replay, qtest, a stopped VM,
+no pending timer, or an earliest timer on another AioContext's list.
+A pending `exit_request` alone does not end the batch: it is often set
+while idle (likely by interrupts the guest has masked; not traced), and
+testing it took 1 s integration from 0.051 back to
+0.216 wall s per guest s), and the kicks that matter also set
+`cpu->stop` or give the vCPU work, as `rr_wait_io_event` relies on.
+
+**Why:** on WSL2 the main-loop round trip per idle period (eventfd,
+futex, ppoll, kick) dominated idle-heavy runs: the vCPU thread spent
+~39 % in the kernel and ~25 % blocked. Measured (prof ELF, icount 7,
+20000 cps, `--pace fast`): 1 s integration 0.368 -> 0.052 wall s per
+guest s (one guest hour 22 -> 3 min); 0.1 s integration (busy) 0.277 ->
+0.253. Guest behaviour identical in both A/B pairs (same overrun skips
+and refill times, same drain, flash ops and chunk counts); see
+docs/stix-port/2026-11-14-fast-forward-plan.md, Task 6.
+
+**Risk:** the warp amount and order are the upstream ones, so guest
+time is unchanged; what moves is which host thread runs the main loop's
+virtual timer callbacks (the vCPU thread under the BQL, as
+`icount_notify_aio_contexts` already does upstream). Only sleep=off
+runs are affected; no gate or qtest uses sleep=off (only
+`rotb-fill-run --pace fast` and the platform's `qemu.pace = "fast"`).
+Known limit (review 2, no in-tree instance): an EXTERNAL-attribute
+QEMU_CLOCK_VIRTUAL timer on a non-main AioContext is invisible to the
+global deadline and its owner is not woken by these warps (in-tree
+EXTERNAL virtual timers, slirp and input, attach to the main loop). A
+notify per batch would restore upstream's guarantee but costs about
+as much as the per-warp notify (a batch is usually one warp).

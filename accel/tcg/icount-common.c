@@ -289,6 +289,51 @@ static void icount_timer_cb(void *opaque)
     icount_warp_rt();
 }
 
+/*
+ * STIX fast-forward (accepted-diffs §49): with sleep=off and every vCPU
+ * idle, advance QEMU_CLOCK_VIRTUAL to its next deadline and run the
+ * main loop's virtual timers right here in the vCPU thread (BQL held,
+ * as icount_notify_aio_contexts already does), instead of waking the
+ * main loop to do the same warp in icount_start_warp_timer and then
+ * being kicked back. The warp amount is the same deadline, so guest
+ * time advances exactly as on the main-loop path; only the host
+ * round trip goes. Only when the earliest deadline is on the main loop's
+ * own timer list: a timer of another AioContext that is due first
+ * takes the main-loop path, whose clock notify wakes its context, so
+ * no notify is needed here (one per warp would wake the main loop and
+ * the iothreads every time and bring the BQL round trips back).
+ * Returns false when nothing was done and the main-loop path must run
+ * (sleep=on, record/replay, qtest, VM not running, no timer, or the
+ * earliest timer is not the main loop's).
+ */
+bool icount_warp_idle_vcpu(void)
+{
+    int64_t deadline;
+    bool ran;
+
+    if (icount_sleep || replay_mode != REPLAY_MODE_NONE || qtest_enabled() ||
+        !runstate_is_running()) {
+        return false;
+    }
+    deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
+                                          ~QEMU_TIMER_ATTR_EXTERNAL);
+    if (deadline < 0 ||
+        timerlist_deadline_ns(main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL]) !=
+        deadline) {
+        return false;
+    }
+    if (deadline > 0) {
+        seqlock_write_lock(&timers_state.vm_clock_seqlock,
+                           &timers_state.vm_clock_lock);
+        qatomic_set(&timers_state.qemu_icount_bias,
+                    timers_state.qemu_icount_bias + deadline);
+        seqlock_write_unlock(&timers_state.vm_clock_seqlock,
+                             &timers_state.vm_clock_lock);
+    }
+    ran = qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    return ran || deadline > 0;
+}
+
 void icount_start_warp_timer(void)
 {
     int64_t clock;

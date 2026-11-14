@@ -441,6 +441,17 @@ Two knobs get to "an hour of observation" without waiting it out
   config load (`sleep=off` is an icount option). The guest's own
   timing is unchanged: vclock, OBT and FSW behaviour are the same,
   only the waiting disappears.
+  **Limit:** the controller's own timing is in bench time sampled at
+  20 Hz of wall time, plus UDP and thread latency of tens of ms wall.
+  With an idle guest and the vCPU idle warp (accepted-diffs §49) a
+  fast run reaches ~20x real time, so 0.5 s of guest margin is ~25 ms
+  wall: the time sync (D-PLd) lands after its target time code
+  (`late_apply`, CUC 1 s off) and gate-spw-link fails at its first
+  step. Run timing-sensitive scenarios (time sync, keep-alive,
+  link-fault windows) with `pace = "wall"`; use `fast` for filling
+  and soaking. At icount 7 gate-keepalive also fails under either
+  pace: NOMINAL entry takes ~32 guest s against its 10 s await (the
+  AX-like CPU, not the pace).
 - **`det.rotb.burst {frames}`**: one runtime QOM write
   (`det-rotb-burst` on `/machine/stixctrl`) that appends that many
   copies of the *last live detector frame* to the ROTB ring at once —

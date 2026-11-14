@@ -106,6 +106,13 @@ static void rr_stop_kick_timer(void)
     }
 }
 
+/*
+ * idle warps per rr loop pass before the main loop takes over (each
+ * runs timer callbacks with the BQL held; the first warp's interrupt
+ * normally ends the idle state)
+ */
+#define RR_IDLE_WARPS_MAX 100
+
 static void rr_wait_io_event(void)
 {
     CPUState *cpu;
@@ -226,11 +233,32 @@ static void *rr_cpu_thread_fn(void *arg)
         }
 
         if (icount_enabled() && all_cpu_threads_idle()) {
+            int warps = 0;
+
             /*
-             * When all cpus are sleeping (e.g in WFI), to avoid a deadlock
-             * in the main_loop, wake it up in order to start the warp timer.
+             * sleep=off: warp from here while every vCPU stays idle
+             * (each warp runs the due timers, whose interrupt usually
+             * ends the idle state); bounded so the main loop still gets
+             * the BQL when the timers raise nothing. A cpu_exit()-only
+             * kick does not end the batch: exit_request is often set
+             * while idle (measured: testing it cost most of the gain;
+             * likely interrupts the guest has masked),
+             * and the kicks that matter (a pending interrupt, queued
+             * work, cpu->stop from vm_stop/pause_all_vcpus) make
+             * all_cpu_threads_idle() false (the same reliance as
+             * rr_wait_io_event)
              */
-            qemu_notify_event();
+            while (all_cpu_threads_idle() && warps++ < RR_IDLE_WARPS_MAX &&
+                   icount_warp_idle_vcpu()) {
+            }
+            if (all_cpu_threads_idle()) {
+                /*
+                 * When all cpus are sleeping (e.g in WFI), to avoid a
+                 * deadlock in the main_loop, wake it up in order to
+                 * start the warp timer.
+                 */
+                qemu_notify_event();
+            }
         }
 
         rr_wait_io_event();

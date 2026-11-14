@@ -215,3 +215,43 @@ The FSW drained at ≈ 300-390 blocks/s while the backlog lasted (the
 same processing as at 0.1 s), then back to the 49 b/s inflow. The prof
 ELF prints nothing on the UART, so the "no new error lines" check is
 empty for it.
+
+## Task 6 (added 2026-11-14 after the host profile): idle warp in the vCPU thread
+
+**Why:** with no perf on WSL2, a /proc sample of a fast-paced run
+(icount 7, 0.1 s, 20000 cps) showed the vCPU thread at 36 % user, 39 %
+kernel and ~25 % blocked, the main loop at 25 % and the monitor
+iothread at 13 %, with thousands of 8-byte eventfd reads/writes per
+second and ~4000 voluntary context switches per second. Clock reads
+are vDSO (49 ns), no page faults; the GPTIMER is the 200 Hz RTEMS tick
+(reload 0x1387). Upstream's sleep=off warp runs in the main loop, so
+every idle period (the RTEMS idle power-down) costs a vCPU -> main loop
+-> vCPU round trip.
+
+**Change:** accepted-diffs §49 (icount_warp_idle_vcpu + the bounded
+loop in rr_cpu_thread_fn). No-op for sleep=on, replay, qtest.
+
+**Spike results** (prof ELF, icount 7, 20000 cps, --pace fast):
+
+| cell | unpatched | spike | final |
+|---|---|---|---|
+| 0.1 s, 1800 guest s, NOMINAL wall/guest | 0.277 | 0.253 | 0.257 |
+| 0.1 s skips / refill | 4 / 232.1, 233.2, 227.5 s | 4 / 232.4, 230.7, 226.3 s | 4 / 232.1, 230.7, 227.1 s |
+| 0.1 s processed | | | 7.34 fr/s |
+| 1 s, 600 guest s, NOMINAL wall/guest | 0.368 | 0.052 | 0.054 |
+| 1 s drain / flash ops/s / processed | 49.9 / 14.34 / | 49.9 / 14.32 / | 49.9 / 14.32 / 1.02 fr/s |
+
+"final" is the reviewed code (two review rounds; an exit_request
+check and a per-warp clock notify each cost the 1 s case back to
+0.17-0.22 and were taken out). Guest-side numbers (skips, refill,
+drain, flash ops) match the unpatched binary within run noise.
+
+**Platform:** at ~20x real time the controller's bench-time timing
+cannot keep the time-sync margin; gate-spw-link fails 3/3 under
+patched + fast at its time-sync step (`late_apply`) and passes under
+patched + wall and unpatched + fast (~2.7x). A platform limit,
+documented in platform.md (Pacing): timing-sensitive scenarios run
+with pace = wall.
+
+The busy 0.1 s case keeps most of its overhead; where it goes is still
+open (the kernel share under load is not the idle round trip).

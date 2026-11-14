@@ -70,6 +70,12 @@ int64_t icount_round(int64_t count);
 
 /* if the CPUs are idle, start accounting real time to virtual clock. */
 void icount_start_warp_timer(void);
+/*
+ * sleep=off: warp to the next deadline and run the due main-loop
+ * timers from the idle vCPU thread (BQL held); false = take the
+ * main-loop path
+ */
+bool icount_warp_idle_vcpu(void);
 void icount_account_warp_timer(void);
 void icount_notify_exit(void);
 
