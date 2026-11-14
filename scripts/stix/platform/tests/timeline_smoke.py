@@ -5,10 +5,8 @@
 --view-run server (--base, default http://127.0.0.1:8080): load every
 saved view plus the generated "everything" and assert each panel
 series has points over the view's window (live trails 10 min like the
-page). hk.trig_med / hk.trig_max are reported, not failed: no IDB
-field name contains "rigger" today, so idb.ALIASES resolves neither
-(plan A2). With no hk ids in the catalogue at all (the IDB JSON is
-absent, review focus 1) the hk series are reported instead of failed.
+page). With no hk ids in the catalogue at all (the IDB JSON is absent,
+review focus 1) the hk series are reported instead of failed.
 
 Usage: python3 timeline_smoke.py [--base URL]
 Exit codes: 0 pass, 1 a view's series failed, 2 the server is wrong.
@@ -20,7 +18,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-TRIG_ALIASES = ("hk.trig_med", "hk.trig_max")
 WINDOWS_NS = {"live": 600e9, "1m": 60e9, "10m": 600e9, "60m": 3600e9}
 
 
@@ -72,9 +69,8 @@ def main():
         for sid in ids:
             if (res.get(sid) or {}).get("t"):
                 continue
-            if sid in TRIG_ALIASES or (sid.startswith("hk") and not has_hk):
-                print("%s: %s: no points (%s: expected)" % (
-                    name, sid, "not in the IDB" if has_hk else "no IDB JSON"))
+            if sid.startswith("hk") and not has_hk:
+                print("%s: %s: no points (no IDB JSON)" % (name, sid))
             else:
                 missing.append(sid)
         for sid in missing:

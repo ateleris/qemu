@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 
 from . import api as api_mod
 from . import config as config_mod
@@ -36,6 +37,7 @@ from . import core as core_mod
 from . import log as log_mod
 from . import probe_lib
 from . import qemu as qemu_mod
+from . import relay as relay_mod
 from . import retention
 from . import scenario
 from . import rundir
@@ -3613,6 +3615,12 @@ def t_sampler_off_in_run_mode(env):
 
 _IDB_SYNTH = {
     "byte_order": "big",
+    "calibrations": {
+        "CIX00041TM": {"type": "polynomial", "coefficients": [0, 4]},
+        "CIXP0999TM": {"type": "interpolation", "unit": "degC",
+                       "points": [[10, 90], [1010, 40], [2010, -10]]},
+        "CIXT0999TM": {"type": "text",
+                       "text_ranges": [[2, 2, "SAFE"], [5, 5, "NOMINAL"]]}},
     "packets": [
         {"id": "stix_54101", "service_type": 3, "service_subtype": 25,
          "pi1_value": 1,
@@ -3623,12 +3631,18 @@ _IDB_SYNTH = {
               "data_type": "uint8", "bit_offset": 4, "bit_length": 4},
              {"name": "CPU load (NIXD0002)", "byte_offset": 15,
               "data_type": "uint8", "bit_offset": 0, "bit_length": 5,
-              "unit": "%"}]},
+              "unit": "%", "calibration": "CIX00041TM"}]},
         {"id": "stix_54102", "service_type": 3, "service_subtype": 25,
          "pi1_value": 2,
          "fields": [
              {"name": "SID (NIX00020)", "byte_offset": 0,
               "data_type": "uint8"},
+             {"name": "Instrument mode (NIXD0023)", "byte_offset": 1,
+              "data_type": "uint8", "bit_offset": 4, "bit_length": 4,
+              "calibration": "CIXT0999TM"},
+             {"name": "HK_DPU_PCB_T (NIXD0025)", "byte_offset": 2,
+              "data_type": "uint16", "bit_offset": 0, "bit_length": 12,
+              "calibration": "CIXP0999TM"},
              {"name": "Archive Memory usage (NIXD0003)", "byte_offset": 51,
               "data_type": "uint8", "bit_offset": 7, "bit_length": 8},
              {"name": "RotBuff fill level (NIXD0501)", "byte_offset": 62,
@@ -3740,11 +3754,179 @@ def t_idb_relay_hk(env):
         ctl.shutdown()
 
 
+def t_idb_calibration(env):
+    """HKC: the synthetic JSON's poly/interp/text calibrations: the
+    values, the tm record's hk raw + hk_cal, the series catalogue
+    kinds/units/values, and a broken or unknown calibration leaves the
+    field raw with one timeline.idb record."""
+    idb = idb_mod.load(_idb_synth(env))
+    check(idb is not None, "the synthetic IDB loads")
+    check(idb.calibrate(1, "NIXD0002", 5) == 20, "poly [0, 4]: 5 -> 20")
+    check(idb.calibrate(2, "NIXD0025", 510) == 65,
+          "interp between the points: 510 -> 65")
+    check(idb.calibrate(2, "NIXD0025", 5) == 90 and
+          idb.calibrate(2, "NIXD0025", 3000) == -10,
+          "interp clamps outside the range")
+    check(idb.calibrate(2, "NIXD0023", 2) == "SAFE",
+          "text: raw 2 -> its text")
+    check(idb.calibrate(2, "NIXD0023", 3) is None,
+          "text: raw 3 is in no range -> None")
+    check(idb.calibrate(2, "NIX00072", 9) == 9,
+          "no calibration: the raw value")
+    f = {x.code: x for x in idb.hk_fields(2)}
+    check(f["NIXD0025"].cal == "interp" and f["NIXD0025"].unit == "degC"
+          and not f["NIXD0025"].raw, "the interp field, the cal's unit")
+    check(f["NIXD0023"].cal == "text" and
+          f["NIXD0023"].labels == ["SAFE", "NOMINAL"], "the text field")
+    check(f["NIX00072"].cal is None and f["NIX00072"].raw,
+          "the raw field")
+    # the relay record: data.hk stays the wire truth, data.hk_cal is
+    # the calibrated one (SID byte 2, mode 2, PCB temp 510, RB 5)
+    ctl = env.controller(timeline={"idb_json": _idb_synth(env)})
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        app = bytes((2, 0x02, 0x1F, 0xE0)) + bytes(58) + \
+            bytes((0b101_00000,))
+        snd.sendto(_tm_unit(0x5A4, 3, 25, app),
+                   ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"]))
+        wait_for(lambda: any(r.kind == "tm" for r in ctl.log.since(0)),
+                 what="the tm record")
+        rec = [r for r in ctl.log.since(0) if r.kind == "tm"][-1]
+        d = rec.obj["data"]
+        check(d["hk"]["NIXD0501"] == 5 and d["hk"]["NIXD0025"] == 510,
+              "hk stays raw: %r" % d.get("hk"))
+        check(d.get("hk_cal") == {"NIXD0023": "SAFE", "NIXD0025": 65},
+              "hk_cal: %r" % d.get("hk_cal"))
+    finally:
+        snd.close()
+        ctl.shutdown()
+    # the series: poly/interp numbers, the text enum indexed in the
+    # text_ranges order (NOMINAL fed first, still index 1), aliases
+    # mirror it, raw fields say "raw"
+    si = series_mod.SeriesIndex(idb=idb)
+    si.feed(_srec("tm", 100, data={
+        "decoded": {"sid": 2},
+        "hk": {"NIXD0023": 5, "NIXD0025": 510, "NIX00072": 9},
+        "hk_cal": {"NIXD0023": "NOMINAL", "NIXD0025": 65}}))
+    si.feed(_srec("tm", 110, data={
+        "decoded": {"sid": 2}, "hk": {"NIXD0023": 2},
+        "hk_cal": {"NIXD0023": "SAFE"}}))
+    si.feed(_srec("tm", 200, data={
+        "decoded": {"sid": 1}, "hk": {"NIXD0002": 5},
+        "hk_cal": {"NIXD0002": 20}}))
+    cat = {e["id"]: e for e in si.catalogue()}
+    m = cat["hk:2:NIXD0023"]
+    check(m["kind"] == "enum" and m["cal"] == "text" and
+          m["values"] == ["SAFE", "NOMINAL"], "the text series: %r" % m)
+    check(cat["hk.mode"]["kind"] == "enum" and
+          cat["hk.mode"]["cal"] == "text" and
+          cat["hk.mode"]["values"] == ["SAFE", "NOMINAL"],
+          "the alias mirrors the text series")
+    q = si.query(["hk:2:NIXD0023", "hk.mode"])
+    check(q["hk:2:NIXD0023"]["t"] == [100, 110] and
+          q["hk:2:NIXD0023"]["v"] == [1, 0] and
+          q["hk:2:NIXD0023"]["labels"] == ["SAFE", "NOMINAL"],
+          "the enum index is the label's, not first-seen: %r"
+          % q["hk:2:NIXD0023"])
+    m = cat["hk:2:NIXD0025"]
+    check(m["kind"] == "number" and m["unit"] == "degC" and
+          m["cal"] == "interp", "the interp series: %r" % m)
+    m = cat["hk:2:NIX00072"]
+    check(m["kind"] == "number" and m["unit"] == "raw" and
+          m["cal"] == "raw", "the raw series: %r" % m)
+    m = cat["hk.cpu_load"]
+    check(m["kind"] == "number" and m["unit"] == "%" and
+          m["cal"] == "poly" and
+          si.query(["hk.cpu_load"])["hk.cpu_load"]["v"] == [20],
+          "the alias carries the calibrated number: %r" % m)
+    # a record without hk_cal (an old log): the raw fallback
+    si2 = series_mod.SeriesIndex(idb=idb)
+    si2.feed(_srec("tm", 5, data={"decoded": {"sid": 2},
+                                  "hk": {"NIXD0023": 3}}))
+    m = {e["id"]: e for e in si2.catalogue()}["hk:2:NIXD0023"]
+    check(m["kind"] == "number" and m["unit"] == "raw" and
+          m["cal"] == "raw", "without hk_cal: raw: %r" % m)
+    # an unknown type or a broken entry: the field stays raw, one
+    # timeline.idb record lists them, the load never fails
+    clk = SimClock()
+    lg = log_mod.RecordLog(None, clk.now)
+    p = os.path.join(env.tmp, "idb-bad-cal.json")
+    with open(p, "w") as f:
+        json.dump({"byte_order": "big", "calibrations": {
+            "CIXX0001TM": {"type": "magic"},
+            "CIXX0002TM": {"type": "polynomial", "coefficients": "no"},
+            "CIXX0003TM": {"type": "interpolation", "points": [[1]]},
+            "CIXX0004TM": {"type": "text", "text_ranges": [[0]]},
+            "CIXX0006TM": {"type": "polynomial",
+                           "coefficients": [0, float("nan")]},
+            "CIXX0007TM": {"type": "text", "text_ranges": [[5, 1, "x"]]},
+            "CIXX0008TM": {"type": "text",
+                           "text_ranges": [[0, 0, "x"], [1, 1, "x"]]}},
+            "packets": [{"id": "stix_54102", "service_type": 3,
+                         "service_subtype": 25, "pi1_value": 2,
+                         "fields": [
+                             {"name": "a (NIXD0600)", "byte_offset": 0,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0001TM"},
+                             {"name": "b (NIXD0601)", "byte_offset": 1,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0002TM"},
+                             {"name": "c (NIXD0602)", "byte_offset": 2,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0003TM"},
+                             {"name": "d (NIXD0603)", "byte_offset": 3,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0004TM"},
+                             {"name": "e (NIXD0604)", "byte_offset": 4,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0005TM"},
+                             {"name": "f (NIXD0605)", "byte_offset": 5,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0006TM"},
+                             {"name": "g (NIXD0606)", "byte_offset": 6,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0007TM"},
+                             {"name": "h (NIXD0607)", "byte_offset": 7,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0008TM"}]}]}, f)
+    idb = idb_mod.load(p, log=lg)
+    check(idb is not None, "a broken calibration never fails the load")
+    check(all(x.raw for x in idb.hk_fields(2)),
+          "all eight stay raw (NaN, lo > hi, duplicate texts included)")
+    recs = [r for r in lg.since(0) if r.obj["path"] == "timeline.idb"]
+    check(len(recs) == 1 and
+          len(recs[0].obj["data"].get("uncalibrated") or ()) == 8,
+          "one record lists them: %r" % [r.obj["data"] for r in recs])
+    # finite coefficients can still overflow to inf: hk_cal drops the
+    # value instead of killing the relay (records are allow_nan=False)
+    p = os.path.join(env.tmp, "idb-inf-cal.json")
+    with open(p, "w") as f:
+        json.dump({"byte_order": "big", "calibrations": {
+            "CIXX0009TM": {"type": "polynomial",
+                           "coefficients": [0, 0, 0, 0, 1e299]},
+            "CIXX0010TM": {"type": "polynomial", "coefficients": [1, 2]}},
+            "packets": [{"id": "stix_54102", "service_type": 3,
+                         "service_subtype": 25, "pi1_value": 2,
+                         "fields": [
+                             {"name": "i (NIXD0608)", "byte_offset": 0,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0009TM"},
+                             {"name": "j (NIXD0609)", "byte_offset": 1,
+                              "data_type": "uint8",
+                              "calibration": "CIXX0010TM"}]}]}, f)
+    idb = idb_mod.load(p)
+    stub = types.SimpleNamespace(idb=idb)
+    got = relay_mod.Relay._hk_cal(stub, {"sid": 2},
+                                  {"NIXD0608": 255, "NIXD0609": 3})
+    check(got == {"NIXD0609": 7}, "the inf value is dropped: %r" % got)
+    json.dumps(got, allow_nan=False)
+
+
 def t_idb_real_json(env):
     """A2: the ground station's real JSON (skipped when the GS repo is
     absent): SID 1 has > 30 and SID 2 > 80 fields, the aliases resolve,
     every coded field with a known data_type decodes, the mode field is
-    the minimal decoder's, everything raw."""
+    the minimal decoder's, the JSON's calibrations apply."""
     path = os.path.expanduser(config_mod.DEFAULTS["timeline"]["idb_json"])
     if not os.path.exists(path):
         print("     (skipped: no IDB JSON at %s)" % path)
@@ -3762,9 +3944,9 @@ def t_idb_real_json(env):
           idb.aliases.get("hk.archive_usage") == (2, "NIXD0003") and
           idb.aliases.get("hk.cpu_load") == (2, "NIXD0002") and
           idb.aliases.get("hk.mode") == (2, "NIXD0023") and
-          "hk.trig_med" not in idb.aliases and
-          "hk.trig_max" not in idb.aliases,
-          "the pinned aliases, no 'rigger' name today: %r" % idb.aliases)
+          idb.aliases.get("hk.trig_med") == (2, "NIX00072") and
+          idb.aliases.get("hk.trig_max") == (2, "NIX00073"),
+          "the pinned aliases: %r" % idb.aliases)
     # decoded fields per SID == the JSON's coded fields with a known
     # data_type; the skipped data_types are named in the failure text
     with open(path, encoding="utf-8") as f:
@@ -3784,10 +3966,41 @@ def t_idb_real_json(env):
               "SID %d: %d decoded != %d coded with a known data_type "
               "(skipped data_types: %r)" % (sid, len(idb.hk_fields(sid)),
                                             len(known), unk))
-    check(all(f.raw for f in f1 + f2), "raw-only without the sqlite")
+    check(all(f.raw == (f.cal is None) and
+              f.cal in (None, "poly", "interp", "text")
+              for f in f1 + f2), "raw iff no usable calibration")
     app = bytes(random.randrange(256) for _ in range(96))
     check(idb.decode_hk(1, app)["NIXD0023"] == app[1] & 0x0F,
           "the real mode field is the minimal decoder's")
+
+
+def t_idb_real_calibrations(env):
+    """HKC: the real JSON's calibrations (skipped when the GS repo is
+    absent): mode 5 is NOMINAL, the CPU load scales by 4, the RB level
+    7 is the overflow text, the temperatures clamp below their first
+    point."""
+    path = os.path.expanduser(config_mod.DEFAULTS["timeline"]["idb_json"])
+    if not os.path.exists(path):
+        print("     (skipped: no IDB JSON at %s)" % path)
+        return
+    idb = idb_mod.load(path)
+    check(idb is not None, "the real IDB loads")
+    check(idb.calibrate(2, "NIXD0023", 5) == "NOMINAL",
+          "mode raw 5 -> NOMINAL")
+    check(idb.calibrate(2, "NIXD0002", 3) == 12, "CPU load raw 3 -> 12")
+    check(idb.calibrate(2, "NIXD0501", 7) == "Overflow occur",
+          "RB level raw 7 -> the overflow text")
+    check(idb.calibrate(2, "NIXD0025", 100) == 99.99,
+          "an interpolation clamps below its first point")
+    f = {x.code: x for x in idb.hk_fields(2)}
+    check(f["NIXD0023"].cal == "text" and
+          f["NIXD0023"].labels.index("NOMINAL") == 5, "the mode labels")
+    check(f["NIXD0002"].cal == "poly" and f["NIXD0002"].unit == "%" and
+          not f["NIXD0002"].raw, "the CPU load poly keeps its unit")
+    check(f["NIXD0501"].cal == "text" and
+          f["NIXD0501"].labels[7] == "Overflow occur", "the RB labels")
+    check(f["NIX00072"].cal is None and f["NIX00072"].raw,
+          "the trigger med has no calibration")
 
 
 def t_tc_237_18_label(env):
@@ -4255,7 +4468,9 @@ CASES = [("config", t_config), ("argv golden", t_argv),
           t_idb_mode_matches_minimal_decoder),
          ("IDB: missing JSON (A2)", t_idb_missing),
          ("IDB: relay attaches hk (A2)", t_idb_relay_hk),
+         ("IDB: calibration (HKC)", t_idb_calibration),
          ("IDB: real JSON (A2)", t_idb_real_json),
+         ("IDB: real calibrations (HKC)", t_idb_real_calibrations),
          ("truncated TC/TM input", t_truncated),
          ("time sync window (D-PLd)", t_timesync_window),
          ("time sync verdicts", t_timesync_verdicts),

@@ -526,8 +526,14 @@ HK and markers on one bench clock, for the plots and for
   `truth:<path>`, `presented:<path>` (from `sample` and `state`
   records), `hk:<sid>:<code>` plus the aliases `hk.cpu_load`,
   `hk.rb_level`, `hk.trig_med`, `hk.trig_max`, `hk.archive_usage`,
-  `hk.mode` (from `tm` records with `data.hk`), and the marker kinds
-  `fault`, `force`, `tc`, `event`, `mode`, `power`, `scenario` (one
+  `hk.mode` (from `tm` records with `data.hk`; a calibrated field
+  plots its `data.hk_cal` value — a number with the unit for
+  poly/interp, labelled steps in the text_ranges order for text — and
+  its catalogue entry says `cal`: `poly`|`interp`|`text`|`raw`; a
+  `tm` record without `hk_cal`, e.g. in a run logged before HKC,
+  plots raw with `cal: raw`), and
+  the marker kinds `fault`, `force`, `tc`, `event`, `mode`, `power`,
+  `scenario` (one
   point per record, the hover text is the label, e.g.
   `TC(237,18) param 312 = 0`). Bools plot as 0/1, enum strings (link
   up/down, the timesync verdict) as labelled steps. Each series keeps
@@ -541,10 +547,17 @@ HK and markers on one bench clock, for the plots and for
 - **IDB** (`stixplat/idb.py`): with the ground station's
   `stix_idb_tlm.json` (`[timeline] idb_json`; the `/idb` mount in the
   container), TM(3,25) SID 1/2 records carry `data.hk = {code: value}`
-  and the series get their names and units. Without it the HK series
+  (the wire truth) plus `data.hk_cal = {code: calibrated}` for the
+  fields with a calibration, and the series get their names and units.
+  The JSON's `calibrations` table is applied: a polynomial
+  (value = sum c_i·raw^i), an interpolation (linear between the
+  [raw, eng] points, clamped outside the range) or a text (the text of
+  the range containing the raw, else nothing to plot);
+  `hk.trig_med`/`hk.trig_max` are the pinned NIX00072/NIX00073. A
+  field whose calibration is unknown or broken stays raw (one
+  `timeline.idb` record lists them). Without the JSON the HK series
   are absent and everything else still works. `[timeline] idb_sqlite`
-  is reserved for calibration curves; until one is applied a value is
-  raw.
+  stays reserved for curves the JSON does not carry.
 - **Views** (`stixplat/views.py`): JSON files
   `{"name", "window": "live"|"1m"|"10m"|"60m"|"run", "markers":
   [kinds], "panels": [{"title", "series": [ids]}]}` in

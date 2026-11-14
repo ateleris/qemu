@@ -1281,7 +1281,8 @@ function tlAppendPt(id, t, v) {
   const have = e ? e.kind : (TL.kindNew.get(id) || kind);
   if (have !== kind) return;    // one kind per series (series.py)
   if (!e && !TL.kindNew.has(id)) TL.kindNew.set(id, kind);
-  if (kind === "enum") {        // the value is its index in first-seen order
+  if (kind === "enum") {        // the value is its index in the
+    // catalogue's value order (first-seen for unknown ids)
     let vals = TL.bufEnum.get(id);
     if (!vals) {
       vals = e && e.values ? [...e.values] : [];
@@ -1305,14 +1306,28 @@ function tlTm(t, d) {
   const dec = d.decoded || {};
   const hk = d.hk;
   if (hk && typeof hk === "object" && (dec.sid === 1 || dec.sid === 2)) {
+    const cal = (d.hk_cal && typeof d.hk_cal === "object") ? d.hk_cal : {};
+    const codes = Object.keys(hk);
+    if (codes.length &&
+        !TL.catById.has("hk:" + dec.sid + ":" + codes[0])) {
+      // the first HK of this SID since the page's catalogue: the server
+      // seeds text enums in text_ranges order and binds the aliases, so
+      // refresh the catalogue (once) and skip this report instead of
+      // guessing first-seen indices
+      if (!TL.catRefresh)
+        TL.catRefresh = tlCatalogue().finally(() => { TL.catRefresh = null; });
+      return;
+    }
     for (const [code, v] of Object.entries(hk)) {
       if (typeof v !== "number" || !isFinite(v)) continue;
       const base = "hk:" + dec.sid + ":" + code;
-      tlAppendPt(base, t, v);
       const label = (TL.catById.get(base) || {}).label;
-      for (const a of (label &&
-           TL.aliasOf.get("hk:" + dec.sid + ":" + label)) || [])
-        tlAppendPt(a, t, v);
+      const ids = [base].concat(
+        (label && TL.aliasOf.get("hk:" + dec.sid + ":" + label)) || []);
+      const c = code in cal ? cal[code] : v;   // hk_cal first, else raw
+      if (c === null || (typeof c === "number" && !isFinite(c)))
+        continue;     // a text calibration with the raw in no range
+      for (const i of ids) tlAppendPt(i, t, c);
     }
   }
   if (dec.type === 5 && dec.eid != null) {

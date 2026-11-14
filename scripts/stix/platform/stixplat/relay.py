@@ -14,6 +14,7 @@ logged, and the queue is dropped (logged) at power off and at boot.
 """
 
 import json
+import math
 import os
 import socket
 import threading
@@ -28,8 +29,8 @@ UDP_MAX = 65535 + 8
 class Relay:
     def __init__(self, cfg, run_dir, log, clock, link_ok, idb=None):
         """@link_ok() -> None when TCs may reach QEMU, else the reason.
-        @idb is the Idb attaching data.hk to HK reports (timeline plan
-        A2), or None without one."""
+        @idb is the Idb attaching data.hk and data.hk_cal to HK reports
+        (timeline plan A2/HKC), or None without one."""
         self.cfg = cfg
         self.log = log
         self.clock = clock
@@ -94,6 +95,9 @@ class Relay:
                     "text": decode_mod.describe(dec)}
             if hk is not None:
                 data["hk"] = hk
+                hkc = self._hk_cal(dec, hk)
+                if hkc is not None:
+                    data["hk_cal"] = hkc
             rec = self.log.emit("tm", "tm", "tm.0x%03x" % (dec["apid"] if dec
                                                           else 0),
                                 data, sim_est=True)
@@ -111,13 +115,35 @@ class Relay:
 
     def _hk(self, dec, sp):
         """data.hk of an HK report (timeline plan A2): the IDB fields of
-        TM(3,25) SID 1/2, or None without an Idb (the old minimal
+        TM(3,25) SID 1/2 raw, or None without an Idb (the old minimal
         decode stays; the HK series are then absent)."""
         if self.idb is None or not dec or \
                 dec.get("apid") != decode_mod.APID_HK or \
                 dec.get("sid") not in (1, 2):
             return None
         return self.idb.decode_hk(dec["sid"], sp[16:])
+
+    def _hk_cal(self, dec, hk):
+        """data.hk_cal of an HK report (timeline HKC): the calibrated
+        value of every field with a calibration, or None when nothing
+        is calibrated. data.hk stays the wire truth."""
+        if self.idb is None or not hk or dec.get("sid") not in (1, 2):
+            return None
+        out = {}
+        for f in self.idb.hk_fields(dec["sid"]):
+            if f.cal is None:
+                continue
+            v = hk.get(f.code)
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            try:
+                c = self.idb.calibrate(dec["sid"], f.code, v)
+            except ArithmeticError:      # an overflowing polynomial
+                continue
+            if isinstance(c, float) and not math.isfinite(c):
+                continue     # never into a record (allow_nan=False)
+            out[f.code] = c
+        return out or None
 
     # -- TC ---------------------------------------------------------------
     def _tc_loop(self):

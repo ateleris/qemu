@@ -10,7 +10,11 @@ Series ids:
   `presented:<path>` only where presented differs from truth;
 - `hk:<sid>:<code>` — a decoded HK field of a `tm` record with
   data.hk (timeline A2), plus the readable aliases of idb.ALIASES
-  (hk.cpu_load, hk.rb_level, ...) when an Idb is loaded;
+  (hk.cpu_load, hk.rb_level, ...) when an Idb is loaded; with
+  data.hk_cal (HKC) a poly/interp field feeds the calibrated number
+  (the unit) and a text field an enum indexed by the text_ranges
+  order (the labels), so the axis order is stable; the catalogue entry
+  says `cal`: "poly"|"interp"|"text"|"raw";
 - marker kinds `fault`, `force`, `tc`, `event`, `mode`, `power`,
   `scenario` — one point per record, the label is the hover text
   (`TC(237,18) param 312 = 0`, `EID 0x0021 mode change`, ...);
@@ -18,8 +22,9 @@ Series ids:
 
 Values: bool as 0/1 (kind "bool"), int/float as-is (kind "number"),
 str as the index in the order first seen (kind "enum", `values` lists
-the strings). A record that carries a value of another kind than the
-series is skipped. Points beyond max_points_per_series drop the oldest
+the strings; an HK text calibration seeds them with the labels). A
+record that carries a value of another kind than the series is
+skipped. Points beyond max_points_per_series drop the oldest
 (catalogue notes "truncated_before"); query() decimates a window with
 more than max_points points into equal-time buckets, each bucket
 returning its first t and the last/min/max value, so spikes survive.
@@ -33,7 +38,7 @@ LABEL_CAP = 240          # a bucket's joined marker labels
 
 class _Series:
     __slots__ = ("id", "label", "unit", "source", "kind", "values",
-                 "points", "truncated_before")
+                 "points", "truncated_before", "cal")
 
     def __init__(self, sid, label, unit, source, kind):
         self.id = sid
@@ -41,9 +46,11 @@ class _Series:
         self.unit = unit
         self.source = source
         self.kind = kind
-        self.values = []            # enum strings, in first-seen order
+        self.values = []            # enum strings: first-seen order, or a
+        #                             text calibration's text_ranges order
         self.points = []            # (t, value) ascending, markers str
         self.truncated_before = None
+        self.cal = None             # hk: "poly"|"interp"|"text"|"raw"
 
 
 class SeriesIndex:
@@ -136,18 +143,35 @@ class SeriesIndex:
         hk = data.get("hk")
         if isinstance(hk, dict) and dec.get("sid") in (1, 2):
             sid = dec["sid"]
+            hkc = data.get("hk_cal")
+            cal = hkc if isinstance(hkc, dict) else {}
             for code, v in hk.items():
                 if isinstance(v, bool) or not isinstance(v, (int, float)):
                     continue
                 f = self._fields.get((sid, code))
-                unit = None if f is None else \
-                    ("raw" if f.raw else (f.unit or None))
                 label = code if f is None else f.name
-                self._add_num("hk:%d:%s" % (sid, code), label, unit,
-                              "hk", "number", t, v)
+                ids = ["hk:%d:%s" % (sid, code)]
                 alias = self._alias_of.get((sid, code))
                 if alias is not None:
-                    self._add_num(alias, label, unit, "hk", "number", t, v)
+                    ids.append(alias)
+                if f is not None and f.cal == "text" and code in cal:
+                    cv = cal[code]
+                    if not isinstance(cv, str):
+                        continue    # raw in no text range: nothing to plot
+                    for i in ids:
+                        self._add_hk_text(i, label, t, cv, f.labels, "text")
+                    continue
+                if code in cal and not isinstance(cal[code], bool) and \
+                        isinstance(cal[code], (int, float)):
+                    for i in ids:
+                        self._add_num(i, label, f.unit if f else None,
+                                      "hk", "number", t, cal[code],
+                                      f.cal if f else None)
+                    continue
+                unit = "raw" if f is not None else None
+                for i in ids:
+                    self._add_num(i, label, unit, "hk", "number", t, v,
+                                  "raw" if f is not None else None)
         if dec.get("type") == 5 and "eid" in dec:
             label = "EID 0x%04X" % dec["eid"]
             if dec.get("eid_name"):
@@ -178,16 +202,33 @@ class SeriesIndex:
                                        data.get("state") or "?")
         self._add_marker(kind, t, label)
 
-    def _add_num(self, sid, label, unit, source, kind, t, v):
+    def _add_num(self, sid, label, unit, source, kind, t, v, cal=None):
         s = self._series.get(sid)
         if s is None:
             s = _Series(sid, label, unit, source, kind)
+            s.cal = cal
             self._series[sid] = s
         elif s.kind != kind:
             return                      # one kind per series
         if s.unit is None and unit is not None:
             s.unit = unit               # e.g. a snapshot after a sample
         self._keep(s, t, v)
+
+    def _add_hk_text(self, sid, label, t, v, labels, cal):
+        """A text-calibrated HK point: the value is the text's index in
+        the ranges order (@labels), not first-seen, so the axis order is
+        the text_ranges order."""
+        s = self._series.get(sid)
+        if s is None:
+            s = _Series(sid, label, None, "hk", "enum")
+            s.values = list(labels)
+            s.cal = cal
+            self._series[sid] = s
+        if s.kind != "enum" or not isinstance(v, str):
+            return
+        if v not in s.values:
+            s.values.append(v)          # a text outside the labels
+        self._keep(s, t, s.values.index(v))
 
     def _add_enum(self, sid, label, source, t, v, unit=None):
         s = self._series.get(sid)
@@ -225,6 +266,8 @@ class SeriesIndex:
                 s = self._series[sid]
                 e = {"id": sid, "label": s.label, "unit": s.unit,
                      "source": s.source, "kind": s.kind}
+                if s.cal is not None:
+                    e["cal"] = s.cal
                 if s.kind == "enum":
                     e["values"] = list(s.values)
                 if s.truncated_before is not None:
