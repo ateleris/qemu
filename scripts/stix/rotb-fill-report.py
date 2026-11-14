@@ -140,6 +140,13 @@ DEFS = {
     "files": "files_per_s = count of 'file ' lines in flash-truth.txt / "
              "window seconds; null without the truth file (a flash "
              "program burst is not a file)",
+    "hk_rb_level": "the FSW's own fill report: TM(3,25) SID 2 status4 "
+                   "bits 31..29 (HKAcquire.c:322-327, app byte 62 as in "
+                   "att-sid2-check.py); 0..6 = blocks*100/capacity*10/143 "
+                   "(14.3 % bins), 7 = an overrun since the previous HK "
+                   "(cleared on read); fill_bound_level = the same bin of "
+                   "the fill.csv peak, so an HK level above it (7 aside) "
+                   "is a decode or model inconsistency",
 }
 
 
@@ -303,6 +310,56 @@ def count_flash_truth_files(path):
             if line.startswith("file "):
                 n += 1
     return n
+
+
+HK_SID2_STATUS4_OFF = 62          # app byte of status4 (TM_3.c SID 2)
+RB_LEVEL_SHIFT, RB_LEVEL_MASK = 29, 0x7
+RB_LEVEL_BIN_X10 = 143            # RB_LEVEL_PERCENT_BIN_WIDTH_TIMES_10
+
+
+def rb_level_of(count, capacity):
+    """The FSW's HK level bin of a block count (HKAcquire.c:323)."""
+    return ((count * 100) // capacity * 10) // RB_LEVEL_BIN_X10
+
+
+def parse_hk_rb(path):
+    """tm.log -> [(vclock_s, level)] from the TM(3,25) SID 2 lines
+    ("<vclock_ns> <apid> 3 25 <app hex>", the drive's format; the app
+    data starts at the SID)."""
+    out = []
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            f = line.split()
+            if len(f) < 5 or f[2] != "3" or f[3] != "25":
+                continue
+            app = f[4]
+            end = 2 * (HK_SID2_STATUS4_OFF + 4)
+            if not app.startswith("02") or len(app) < end:
+                continue
+            try:
+                st4 = int(app[2 * HK_SID2_STATUS4_OFF:end], 16)
+                vc = int(f[0]) / 1e9
+            except ValueError:
+                continue
+            out.append((vc, (st4 >> RB_LEVEL_SHIFT) & RB_LEVEL_MASK))
+    return out
+
+
+def hk_rb_summary(samples, peak, capacity):
+    hist = {}
+    for _, lv in samples:
+        hist[str(lv)] = hist.get(str(lv), 0) + 1
+    levels = [lv for _, lv in samples if lv != 7]
+    over = [t for t, lv in samples if lv == 7]
+    bound = (rb_level_of(peak["count"], capacity)
+             if peak and capacity else None)
+    return {"samples": len(samples), "histogram": hist,
+            "max_level": max(levels) if levels else None,
+            "overrun_samples": len(over),
+            "first_overrun_s": over[0] if over else None,
+            "fill_bound_level": bound,
+            "consistent": (None if bound is None or not levels
+                           else max(levels) <= bound)}
 
 
 def _bracket_secs(e):
@@ -628,6 +685,18 @@ def report(run_dir, plot=True):
                          if k not in sm["params"]})
     sm["generated_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                         time.gmtime())
+    tm_path = os.path.join(run_dir, "tm.log")
+    if os.path.isfile(tm_path):
+        try:
+            sm["hk_rb_level"] = hk_rb_summary(
+                parse_hk_rb(tm_path), sm["fill"]["peak"],
+                sm["fill"].get("capacity_blocks"))
+            if sm["hk_rb_level"]["consistent"] is False:
+                notes.append("HK rb level above the fill.csv peak's bin")
+        except OSError as e:
+            notes.append("tm.log unreadable (%s)" % e)
+    else:
+        notes.append("tm.log absent: no HK rb level")
     sm["defs"] = DEFS
     sm["notes"] = notes
 
@@ -830,6 +899,15 @@ def self_test():
         _st_write(os.path.join(tmp, "events.log"), events)
         _st_write(os.path.join(tmp, "flash-truth.txt"), truth)
         _st_write(os.path.join(tmp, "run.json"), run_json)
+
+        def sid2(level):
+            st4 = (level << RB_LEVEL_SHIFT) | 0x00F00000
+            return "02" + "00" * 61 + "%08X" % st4 + "00" * 20
+        _st_write(os.path.join(tmp, "tm.log"),
+                  "100 1447 3 25 %s\n101 1447 3 25 %s\n"
+                  "102 1509 3 25 04000000\n103 1447 3 25 %s\n"
+                  "104 1447 3 25 02AB\n"
+                  % (sid2(0), sid2(6), sid2(7)))
         sm = report(tmp, plot=False)
 
         ok = 0
@@ -910,6 +988,17 @@ def self_test():
                              "icount_shift": 6, "latency": True,
                              "seconds": 600, "rotb_overflow": "drop-new"},
             "params %r" % sm["params"])
+        chk(sm["hk_rb_level"] == {"samples": 3,
+                                  "histogram": {"0": 1, "6": 1, "7": 1},
+                                  "max_level": 6, "overrun_samples": 1,
+                                  "first_overrun_s": 103e-9,
+                                  "fill_bound_level": 6,
+                                  "consistent": True},
+            "hk_rb_level %r" % sm.get("hk_rb_level"))
+        chk(rb_level_of(14936, 104448) == 0 and
+            rb_level_of(14937, 104448) == 0 and
+            rb_level_of(15669, 104448) == 1 and
+            rb_level_of(104448, 104448) == 6, "rb_level_of bins")
         with open(os.path.join(tmp, "summary.json")) as fh:
             sm2 = json.load(fh)
         chk(sm2["inflow"]["mean_blocks_per_s"] == 49.0
