@@ -26,6 +26,10 @@ https://claude.ai/artifact/V9rbLbVVcfwFJjnoiKciqJ for the layout.
 - API v1 additions only; no existing field, path or verb changes.
 - Record schema v1: new kind `sample` and topic `sample` are additions
   to `log.KINDS` / `log.TOPICS`; `check_record` keeps working.
+- Listener rule (review): `RecordLog.emit` calls `self.listeners`
+  after releasing `self.cond` (collect under the lock, call after),
+  each in try/except that logs once per listener and never re-raises;
+  a listener never takes `state.lock` or emits a record.
 - Self-test: `cd scripts/stix/platform && python3 stixplat.py --self-test`
   must stay PASS; every task adds its own `check(...)` cases in
   `stixplat/selftest.py`.
@@ -53,13 +57,13 @@ https://claude.ai/artifact/V9rbLbVVcfwFJjnoiKciqJ for the layout.
 ### Task A1: sampler
 
 **Files:** create `stixplat/timeline.py`; modify `config.py`
-(DEFAULTS `timeline`), `log.py` (KINDS += "sample", TOPICS += "sample",
+(DEFAULTS `timeline`; `sample_s` default -1.0 = "by mode", since `_merge` type-checks against the default), `log.py` (KINDS += "sample", TOPICS += "sample",
 `_TOPIC` maps sample->sample), `core.py` (start/stop the sampler),
 `selftest.py`.
 
 **Interfaces — produces:**
-- config `[timeline]`: `sample_s` (float, default `None` = 1.0 in
-  interactive, 0 in run mode; 0 = off; range 0 or 0.1..60),
+- config `[timeline]`: `sample_s` (float, default -1.0 = 1.0 in
+  interactive, 0 in run mode; 0 = off; range -1, 0 or 0.5..60),
   `sample_paths` (list of fnmatch globs, default
   `["instrument.rotb.*", "instrument.detector.*cps",
   "instrument.detector.flare", "idpu.watchdog.count",
@@ -75,6 +79,9 @@ https://claude.ai/artifact/V9rbLbVVcfwFJjnoiKciqJ for the layout.
   `truth` per matched leaf, plus `"<path>@presented": value` only
   where presented != truth. Values: int/float as-is, bool as-is,
   str as-is, others skipped. No record when power is off / tree empty.
+  Start/stop via `power.hooks` on_boot/on_off like keepalive.py
+  (bench-time deadlines do not fire while off or paused); every tick
+  re-arms itself.
 
 - [ ] Self-test `sampler_record_shape`: fake StateTree with
   `instrument.rotb.count=5`, `instrument.rotb.full=False`,
@@ -101,11 +108,20 @@ result goes into the `tm` record data, `relay.py`/`plat.py`), `selftest.py`.
 - Aliases (readable ids) in `idb.ALIASES`: `hk.cpu_load`,
   `hk.rb_level` (NIXD0501), `hk.trig_med`, `hk.trig_max`,
   `hk.archive_usage` (NIXD0003), `hk.mode` — resolve the codes for
-  CPU load and the trigger fields from the JSON by name.
+  CPU load and the trigger fields from the JSON by name; an alias
+  whose field is not in the JSON is absent from the catalogue (no field
+  name contains "rigger" today, so `hk.trig_*` may be absent).
 
 **Pinned semantics to establish first:** the JSON's `byte_offset` base
 (packet start, data field, or app data) and its bit numbering
-(`bit_offset` 0 = MSB or LSB). Decide them from the known RB level:
+(`bit_offset` 0 = MSB or LSB). **Settled at plan review:** byte_offset
+is relative to the app data (SID at byte 0); bit_offset counts from the
+MSB of the field read big-endian; a field may cross bytes (Archive
+usage NIXD0003: byte 51, bit_offset 7, length 8), so read
+ceil((bit_offset+bit_length)/8) bytes. The packets are `stix_54101`
+(pi1 1) and `stix_54102` (pi1 2), fields in `parameters`. RB level
+NIXD0501 is in SID 2 only; mode is NIXD0023 (byte 1, bit_offset 4,
+len 4); CPU load NIXD0002. Evidence: Decide them from the known RB level:
 FSW `TM_3.c` packs it into status4 bits 31..29 at app byte 62 bits 7..5
 while the JSON says byte 62, bit_offset 0, bit_length 3 — so bit_offset
 counts from the MSB and byte_offset is relative to the app data
@@ -114,13 +130,16 @@ counts from the MSB and byte_offset is relative to the app data
 docstring with the evidence.
 
 - [ ] Self-test `idb_rb_level`: a synthetic SID 2 app buffer with
-  byte 62 = 0b101_00000 -> `decode_hk(2, app)["NIXD0501"] == 5`.
+  byte 62 = 0b101_00000 -> `decode_hk(2, app)["NIXD0501"] == 5`;
+  byte 62 = 0b000_00101 -> 0 (pins MSB numbering).
+- [ ] Self-test `idb_cross_byte`: NIXD0003 with bytes 51,52 =
+  0x01,0xFE -> 0xFF.
 - [ ] Self-test `idb_mode_matches_minimal_decoder`: random app bytes,
   the IDB mode field == `app[1] & 0x0F` (or the documented relation).
 - [ ] Self-test `idb_missing`: `idb.load("/nonexistent")` is None, the
   relay logs `tm` records without `hk`, no exception.
 - [ ] Self-test `idb_real_json` (skips with a PASS note if the GS repo
-  is absent): load the real JSON, SID 1 and SID 2 have > 20 fields,
+  is absent): load the real JSON, SID 1 has > 30 and SID 2 > 80 fields,
   every alias resolves.
 - [ ] Calibration from sqlite: optional; if `idb_sqlite` set and the
   curve is a linear/polynomial in the IDB, apply it and drop "raw";
@@ -129,8 +148,8 @@ docstring with the evidence.
 
 ### Task A3: TC(237,18) labels
 
-**Files:** where `tc` records are emitted for `tc.gs.send` and relayed
-GS TCs (`plat.py v_tc_gs`, `relay.py`); `selftest.py`.
+**Files:** `relay.py` `gs_tc` (the one emit site for built and relayed
+GS TCs, ~relay.py:143-155); `selftest.py`.
 
 - [ ] For service 237 subtype 18 add `data.param = {"index": u16,
   "sub": u8, "value": u32}` decoded from the app data (PIX00016 u16,
@@ -156,8 +175,8 @@ ring append, outside nothing else — keep it cheap), `selftest.py`.
 - Ids: `truth:<path>`, `presented:<path>` (from `sample` and `state`
   records), `hk:<sid>:<code>` + aliases (from `tm` records with
   `data.hk`), markers `fault`, `force`, `tc`, `event`, `mode`,
-  `power`, `scenario` (from fault/force/tc/tm(5,x)/power/expect
-  records; marker points carry `label` text, e.g. `TC(237,18) param
+  `power`, `scenario` (from fault/force/tc/tm(5,x)/power records;
+  `scenario` = log/expect records whose path starts with `scenario.`; marker points carry `label` text, e.g. `TC(237,18) param
   312 = 0`, `EID 0x0021 mode change`).
 - Decimation: when a window has > max_points samples, buckets of equal
   time, each bucket returns first t, and min/max/last; step series
@@ -192,7 +211,8 @@ cpu-and-hk,memory-upsets,power-and-link}.json`; `stixplat/views.py`;
 - Starter views copied into views_dir only when missing.
 - "everything" is generated (`GET /api/v1/views/everything`): one panel
   per leaf group (path up to the second dot) from the catalogue, all
-  markers; it cannot be saved over or deleted (409).
+  markers; it cannot be saved over or deleted (409); the route
+  checks `everything` before `<name>`.
 - `GET /api/v1/views` -> `{"views": [names], "dir": d}`;
   `GET /api/v1/views/<name>`; verbs `view.save {name, view}`,
   `view.delete {name}`.
@@ -277,7 +297,9 @@ cpu-and-hk,memory-upsets,power-and-link}.json`; `stixplat/views.py`;
   vertical lines across all panels coloured by kind with hover label,
   hover readout of every series at the cursor, drag to zoom,
   double-click to reset, "save view as" (`view.save`), delete.
-- [ ] Live: SSE topics `sample,tm,tc,cmd,fault,state,expect`; appends
+- [ ] Live: SSE topics `sample,tm,tc,cmd,fault,state,expect` (add
+  "sample" to the page's listener list ~index.html:679 and its
+  TOPIC/onRecord handling ~:634-662); appends
   points client-side from records (same rules as series.py) and
   re-queries `/series` on zoom or window change.
 - [ ] Page says "HK series need the IDB JSON" when the catalogue has
@@ -304,3 +326,12 @@ gate → ff. Post-merge steps per memory.
 2. Detector stimulus (board 2c): per-detector/pixel rates, spectra,
    single events need detector-model work: plan it?
 3. Run bundles (board 7): its own design.
+
+## Plan review (GLM, 2026-11-14) — applied
+
+Blocker "no SID 2 packet" was wrong (the worker lost grep mid-session;
+`stix_54102` exists, 83 fields). Applied: listener rule outside the log
+lock with try/except; `sample_s` sentinel -1; sampler via power hooks;
+TC(237,18) label in `relay.gs_tc`; scenario marker prefix rule; page
+SSE edits named; sampler floor 0.5 s; `everything` route order; mode
+code NIXD0023; cross-byte fields; test `series_api_ids_repeat`.
