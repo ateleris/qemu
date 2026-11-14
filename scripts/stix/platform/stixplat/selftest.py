@@ -11,6 +11,7 @@ import hashlib
 import http.client
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -23,8 +24,10 @@ from . import api as api_mod
 from . import config as config_mod
 from . import decode
 from . import faults as faults_mod
+from . import idb as idb_mod
 from . import keepalive as keepalive_mod
 from . import tcbuild
+from . import timeline as timeline_mod
 from . import timesync
 from . import core as core_mod
 from . import log as log_mod
@@ -33,6 +36,7 @@ from . import qemu as qemu_mod
 from . import retention
 from . import scenario
 from . import rundir
+from . import state as state_mod
 from .dispatch import VerbError
 from .qmp import QmpConnection, QmpError, parse_address
 from .simclock import SimClock
@@ -171,6 +175,20 @@ def t_config(env):
     c = config_mod.load(text='[qemu]\nicount_shift = 7\npace = "fast"\n')
     check(c["qemu"]["icount_shift"] == 7 and c["qemu"]["pace"] == "fast",
           "a fast profile needs icount > 0")
+    # A1: the timeline sampler keys (-1 = by mode, 0 = off, 0.5..60)
+    c = config_mod.load()
+    check(c["timeline"]["sample_s"] == -1.0 and
+          c["timeline"]["idb_json"].startswith("~/dev/") and
+          c["timeline"]["views_dir"] == "",
+          "the timeline defaults")
+    for bad in ('[timeline]\nsample_s = 0.4\n',
+                '[timeline]\nsample_s = 61\n',
+                '[timeline]\nsample_s = -2\n',
+                '[timeline]\nsample_s = "1"\n',
+                '[timeline]\nsample_paths = [1]\n'):
+        raises(config_mod.ConfigError, config_mod.load, text=bad)
+    c = config_mod.load(text='[timeline]\nsample_s = 0.5\n')
+    check(c["timeline"]["sample_s"] == 0.5, "the sampler floor 0.5 s")
 
 
 ARGV_GOLDEN = [
@@ -3443,6 +3461,317 @@ def t_probe_lib(env):
     check(isinstance(units, list), "probe frame_units")
 
 
+# -- timeline (A1 sampler, A2 IDB HK decode, A3 TC(237,18) label) ---------
+def _sampler_rig(paths, leaves):
+    t = [0.0]
+    clk = SimClock(mono_fn=lambda: t[0])
+    clk.process_started()
+    clk.resumed()
+    clk.sample(0)
+    st = state_mod.StateTree()
+    with st.lock:
+        st.leaves.update(leaves)
+    lg = log_mod.RecordLog(None, clk.now)
+    s = timeline_mod.Sampler(clk, st, lg, paths, 1.0)
+    return clk, st, lg, s, t
+
+
+def _sampler_tick(clk, t):
+    t[0] += 1.0
+    clk.sample(int(t[0] * NS))
+    clk.run_due()
+
+
+def _sample_recs(lg):
+    return [r for r in lg.since(0) if r.kind == "sample"]
+
+
+def t_sampler_record_shape(env):
+    """A1: one `sample` record per bench-time tick, keys exactly the
+    matched paths (+ "<path>@presented" only where presented differs),
+    bools and strings as-is, None and containers skipped, nothing while
+    off or unmatched."""
+    clk, st, lg, s, t = _sampler_rig(
+        ["instrument.rotb.*", "platform.timesync.verdict"],
+        {"instrument.rotb.count": state_mod.leaf(5),
+         "instrument.rotb.full": state_mod.leaf(False),
+         "instrument.rotb.spare": state_mod.leaf(None),
+         "instrument.rotb.frames": state_mod.leaf([1, 2]),
+         "platform.timesync.verdict": state_mod.leaf("ok"),
+         "instrument.hk_adc.0": state_mod.leaf(100)})  # not matched
+    s.start()
+    _sampler_tick(clk, t)
+    recs = _sample_recs(lg)
+    check(len(recs) == 1, "one record per tick: %d" % len(recs))
+    r = recs[0]
+    log_mod.check_record(r.obj)
+    check(r.topic == "sample" and r.obj["source"] == "ctl" and
+          r.obj["path"] == "", "the record shape: %r" % r.obj)
+    check(set(r.obj["data"]) == {"instrument.rotb.count",
+                                 "instrument.rotb.full",
+                                 "platform.timesync.verdict"},
+          "exactly the matched leaves: %r" % sorted(r.obj["data"]))
+    check("instrument.rotb.spare" not in r.obj["data"] and
+          "instrument.rotb.frames" not in r.obj["data"],
+          "a None and a list leaf are absent: %r" % sorted(r.obj["data"]))
+    check(r.obj["data"]["instrument.rotb.count"] == 5 and
+          r.obj["data"]["instrument.rotb.full"] is False and
+          r.obj["data"]["platform.timesync.verdict"] == "ok",
+          "values as-is: %r" % r.obj["data"])
+    # presented != truth adds "<path>@presented"
+    with st.lock:
+        st.leaves["instrument.rotb.count"]["presented"] = 7
+    _sampler_tick(clk, t)
+    recs = _sample_recs(lg)
+    check(set(recs[-1].obj["data"]) == {"instrument.rotb.count",
+                                        "instrument.rotb.full",
+                                        "platform.timesync.verdict",
+                                        "instrument.rotb.count@presented"}
+          and recs[-1].obj["data"]["instrument.rotb.count@presented"] == 7,
+          "the presented delta: %r" % sorted(recs[-1].obj["data"]))
+    # no record while off (deadlines do not fire) or with nothing matched
+    n = len(recs)
+    clk.process_ended()
+    _sampler_tick(clk, t)
+    check(len(_sample_recs(lg)) == n, "no record while off")
+    clk.process_started()
+    clk.resumed()
+    with st.lock:
+        st.leaves.clear()
+    _sampler_tick(clk, t)
+    check(len(_sample_recs(lg)) == n, "no record with an empty tree")
+
+
+def t_sampler_off_in_run_mode(env):
+    """A1: sample_s unset means 1 s in interactive and no sampler in run
+    mode; an explicit value overrides it."""
+    cfg = config_mod.load(overrides=dict(env.overrides(), mode="run"))
+    check(cfg["timeline"]["sample_s"] == -1.0, "the sentinel default")
+    ctl = core_mod.Controller(cfg, run_dir=env.run_dir())
+    try:
+        check(ctl.sampler is None, "run mode without sample_s: no sampler")
+    finally:
+        ctl.shutdown()
+    cfg = config_mod.load(overrides=dict(env.overrides(), mode="run",
+                                         timeline={"sample_s": 2.0}))
+    ctl = core_mod.Controller(cfg, run_dir=env.run_dir())
+    try:
+        check(ctl.sampler is not None and ctl.sampler.period_ns == 2 * NS,
+              "run mode with sample_s = 2.0")
+    finally:
+        ctl.shutdown()
+    ctl = env.controller()
+    try:
+        check(ctl.sampler is not None and ctl.sampler.period_ns == NS,
+              "interactive: 1 s")
+    finally:
+        ctl.shutdown()
+
+
+_IDB_SYNTH = {
+    "byte_order": "big",
+    "packets": [
+        {"id": "stix_54101", "service_type": 3, "service_subtype": 25,
+         "pi1_value": 1,
+         "fields": [
+             {"name": "SID (NIX00020)", "byte_offset": 0,
+              "data_type": "uint8"},
+             {"name": "Instrument mode (NIXD0023)", "byte_offset": 1,
+              "data_type": "uint8", "bit_offset": 4, "bit_length": 4},
+             {"name": "CPU load (NIXD0002)", "byte_offset": 15,
+              "data_type": "uint8", "bit_offset": 0, "bit_length": 5,
+              "unit": "%"}]},
+        {"id": "stix_54102", "service_type": 3, "service_subtype": 25,
+         "pi1_value": 2,
+         "fields": [
+             {"name": "SID (NIX00020)", "byte_offset": 0,
+              "data_type": "uint8"},
+             {"name": "Archive Memory usage (NIXD0003)", "byte_offset": 51,
+              "data_type": "uint8", "bit_offset": 7, "bit_length": 8},
+             {"name": "RotBuff fill level (NIXD0501)", "byte_offset": 62,
+              "data_type": "uint8", "bit_offset": 0, "bit_length": 3},
+             {"name": "Med value of trig acc (NIX00072)", "byte_offset": 66,
+              "data_type": "uint32", "bit_offset": 0, "bit_length": 24}]}]}
+
+
+def _idb_synth(env):
+    p = os.path.join(env.tmp, "idb-synth.json")
+    with open(p, "w") as f:
+        json.dump(_IDB_SYNTH, f)
+    return p
+
+
+def t_idb_rb_level(env):
+    """A2 pinned semantics: byte_offset is relative to the app data and
+    bit_offset counts from the MSB."""
+    idb = idb_mod.load(_idb_synth(env))
+    check(idb is not None, "the synthetic IDB loads")
+    app = bytes(62) + bytes((0b101_00000,))
+    check(idb.decode_hk(2, app)["NIXD0501"] == 5, "0b101_00000 -> 5")
+    app = bytes(62) + bytes((0b000_00101,))
+    check(idb.decode_hk(2, app)["NIXD0501"] == 0,
+          "0b000_00101 -> 0 (MSB numbering, not LSB)")
+
+
+def t_idb_cross_byte(env):
+    """A2: a field may cross bytes (NIXD0003: byte 51, bit_offset 7,
+    bit_length 8 -> bytes 51..52)."""
+    idb = idb_mod.load(_idb_synth(env))
+    app = bytes(51) + bytes((0x01, 0xFE))
+    check(idb.decode_hk(2, app)["NIXD0003"] == 0xFF, "0x01,0xFE -> 0xFF")
+
+
+def t_idb_mode_matches_minimal_decoder(env):
+    """A2: the IDB mode field (NIXD0023, byte 1, bit_offset 4,
+    bit_length 4) is decode.py's app[1] & 0x0F."""
+    idb = idb_mod.load(_idb_synth(env))
+    for _ in range(64):
+        app = bytes(random.randrange(256) for _ in range(24))
+        check(idb.decode_hk(1, app)["NIXD0023"] == app[1] & 0x0F,
+              "mode of %s != app[1] & 0x0F" % app.hex())
+
+
+def t_idb_missing(env):
+    """A2: a missing IDB JSON is None with one timeline.idb record; a
+    malformed field is the same (never a TypeError/KeyError out of
+    load); the relay still logs tm records, without hk."""
+    clk = SimClock()
+    lg = log_mod.RecordLog(None, clk.now)
+    missing = os.path.join(env.tmp, "no-idb.json")
+    check(idb_mod.load(missing) is None, "load returns None")
+    check(idb_mod.load(missing, log=lg) is None, "load returns None")
+    recs = [r for r in lg.since(0) if r.obj["path"] == "timeline.idb"]
+    check(len(recs) == 1 and "No such file" in recs[0].obj["data"]["error"],
+          "one timeline.idb record: %r" % [r.obj["data"] for r in recs])
+    # a malformed field makes the file broken: None + the record
+    for i, fld in enumerate((
+            {"name": 5, "byte_offset": 0, "data_type": "uint8"},
+            {"name": "SID (NIX00020)", "data_type": "uint8"},
+            {"name": "SID (NIX00020)", "byte_offset": 0})):
+        p = os.path.join(env.tmp, "idb-bad-%d.json" % i)
+        with open(p, "w") as f:
+            json.dump({"byte_order": "big", "packets": [
+                {"id": "stix_54102", "service_type": 3,
+                 "service_subtype": 25, "pi1_value": 2,
+                 "fields": [fld]}]}, f)
+        lgb = log_mod.RecordLog(None, clk.now)
+        check(idb_mod.load(p, log=lgb) is None, "a bad field: %r" % fld)
+        recs = [r for r in lgb.since(0)
+                if r.obj["path"] == "timeline.idb"]
+        check(len(recs) == 1, "one timeline.idb record for %r: %r"
+              % (fld, [r.obj["data"] for r in recs]))
+    ctl = env.controller(timeline={"idb_json": missing})
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        u = _tm_unit(0x5A4, 3, 25, bytes((2, 5)) + bytes(90))
+        snd.sendto(u, ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"]))
+        wait_for(lambda: any(r.kind == "tm" for r in ctl.log.since(0)),
+                 what="the tm record")
+        rec = [r for r in ctl.log.since(0) if r.kind == "tm"][-1]
+        check("hk" not in rec.obj["data"],
+              "no hk without the IDB: %r" % sorted(rec.obj["data"]))
+        check(rec.obj["data"]["decoded"]["sid"] == 2, "the SID 2 report")
+    finally:
+        snd.close()
+        ctl.shutdown()
+
+
+def t_idb_relay_hk(env):
+    """A2: with the synthetic IDB, a TM(3,25) SID 2 report's tm record
+    carries data.hk; app byte 62 = 0b101_00000 -> NIXD0501 == 5."""
+    ctl = env.controller(timeline={"idb_json": _idb_synth(env)})
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        app = bytes((2,)) + bytes(61) + bytes((0b101_00000,))
+        u = _tm_unit(0x5A4, 3, 25, app)
+        snd.sendto(u, ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"]))
+        wait_for(lambda: any(r.kind == "tm" for r in ctl.log.since(0)),
+                 what="the tm record")
+        rec = [r for r in ctl.log.since(0) if r.kind == "tm"][-1]
+        check(rec.obj["data"]["decoded"]["sid"] == 2, "the SID 2 report")
+        check(rec.obj["data"].get("hk", {}).get("NIXD0501") == 5,
+              "hk attached with the RB level: %r"
+              % rec.obj["data"].get("hk"))
+    finally:
+        snd.close()
+        ctl.shutdown()
+
+
+def t_idb_real_json(env):
+    """A2: the ground station's real JSON (skipped when the GS repo is
+    absent): SID 1 has > 30 and SID 2 > 80 fields, the aliases resolve,
+    every coded field with a known data_type decodes, the mode field is
+    the minimal decoder's, everything raw."""
+    path = os.path.expanduser(config_mod.DEFAULTS["timeline"]["idb_json"])
+    if not os.path.exists(path):
+        print("     (skipped: no IDB JSON at %s)" % path)
+        return
+    idb = idb_mod.load(path)
+    check(idb is not None, "the real IDB loads")
+    f1, f2 = idb.hk_fields(1), idb.hk_fields(2)
+    check(len(f1) > 30, "SID 1 has %d fields" % len(f1))
+    check(len(f2) > 80, "SID 2 has %d fields" % len(f2))
+    for alias, (sid, code) in sorted(idb.aliases.items()):
+        check(code in [f.code for f in idb.hk_fields(sid)],
+              "alias %s -> (%d, %s) is in the catalogue" % (alias, sid,
+                                                            code))
+    check(idb.aliases.get("hk.rb_level") == (2, "NIXD0501") and
+          idb.aliases.get("hk.archive_usage") == (2, "NIXD0003") and
+          idb.aliases.get("hk.cpu_load") == (2, "NIXD0002") and
+          idb.aliases.get("hk.mode") == (2, "NIXD0023") and
+          "hk.trig_med" not in idb.aliases and
+          "hk.trig_max" not in idb.aliases,
+          "the pinned aliases, no 'rigger' name today: %r" % idb.aliases)
+    # decoded fields per SID == the JSON's coded fields with a known
+    # data_type; the skipped data_types are named in the failure text
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    for sid in (1, 2):
+        flds = [x for pkt in raw["packets"] if isinstance(pkt, dict) and
+                (pkt.get("service_type"), pkt.get("service_subtype"),
+                 pkt.get("pi1_value")) == (3, 25, sid)
+                for x in (pkt.get("fields") or []) if isinstance(x, dict)]
+        coded = [x for x in flds
+                 if idb_mod.CODE_RE.search(x.get("name") or "")]
+        known = [x for x in coded if x.get("data_type") in idb_mod._TYPES]
+        unk = sorted({x["data_type"] for x in coded
+                      if isinstance(x.get("data_type"), str) and
+                      x["data_type"] not in idb_mod._TYPES})
+        check(len(idb.hk_fields(sid)) == len(known),
+              "SID %d: %d decoded != %d coded with a known data_type "
+              "(skipped data_types: %r)" % (sid, len(idb.hk_fields(sid)),
+                                            len(known), unk))
+    check(all(f.raw for f in f1 + f2), "raw-only without the sqlite")
+    app = bytes(random.randrange(256) for _ in range(96))
+    check(idb.decode_hk(1, app)["NIXD0023"] == app[1] & 0x0F,
+          "the real mode field is the minimal decoder's")
+
+
+def t_tc_237_18_label(env):
+    """A3: a TC(237,18) record carries data.param {index, sub, value}
+    (PIX00016/17/18, big-endian, TcService237.c:66-94); dropped or not,
+    and no label for other subtypes or too-short app data."""
+    ctl = env.controller()
+    try:
+        sp = tcbuild.tc_packet(0x5AC, 1, 237, 18,
+                               bytes.fromhex("01380000000000"))
+        ctl.plat.relay.gs_tc(sp)    # power off: dropped, still logged
+        rec = [r for r in ctl.log.since(0) if r.kind == "tc"][-1]
+        check(rec.obj["data"]["param"] == {"index": 312, "sub": 0,
+                                           "value": 0},
+              "the label: %r" % rec.obj["data"])
+        sp = tcbuild.tc_packet(0x5AC, 2, 237, 18, b"\x01\x38")
+        ctl.plat.relay.gs_tc(sp)
+        rec = [r for r in ctl.log.since(0) if r.kind == "tc"][-1]
+        check("param" not in rec.obj["data"], "no param below 7 app bytes")
+        sp = tcbuild.tc_packet(0x5AC, 3, 237, 19, bytes(7))
+        ctl.plat.relay.gs_tc(sp)
+        rec = [r for r in ctl.log.since(0) if r.kind == "tc"][-1]
+        check("param" not in rec.obj["data"], "TC(237,19) is not labelled")
+    finally:
+        ctl.shutdown()
+
+
 CASES = [("config", t_config), ("argv golden", t_argv),
          ("run-dir guard + sparse preflight", t_rundir),
          ("binary guard", t_binary_guard), ("retention", t_retention),
@@ -3456,6 +3785,13 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("snapshot race", t_snapshot_race),
          ("tcbuild: CRC + smoke TCs", t_tcbuild),
          ("decoder on real units", t_decode),
+         ("IDB: RB level (A2)", t_idb_rb_level),
+         ("IDB: cross-byte field (A2)", t_idb_cross_byte),
+         ("IDB: mode == minimal decoder (A2)",
+          t_idb_mode_matches_minimal_decoder),
+         ("IDB: missing JSON (A2)", t_idb_missing),
+         ("IDB: relay attaches hk (A2)", t_idb_relay_hk),
+         ("IDB: real JSON (A2)", t_idb_real_json),
          ("truncated TC/TM input", t_truncated),
          ("time sync window (D-PLd)", t_timesync_window),
          ("time sync verdicts", t_timesync_verdicts),
@@ -3465,6 +3801,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("keep-alive: no drift", t_keepalive_drift),
          ("keep-alive: aggregate log", t_keepalive_log),
          ("keep-alive: rx trace filter", t_keepalive_trace),
+         ("sampler record shape (A1)", t_sampler_record_shape),
+         ("sampler by mode (A1)", t_sampler_off_in_run_mode),
          ("scenario: validation", t_scn_validate),
          ("scenario: runner", t_scn_runner),
          ("scenario: variants, T0, after", t_scn_variants),
@@ -3479,6 +3817,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("hold queue (SF5)", t_hold_queue),
          ("GS side security (SF6)", t_gs_security),
          ("platform TCs (9/20, R2)", t_platform_tcs),
+         ("TC(237,18) label (A3)", t_tc_237_18_label),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("fault model: truth|presented, qom", t_fault_model),

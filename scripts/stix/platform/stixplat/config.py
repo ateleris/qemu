@@ -79,6 +79,19 @@ DEFAULTS = {
               "sparse_check_s": 30.0, "sparse_limit_mb": 1024},
     "clock": {"sample_hz": 20.0, "state_hz": 2.0,
               "snapshot_s": 10.0},  # a full state record (0 = off)
+    # A1: the truth sampler; sample_s -1 = by mode (1 s interactive,
+    # 0 in run mode), 0 = off, else the period in seconds (0.5..60)
+    "timeline": {"sample_s": -1.0,
+                 "sample_paths": [
+                     "instrument.rotb.*", "instrument.detector.*cps",
+                     "instrument.detector.flare", "idpu.watchdog.count",
+                     "idpu.spw.counters.*", "instrument.memory.*",
+                     "platform.keepalive.*", "platform.timesync.verdict",
+                     "platform.power", "idpu.spw.link_down"],
+                 # A2: "" would disable; views_dir "" = <run_root>/views
+                 "idb_json": "~/dev/ATS-GroundStation-stix/definitions/"
+                             "telemetry/stix_idb_tlm.json",
+                 "idb_sqlite": "", "views_dir": ""},
     "log": {"max_log_mb": 50, "max_log_files": 5, "ring": 20000},
     "retention": {"run_root": "/tmp/stix-plat/runs-root", "keep_runs": 10,
                   "keep_failed_days": 7, "max_total_mb": 2048,
@@ -209,6 +222,12 @@ def _check(cfg):
     for k in ("sample_hz", "state_hz"):
         if cfg["clock"][k] <= 0:
             raise ConfigError("clock.%s must be > 0" % k)
+    ss = cfg["timeline"]["sample_s"]
+    if ss != -1.0 and ss != 0.0 and not 0.5 <= ss <= 60:
+        raise ConfigError("timeline.sample_s is -1 (by mode), 0 (off) "
+                          "or 0.5..60")
+    if not all(isinstance(x, str) for x in cfg["timeline"]["sample_paths"]):
+        raise ConfigError("timeline.sample_paths is a list of globs")
 
 
 def merged(cfg, *overs):

@@ -26,8 +26,10 @@ UDP_MAX = 65535 + 8
 
 
 class Relay:
-    def __init__(self, cfg, run_dir, log, clock, link_ok):
-        """@link_ok() -> None when TCs may reach QEMU, else the reason."""
+    def __init__(self, cfg, run_dir, log, clock, link_ok, idb=None):
+        """@link_ok() -> None when TCs may reach QEMU, else the reason.
+        @idb is the Idb attaching data.hk to HK reports (timeline plan
+        A2), or None without one."""
         self.cfg = cfg
         self.log = log
         self.clock = clock
@@ -54,6 +56,7 @@ class Relay:
         self.tm_file = open(self.tm_path, "a", encoding="utf-8")
         self.lock = threading.Lock()
         self.listeners = []         # fn(unit, decoded) per TM
+        self.idb = idb              # the Idb for data.hk (timeline A2)
         self.tm_count = 0
         self.stopping = False
         self.threads = []
@@ -84,13 +87,16 @@ class Relay:
             except OSError:
                 pass            # a GS that is not listening is fine
         dec = decode_mod.decode(unit)
+        hk = self._hk(dec, sp)
         with self.lock:
             self.tm_count += 1
+            data = {"hex": sp.hex(), "decoded": dec,
+                    "text": decode_mod.describe(dec)}
+            if hk is not None:
+                data["hk"] = hk
             rec = self.log.emit("tm", "tm", "tm.0x%03x" % (dec["apid"] if dec
                                                           else 0),
-                                {"hex": sp.hex(), "decoded": dec,
-                                 "text": decode_mod.describe(dec)},
-                                sim_est=True)
+                                data, sim_est=True)
             self.tm_file.write(json.dumps(
                 {"seq": rec.seq, "sim_time": rec.obj["sim_time"],
                  "boot_id": rec.obj["boot_id"], "hex": sp.hex()},
@@ -102,6 +108,16 @@ class Relay:
             except Exception as e:
                 self.log.emit("ctl", "log", "relay.listener_error",
                               {"error": "%s: %s" % (type(e).__name__, e)})
+
+    def _hk(self, dec, sp):
+        """data.hk of an HK report (timeline plan A2): the IDB fields of
+        TM(3,25) SID 1/2, or None without an Idb (the old minimal
+        decode stays; the HK series are then absent)."""
+        if self.idb is None or not dec or \
+                dec.get("apid") != decode_mod.APID_HK or \
+                dec.get("sid") not in (1, 2):
+            return None
+        return self.idb.decode_hk(dec["sid"], sp[16:])
 
     # -- TC ---------------------------------------------------------------
     def _tc_loop(self):
@@ -198,4 +214,21 @@ def _tc_info(sp):
         apid, seq, svc, sub, src, ack, ok = p
         info.update(apid=apid, seq=seq, service=svc, subtype=sub,
                     source=src, ack=ack, crc_ok=ok)
+        if (svc, sub) == (237, 18):
+            param = tc237_18_param(sp)
+            if param is not None:
+                info["param"] = param
     return info
+
+
+def tc237_18_param(sp):
+    """data.param of a TC(237,18) (timeline plan A3): PIX00016 index
+    u16, PIX00017 sub-id u8, PIX00018 value u32, big-endian
+    (TCData.h:103-106, TcService237.c:66-94) -- the first parameter
+    set, or None when the app data is too short."""
+    app = sp[10:-2]
+    if len(app) < 7:
+        return None
+    return {"index": int.from_bytes(app[0:2], "big"),
+            "sub": app[2],
+            "value": int.from_bytes(app[3:7], "big")}

@@ -16,6 +16,7 @@ from . import power as power_mod
 from . import qemu as qemu_mod
 from . import rundir
 from . import scenario as scenario_mod
+from . import timeline as timeline_mod
 from .dispatch import Dispatcher, VerbError
 from .qmp import QmpError
 from .simclock import SimClock
@@ -69,6 +70,19 @@ class Controller:
         self.plat = Platform(self)
         self.plat.register(self.dispatcher)
         self.state.fault_ids = self.plat.faults.active_targets
+        # A1: the truth sampler; -1 means by mode (1 s interactive, off
+        # in run mode unless the scenario or config sets it)
+        tl = cfg["timeline"]
+        ss = tl["sample_s"]
+        if ss < 0:
+            ss = 1.0 if cfg["mode"] == "interactive" else 0.0
+        self.sampler = (timeline_mod.Sampler(self.clock, self.state,
+                                             self.log, tl["sample_paths"],
+                                             ss)
+                        if ss > 0 else None)
+        if self.sampler is not None:
+            self.sampler.start()
+            self.power.hooks.append(self._sampler_power)
         self.log.emit("ctl", "log", "controller.start",
                       {"run_dir": self.run_dir, "fresh_removed":
                        self.removed, "config": _public(cfg)})
@@ -226,6 +240,14 @@ class Controller:
     def _emit_changes(self, changes):
         for path, (old, new) in sorted(changes.items()):
             self.log.emit("ctl", "state", path, {"old": old, "new": new})
+
+    def _sampler_power(self, event, power):
+        """A1: bench-time ticks never fire while off or paused, so the
+        sampler only restarts at a boot or a guest reset."""
+        if event in ("boot", "guest_reset"):
+            self.sampler.on_boot()
+        elif event == "off":
+            self.sampler.on_off()
 
     # -- polling (D-PLr, D-PLo) --
     def poll_state(self, snapshot=True):
@@ -421,6 +443,8 @@ class Controller:
             self.server.server_close()
         if self.poller is not None:
             self.poller.join(timeout=2)
+        if self.sampler is not None:
+            self.sampler.stop()
         self.plat.close()
         self.log.close()
         if self.lock_fd is not None:

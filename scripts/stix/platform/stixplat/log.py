@@ -6,7 +6,8 @@ Every record is
   {"v":1,"seq":N,"sim_time":<ns>,"boot_id":B,"vclock_ns":<ns|null>,
    "wall_time":"...Z","source":"ctl|qemu|fsw|tm|tc|scn|api",
    "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|
-           uart|log|debug","path":"<state path or verb>","data":{...}}
+           uart|log|debug|sample","path":"<state path or verb>",
+   "data":{...}}
 plus "sim_est": true when the controller could not sample the time
 exactly. The serialised line is built once; the same bytes go to
 log.jsonl, the in-memory ring and every SSE subscriber.
@@ -23,16 +24,16 @@ import threading
 SCHEMA_VERSION = 1
 SOURCES = ("ctl", "qemu", "fsw", "tm", "tc", "scn", "api")
 KINDS = ("cmd", "result", "state", "power", "tm", "tc", "fault", "force",
-         "expect", "mismatch", "uart", "log", "debug")
+         "expect", "mismatch", "uart", "log", "debug", "sample")
 FIELDS = ("v", "seq", "sim_time", "boot_id", "vclock_ns", "wall_time",
           "source", "kind", "path", "data")
 
 # D-PLn kind -> SSE topic
 _TOPIC = {"cmd": "cmd", "result": "cmd", "state": "state",
           "power": "state", "fault": "fault", "force": "fault",
-          "debug": "log"}
+          "debug": "log", "sample": "sample"}
 TOPICS = ("cmd", "state", "tm", "tc", "fault", "expect", "mismatch",
-          "uart", "log")
+          "uart", "log", "sample")
 
 
 def topic_of(kind):

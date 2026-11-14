@@ -15,6 +15,7 @@ import threading
 
 from . import faults as faults_mod
 from . import flashlib
+from . import idb as idb_mod
 from . import tcbuild
 from .dispatch import VerbError
 from .force import Forcing
@@ -41,8 +42,14 @@ class Platform:
         self.timecodes = None           # None = QEMU's default
         self.seq14 = 0                  # source 14 on APID 0x5AC
         self.seq_gs = 0                 # GS emulation (source 121)
+        # A2: the HK decoder is given to the relay before its threads
+        # start; None (with one timeline.idb record) when the IDB JSON
+        # is missing or broken
         self.relay = Relay(cfg, ctl.run_dir, self.log, self.clock,
-                           self.gs_link_ok)
+                           self.gs_link_ok,
+                           idb_mod.load(cfg["timeline"]["idb_json"],
+                                        cfg["timeline"]["idb_sqlite"],
+                                        self.log))
         self.keepalive = KeepAlive(cfg, self.clock, self.log,
                                    self.relay.send_unit, self.can_send)
         self.timesync = TimeSync(self.clock, self.log, self.read_obt,
