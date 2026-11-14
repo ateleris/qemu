@@ -230,6 +230,18 @@ typedef struct StixDetState {
     /* the chunk being built at a nominal swap */
     uint8_t chunk[STIX_DET_CHUNK_BLOCKS * STIXCTRL_BLOCK_SIZE];
     /*
+     * det-rotb-burst (FF plan): the last live chunk's SCET — the chunk
+     * as built at a nominal swap whose append was APPENDED or FULL —
+     * and the status of the last burst. A device reset clears both.
+     */
+    bool last_chunk_valid;
+    uint32_t last_chunk_coarse; /* as 0xC8 reads, UNSYNCED in bit 31 */
+    uint16_t last_chunk_fine;
+    uint32_t burst_requested;
+    uint32_t burst_appended;
+    const char *burst_stop;     /* "none" before any burst */
+    uint32_t burst_rotb_count;
+    /*
      * D-7 (D-Dk): the DSS .dssevs replay. The table is the realize
      * pre-scan of det-replay-file; the trigger and offset are scene
      * knobs (they survive a device reset), a running replay does not
@@ -273,9 +285,9 @@ void stix_det_instance_init(StixDetState *d);
 /*
  * The runtime scene properties (det-source, det-flare, det-quiet-cps,
  * det-flare-cps, det-replay-trigger, det-replay-offset-ms,
- * det-replay-start, and the read-only det-replay-status) on the
- * owning device class; @det_offset is offsetof(owner, det), so the
- * owner's struct stays private
+ * det-replay-start, the read-only det-replay-status, and the
+ * det-rotb-burst pair) on the owning device class; @det_offset is
+ * offsetof(owner, det), so the owner's struct stays private
  */
 void stix_det_class_init(ObjectClass *klass, size_t det_offset);
 

@@ -1730,6 +1730,8 @@ static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
 #define STIX_DET_CHUNK_DATA_OFF 8u
 #define STIX_DET_CHUNK_DATA_BYTES \
     (STIXCTRL_BLOCK_SIZE - STIX_DET_CHUNK_DATA_OFF)
+/* the UNSYNCED status flag, bit 31 of the coarse SCET register (0xC8) */
+#define STIX_DET_SCET_UNSYNCED 0x80000000u
 
 static const char *const stix_det_rotb_result_name[] = {
     [STIX_DET_ROTB_APPENDED] = "appended",
@@ -1880,6 +1882,12 @@ static void stix_det_nominal_swap(StixDetState *d)
         stix_det_chunk_build(d, done, coarse_reg, fine);
         r = stixctrl_rotb_append(d->owner, d->chunk, STIX_DET_CHUNK_BLOCKS,
                                  &rotb_count);
+        if (r == STIX_DET_ROTB_APPENDED || r == STIX_DET_ROTB_FULL) {
+            /* what a det-rotb-burst repeats (its `last`) */
+            d->last_chunk_coarse = coarse_reg;
+            d->last_chunk_fine = fine;
+            d->last_chunk_valid = true;
+        }
         if (r == STIX_DET_ROTB_APPENDED) {
             trace_stixdet_chunk(done, STIX_DET_CHUNK_BLOCKS, coarse_reg, fine,
                                 int_ticks, eacc_events, rotb_count, now);
@@ -1891,6 +1899,86 @@ static void stix_det_nominal_swap(StixDetState *d)
         trace_stixdet_chunk_drop("det-rotb-off", done, int_ticks, 0, now);
     }
     stix_det_nom_bank_zero(d, done);
+}
+
+/*
+ * det-rotb-burst (FF plan): append @n copies of the last live chunk
+ * (d->chunk) to the ROTB now. Frame k = 1..n carries the SCET
+ * last + (now - last) * k / n on the 48-bit coarse:fine value, the
+ * UNSYNCED flag from the current register; with the clock paused or
+ * stepped back (now <= last) the delta is 0, so every frame carries
+ * `last` and the timestamps never go backwards. Rejected with
+ * error_setg and nothing appended: @n = 0, more frames than the ring's
+ * block capacity holds chunks, det-rotb off, and no live chunk since
+ * the last device reset. An append that is not APPENDED stops the
+ * burst — not an error: the status and the trace say how many frames
+ * went in and why. Afterwards last = now, so the next live chunk is
+ * later than every burst frame.
+ */
+static void stix_det_rotb_burst(StixDetState *d, uint32_t n, Error **errp)
+{
+    const char *stop = "done";
+    uint32_t coarse_reg, rotb_count = 0, k, appended = 0;
+    uint16_t fine;
+    uint64_t last48, now48, delta;
+
+    if (n == 0) {
+        error_setg(errp, "det-rotb-burst: 0 frames appends nothing");
+        return;
+    }
+    if (n > STIXCTRL_ROTB_MAX_BLOCKS / STIX_DET_CHUNK_BLOCKS) {
+        error_setg(errp, "det-rotb-burst: %u frames is past the %u "
+                   "chunks the ring's %u blocks hold", n,
+                   STIXCTRL_ROTB_MAX_BLOCKS / STIX_DET_CHUNK_BLOCKS,
+                   STIXCTRL_ROTB_MAX_BLOCKS);
+        return;
+    }
+    if (!d->rotb) {
+        error_setg(errp, "det-rotb-burst: det-rotb is off");
+        return;
+    }
+    if (!d->last_chunk_valid) {
+        error_setg(errp, "det-rotb-burst repeats the last live frame: "
+                   "none yet");
+        return;
+    }
+    stixctrl_scet_reg(d->owner, &coarse_reg, &fine);
+    last48 = ((uint64_t)(d->last_chunk_coarse & ~STIX_DET_SCET_UNSYNCED)
+              << 16) | d->last_chunk_fine;
+    now48 = ((uint64_t)(coarse_reg & ~STIX_DET_SCET_UNSYNCED) << 16) | fine;
+    delta = now48 > last48 ? now48 - last48 : 0;
+
+    for (k = 1; k <= n; k++) {
+        StixDetRotbResult r;
+        uint64_t scet48 = last48 + delta * k / n;
+        uint32_t coarse = (uint32_t)(scet48 >> 16) |
+                          (coarse_reg & STIX_DET_SCET_UNSYNCED);
+        uint16_t fine16 = (uint16_t)scet48;
+        uint32_t b;
+
+        for (b = 0; b < STIX_DET_CHUNK_BLOCKS; b++) {
+            uint8_t *blk = d->chunk + b * STIXCTRL_BLOCK_SIZE;
+
+            stl_be_p(blk + 2, coarse);
+            stw_be_p(blk + 6, fine16);
+        }
+        r = stixctrl_rotb_append(d->owner, d->chunk, STIX_DET_CHUNK_BLOCKS,
+                                 &rotb_count);
+        if (r != STIX_DET_ROTB_APPENDED) {
+            stop = stix_det_rotb_result_name[r];
+            break;
+        }
+        appended++;
+    }
+    /* last = now: the next live chunk is later than every burst frame */
+    d->last_chunk_coarse = coarse_reg;
+    d->last_chunk_fine = fine;
+    d->burst_requested = n;
+    d->burst_appended = appended;
+    d->burst_stop = stop;
+    d->burst_rotb_count = rotb_count;
+    trace_stixdet_rotb_burst(n, appended, stop, rotb_count,
+                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /* one tick of the running integration: count it, swap when it ends */
@@ -2334,6 +2422,40 @@ static void stix_det_replay_start_set(Object *obj, Visitor *v,
     }
 }
 
+/*
+ * det-rotb-burst (FF plan; write-only, like det-inject): append this
+ * many frames now; det-rotb-burst-status carries the outcome.
+ */
+static void stix_det_burst_set(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    stix_det_rotb_burst(d, value, errp);
+}
+
+/*
+ * det-rotb-burst-status (read-only): one atomic line with the last
+ * burst's request, what went in and why, like det-replay-status.
+ */
+static void stix_det_burst_status_get(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    char *value = g_strdup_printf("requested=%u,appended=%u,stop=%s,"
+                                  "rotb_count=%u", d->burst_requested,
+                                  d->burst_appended, d->burst_stop,
+                                  d->burst_rotb_count);
+
+    visit_type_str(v, name, &value, errp);
+    g_free(value);
+}
+
 void stix_det_instance_init(StixDetState *d)
 {
     d->source = STIX_DET_SOURCE_SYNTHETIC;
@@ -2342,6 +2464,7 @@ void stix_det_instance_init(StixDetState *d)
     d->flare_cps = STIX_DET_FLARE_CPS_DEFAULT;
     d->replay_trigger = STIX_DET_REPLAY_TRIGGER_NOMINAL;
     d->replay_offset_ms = 0;
+    d->burst_stop = "none";
 }
 
 void stix_det_class_init(ObjectClass *klass, size_t det_offset)
@@ -2419,6 +2542,29 @@ void stix_det_class_init(ObjectClass *klass, size_t det_offset)
         "reads armed); dropped counts only the D-6 gate's drops, "
         "unsupported the 0xD setup words the model does not implement "
         "(runtime)");
+    object_class_property_add(klass, "det-rotb-burst", "uint32",
+                              &uint32_type_info, NULL, stix_det_burst_set,
+                              NULL, opaque);
+    object_class_property_set_description(klass, "det-rotb-burst",
+        "append this many copies of the last live chunk to the ROTB "
+        "now, write-only (one 49-block frame per stixctrl_rotb_append): "
+        "frame k of n carries the SCET last + (now - last) * k / n of "
+        "the last live chunk's SCET, the UNSYNCED flag from the current "
+        "register; with the clock paused (now <= last) every frame "
+        "carries `last`. 0, more than the ring's 2131 chunks, "
+        "det-rotb=off and no live chunk since the last device reset "
+        "are refused; an append that does not fit stops the burst "
+        "(stop=ring-full; with rotb-overflow=overwrite-oldest it never "
+        "does, the oldest blocks are overwritten instead). Burst frames "
+        "get near-zero archived durations (ArchiveManager.c:168) "
+        "(runtime)");
+    object_class_property_add(klass, "det-rotb-burst-status", "str",
+                              &str_type_info, stix_det_burst_status_get,
+                              NULL, NULL, opaque);
+    object_class_property_set_description(klass, "det-rotb-burst-status",
+        "read-only line of the last det-rotb-burst: requested=N,"
+        "appended=M,stop=done|ring-full|rotb-disabled|rotb-testmode,"
+        "rotb_count=C; requested=0,stop=none before any (runtime)");
 }
 
 bool stix_det_owns(StixDetState *d, hwaddr addr)
@@ -2580,6 +2726,12 @@ void stix_det_reset(StixDetState *d)
     d->nom_int_events_max = 0;
     /* a pending det-inject is in-flight model state, not a scene knob */
     d->inject_pending = false;
+    /* a burst repeats the last live chunk: none survives a reset */
+    d->last_chunk_valid = false;
+    d->burst_requested = 0;
+    d->burst_appended = 0;
+    d->burst_stop = "none";
+    d->burst_rotb_count = 0;
     /*
      * D-Dk: a running replay stops and re-arms on its trigger; the
      * table and the scene knobs (trigger, offset) stay (they describe

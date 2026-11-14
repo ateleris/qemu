@@ -7705,6 +7705,13 @@ static void nom_expect_scet_now(QTestState *qts, const NomChunk *c)
     }
 }
 
+/* block 0's SCET as the u48 coarse << 16 | fine, UNSYNCED masked off */
+static uint64_t nom_scet48(const NomChunk *c)
+{
+    return ((uint64_t)(c->scet_coarse_reg[0] & 0x7FFFFFFFu) << 16) |
+           c->scet_fine[0];
+}
+
 /*
  * det-chunk-format: a nominal integration of 5 s (time rule, no event
  * limit) ends with one 49-block chunk in the ring, decoded the way
@@ -8126,6 +8133,168 @@ static void test_det_chunk_guard(void)
     g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS - 1);
     g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
                     CHUNK_DESC_DETECTOR | 1u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* ---- det-rotb-burst: the runtime ROTB burst (FF plan Task 2) ---- */
+
+/*
+ * qom-set det-rotb-burst; returns the QMP error desc (NULL on success),
+ * so the test can assert on the text (flash_dmg_set's pattern)
+ */
+static char *det_burst_set(QTestState *qts, uint32_t val)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %u}}", SKY_CTRL_PATH,
+                            "det-rotb-burst", val);
+    QDict *err = qdict_get_qdict(resp, "error");
+    char *desc = err ? g_strdup(qdict_get_try_str(err, "desc")) : NULL;
+
+    qobject_unref(resp);
+    return desc;
+}
+
+/*
+ * det-rotb-burst (FF plan Task 2, A1/A3): the runtime det-rotb-burst /
+ * det-rotb-burst-status pair on /machine/stixctrl. Before the first
+ * live chunk a burst is refused ("none yet"), as are 0 and 2132
+ * frames. After one live chunk, 10 frames go in (status
+ * requested=10,appended=10,stop=done,rotb_count=539), each a copy of
+ * the live chunk outside the SCET bytes +2..+7 of every block, their
+ * SCETs strictly increasing across live -> burst -> live. Two bursts
+ * without stepping the clock (the paused case, A1) keep the SCETs
+ * non-decreasing. With the ring 3 chunks short of capacity the burst
+ * stops at ring-full with 3 frames in (drop-new; A2: with
+ * overwrite-oldest it would overwrite instead of stopping).
+ * RED before Task 2: the property is unknown, the first qom-set
+ * errors and the assert aborts.
+ */
+static void test_det_rotb_burst(void)
+{
+    QTestState *qts = rotb_qtest_new(49 * 20);
+    NomChunk *c = g_new0(NomChunk, 12);
+    char *desc, *status;
+    uint64_t scet, last;
+    uint32_t n;
+    int i;
+
+    /* no live chunk since the device reset: refused */
+    desc = det_burst_set(qts, 5);
+    g_assert_nonnull(desc);
+    g_assert_nonnull(strstr(desc, "none yet"));
+    g_free(desc);
+    status = sky_get_str(qts, "det-rotb-burst-status");
+    g_assert_cmpstr(status, ==,
+                    "requested=0,appended=0,stop=none,rotb_count=0");
+    g_free(status);
+
+    /* one live chunk (a 10-tick integration), then half a period
+     * later the burst: its frames spread over that half second */
+    rotb_cfg(qts, true, false);
+    sky_start_nom(qts, 39, 0xFFF, 0, 9, 0xFFFFFFFFu);
+    det_step_ticks(qts, 10);
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    det_step_ticks(qts, 5);
+    desc = det_burst_set(qts, 10);
+    g_assert_null(desc);
+    status = sky_get_str(qts, "det-rotb-burst-status");
+    g_assert_cmpstr(status, ==,
+                    "requested=10,appended=10,stop=done,rotb_count=539");
+    g_free(status);
+    g_assert_cmpuint(rotb_count(qts), ==, 11 * CHUNK_BLOCKS);
+
+    /* 0 frames and past the ring's 104448 blocks / 49 are refused */
+    desc = det_burst_set(qts, 0);
+    g_assert_nonnull(desc);
+    g_free(desc);
+    desc = det_burst_set(qts, 2132);
+    g_assert_nonnull(desc);
+    g_free(desc);
+
+    /* the next live chunk closes the test ring: drain it in order */
+    det_step_ticks(qts, 5);
+    g_assert_cmpuint(rotb_count(qts), ==, 12 * CHUNK_BLOCKS);
+    for (i = 0; i < 12; i++) {
+        nom_read_chunk(qts, &c[i]);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 0);
+
+    /* SCETs as u48 strictly increase across live, the 10 frames, live */
+    last = nom_scet48(&c[0]);
+    for (i = 1; i <= 10; i++) {
+        scet = nom_scet48(&c[i]);
+        g_assert_cmpuint(scet, >, last);
+        g_assert_cmpuint(scet, <, nom_scet48(&c[11]));
+        last = scet;
+    }
+    g_assert_cmpuint(nom_scet48(&c[11]), >, last);
+
+    /* all 49 blocks of a frame carry its SCET */
+    for (i = 1; i <= 10; i++) {
+        for (n = 0; n < CHUNK_BLOCKS; n++) {
+            g_assert_cmphex(c[i].scet_coarse_reg[n], ==,
+                            c[i].scet_coarse_reg[0]);
+            g_assert_cmphex(c[i].scet_fine[n], ==, c[i].scet_fine[0]);
+        }
+    }
+
+    /* every frame is the live chunk outside the SCET bytes +2..+7 */
+    for (i = 1; i <= 10; i++) {
+        g_assert_cmpint(memcmp(c[i].desc, c[0].desc, sizeof(c[0].desc)),
+                        ==, 0);
+        g_assert_cmpint(memcmp(c[i].eacc, c[0].eacc, sizeof(c[0].eacc)),
+                        ==, 0);
+        g_assert_cmpint(memcmp(c[i].etrg_grp, c[0].etrg_grp,
+                               sizeof(c[0].etrg_grp)), ==, 0);
+        g_assert_cmpint(memcmp(c[i].pad, c[0].pad, sizeof(c[0].pad)),
+                        ==, 0);
+    }
+
+    /* the paused clock (A1): two bursts without stepping it — now <=
+     * last, so every frame carries `last` and the SCETs never go
+     * backwards */
+    for (i = 0; i < 2; i++) {
+        desc = det_burst_set(qts, 3);
+        g_assert_null(desc);
+    }
+    status = sky_get_str(qts, "det-rotb-burst-status");
+    g_assert_cmpstr(status, ==,
+                    "requested=3,appended=3,stop=done,rotb_count=294");
+    g_free(status);
+    for (i = 0; i < 6; i++) {
+        nom_read_chunk(qts, &c[i]);
+    }
+    last = nom_scet48(&c[0]);
+    for (i = 1; i < 6; i++) {
+        scet = nom_scet48(&c[i]);
+        g_assert_cmpuint(scet, >=, last);
+        last = scet;
+    }
+
+    g_free(c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* the ring 3 chunks short of capacity: the burst stops at the
+     * first chunk that does not fit and reports how many went in */
+    qts = rotb_qtest_new(49 * 20);
+    rotb_cfg(qts, true, false);
+    sky_start_nom(qts, 39, 0xFFF, 0, 9, 0xFFFFFFFFu);
+    det_step_ticks(qts, 170);           /* 17 live chunks */
+    g_assert_cmpuint(rotb_count(qts), ==, 17 * CHUNK_BLOCKS);
+    desc = det_burst_set(qts, 10);
+    g_assert_null(desc);
+    status = sky_get_str(qts, "det-rotb-burst-status");
+    g_assert_cmpstr(status, ==,
+                    "requested=10,appended=3,stop=ring-full,"
+                    "rotb_count=980");
+    g_free(status);
+    g_assert_cmpuint(rotb_count(qts), ==, 20 * CHUNK_BLOCKS);
+    g_assert_cmpuint(rotb_full(qts), ==, 1);
 
     qtest_quit(qts);
     stix_qtest_cleanup();
@@ -16225,9 +16394,10 @@ static void stix_edac_register(void)
     qtest_add_func("/sparc/stix/edac-bram-reject", test_edac_bram_reject);
     qtest_add_func("/sparc/stix/edac-random", test_edac_random);
     qtest_add_func("/sparc/stix/edac-hw-state", test_edac_hw_state);
-    /* a det/ROTB test, registered here because it is defined after
-     * the det and platform register functions (PL-11c) */
+    /* det/ROTB tests, registered here because det-rotb-hw-state is
+     * defined after the det and platform register functions (PL-11c) */
     qtest_add_func("/sparc/stix/det-rotb-hw-state", test_det_rotb_hw_state);
+    qtest_add_func("/sparc/stix/det-rotb-burst", test_det_rotb_burst);
 }
 
 int main(int argc, char **argv)
