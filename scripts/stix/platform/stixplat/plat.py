@@ -298,11 +298,21 @@ class Platform:
         except (KeyError, ValueError):
             raise VerbError(500, "det-rotb-burst-status %r" % status)
 
+    @staticmethod
+    def _flash_name(name):
+        """A bad library name is the caller's error (400), whatever the
+        power state."""
+        try:
+            flashlib.check_name(name)
+        except ValueError as e:
+            raise VerbError(400, str(e))
+
     def v_flash_save(self, name):
         """FF plan: save flash.bin into the flash library. Only while
         the FSW cannot be writing it: power off, or on and paused (the
         device fflush()es each page before its completion IRQ, so a
         paused flash file is consistent)."""
+        self._flash_name(name)
         if self.power.state not in ("off", "paused"):
             raise VerbError(409, "flash save needs power off or paused "
                             "(STIX is %s and may be writing the flash)"
@@ -332,6 +342,7 @@ class Platform:
     def v_flash_load(self, name):
         """FF plan: replace flash.bin from the flash library; power off
         only (QEMU must not have the file open)."""
+        self._flash_name(name)
         if self.power.state != "off":
             raise VerbError(409, "flash load needs power off (STIX is "
                             "%s)" % self.power.state)
