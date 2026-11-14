@@ -1,0 +1,17 @@
+{
+ "name": "power-and-link",
+ "window": "run",
+ "markers": ["power", "fault"],
+ "panels": [
+  {"title": "power and SpW", "series": ["truth:platform.power",
+    "truth:platform.spw.link", "truth:idpu.spw.link_down",
+    "truth:idpu.spw.ls"]},
+  {"title": "supplies", "series": ["truth:instrument.supplies.lv.enabled",
+    "truth:instrument.supplies.lv.good",
+    "truth:instrument.supplies.hv01.good",
+    "truth:instrument.supplies.hv17.good"]},
+  {"title": "time sync and keep-alive", "series": [
+    "truth:platform.timesync.verdict", "truth:platform.keepalive.enabled",
+    "truth:platform.keepalive.period_s"]}
+ ]
+}

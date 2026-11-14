@@ -1,0 +1,11 @@
+{
+ "name": "rotb-fill-vs-faults",
+ "window": "run",
+ "markers": ["fault", "tc", "event"],
+ "panels": [
+  {"title": "ROTB fill", "series": ["truth:instrument.rotb.count",
+    "truth:instrument.rotb.full", "hk.rb_level"]},
+  {"title": "load and stimulus", "series": ["hk.cpu_load",
+    "truth:instrument.detector.flare_cps", "truth:instrument.detector.flare"]}
+ ]
+}

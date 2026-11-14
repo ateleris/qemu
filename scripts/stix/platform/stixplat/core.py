@@ -16,7 +16,9 @@ from . import power as power_mod
 from . import qemu as qemu_mod
 from . import rundir
 from . import scenario as scenario_mod
+from . import series as series_mod
 from . import timeline as timeline_mod
+from . import views as views_mod
 from .dispatch import Dispatcher, VerbError
 from .qmp import QmpError
 from .simclock import SimClock
@@ -70,6 +72,10 @@ class Controller:
         self.plat = Platform(self)
         self.plat.register(self.dispatcher)
         self.state.fault_ids = self.plat.faults.active_targets
+        # A4: the series index, fed by a record-log listener (called
+        # after the ring append, outside the log lock)
+        self.series = series_mod.SeriesIndex(idb=self.plat.relay.idb)
+        self.log.listeners.append(self.series.on_record)
         # A1: the truth sampler; -1 means by mode (1 s interactive, off
         # in run mode unless the scenario or config sets it)
         tl = cfg["timeline"]
@@ -83,6 +89,7 @@ class Controller:
         if self.sampler is not None:
             self.sampler.start()
             self.power.hooks.append(self._sampler_power)
+        views_mod.ensure_starters(cfg)      # A5: only when missing
         self.log.emit("ctl", "log", "controller.start",
                       {"run_dir": self.run_dir, "fresh_removed":
                        self.removed, "config": _public(cfg)})
@@ -114,6 +121,15 @@ class Controller:
               doc="run a scenario from the scenario dir (one at a time)")
         d.add("scenario.abort", self._scenario_abort,
               doc="abort the running scenario (its teardown still runs)")
+        d.add("view.save", self._view_save,
+              args={"name": {"type": "string", "required": True},
+                    "view": {"type": "object", "required": True}},
+              doc="save a timeline view (name, window, markers, panels) "
+                  "as <name>.json in the views dir; 409 for the "
+                  "generated \"everything\"")
+        d.add("view.delete", self._view_delete,
+              args={"name": {"type": "string", "required": True}},
+              doc="delete a saved timeline view (409 for \"everything\")")
         d.add("debug.qmp", self._debug_qmp,
               args={"command": {"type": "string", "required": True,
                                 "enum": list(DEBUG_QMP)},
@@ -167,6 +183,14 @@ class Controller:
             raise VerbError(409, "no scenario is running")
         r.abort("scenario.abort")
         return {"aborting": r.state["name"]}
+
+    # -- views (timeline plan A5) --
+    def _view_save(self, name, view):
+        return views_mod.save(self.cfg, name, view)
+
+    def _view_delete(self, name):
+        views_mod.delete(self.cfg, name)
+        return {"deleted": name}
 
     def command(self, verb, args, source="api"):
         res = self.dispatcher.run(verb, args, source=source)

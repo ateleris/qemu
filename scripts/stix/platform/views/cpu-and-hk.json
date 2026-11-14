@@ -1,0 +1,10 @@
+{
+ "name": "cpu-and-hk",
+ "window": "run",
+ "markers": ["tc", "event", "mode"],
+ "panels": [
+  {"title": "CPU and archive", "series": ["hk.cpu_load", "hk.archive_usage"]},
+  {"title": "triggers and mode", "series": ["hk.trig_med", "hk.trig_max",
+    "hk.mode"]}
+ ]
+}

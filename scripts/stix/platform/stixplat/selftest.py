@@ -26,9 +26,12 @@ from . import decode
 from . import faults as faults_mod
 from . import idb as idb_mod
 from . import keepalive as keepalive_mod
+from . import series as series_mod
 from . import tcbuild
 from . import timeline as timeline_mod
 from . import timesync
+from . import viewrun as viewrun_mod
+from . import views as views_mod
 from . import core as core_mod
 from . import log as log_mod
 from . import probe_lib
@@ -3772,6 +3775,418 @@ def t_tc_237_18_label(env):
         ctl.shutdown()
 
 
+# -- timeline series, views, view-run (A4, A5, A6) -------------------------
+def _srec(kind, t, path="", data=None):
+    """A minimal record dict for SeriesIndex.feed."""
+    return {"kind": kind, "sim_time": t, "path": path,
+            "data": data if data is not None else {}}
+
+
+def t_series_decimate_keeps_spikes(env):
+    """A4: a window with more points than max_points is decimated into
+    equal-time buckets, each with first t and last/min/max, so a one-
+    point spike survives in max."""
+    si = series_mod.SeriesIndex()
+    t0 = 1000 * NS
+    for i in range(10000):
+        si.feed(_srec("sample", t0 + i * NS,
+                      data={"x": 99.0 if i == 5000 else 1.0}))
+    s = si.query(["truth:x"], max_points=100)["truth:x"]
+    check(len(s["t"]) <= 100 and "min" in s and "max" in s,
+          "decimated into buckets: %d" % len(s["t"]))
+    check(99.0 in s["max"] and 99.0 not in s["min"],
+          "the spike survives in max: %r" % s["max"][:4])
+    # a window that fits is served as-is, without min/max
+    s = si.query(["truth:x"], t_from=t0, t_to=t0 + 5 * NS,
+                 max_points=100)["truth:x"]
+    check("min" not in s and s["v"] == [1.0] * 6, "small window: %r" % s)
+
+
+def t_series_enum_steps(env):
+    """A4: an enum leaf (the timesync verdict) plots as labelled steps,
+    the value's index in the order first seen; repeats add no step."""
+    si = series_mod.SeriesIndex()
+    p = "platform.timesync.verdict"
+    for i, v in enumerate(("none", "ok", "late_apply")):
+        si.feed(_srec("sample", 10 + i, data={p: v}))
+    si.feed(_srec("sample", 20, data={p: "late_apply"}))    # no change
+    cat = {e["id"]: e for e in si.catalogue()}["truth:" + p]
+    check(cat["kind"] == "enum" and cat["values"] ==
+          ["none", "ok", "late_apply"], "the catalogue: %r" % cat)
+    s = si.query(["truth:" + p], max_points=1000)["truth:" + p]
+    check(s["t"] == [10, 11, 12] and s["v"] == [0, 1, 2] and
+          s["labels"] == ["none", "ok", "late_apply"],
+          "labelled steps: %r" % s)
+
+
+def t_series_markers(env):
+    """A4: fault inject, TC(237,18) and a TM(5,x) EID carry marker
+    labels; a mode change is both an event and a mode marker."""
+    ctl = env.controller()
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ctl.command("fault.inject", {"id": "spw.link.disconnect"})
+        sp = tcbuild.tc_packet(0x5AC, 1, 237, 18,
+                               bytes.fromhex("01380000000000"))
+        ctl.plat.relay.gs_tc(sp)
+        snd.sendto(_tm_unit(0x5A7, 5, 1, bytes.fromhex("0021")),
+                   ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"]))
+        wait_for(lambda: any(r.kind == "tm" for r in ctl.log.since(0)),
+                 what="the event TM")
+        q = ctl.series.query(["fault", "tc", "event", "mode"],
+                             max_points=100)
+        check(q["unknown"] == [], "all four markers exist: %r" % q["unknown"])
+        check("fault inject spw.link.disconnect" in q["fault"]["labels"],
+              "the fault label: %r" % q["fault"]["labels"])
+        check("TC(237,18) param 312 = 0" in q["tc"]["labels"],
+              "the TC label: %r" % q["tc"]["labels"])
+        check("EID 0x0021 mode change" in q["event"]["labels"] and
+              "EID 0x0021 mode change" in q["mode"]["labels"],
+              "the event and mode labels: %r / %r"
+              % (q["event"]["labels"], q["mode"]["labels"]))
+    finally:
+        snd.close()
+        ctl.shutdown()
+
+
+def t_series_cap(env):
+    """A4: over-cap drops the oldest points per series and the
+    catalogue notes truncated_before."""
+    si = series_mod.SeriesIndex(max_points_per_series=1000)
+    for i in range(1500):
+        si.feed(_srec("sample", 1000 + i, data={"x": i}))
+    cat = {e["id"]: e for e in si.catalogue()}["truth:x"]
+    check(cat["truncated_before"] == 1500, "truncated_before: %r" % cat)
+    s = si.query(["truth:x"], max_points=5000)["truth:x"]
+    check(len(s["t"]) == 1000 and s["t"][0] == 1500 and
+          s["v"][0] == 500 and s["v"][-1] == 1499,
+          "the last 1000 kept: %r" % s["v"][:2])
+
+
+def t_series_concurrent(env):
+    """A4: one thread feeds 20000 records over many new ids while
+    another calls catalogue()/query() in a loop; the index lock keeps
+    the reads consistent, no exception."""
+    si = series_mod.SeriesIndex()
+    stop = threading.Event()
+    err = []
+
+    def feed():
+        try:
+            for i in range(20000):
+                si.feed(_srec("sample", i, data={"x.%d" % (i % 50): i}))
+        except Exception as e:
+            err.append(e)
+        finally:
+            stop.set()
+
+    th = threading.Thread(target=feed)
+    th.start()
+    while not stop.is_set():
+        si.catalogue()
+        si.query(["truth:x.0", "truth:x.1", "nope"], max_points=100)
+    th.join()
+    check(not err, "no exception out of feed: %r" % err[:1])
+    ids = {e["id"] for e in si.catalogue()}
+    check(len(ids) == 50 and si.query(sorted(ids))["unknown"] == [],
+          "all 50 series there: %d" % len(ids))
+
+
+def _series_server(env):
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    return ctl, srv, srv.server_address[1]
+
+
+def t_series_api_bad_input(env):
+    """A4: 400 on bad input: no ids, an empty ids= value, max_points
+    out of 10..5000 or not an integer, a bad from/to."""
+    ctl, srv, port = _series_server(env)
+    try:
+        for q in ("", "?ids=", "?ids=&ids=truth:x",
+                  "?ids=truth:x&max_points=0",
+                  "?ids=truth:x&max_points=5001",
+                  "?ids=truth:x&max_points=x", "?ids=truth:x&from=abc"):
+            st, _, body = _http(port, "GET", "/api/v1/series" + q)
+            check(st == 400, "%r -> %d (%r)" % (q, st, body[:80]))
+        st, _, _ = _http(port, "GET",
+                         "/api/v1/series?ids=truth:x&max_points=10")
+        check(st == 200, "max_points 10 is served: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
+def t_series_api_ids_repeat(env):
+    """A4: the ids are repeated ids= query parameters, each one id (the
+    api _csv helper is not used, so no comma splitting); an unknown id
+    is an empty series listed in "unknown"."""
+    ctl, srv, port = _series_server(env)
+    try:
+        ctl.log.emit("ctl", "sample", "", {"a": 1, "b": 2})
+        st, _, body = _http(port, "GET",
+                            "/api/v1/series?ids=truth:a&ids=truth:b")
+        d = json.loads(body)
+        check(st == 200 and sorted(d) == ["truth:a", "truth:b", "unknown"]
+              and d["unknown"] == [], "both served: %r" % sorted(d))
+        check(d["truth:a"]["v"] == [1] and d["truth:b"]["v"] == [2],
+              "the values: %r" % d)
+        st, _, body = _http(port, "GET",
+                            "/api/v1/series?ids=truth:a,truth:b")
+        d = json.loads(body)
+        check(d["unknown"] == ["truth:a,truth:b"],
+              "one ids= value is one id, no comma split: %r" % d["unknown"])
+        st, _, body = _http(port, "GET", "/api/v1/series/catalogue")
+        cat = json.loads(body)
+        check(st == 200 and "truth:a" in [e["id"] for e in cat],
+              "the catalogue: %r" % [e["id"] for e in cat][:4])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
+def t_log_listeners(env):
+    """The A4 listener rule: called after the ring append and after the
+    log lock is released, each in try/except, never raised, and the
+    others still run (also for the error record itself, without
+    recursion); a failing listener is one log.listener_error record,
+    again only after it succeeded once."""
+    lg = log_mod.RecordLog(None, None)
+    seen = []
+    fail = [True]
+
+    def ok(rec):
+        seen.append(rec.seq)
+        check(lg.cond.acquire(blocking=False),
+              "the listener ran under the log lock")
+        lg.cond.release()
+
+    def bad(rec):
+        if fail[0]:
+            raise RuntimeError("boom")
+
+    lg.listeners += [ok, bad]
+    rec = lg.emit("ctl", "log", "x", {"i": 1})
+    errs = [r for r in lg.since(0) if r.obj["path"] == "log.listener_error"]
+    check(len(errs) == 1 and
+          errs[0].obj["data"]["error"] == "RuntimeError: boom" and
+          errs[0].obj["data"]["listener"].endswith("bad"),
+          "one record for the failing listener: %r"
+          % [r.obj["data"] for r in errs])
+    check(seen == [rec.seq, errs[0].seq],
+          "both records reached the listener, the error round did not "
+          "recurse: %r" % seen)
+    lg.emit("ctl", "log", "y")
+    errs = [r for r in lg.since(0) if r.obj["path"] == "log.listener_error"]
+    check(len(errs) == 1, "still failing: reported once, not per call")
+    fail[0] = False
+    lg.emit("ctl", "log", "z")          # bad succeeds: re-armed
+    fail[0] = True
+    lg.emit("ctl", "log", "v")
+    errs = [r for r in lg.since(0) if r.obj["path"] == "log.listener_error"]
+    check(len(errs) == 2, "re-armed after a success: %d" % len(errs))
+    check(lg.emit("ctl", "log", "end") is not None, "emit never raises")
+
+
+def _post():
+    return {"Content-Type": "application/json", "X-Stix-Platform": "1"}
+
+
+def t_views(env):
+    """A5: the name rule before any file access, view validation, the
+    starter views copied only when missing, "everything" generated and
+    undeletable, and view.save/view.delete round-trip."""
+    d = os.path.join(env.tmp, "views-root")
+    vdir = os.path.join(d, "views")
+    ctl = env.controller(retention={"run_root": d})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    good = {"name": "mine", "window": "10m", "markers": ["tc"],
+            "panels": [{"title": "p", "series": ["truth:x"]}]}
+    try:
+        for bad in ("../x", "a/b", "", ".hidden", "x" * 65, "a b", 5):
+            e = raises(VerbError, views_mod.check_name, bad)
+            check(e.status == 400, "a bad name is 400: %r" % (bad,))
+        for ok in ("a", "Z9._-", "x" * 64):
+            views_mod.check_name(ok)
+        check(views_mod.validate(dict(good)) == good, "a good view")
+        for bad in ({}, dict(good, window="1h"), dict(good, markers=["x"]),
+                    dict(good, markers="tc"), dict(good, panels={}),
+                    dict(good, panels=[{"title": "p"}]),
+                    dict(good, panels=[{"title": "", "series": []}]),
+                    dict(good, name="../x")):
+            raises(VerbError, views_mod.validate, bad)
+        # the starters, copied only when missing
+        st, _, body = _http(port, "GET", "/api/v1/views")
+        lst = json.loads(body)
+        check(st == 200 and lst["dir"] == vdir and lst["views"] and
+              sorted(lst["views"]) == sorted(f[:-len(".json")]
+                                             for f in os.listdir(vdir)),
+              "the views dir: %r" % lst)
+        check(len(lst["views"]) == 4, "the four starters: %r" % lst["views"])
+        for name in lst["views"]:
+            with open(os.path.join(vdir, name + ".json")) as f:
+                views_mod.validate(json.load(f))
+        keep, drop = lst["views"][0], lst["views"][1]
+        changed = '{"name": "%s", "window": "1m", "markers": [], ' \
+                  '"panels": []}' % keep
+        with open(os.path.join(vdir, keep + ".json"), "w") as f:
+            f.write(changed)
+        os.unlink(os.path.join(vdir, drop + ".json"))
+        ctl2 = env.controller(retention={"run_root": d})
+        try:
+            with open(os.path.join(vdir, drop + ".json")) as f:
+                json.load(f)
+            with open(os.path.join(vdir, keep + ".json")) as f:
+                check(f.read() == changed, "a changed starter is kept")
+        finally:
+            ctl2.shutdown()
+        # "everything": generated, before <name>, undeletable
+        st, _, body = _http(port, "GET", "/api/v1/views/everything")
+        ev = json.loads(body)
+        check(st == 200 and ev["name"] == "everything" and
+              ev["window"] == "run" and
+              ev["markers"] == list(views_mod.MARKERS) and
+              any(p["title"] == "platform" and
+                  "truth:platform.power" in p["series"]
+                  for p in ev["panels"]),
+              "everything is generated: %r" % ev)
+        st, _, body = _http(port, "POST", "/api/v1/cmd/view.save",
+                            body=json.dumps({"name": "mine",
+                                             "view": good}).encode(),
+                            headers=_post())
+        check(st == 200 and os.path.isfile(os.path.join(vdir, "mine.json")),
+              "view.save: %d %r" % (st, body[:80]))
+        st, _, body = _http(port, "GET", "/api/v1/views/mine")
+        check(st == 200 and json.loads(body)["name"] == "mine",
+              "read back: %d" % st)
+        st, _, _ = _http(port, "GET", "/api/v1/views/no-such")
+        check(st == 404, "an unknown view is 404")
+        with open(os.path.join(vdir, "broken.json"), "w") as f:
+            f.write('{"name": "broken", ')
+        st, _, _ = _http(port, "GET", "/api/v1/views/broken")
+        check(st == 400, "a corrupt view file is 400")
+        os.unlink(os.path.join(vdir, "broken.json"))
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/view.save",
+                         body=json.dumps({"name": "everything",
+                                          "view": good}).encode(),
+                         headers=_post())
+        check(st == 409, "everything cannot be saved over")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/view.delete",
+                         body=b'{"name": "everything"}', headers=_post())
+        check(st == 409, "everything cannot be deleted")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/view.save",
+                         body=b'{"name": "../x", "view": {}}',
+                         headers=_post())
+        check(st == 400, "a bad name is refused")
+        st, _, _ = _http(port, "GET", "/api/v1/views/%2e%2e%2fx")
+        check(st == 400, "a bad name in the path too")
+        check(not os.path.exists(os.path.join(d, "x.json")),
+              "nothing written outside the views dir")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/view.delete",
+                         body=b'{"name": "mine"}', headers=_post())
+        check(st == 200, "deleted")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/view.delete",
+                         body=b'{"name": "mine"}', headers=_post())
+        check(st == 404, "gone")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
+def _dir_state(d):
+    out = []
+    for root, _, files in os.walk(d):
+        for n in files:
+            p = os.path.join(root, n)
+            out.append((os.path.relpath(p, d), os.stat(p).st_size))
+    return sorted(out)
+
+
+def t_view_run(env):
+    """A6: a finished run's log (one rotated part) read-only: /status
+    says view_run, the rotated part is read oldest first, every verb
+    but view.* is a 403, the page and the views dir are served, and
+    nothing is written into the run dir."""
+    d = os.path.realpath(os.path.join(env.tmp, "run-view"))
+    os.makedirs(d)
+    vdir = os.path.join(env.tmp, "views-view")
+    t = [0.0]
+    lg = log_mod.RecordLog(None, lambda: (int(t[0]), 0, None, True))
+    lg.emit("ctl", "log", "controller.start",
+            {"run_dir": d, "config": {
+                "timeline": {"views_dir": vdir, "idb_json": "",
+                             "idb_sqlite": "", "sample_paths": [],
+                             "sample_s": 0.0},
+                "retention": {"run_root": env.tmp}}})
+    for i in range(60):
+        t[0] += 1.0
+        lg.emit("ctl", "sample", "", {"instrument.rotb.count": i})
+    lg.emit("ctl", "fault", "fault.spw.link.disconnect",
+            {"action": "inject", "params": {}})
+    recs = lg.since(0)
+    lg.close()
+    with gzip.open(os.path.join(d, "log.jsonl.1.gz"), "wt") as f:
+        for r in recs[:21]:         # the oldest part, controller.start in
+            f.write(r.line + "\n")
+    with open(os.path.join(d, "log.jsonl"), "w") as f:
+        for r in recs[21:]:
+            f.write(r.line + "\n")
+    before = _dir_state(d)
+    vr = viewrun_mod.ViewRun(d)
+    srv = api_mod.make_server(vr, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/api/v1/status")
+        s = json.loads(body)
+        check(st == 200 and s["view_run"] == d and s["mode"] == "view",
+              "status: %r" % s)
+        st, _, body = _http(port, "GET",
+                            "/api/v1/series?ids=truth:instrument.rotb.count")
+        q = json.loads(body)
+        srs = q["truth:instrument.rotb.count"]
+        check(st == 200 and q["unknown"] == [] and srs["v"][0] == 0 and
+              srs["v"][-1] == 59 and len(srs["v"]) == 60,
+              "the whole run, oldest part first: %r" % srs["v"][:2])
+        st, _, body = _http(port, "GET", "/api/v1/series?ids=fault")
+        check(json.loads(body)["fault"]["labels"] ==
+              ["fault inject spw.link.disconnect"], "the marker")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/log.mark",
+                         body=b'{"text": "x"}', headers=_post())
+        check(st == 403, "log.mark refused")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/platform.power.on",
+                         body=b"{}", headers=_post())
+        check(st == 403, "power.on refused")
+        view = {"name": "from-view-run", "window": "run", "markers": ["tc"],
+                "panels": [{"title": "p", "series": ["truth:x"]}]}
+        st, _, body = _http(port, "POST", "/api/v1/cmd/view.save",
+                            body=json.dumps({"name": "from-view-run",
+                                             "view": view}).encode(),
+                            headers=_post())
+        check(st == 200 and
+              os.path.isfile(os.path.join(vdir, "from-view-run.json")),
+              "view.save works: %d %r" % (st, body[:80]))
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/view.delete",
+                         body=b'{"name": "from-view-run"}', headers=_post())
+        check(st == 200, "view.delete works in a view-run")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/view.delete",
+                         body=b'{"name": "from-view-run"}', headers=_post())
+        check(st == 404, "an unknown view is 404")
+        st, _, body = _http(port, "GET", "/api/v1/views")
+        check(json.loads(body)["dir"] == vdir, "the run's own views dir")
+        st, _, _ = _http(port, "GET", "/")
+        check(st == 200, "the page")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    check(_dir_state(d) == before, "nothing written into the run dir")
+    raises(viewrun_mod.ViewRunError, viewrun_mod.ViewRun,
+           os.path.join(env.tmp, "no-such-run"))
+
+
 CASES = [("config", t_config), ("argv golden", t_argv),
          ("run-dir guard + sparse preflight", t_rundir),
          ("binary guard", t_binary_guard), ("retention", t_retention),
@@ -3818,6 +4233,17 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("GS side security (SF6)", t_gs_security),
          ("platform TCs (9/20, R2)", t_platform_tcs),
          ("TC(237,18) label (A3)", t_tc_237_18_label),
+         ("record log: listeners (A4)", t_log_listeners),
+         ("series: decimation keeps spikes (A4)",
+          t_series_decimate_keeps_spikes),
+         ("series: enum steps (A4)", t_series_enum_steps),
+         ("series: markers (A4)", t_series_markers),
+         ("series: cap (A4)", t_series_cap),
+         ("series: concurrent feed and read (A4)", t_series_concurrent),
+         ("series API: bad input (A4)", t_series_api_bad_input),
+         ("series API: repeated ids (A4)", t_series_api_ids_repeat),
+         ("views (A5)", t_views),
+         ("view-run (A6)", t_view_run),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("fault model: truth|presented, qom", t_fault_model),

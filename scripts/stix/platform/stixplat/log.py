@@ -79,6 +79,11 @@ class RecordLog:
         self.cond = threading.Condition()
         self.fh = None
         self.closed = False
+        # fn(rec) per record, called after the ring append and after
+        # self.cond is released (the series index, timeline plan A4)
+        self.listeners = []
+        self._listener_failing = set()  # reported, until a success re-arms
+        self._tls = threading.local()
         if path is not None:
             self.fh = open(path, "a", encoding="utf-8")
 
@@ -107,7 +112,57 @@ class RecordLog:
             while len(self.ring) > self.ring_size:
                 self.ring.popleft()
             self.cond.notify_all()
-            return rec
+            listeners = list(self.listeners)
+        self._tell_listeners(rec, listeners)
+        return rec
+
+    def ingest(self, obj):
+        """A pre-built record (a log.jsonl line, --view-run): into the
+        ring as-is (its own seq and times), then the listeners, like
+        emit; no file is written and time_fn is not called."""
+        rec = Record(obj)
+        with self.cond:
+            self.seq = rec.seq
+            self.ring.append(rec)
+            while len(self.ring) > self.ring_size:
+                self.ring.popleft()
+            self.cond.notify_all()
+            listeners = list(self.listeners)
+        self._tell_listeners(rec, listeners)
+        return rec
+
+    def _tell_listeners(self, rec, listeners):
+        """The listener rule (timeline plan A4): after self.cond is
+        released, each listener in try/except that never re-raises and
+        logs a failing listener once, until it succeeds again; a
+        listener never takes state.lock or emits a record."""
+        for fn in listeners:
+            try:
+                fn(rec)
+            except Exception as e:
+                self._listener_error(fn, e)
+            else:
+                self._listener_failing.discard(fn)
+
+    def _listener_error(self, fn, e):
+        """One log.listener_error record per failing listener, again
+        only after it succeeded once; never in the error record's own
+        round, never raised."""
+        if getattr(self._tls, "in_listeners", False):
+            return              # the error record's own round
+        with self.cond:
+            if fn in self._listener_failing:
+                return          # already reported
+            self._listener_failing.add(fn)
+        self._tls.in_listeners = True
+        try:
+            self.emit("ctl", "log", "log.listener_error",
+                      {"listener": getattr(fn, "__qualname__", repr(fn)),
+                       "error": "%s: %s" % (type(e).__name__, e)})
+        except Exception:
+            pass
+        finally:
+            self._tls.in_listeners = False
 
     def _maybe_rotate(self):
         """D-PLl: rotate at max_bytes; the rotated part is gzipped and at

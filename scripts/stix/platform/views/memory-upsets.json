@@ -1,0 +1,28 @@
+{
+  "name": "memory-upsets",
+  "window": "run",
+  "markers": [
+    "fault",
+    "event"
+  ],
+  "panels": [
+    {
+      "title": "counters",
+      "series": [
+        "truth:instrument.memory.cache.injected",
+        "truth:instrument.memory.cache.corrected",
+        "truth:instrument.memory.cache.detected",
+        "truth:instrument.memory.sdram.injected",
+        "truth:instrument.memory.sdram.corrected",
+        "truth:instrument.memory.sdram.detected",
+        "truth:instrument.memory.rotbuf.injected",
+        "truth:instrument.memory.rotbuf.corrected",
+        "truth:instrument.memory.rotbuf.detected"
+      ]
+    },
+    {
+      "title": "armed upsets",
+      "series": []
+    }
+  ]
+}

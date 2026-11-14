@@ -190,6 +190,8 @@ lists exactly these verbs and arguments.
 | `tc.gs.send` | `service`, `subtype`, `data`, `ack` | GS emulation: an operator TC from source 121, labelled GS-EMULATION; needs `[gs] emulation` (on in run mode by default) |
 | `scenario.run` | `file`, `variant` | run a scenario file from the scenario dir (`[run] scenario_dir`) in this controller, one at a time (409); `variant` is required when the scenario declares variants; verdicts are `expect` records, progress is `status.scenario` |
 | `scenario.abort` | | abort the running scenario: open checks and steps not started become `error`, the teardown still runs |
+| `view.save` | `name`, `view` | save a timeline view (`name`, `window`, `markers`, `panels`) as `<name>.json` in the views dir; an existing name is replaced, the generated `everything` is a 409 |
+| `view.delete` | `name` | delete a saved timeline view (404 unknown, 409 `everything`) |
 | `debug.qmp` | `command`, `arguments` | one raw `qom-get` or `qom-set` on `/machine/stixspw` or `/machine/stixctrl`, or `query-status`; refused (403) unless `[debug] raw_qmp = true`, and in run mode also `[debug] allow_in_run = true`; every call is a `debug` record and sets the sticky `status.debug_used` taint (dev and gate use only) |
 <!-- verbs:end -->
 
@@ -211,7 +213,7 @@ self-test checks that it matches the table above.
 ```
 {"v":1,"seq":N,"sim_time":<ns>,"boot_id":B,"vclock_ns":<ns|null>,
  "wall_time":"...Z","source":"ctl|qemu|fsw|tm|tc|scn|api",
- "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|uart|log|debug",
+ "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|uart|log|debug|sample",
  "path":"<state path or verb>","data":{...}}
 ```
 
@@ -261,6 +263,7 @@ over the gate scenarios). The keys most often set:
 | `timesync.autostart` | `"first_tm"` | the automatic TC(9,129) once per boot |
 | `api.bind`, `.container` | `"127.0.0.1"`, false | loopback unless the container of PL-7 |
 | `clock.snapshot_s` | 10.0 | the full state record cadence (0 = off) |
+| `timeline.sample_s`, `.sample_paths`, `.idb_json`, `.views_dir` | -1, the volatile leaves, the GS's IDB JSON, `""` | the truth sampler's period (-1 = by mode: 1 s interactive, off in run mode; 0 = off; else 0.5..60), its globs, the HK decoder's `stix_idb_tlm.json` and the views dir (`""` = `<retention.run_root>/views`) |
 | `retention.*` | see `config.py` | run mode's run root and cleanup (D-PLl) |
 | `faults.catalogue` | `""` (the v1 catalogue) | a JSON catalogue path |
 | `run.scenario_dir`, `.scenarios`, `.variants` | `""` (shipped), [], [] | run mode's inputs |
@@ -504,6 +507,63 @@ existing name is a 409; an unknown one a 404.
 The library lives under the run root, outside the per-run dirs; the
 retention cleanup only ever touches `runs/`, so saved flashes stay
 until removed by hand.
+
+## Timeline (sampler, series, views, view-run)
+
+The timeline plan (`2026-11-14-timeline-design.md`) puts truth, decoded
+HK and markers on one bench clock, for the plots and for
+`--view-run`'s replay of a finished run.
+
+- **Sampler** (`stixplat/timeline.py`): `[timeline] sample_s` (-1 = by
+  mode: 1 s interactive, off in run mode unless the config or a
+  scenario sets it; 0 = off; else 0.5..60) ticks on bench time like the
+  keep-alive (nothing while off or paused, no drift, no catch-up
+  bursts) and logs one `sample` record per tick with the truth of every
+  leaf matching a `[timeline] sample_paths` glob, plus
+  `<path>@presented` only where the presented value differs. It reads
+  the state tree the poller already fills and issues no QMP of its own.
+- **Series** (`stixplat/series.py`, fed by a record-log listener):
+  `truth:<path>`, `presented:<path>` (from `sample` and `state`
+  records), `hk:<sid>:<code>` plus the aliases `hk.cpu_load`,
+  `hk.rb_level`, `hk.trig_med`, `hk.trig_max`, `hk.archive_usage`,
+  `hk.mode` (from `tm` records with `data.hk`), and the marker kinds
+  `fault`, `force`, `tc`, `event`, `mode`, `power`, `scenario` (one
+  point per record, the hover text is the label, e.g.
+  `TC(237,18) param 312 = 0`). Bools plot as 0/1, enum strings (link
+  up/down, the timesync verdict) as labelled steps. Each series keeps
+  at most 200k points (the oldest drop; the catalogue notes
+  `truncated_before`); a window with more than `max_points` points is
+  decimated into equal-time buckets with last/min/max, so spikes
+  survive. `GET /api/v1/series/catalogue` lists them;
+  `GET /api/v1/series?ids=..&ids=..&from=&to=&max_points=` answers the
+  points (ids are repeated query parameters, `max_points` 10..5000
+  default 1000, an unknown id comes back empty and in `unknown`).
+- **IDB** (`stixplat/idb.py`): with the ground station's
+  `stix_idb_tlm.json` (`[timeline] idb_json`; the `/idb` mount in the
+  container), TM(3,25) SID 1/2 records carry `data.hk = {code: value}`
+  and the series get their names and units. Without it the HK series
+  are absent and everything else still works. `[timeline] idb_sqlite`
+  is reserved for calibration curves; until one is applied a value is
+  raw.
+- **Views** (`stixplat/views.py`): JSON files
+  `{"name", "window": "live"|"1m"|"10m"|"60m"|"run", "markers":
+  [kinds], "panels": [{"title", "series": [ids]}]}` in
+  `[timeline] views_dir` (default `<retention.run_root>/views`, shared
+  by all runs, never touched by `run_dir.fresh`). The four starter
+  views are copied in only when missing. `GET /api/v1/views`,
+  `GET /api/v1/views/<name>`, `view.save {name, view}`,
+  `view.delete {name}`; a name is 1..64 of `A-Za-z0-9._-` not starting
+  with a dot, refused with 400 before any file access.
+  `GET /api/v1/views/everything` is generated from the series
+  catalogue (one panel per leaf group, every marker kind on) and cannot
+  be saved over or deleted (409).
+- **`--view-run DIR [--port N]`** (default port 8081, so it can run
+  next to a live controller): serves a finished run's
+  `log.jsonl.N.gz` (oldest first) and `log.jsonl` read-only through the
+  same API and page — no QEMU, nothing appended to the run dir, the
+  run's own seq space; `/status` says `view_run` and the mode is
+  `view`; every verb except `view.*` is refused with 403. The views dir
+  and the IDB come from the run's own `controller.start` record.
 
 ## Security
 

@@ -4,10 +4,12 @@
 
   stixplat.py --config FILE [--run-dir DIR] [--api-port N]
   stixplat.py --config FILE --scenario NAME [--scenario ..] [--variant G]
+  stixplat.py --view-run DIR [--port N]
   stixplat.py --self-test [CASE]
 
 mode = "run" (or --scenario, which implies it) runs the scenarios each
 in its own QEMU and exits; --run-dir then sets retention.run_root.
+--view-run serves a finished run's log read-only (view.* verbs only).
 See docs/stix-port/platform.md. Stdlib only (Python >= 3.11).
 Exit codes: 0 ok (run mode: all passed), 1 a scenario failed, 2 a
 config or scenario error, 3 an infrastructure failure.
@@ -35,6 +37,11 @@ def main():
                     "unless absolute); repeatable")
     ap.add_argument("--variant", action="append", metavar="GLOB",
                     help="run mode: only these variants; repeatable")
+    ap.add_argument("--view-run", metavar="DIR",
+                    help="serve a finished run dir's log read-only: the "
+                         "same API and page, view.* verbs only")
+    ap.add_argument("--port", type=int,
+                    help="with --view-run: the API port (default 8081)")
     ap.add_argument("--self-test", nargs="?", const="", metavar="CASE",
                     help="run the offline self-test (optionally one case)")
     ap.add_argument("--check-ui", metavar="URL",
@@ -42,6 +49,15 @@ def main():
                     "(http://127.0.0.1:PORT) against its verbs; exit 1 on "
                     "a mismatch")
     args = ap.parse_args()
+    if args.view_run and (args.self_test is not None or args.check_ui):
+        ap.error("--view-run cannot be combined with --self-test or "
+                 "--check-ui")
+    if args.port is not None and not args.view_run:
+        ap.error("--port needs --view-run")
+    if args.view_run:
+        from stixplat import viewrun
+        return viewrun.main(args.view_run,
+                            8081 if args.port is None else args.port)
     if args.check_ui:
         from stixplat import uicheck
         ok, why = uicheck.check(args.check_ui.rstrip("/"))

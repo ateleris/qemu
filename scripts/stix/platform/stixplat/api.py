@@ -22,6 +22,7 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import views as views_mod
 from .dispatch import VerbError
 
 PREFIX = "/api/v1"
@@ -115,6 +116,11 @@ def parse_last_id(value):
         return None
 
 
+def _int_opt(vals):
+    """The first of the repeated query values as an int, None if absent."""
+    return None if not vals else int(vals[0])
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "stixplat/1"
     protocol_version = "HTTP/1.1"
@@ -161,6 +167,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._gate("GET"):
             return
+        try:
+            return self._get()
+        except VerbError as e:      # a bad name or query: 4xx, not a hang-up
+            return self._err(e.status, str(e))
+        except Exception as e:      # S3: a 500, never a dropped connection
+            return self._err(500, "%s: %s" % (type(e).__name__, e))
+
+    def _get(self):
         url = urllib.parse.urlsplit(self.path)
         q = urllib.parse.parse_qs(url.query)
         path = url.path.rstrip("/")
@@ -179,6 +193,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, ctl.plat.faults.catalogue())
         if path == PREFIX + "/verbs":
             return self._send(200, {"verbs": ctl.dispatcher.describe()})
+        if path == PREFIX + "/series/catalogue":
+            return self._send(200, ctl.series.catalogue())
+        if path == PREFIX + "/series":
+            # keep_blank_values: an empty ids= value is a 400, not dropped
+            return self._series(urllib.parse.parse_qs(
+                url.query, keep_blank_values=True))
+        if path == PREFIX + "/views":
+            return self._send(200, views_mod.listing(ctl.cfg))
+        if path == PREFIX + "/views/everything":    # generated: before <name>
+            return self._send(200,
+                              views_mod.everything(ctl.series.catalogue()))
+        if path.startswith(PREFIX + "/views/"):
+            name = urllib.parse.unquote(path[len(PREFIX + "/views/"):])
+            return self._send(200, views_mod.read(ctl.cfg, name))
         if path == PREFIX + "/state" or path.startswith(PREFIX + "/state/"):
             sub = path[len(PREFIX + "/state"):].lstrip("/") or None
             tree = ctl.state.get(sub)
@@ -207,6 +235,26 @@ class Handler(BaseHTTPRequestHandler):
                    (("Content-Security-Policy", page_csp(page)),
                     ("X-Frame-Options", "DENY"),
                     ("Referrer-Policy", "no-referrer")))
+
+    def _series(self, q):
+        """GET /api/v1/series?ids=..&ids=..&from=&to=&max_points=: the
+        ids are repeated query parameters (not comma-joined), an empty
+        ids= value is a 400, the window is in ns, max_points 10..5000
+        (default 1000)."""
+        ids = q.get("ids")
+        if not ids or not all(ids):
+            return self._err(400, "ids required: repeat the ids= parameter")
+        try:
+            t_from = _int_opt(q.get("from"))
+            t_to = _int_opt(q.get("to"))
+            raw = (q.get("max_points") or [None])[0]
+            max_points = 1000 if raw is None else int(raw)
+        except ValueError:
+            return self._err(400, "from, to and max_points are integers")
+        if not 10 <= max_points <= 5000:
+            return self._err(400, "max_points is 10..5000")
+        return self._send(200, self.ctl.series.query(ids, t_from, t_to,
+                                                     max_points))
 
     def _stream(self, q):
         topics = _csv(q.get("topics"))
