@@ -40,7 +40,7 @@ def main():
         cat = get(base, "/series/catalogue")
         views = get(base, "/views")["views"]
         now = get(base, "/time")["sim_time"]
-    except (urllib.error.URLError, ValueError) as e:
+    except (urllib.error.URLError, ValueError, KeyError) as e:
         print("ENV: %s: %s" % (type(e).__name__, e))
         return 2
     has_hk = any(e["id"].startswith("hk") for e in cat)

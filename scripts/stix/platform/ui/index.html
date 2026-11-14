@@ -518,9 +518,10 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
   <div id="tl-hover" class="log"></div>
   <div id="tl-plot"><canvas id="tl-canvas"></canvas></div>
   <div class="desc">Drag on the plot to zoom, double-click to reset.
-    Panels: click a title to expand its series and make it the
-    "add to panel" target (one at a time), a series chip or "remove
-    panel" to drop it.</div>
+    Windows live, 1/10/60 min trail the newest records; "whole run" is
+    a snapshot, the reload button refreshes it. Panels: click a title
+    to expand its series and make it the "add to panel" target (one at
+    a time), a series chip or "remove panel" to drop it.</div>
 </section>
 </div>
 </main>
@@ -1045,6 +1046,8 @@ $("scn-file").addEventListener("change", scenarioChanged);
    appends from the SSE records (the same rules as series.py) ---- */
 const TL_MAX_POINTS = 2000;
 const TL_LIVE_NS = 600e9;         // the live window trails 10 min
+const TL_WINDOWS_NS = { live: TL_LIVE_NS, "1m": 60e9, "10m": TL_LIVE_NS,
+                        "60m": 3600e9 };   // the trailing windows
 const TL_PANEL_H = 170;           // one panel, before its legend rows
 const TL_LEGEND_H = 13;           // one legend row
 const TL_AXIS_H = 36;             // the time axis + the marker legend line
@@ -1060,11 +1063,11 @@ const TL_KIND_VAR = { fault: "--bad", force: "--warn", tc: "--accent",
 const TL_STARTERS = ["rotb-fill-vs-faults", "cpu-and-hk",
                      "memory-upsets", "power-and-link"];
 const TL = {
-  cat: [], catById: new Map(), aliasOf: new Map(),   // hk label -> alias ids
+  cat: [], catById: new Map(), aliasOf: new Map(),   // hk:<sid>:<label>
   kindNew: new Map(), bufEnum: new Map(),            // ids seen live
   panels: [], markers: [...TL_MARKERS], window: "live", zoom: null,
   data: new Map(), buf: new Map(), panelIds: new Set(),
-  active: -1, now: null, queryTo: null, unknown: [],
+  active: -1, now: null, queryTo: null, unknown: [], catErr: null,
   view: null, viewNames: [],
   hoverX: null, drag: null, dirty: false,
 };
@@ -1074,6 +1077,9 @@ function tlVar(n) {
     .getPropertyValue(n).trim() || "#888";
 }
 function tlNow() { return TL.now == null ? 0 : TL.now; }
+function tlWinNs() {            // a trailing window's length; null for
+  return TL_WINDOWS_NS[TL.window] || null;   // the "run" snapshot
+}
 function tlIds() {
   const ids = [];
   for (const p of TL.panels)
@@ -1081,23 +1087,44 @@ function tlIds() {
   for (const m of TL.markers) if (!ids.includes(m)) ids.push(m);
   return ids;
 }
+function tlIsMarker(id) {
+  return TL_MARKERS.includes(id) ||
+    (TL.catById.get(id) || {}).kind === "marker";
+}
+function tlPlotIds() {          // the drawn ids: the panels' series plus
+  return tlIds()                // the chosen markers; a marker kind that
+    .filter((id) => TL.markers.includes(id) || !tlIsMarker(id));
+}                               // only a panel lists is skipped, not drawn
 function tlNote() {
   const msgs = [];
   if (TL.unknown.length)
-    msgs.push("unknown view ids: " + TL.unknown.join(", "));
-  if (!TL.cat.some((e) => e.id.startsWith("hk")))
+    msgs.push("skipped view ids: " + TL.unknown.join(", "));
+  if (TL.catErr != null)
+    msgs.push("catalogue unavailable: " + TL.catErr);
+  else if (!TL.cat.some((e) => e.id.startsWith("hk")))
     msgs.push("HK series need the IDB JSON");
   text($("tl-note"), msgs.join(" · "));
 }
 
 async function tlCatalogue() {
-  try { TL.cat = await getJSON("series/catalogue"); } catch (e) { TL.cat = []; }
+  TL.catErr = null;
+  try { TL.cat = await getJSON("series/catalogue"); }
+  catch (e) { TL.cat = []; TL.catErr = String(e.message || e); }
   TL.catById = new Map(TL.cat.map((e) => [e.id, e]));
-  TL.aliasOf = new Map();       // an hk label -> the alias ids (hk.*) it feeds
+  TL.aliasOf = new Map();   // "hk:<sid>:<label>" -> the alias ids bound
+  const sids = new Map();   // to it, like series.py binds (sid, code)
   for (const e of TL.cat) {
-    if (/^hk\./.test(e.id)) {
-      if (!TL.aliasOf.has(e.label)) TL.aliasOf.set(e.label, []);
-      TL.aliasOf.get(e.label).push(e.id);
+    const m = /^hk:(\d+):/.exec(e.id);
+    if (!m) continue;
+    if (!sids.has(e.label)) sids.set(e.label, []);
+    sids.get(e.label).push(m[1]);
+  }
+  for (const e of TL.cat) {
+    if (!/^hk\./.test(e.id)) continue;
+    for (const sid of sids.get(e.label) || []) {
+      const k = "hk:" + sid + ":" + e.label;
+      if (!TL.aliasOf.has(k)) TL.aliasOf.set(k, []);
+      TL.aliasOf.get(k).push(e.id);
     }
   }
   tlPick();
@@ -1157,15 +1184,15 @@ async function tlLoadView(name) {
 }
 
 function tlApply() {
-  TL.panelIds = new Set(tlIds());
+  TL.panelIds = new Set(tlPlotIds());
   tlPanelsDom();
   tlQuery();
 }
 
 function tlPick() {
   const q = $("tl-search").value.trim().toLowerCase();
-  const hits = TL.cat.filter((e) => !q ||
-    e.id.toLowerCase().includes(q) || e.label.toLowerCase().includes(q))
+  const hits = TL.cat.filter((e) => e.kind !== "marker" && (!q ||
+    e.id.toLowerCase().includes(q) || e.label.toLowerCase().includes(q)))
     .slice(0, 200);
   $("tl-hits").replaceChildren(...hits.map((e) =>
     new Option(e.label + " · " + e.id, e.id)));
@@ -1174,11 +1201,12 @@ function tlPick() {
 let TL_QUERY = 0;
 async function tlQuery() {
   const q = ++TL_QUERY;
-  TL.panelIds = new Set(tlIds());
-  const ids = tlIds();
+  const ids = tlPlotIds();
+  TL.panelIds = new Set(ids);
+  const skipped = tlIds().filter((id) => !ids.includes(id));
   if (!ids.length) {
     TL.data = new Map();
-    TL.unknown = [];
+    TL.unknown = skipped;
     tlNote();
     tlDraw();
     return;
@@ -1199,7 +1227,8 @@ async function tlQuery() {
   TL.bufEnum = new Map();
   for (const id of ids) TL.data.set(id, res[id] || { t: [], v: [] });
   // a marker kind with no points yet is "unknown" too: not a view error
-  TL.unknown = (res.unknown || []).filter((u) => !TL_MARKERS.includes(u));
+  TL.unknown = (res.unknown || []).filter((u) => !TL_MARKERS.includes(u))
+    .concat(skipped);   // marker kinds a saved view lists as series
   tlNote();
   tlDraw();
 }
@@ -1207,24 +1236,22 @@ async function tlQuery() {
 function tlRange() {
   if (TL.zoom) return { from: TL.zoom[0], to: TL.zoom[1] };
   if (TL.window === "run") return { from: null, to: null };
-  if (TL.window === "live")
-    return { from: Math.max(0, tlNow() - TL_LIVE_NS), to: tlNow() };
-  const w = { "1m": 60, "10m": 600, "60m": 3600 }[TL.window] * 1e9;
-  return { from: Math.max(0, tlNow() - w), to: null };
+  return { from: Math.max(0, tlNow() - tlWinNs()), to: tlNow() };
 }
 
 /* ---- live appends: the client side of series.py's feed rules ---- */
-function tlTrimData() {         // the queried history trails too (live)
-  const cutoff = tlNow() - TL_LIVE_NS;
+function tlTrimData() {         // the queried history trails too
+  const cutoff = tlNow() - tlWinNs();
   for (const d of TL.data.values()) {
     let i = 0;
     while (i < d.t.length && d.t[i] < cutoff) i++;
     if (!i) continue;
     d.t = d.t.slice(i);
-    d.v = d.v.slice(i);
+    if (d.v) d.v = d.v.slice(i);    // a marker has labels, not v
     if (d.min) d.min = d.min.slice(i);
     if (d.max) d.max = d.max.slice(i);
-  }
+    if (!d.v && d.labels) d.labels = d.labels.slice(i);  // per point;
+  }                               // an enum's labels (the values) stay
 }
 function tlValKind(v) {
   if (typeof v === "boolean") return "bool";
@@ -1232,13 +1259,18 @@ function tlValKind(v) {
   if (typeof v === "string") return "enum";
   return null;
 }
+function tlDiffers(a, b) {      // Python !=: a bool counts as its own
+  if (typeof a === "boolean") a = Number(a);   // number, so 0 == false
+  if (typeof b === "boolean") b = Number(b);   // and 1 == true
+  return a !== b;
+}
 function tlBufOf(id) {
   let b = TL.buf.get(id);
   if (!b) { b = []; TL.buf.set(id, b); }
   return b;
 }
 function tlTrim(b, t) {
-  const cutoff = Math.max(t, tlNow()) - TL_LIVE_NS;
+  const cutoff = Math.max(t, tlNow()) - (tlWinNs() || TL_LIVE_NS);
   while (b.length && b[0][0] < cutoff) b.shift();
   if (b.length > 4000) b.splice(0, b.length - 4000);
 }
@@ -1278,7 +1310,8 @@ function tlTm(t, d) {
       const base = "hk:" + dec.sid + ":" + code;
       tlAppendPt(base, t, v);
       const label = (TL.catById.get(base) || {}).label;
-      for (const a of (label && TL.aliasOf.get(label)) || [])
+      for (const a of (label &&
+           TL.aliasOf.get("hk:" + dec.sid + ":" + label)) || [])
         tlAppendPt(a, t, v);
     }
   }
@@ -1311,7 +1344,7 @@ function tlMarkerRec(kind, t, r, d) {
   tlAppendMark(kind, t, label);
 }
 function tlRecord(r) {
-  if (TL.window !== "live" || TL.zoom) return;
+  if (tlWinNs() == null || TL.zoom) return;  // "run" is a snapshot
   const t = r.sim_time;
   if (t == null) return;
   if (TL.queryTo != null && t <= TL.queryTo) return;  // in the query already
@@ -1329,13 +1362,13 @@ function tlRecord(r) {
       for (const [p, lf] of Object.entries(d.leaves)) {
         if (!lf || typeof lf !== "object") continue;
         tlAppendPt("truth:" + p, t, lf.truth);
-        if (lf.presented !== lf.truth)
+        if (tlDiffers(lf.presented, lf.truth))
           tlAppendPt("presented:" + p, t, lf.presented);
       }
     } else if (d.new && typeof d.new === "object") {
       const lf = d.new, p = String(r.path || "");
       tlAppendPt("truth:" + p, t, lf.truth);
-      if (lf.presented !== lf.truth)
+      if (tlDiffers(lf.presented, lf.truth))
         tlAppendPt("presented:" + p, t, lf.presented);
     }
   } else if (k === "tm") tlTm(t, d);
@@ -1363,7 +1396,7 @@ function tlDomain() {
     if (d.t[d.t.length - 1] > hi) hi = d.t[d.t.length - 1];
   }
   if (!isFinite(lo)) return [0, 1];
-  if (TL.window === "live" && TL.now != null && TL.now > hi) hi = TL.now;
+  if (tlWinNs() != null && TL.now != null && TL.now > hi) hi = TL.now;
   if (hi - lo < 1e9) hi = lo + 1e9;
   return [lo, hi];
 }
@@ -1395,7 +1428,7 @@ function tlSearch(ts, t) {
 }
 function tlAt(id, t) {
   const d = TL.data.get(id);
-  if (d && d.t.length && d.t[0] <= t) {
+  if (d && d.v && d.t.length && d.t[0] <= t) {   // no v: a marker kind
     const i = tlSearch(d.t, t);
     return [d.t[i], d.v[i], d.min ? d.min[i] : null,
             d.max ? d.max[i] : null, d.labels || null];
@@ -1442,7 +1475,7 @@ function tlScaleOf(entries, axis, t0, t1) {
   let bools = 0, enums = 0, top = 0, labels = null;
   const vals = (id) => {
     const d = TL.data.get(id);
-    if (d) {
+    if (d && d.v) {             // no v: a marker kind, skip it
       for (let i = 0; i < d.t.length; i++) {
         if (d.t[i] < t0 || d.t[i] > t1) continue;
         if (typeof d.v[i] === "number" && isFinite(d.v[i])) {
@@ -1537,7 +1570,8 @@ function tlSeries(ctx, en, x, t0, t1, top, bot, L, R, col) {
     ctx.lineTo(xi, y(v));
     lastV = v;
   };
-  if (d) for (let i = 0; i < d.t.length; i++) point(d.t[i], d.v[i]);
+  if (d && d.v)                 // no v: a marker kind, not a series
+    for (let i = 0; i < d.t.length; i++) point(d.t[i], d.v[i]);
   for (const [bt, bv] of TL.buf.get(en.id) || []) point(bt, bv);
   if (step && started && lastV != null)       // the level holds to the edge
     ctx.lineTo(x(t1), y(lastV));
@@ -1852,10 +1886,10 @@ async function loadTimeline() {
   $("tl-save").addEventListener("click", tlSave);
   $("tl-delete").addEventListener("click", tlDelete);
   window.addEventListener("resize", () => tlDraw());
-  setInterval(() => {           // the live redraw, at most ~4 Hz
+  setInterval(() => {           // the trailing windows' redraw, ~4 Hz
     if (!TL.dirty) return;
     TL.dirty = false;
-    if (TL.window === "live") {
+    if (tlWinNs() != null) {
       tlTrimData();
       tlDraw();
     }
@@ -1870,11 +1904,15 @@ async function loadTimeline() {
 const tlCanvas = $("tl-canvas");
 tlCanvas.addEventListener("pointerdown",
   (ev) => { TL.drag = { x0: ev.offsetX, x1: null }; });
+let tlRaf = 0;                  // one draw + hover update per frame
 tlCanvas.addEventListener("pointermove", (ev) => {
   TL.hoverX = ev.offsetX;
   if (TL.drag) TL.drag.x1 = ev.offsetX;
-  tlDraw();
-  tlHoverDom();
+  if (!tlRaf) tlRaf = requestAnimationFrame(() => {
+    tlRaf = 0;
+    tlDraw();
+    tlHoverDom();
+  });
 });
 tlCanvas.addEventListener("pointerup", (ev) => {
   const d = TL.drag;
