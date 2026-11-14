@@ -140,8 +140,11 @@ The path prefix is `/api/v1`. Read endpoints:
 `GET /` serves the web UI (below).
 
 The state tree (D-PLo) holds one leaf per watched value, each
-`{truth, presented, reported, unit, index_space, t_sim, status,
-fault_ids}`. The namespaces and where each comes from:
+`{truth, presented, reported, unit, index_space, t_sim, t_changed,
+status, fault_ids}`. `t_changed` is the bench time (`t_sim`) of the
+leaf's last truth/presented change: set when a poll stores a new value,
+kept while the value holds (the State tab's Changed column). The
+namespaces and where each comes from:
 
 | Namespace | From |
 |---|---|
@@ -361,7 +364,11 @@ logged as `force`. Each entry declares:
 validated before anything is marked; an apply that fails at its trigger
 leaves nothing armed or active; every inject and clear is a `fault` log
 record with the resolved params and seed, so a run can be replayed from
-its log.
+its log. `status().faults` (and the active list in `GET /faults`) shows
+an armed fault with its `trigger` (the row reads "armed at
+<trigger.sim_time>") and an active lasting fault with `since_sim`, the
+bench time it turned active — an inject now, or the moment its
+`at_sim` trigger fired (additive, UI plan D1).
 
 **Power cycles and faults (PL-11a, D-PSa).** The catalogue's active
 list is controller-side and survives a power cycle; the device does not
@@ -733,8 +740,38 @@ the launch configuration from `status()["setup"]` (`binary`, `elf`,
 `obt_continuity`, `on_guest_reset`, `sample_s`) in plain words, the
 measured speeds (icount 7: 0.28 wall s per guest s at 0.1 s frames,
 0.05 with `pace = fast` at 1 s frames) and the skip-ahead controls
-(`det.rotb.burst`, the flash library save/load/list). Timeline is a
-placeholder until Track C.
+(`det.rotb.burst`, the flash library save/load/list). Timeline plots
+the series and markers (see Timeline above).
+
+**Mockup port** (UI plan D, 2026-11-14): the header has a global
+pause/resume button pair (the label follows `time.running`). The
+Platform tab has a "Faults here" box: the catalogue's Link & time and
+Supplies & HK rows, each with a Now inject. The Faults tab shows the
+catalogue as a table (fault, what it does, parameters, state, inject),
+grouped by category (`spw/timecode/obt/keepalive` = Link & time,
+`power/thermal/hk_prot` = Supplies & HK, `attenuator`, `memory`,
+anything else Other) with filter chips; the inject column has "now"
+and "at…" — an input of guest seconds, absolute (`120`) or relative
+(`+30`), sent as an `at_sim` trigger on the controller's sim time; the
+State column reads idle / armed at T / active since T (`since_sim`).
+An Active-now list shows the active and armed faults with their time
+and params, clear per row and a clear-all (one confirm, one
+`fault.clear` each, the 409s reported per row); forcings list the
+active ones with clear per row. The Logs chips are tm, heartbeat, tc,
+cmd, fault, state, expect, mismatch, sample, log (heartbeat = the TM
+records of APID 0x5E5, which the tm chip then excludes; sample and
+heartbeat off by default; UART stays in its own panel) plus a
+case-insensitive text search over the rendered lines that also applies
+to new ones. The State tab groups the leaves by parent path
+(collapsible, open by default) with the columns leaf, truth, presented
+to FSW, reported in TM, status and changed: "reported in TM" maps
+`instrument.rotb.count` to the `hk.rb_level` series' latest point via
+`/series` ("–" without an IDB), "changed" is the leaf's `t_changed`.
+Filters "only differences" (presented ≠ truth) and "only faulted"
+(`fault_ids` non-empty or a status other than `ok`) sit beside the text filter. Clicking a
+numeric/bool/enum row adds `truth:<path>` to the Timeline's expanded
+panel (a new one when none is expanded) and switches to that tab; a
+just-added series may be listed as skipped until its first point.
 
 The server sends it behind the same Host filter, with
 `Content-Security-Policy: default-src 'none'; script-src <hash>;

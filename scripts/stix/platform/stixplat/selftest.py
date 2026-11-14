@@ -2658,6 +2658,46 @@ def t_det_rotb_leaves(env):
         ctl.shutdown()
 
 
+def t_state_t_changed(env):
+    """UI plan D4: leaves gain t_changed, the t_sim of the last
+    truth/presented change, kept while the value holds (also when only
+    the poll time moves). Additive: every former key stays."""
+    tr = state_mod.StateTree()
+    tr.set_platform({"platform.power": "off"}, 10 * NS)
+    a = tr.get("platform.power")
+    check(a["t_changed"] == 10 * NS, "set at creation: %r" % (a,))
+    tr.set_platform({"platform.power": "off"}, 20 * NS)
+    a = tr.get("platform.power")
+    check(a["t_sim"] == 20 * NS and a["t_changed"] == 10 * NS,
+          "kept while the value holds: %r" % (a,))
+    tr.set_platform({"platform.power": "on"}, 30 * NS)
+    a = tr.get("platform.power")
+    check(a["truth"] == "on" and a["t_changed"] == 30 * NS,
+          "set on a truth change: %r" % (a,))
+    # a presented-only change (a forcing, via the poll) counts too
+    ctrl = {"supplies": {"lines": {}},
+            "hk_adc": {"3": {"truth": 100, "presented": 100}},
+            "hk_prot": {"irqen": 0, "protstat": 0, "hotsample": 0,
+                        "lines": []},
+            "watchdog": {}, "scet": {}, "det": {"quarter_on": [1, 1, 1, 1]}}
+    tr.update_hw(ctrl, None, 40 * NS)
+    a = tr.get("instrument.hk_adc.3")
+    check(a["t_changed"] == 40 * NS and a["truth"] == a["presented"],
+          "a fresh poll leaf: %r" % (a,))
+    ctrl["hk_adc"]["3"]["presented"] = 122
+    tr.update_hw(ctrl, None, 50 * NS)
+    a = tr.get("instrument.hk_adc.3")
+    check(a["presented"] == 122 and a["t_changed"] == 50 * NS,
+          "set on a presented change: %r" % (a,))
+    tr.update_hw(ctrl, None, 60 * NS)
+    a = tr.get("instrument.hk_adc.3")
+    check(a["t_sim"] == 60 * NS and a["t_changed"] == 50 * NS,
+          "kept when only the poll time moves: %r" % (a,))
+    check(set(a) >= {"truth", "presented", "reported", "unit",
+                     "index_space", "t_sim", "status", "fault_ids"},
+          "additive, the former keys stay: %r" % sorted(a))
+
+
 def t_det_burst(env):
     """FF plan Task 3: the det.rotb.burst verb over the fake's
     det-rotb-burst QOM pair: power off refuses, the device's refusal
@@ -2859,6 +2899,33 @@ def t_faults(env):
               "forcings in status")
     finally:
         ctl.shutdown()
+
+
+def t_faults_since_sim(env):
+    """UI plan D1: faults.status() gains since_sim, the bench time a
+    lasting fault turned active (an inject now, or an armed fault's
+    trigger firing); an armed fault is not active yet. Additive: the
+    former keys stay."""
+    clk, f, calls, fail, recs = _fault_rig()
+    clk.sample(1 * NS)
+    f.inject("spw.link.disconnect")
+    st = f.status()["spw.link.disconnect"]
+    check(st.get("since_sim") == 1 * NS,
+          "since_sim at the inject: %r" % (st,))
+    check(set(st) == {"params", "seed", "pending", "since_sim"},
+          "an active fault's keys: %r" % sorted(st))
+    f.inject("keepalive.missing",
+             trigger={"at": "at_sim", "sim_time": 5 * NS})
+    check("since_sim" not in f.status()["keepalive.missing"],
+          "an armed fault has no since_sim yet: %r"
+          % (f.status()["keepalive.missing"],))
+    clk.sample(5 * NS)
+    clk.run_due()
+    st = f.status()["keepalive.missing"]
+    check(st.get("since_sim") == 5 * NS,
+          "since_sim when the trigger fires: %r" % (st,))
+    f.clear("spw.link.disconnect")
+    check("spw.link.disconnect" not in f.status(), "the clear still works")
 
 
 def _fake_children():
@@ -3161,6 +3228,11 @@ UI_TIMELINE_IDS = {"tl-view", "tl-window", "tl-search", "tl-hits",
                    "tl-add", "tl-save", "tl-save-name", "tl-delete",
                    "tl-note", "tl-panels", "tl-hover", "tl-plot",
                    "tl-canvas", "tl-reload", "tl-add-panel"}
+# UI plan D: the faults catalogue + its category chips and active list,
+# the Platform tab's faults-here box, the header pause, the log search
+# and the State tab's filters
+UI_MOCKUP_IDS = {"faults", "fault-cats", "faults-active", "plat-faults",
+                 "hdr-run", "log-search", "state-diff", "state-faulted"}
 
 
 def _csp_hashes(page, tag):
@@ -3424,6 +3496,37 @@ def t_ui_timeline(env):
               "<%s %r>: style attribute or inline handler" % (tag, a))
     for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
         check(bad not in page.lower(), "the page uses %s" % bad)
+
+
+def t_ui_mockup_d(env):
+    """UI plan D (mockup boards 2, 3, 5, 6): the faults catalogue keeps
+    its container and gains the category chips and the active list, the
+    Platform tab its faults-here box, the header carries the pause and
+    resume verbs, the Logs panel a search input and the State tab its
+    filters; the pre-tab data-verb set is still all there."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    page = body.decode()
+    p = _UiParser()
+    p.feed(page)
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check(UI_MOCKUP_IDS <= ids, "mockup ids missing %r"
+          % sorted(UI_MOCKUP_IDS - ids))
+    head = re.search(r"<header>(.*?)</header>", page, re.S).group(1)
+    check('data-verb="sim.pause"' in head and
+          'data-verb="sim.resume"' in head,
+          "the header pause button: sim.pause and sim.resume")
+    used = {v for v, _ in p.verbs}
+    check(UI_VERBS <= used, "the pre-tab data-verbs lost %r"
+          % (UI_VERBS - used))
 
 
 SETUP_KEYS = {"binary", "elf", "elf_sha256", "icount_shift", "pace",
@@ -4510,10 +4613,12 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("view-run (A6)", t_view_run),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
+         ("faults: since_sim (D1)", t_faults_since_sim),
          ("fault model: truth|presented, qom", t_fault_model),
          ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
          ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
          ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
+         ("state: t_changed (D4)", t_state_t_changed),
          ("detector burst verb (FF)", t_det_burst),
          ("flash library (FF)", t_flashlib),
          ("guest-reset policies", t_guest_reset),
@@ -4524,6 +4629,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: the page (no browser)", t_ui_page),
          ("UI: tabs (timeline B1)", t_ui_tabs),
          ("UI: timeline (C1)", t_ui_timeline),
+         ("UI: mockup port (D)", t_ui_mockup_d),
          ("setup status (timeline B2)", t_setup_status),
          ("UI: the live check (smokes)", t_ui_check)]
 

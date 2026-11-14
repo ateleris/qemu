@@ -26,7 +26,9 @@ Lifecycle (PL-4 review SF4):
   and may be injected again;
 - apply returns the state it replaced, and undo restores exactly that;
 - after a power cycle the active device-state faults are re-applied
-  (PL-11a, D-PSa), with the prior of the first apply kept.
+  (PL-11a, D-PSa), with the prior of the first apply kept;
+- `status()` reports an active lasting fault's `since_sim`, the bench
+  time it turned active (UI plan D1).
 """
 
 import json
@@ -271,7 +273,11 @@ class Faults:
         prior = apply_fn(entry, params)
         with self.lock:
             if entry["id"] in self.active:
-                self.active[entry["id"]].update(pending=False, prior=prior)
+                # since_sim: the bench time the fault became active —
+                # an inject now, or the at_sim trigger firing (UI D1)
+                self.active[entry["id"]].update(
+                    pending=False, prior=prior,
+                    since_sim=self.clock.now()[0])
         self.log.emit("api", "fault", "fault." + entry["id"],
                       {"action": "inject", "target": entry["target"],
                        "mode": entry["mode"], "params": params,

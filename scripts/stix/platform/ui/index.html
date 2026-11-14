@@ -99,6 +99,7 @@ th, td { text-align: left; padding: 2px 6px; border-bottom:
          1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
      background: var(--panel); }
+tbody th { position: static; }   /* group headers scroll, thead sticks */
 .scroll { max-height: 340px; overflow: auto; }
 .tall { max-height: 520px; }
 .log { font: 12px/1.35 var(--mono); white-space: pre-wrap;
@@ -150,6 +151,10 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
   <span class="chip">TM <b id="s-tm">?</b></span>
   <span class="chip">scenario <b id="s-scn">none</b></span>
   <span class="chip">mode <b id="s-mode">?</b></span>
+  <span id="hdr-run" class="ctl">
+    <button data-verb="sim.pause">pause</button>
+    <button data-verb="sim.resume" hidden>resume</button>
+  </span>
   <span id="toast" class="muted"></span>
 </header>
 <nav id="tabbar">
@@ -219,6 +224,13 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
     <button data-verb="sim.pause">pause</button>
     <button data-verb="sim.resume">resume</button>
   </div>
+</section>
+
+<section>
+  <h2>Faults here</h2>
+  <div class="desc">The link, supply and HK faults of this tab's
+    subsystems; the full catalogue is on the Faults tab.</div>
+  <div id="plat-faults"></div>
 </section>
 
 <section>
@@ -347,22 +359,38 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
 
 <div class="tab" data-tab-panel="faults" hidden>
 <section>
-  <h2>Faults</h2>
-  <div id="faults" class="scroll"><span class="muted">loading…</span></div>
+  <h2>Faults <span id="fault-cats" class="ctl"></span></h2>
+  <div class="scroll tall">
+    <table>
+      <thead><tr><th>fault</th><th>what it does</th><th>parameters</th>
+        <th>state</th><th>inject</th></tr></thead>
+      <tbody id="faults"></tbody>
+    </table>
+  </div>
+  <div id="faults-empty" class="desc"></div>
   <template id="t-fault">
-    <div class="row">
-      <div class="ctl">
-        <b class="f-id"></b>
-        <span class="chip f-state"></span>
-      </div>
-      <div class="desc f-desc"></div>
-      <div class="ctl f-params"></div>
-      <div class="ctl">
-        <button data-verb="fault.inject">inject</button>
+    <tr>
+      <td><b class="f-id"></b></td>
+      <td class="desc f-desc"></td>
+      <td class="ctl f-params"></td>
+      <td><span class="chip f-state"></span></td>
+      <td class="ctl">
+        <input name="at_s" size="8"
+               title="at…: guest seconds, 120 absolute or +30 relative">
+        <button data-verb="fault.inject">now</button>
+        <button data-verb="fault.inject" data-at="1">at…</button>
         <button data-verb="fault.clear">clear</button>
-      </div>
-    </div>
+      </td>
+    </tr>
   </template>
+</section>
+
+<section>
+  <h2>Active now
+    <button type="button" id="faults-clear-all" class="danger">clear
+      all</button>
+  </h2>
+  <div id="faults-active"></div>
 </section>
 
 <section>
@@ -374,7 +402,7 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
     <button data-verb="force.set" class="danger">force</button>
     <button data-verb="force.clear" data-only="path">clear</button>
   </div>
-  <div id="forcings" class="desc"></div>
+  <div id="forcings"></div>
 </section>
 </div>
 
@@ -395,13 +423,17 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
 <div class="tab" data-tab-panel="logs" hidden>
 <section class="wide">
   <h2>Events
+    <input id="log-search" class="wide" placeholder="search the lines">
     <span class="muted">
       <label><input type="checkbox" class="topic" value="tm" checked> TM</label>
+      <label><input type="checkbox" class="topic" value="heartbeat">
+        heartbeat</label>
       <label><input type="checkbox" class="topic" value="tc" checked> TC</label>
       <label><input type="checkbox" class="topic" value="cmd" checked> cmd</label>
       <label><input type="checkbox" class="topic" value="state" checked> state</label>
       <label><input type="checkbox" class="topic" value="fault" checked> fault</label>
       <label><input type="checkbox" class="topic" value="expect" checked> expect</label>
+      <label><input type="checkbox" class="topic" value="mismatch" checked> mismatch</label>
       <label><input type="checkbox" class="topic" value="log"> log</label>
       <label><input type="checkbox" class="topic" value="sample"> sample</label>
       <label><input type="checkbox" id="follow" checked> follow</label>
@@ -413,15 +445,24 @@ th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
 
 <div class="tab" data-tab-panel="state" hidden>
 <section class="wide">
-  <h2>State <input id="state-filter" placeholder="filter, e.g. idpu.spw"
-                   class="wide"></h2>
+  <h2>State
+    <input id="state-filter" placeholder="filter, e.g. idpu.spw"
+                   class="wide">
+    <label class="muted"><input type="checkbox" id="state-diff">
+      only differences</label>
+    <label class="muted"><input type="checkbox" id="state-faulted">
+      only faulted</label>
+  </h2>
   <div class="scroll tall">
     <table>
-      <thead><tr><th>path</th><th>truth</th><th>presented</th>
-        <th>status</th><th>unit</th><th>faults</th></tr></thead>
+      <thead><tr><th>leaf</th><th>truth</th>
+        <th>presented to FSW</th><th>reported in TM</th><th>status</th>
+        <th>changed</th></tr></thead>
       <tbody id="state"></tbody>
     </table>
   </div>
+  <div class="desc">Click a leaf row to plot its truth series on the
+    Timeline.</div>
 </section>
 </div>
 
@@ -580,14 +621,24 @@ function collect(scope, args, only) {
 }
 
 /* the args of a control: its data-args if it has them, else the inputs
-   of its .ctl row (only those in data-only when it is set); a fault row's buttons carry the fault id, and inject
-   also takes the row's params */
+   of its .ctl row (only those in data-only when it is set); a fault
+   button carries the fault id, inject also takes the row's params and,
+   on the "at…" button, the row's guest-seconds input */
 function argsOf(btn) {
   if (btn.dataset.id) {
     const args = { id: btn.dataset.id };
     if (btn.dataset.verb === "fault.inject") {
-      const p = collect(btn.closest(".row").querySelector(".f-params"), {});
-      if (p.params) args.params = p.params;
+      const row = btn.closest("[data-fault]");
+      const ps = row && row.querySelector(".f-params");
+      if (ps) {
+        const p = collect(ps, {});
+        if (p.params) args.params = p.params;
+      }
+      if (btn.dataset.at) {   // "at…" never falls back to an inject now
+        const t = atTrigger(row);
+        if (!t) throw new Error("at…: enter guest seconds (120 or +30)");
+        args.trigger = t;
+      }
     }
     return args;
   }
@@ -596,6 +647,20 @@ function argsOf(btn) {
   const only = btn.dataset.only == null ? null :
     btn.dataset.only.split(",").filter((x) => x);
   return scope ? collect(scope, {}, only) : {};
+}
+
+/* the "at…" input (D1): guest seconds, absolute (120) or relative
+   (+30), as an at_sim trigger on the controller's sim time */
+function atTrigger(row) {
+  const inp = row && row.querySelector("input[name=at_s]");
+  const v = inp ? inp.value.trim() : "";
+  if (!v) return null;
+  const rel = v.startsWith("+");
+  const s = Number(rel ? v.slice(1) : v);   // strict: "30x" is an error
+  if (!isFinite(s) || s < 0)
+    throw new Error("at…: guest seconds (120 or +30)");
+  return { at: "at_sim",
+           sim_time: Math.round((rel ? (TL.now || 0) : 0) + s * 1e9) };
 }
 
 document.addEventListener("click", async (ev) => {
@@ -740,11 +805,13 @@ async function refresh() {
        (scn.verdict ? " " + scn.verdict : "") : "none",
        scn ? (scn.verdict === "pass" ? "ok" : scn.verdict ? "fail" : "pending") : "muted");
   text($("scn-state"), scn ? JSON.stringify(scn) : "");
+  const run = !!(st.time && st.time.running);
+  // the header pause/resume: pause while running, resume only while
+  // paused (sim.resume answers 409 in any other power state)
+  $("hdr-run").children[0].hidden = !run;
+  $("hdr-run").children[1].hidden = run || st.power !== "paused";
   renderFaultState(st.faults || {});
-  const f = st.forcings || {};
-  text($("forcings"), Object.keys(f).length ?
-       "active: " + Object.entries(f).map(([k, v]) => k + " = " +
-         JSON.stringify(v)).join(", ") : "no forcing active");
+  renderForcings(st.forcings || {});
   const fa = Object.values(st.faults || {});
   text($("ov-platform"), (st.power || "?") + " · link " + (p.link || "?"));
   text($("ov-idpu"), (p.timecodes === false ? "time codes off" :
@@ -804,16 +871,32 @@ function renderSetup(s) {
   body.replaceChildren(...trs);
 }
 
-/* ---- faults, generated from the catalogue ---- */
+/* ---- faults, generated from the catalogue (D1) ---- */
+const FAULT_CATS = [
+  ["Link & time", ["spw", "timecode", "obt", "keepalive"]],
+  ["Supplies & HK", ["power", "thermal", "hk_prot"]],
+  ["Attenuator", ["attenuator"]],
+  ["Memory", ["memory"]],
+];
+function faultCat(id) {
+  const seg = String(id).split(".")[0];
+  for (const [name, segs] of FAULT_CATS)
+    if (segs.includes(seg)) return name;
+  return "Other";
+}
 async function loadFaults() {
   const c = await getJSON("faults");
   catalogue = c.catalogue || [];
+  const order = FAULT_CATS.map(([n]) => n).concat("Other");
+  const sorted = [...catalogue].sort((a, b) =>
+    order.indexOf(faultCat(a.id)) - order.indexOf(faultCat(b.id)));
   const box = $("faults");
   box.replaceChildren();
   const tpl = $("t-fault");
-  for (const f of catalogue) {
+  for (const f of sorted) {
     const row = tpl.content.firstElementChild.cloneNode(true);
     row.dataset.fault = f.id;
+    row.dataset.cat = faultCat(f.id);
     text(row.querySelector(".f-id"), f.id);
     text(row.querySelector(".f-desc"), f.class + ", " + f.mode + " on " +
          f.target + " (" + f.changes + ", " + f.persistence + ")");
@@ -836,23 +919,178 @@ async function loadFaults() {
     }
     box.append(row);
   }
-  if (!catalogue.length) text(box, "the catalogue is empty");
+  text($("faults-empty"), catalogue.length ? "" : "the catalogue is empty");
+  faultCats(sorted);
+  platFaults();
+  $("faults-clear-all").addEventListener("click", async () => {
+    const ids = [...$("faults-active")
+      .querySelectorAll('button[data-verb="fault.clear"]')]
+      .map((b) => b.dataset.id);
+    if (!ids.length) return;
+    if (!window.confirm("clear " + ids.length + " fault(s)?")) return;
+    for (const id of ids) {
+      try {
+        await post("fault.clear", { id });
+      } catch (e) {
+        toast(String(e.message || e), true);   // the 409s, never abort
+      }
+    }
+    refresh();
+  });
+}
+
+/* the filter chips "All N", "<Category> N" */
+let faultCatSel = "";
+function faultCats(sorted) {
+  const bar = $("fault-cats");
+  const counts = new Map();
+  for (const f of sorted) {
+    const c = faultCat(f.id);
+    counts.set(c, (counts.get(c) || 0) + 1);
+  }
+  const mk = (label, cat) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.dataset.cat = cat;
+    text(b, label);
+    b.addEventListener("click", () => {
+      faultCatSel = cat;
+      faultCatFilter();
+    });
+    return b;
+  };
+  bar.replaceChildren(mk("all " + sorted.length, ""));
+  for (const [c, n] of counts) bar.append(mk(c + " " + n, c));
+  faultCatFilter();
+}
+function faultCatFilter() {
+  const bar = $("fault-cats");
+  for (const b of bar.children)
+    cls(b, b.dataset.cat === faultCatSel ? "chip on" : "");
+  for (const row of $("faults").rows)
+    if (row.dataset.cat)
+      row.hidden = faultCatSel !== "" && row.dataset.cat !== faultCatSel;
+}
+
+/* the Platform tab's "Faults here" box (D2) */
+function platFaults() {
+  const box = $("plat-faults");
+  const rows = [];
+  for (const f of catalogue) {
+    const c = faultCat(f.id);
+    if (c !== "Link & time" && c !== "Supplies & HK") continue;
+    const row = document.createElement("div");
+    cls(row, "row");
+    const lab = document.createElement("span");
+    cls(lab, "chip");
+    text(lab, f.id);
+    row.append(lab);
+    const b = document.createElement("button");
+    b.dataset.verb = "fault.inject";
+    b.dataset.id = f.id;
+    text(b, "now");
+    row.append(b);
+    rows.push(row);
+  }
+  box.replaceChildren(...rows);
+}
+
+function faultStateWord(a) {
+  if (!a) return "idle";
+  if (a.pending && a.trigger) return "armed at " + fmtS(a.trigger.sim_time);
+  if (a.pending) return "arming";
+  return a.since_sim != null ? "active since " + fmtS(a.since_sim)
+    : "active";
 }
 
 function renderFaultState(active) {
   for (const row of document.querySelectorAll("[data-fault]")) {
     const a = active[row.dataset.fault];
     const s = row.querySelector(".f-state");
-    text(s, a ? (a.pending ? "armed" : "active") : "idle");
-    cls(s, "chip f-state " + (a ? (a.pending ? "pending" : "fail") : "muted"));
+    text(s, faultStateWord(a));
+    cls(s, "chip f-state " +
+        (a ? (a.pending && !a.trigger ? "pending" : "fail") : "muted"));
   }
+  // the Active now list: active and armed, rebuilt only on a change
+  const box = $("faults-active");
+  const sig = JSON.stringify(Object.entries(active).map(([id, a]) =>
+    [id, faultStateWord(a), a.params || {}]));
+  if (sig === box.dataset.sig) return;
+  box.dataset.sig = sig;
+  const rows = [];
+  for (const [id, a] of Object.entries(active)) {
+    const row = document.createElement("div");
+    cls(row, "row");
+    const lab = document.createElement("span");
+    cls(lab, "chip " + (a.pending && !a.trigger ? "pending" : "fail"));
+    text(lab, id + " — " + faultStateWord(a));
+    row.append(lab);
+    if (a.params && Object.keys(a.params).length) {
+      const p = document.createElement("span");
+      cls(p, "muted");
+      text(p, " " + JSON.stringify(a.params));
+      row.append(p);
+    }
+    const b = document.createElement("button");
+    b.dataset.verb = "fault.clear";
+    b.dataset.id = id;
+    text(b, "clear");
+    row.append(b);
+    rows.push(row);
+  }
+  if (!rows.length) {
+    const none = document.createElement("span");
+    cls(none, "muted");
+    text(none, "no fault active or armed");
+    rows.push(none);
+  }
+  box.replaceChildren(...rows);
+}
+
+/* ---- forcings (D1): the active ones, clear per row ---- */
+function renderForcings(f) {
+  const box = $("forcings");
+  const ids = Object.keys(f || {});
+  const sig = JSON.stringify(ids.map((p) => [p, f[p]]));
+  if (!ids.length) {
+    if (box.dataset.sig !== "0") {
+      box.dataset.sig = "0";
+      text(box, "no forcing active");
+    }
+    return;
+  }
+  if (sig === box.dataset.sig) return;
+  box.dataset.sig = sig;
+  const rows = [];
+  for (const p of ids) {
+    const row = document.createElement("div");
+    cls(row, "row");
+    const lab = document.createElement("span");
+    cls(lab, "chip");
+    text(lab, p + " = " + JSON.stringify(f[p]));
+    row.append(lab);
+    const b = document.createElement("button");
+    b.dataset.verb = "force.clear";
+    b.dataset.args = JSON.stringify({ path: p });
+    text(b, "clear");
+    row.append(b);
+    rows.push(row);
+  }
+  box.replaceChildren(...rows);
 }
 
 /* ---- forcings: the forceable leaves from the state tree ---- */
+/* A leaf is the state.py leaf() record (numeric t_sim, fault_ids list),
+   not any node with a "truth" key: instrument.attenuator has child
+   subtrees named "truth"/"presented". */
+function isLeaf(v) {
+  return !!v && typeof v === "object" && "truth" in v &&
+    typeof v.t_sim === "number" && Array.isArray(v.fault_ids);
+}
 function leaves(tree, prefix, out) {
   for (const [k, v] of Object.entries(tree || {})) {
     const p = prefix ? prefix + "." + k : k;
-    if (v && typeof v === "object" && "truth" in v) out.push([p, v]);
+    if (isLeaf(v)) out.push([p, v]);
     else if (v && typeof v === "object") leaves(v, p, out);
   }
   return out;
@@ -873,31 +1111,118 @@ async function loadState() {
     sel.replaceChildren(...want.map((p) => new Option(p, p)));
     if (want.includes(keep)) sel.value = keep;
   }
+  // "Reported in TM" (D4): the latest point of the HK series a leaf is
+  // mapped to; "–" without an IDB
+  const tmPaths = stateRows.map(([p]) => p).filter((p) => TM_OF[p]);
+  const onTab = !document.querySelector('[data-tab-panel="state"]').hidden;
+  if (tmPaths.length && onTab) {
+    try {
+      const ids = [...new Set(tmPaths.map((p) => TM_OF[p]))];
+      const r = await getJSON("series?max_points=10" +
+        ids.map((i) => "&ids=" + encodeURIComponent(i)).join(""));
+      for (const p of tmPaths) {
+        const d = r[TM_OF[p]];
+        tmNow[p] = d && d.t.length ? show(d.v[d.v.length - 1]) : null;
+      }
+      renderState();
+    } catch (e) { /* the previous values, else "–" */ }
+  }
 }
 
 function show(v) { return v == null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v); }
 
+/* ---- the State tab (D4): leaves grouped by parent path, the
+   Reported-in-TM map, the filters, click-to-Timeline ---- */
+const TM_OF = { "instrument.rotb.count": "hk.rb_level" };
+const tmNow = {};
+const stateCollapsed = new Set();
+
+function leafName(p) {
+  const i = p.lastIndexOf(".");
+  return i < 0 ? p : p.slice(i + 1);
+}
+
 function renderState() {
   const flt = $("state-filter").value.trim();
+  const onlyDiff = $("state-diff").checked;
+  const onlyFaulted = $("state-faulted").checked;
   const body = $("state");
-  const rows = [];
+  const groups = new Map();
   for (const [p, lf] of stateRows) {
     if (flt && !p.includes(flt)) continue;
-    const tr = document.createElement("tr");
-    const cells = [p, show(lf.truth), show(lf.presented), lf.status,
-                   lf.unit || "", (lf.fault_ids || []).join(" ")];
-    cells.forEach((c, i) => {
-      const td = document.createElement("td");
-      text(td, c);
-      if (i === 2 && show(lf.truth) !== show(lf.presented)) cls(td, "diff");
-      if (i === 3) cls(td, lf.status);
-      tr.append(td);
+    if (onlyDiff && show(lf.truth) === show(lf.presented)) continue;
+    if (onlyFaulted && !(lf.fault_ids || []).length && lf.status === "ok")
+      continue;
+    const i = p.lastIndexOf(".");
+    const g = i < 0 ? "(root)" : p.slice(0, i);
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push([p, lf]);
+  }
+  const rows = [];
+  for (const g of [...groups.keys()].sort()) {
+    const items = groups.get(g);
+    const head = document.createElement("tr");
+    const th = document.createElement("th");
+    th.colSpan = 6;
+    const b = document.createElement("button");
+    b.type = "button";
+    const word = () => text(b, (stateCollapsed.has(g) ? "▸ " : "▾ ") +
+                           g + " (" + items.length + ")");
+    word();
+    b.addEventListener("click", () => {
+      const open = stateCollapsed.has(g);
+      if (open) stateCollapsed.delete(g); else stateCollapsed.add(g);
+      word();
+      for (const r of body.rows)
+        if (r.dataset.grp === g) r.hidden = !open;
     });
-    rows.push(tr);
+    th.append(b);
+    head.append(th);
+    rows.push(head);
+    for (const [p, lf] of items) {
+      const tr = document.createElement("tr");
+      tr.dataset.path = p;
+      tr.dataset.grp = g;
+      tr.hidden = stateCollapsed.has(g);
+      const tm = TM_OF[p] && tmNow[p] != null ? tmNow[p] : "–";
+      const cells = [leafName(p), show(lf.truth), show(lf.presented),
+                     tm, lf.status, fmtS(lf.t_changed)];
+      cells.forEach((c, i) => {
+        const td = document.createElement("td");
+        text(td, c);
+        if (i === 2 && show(lf.truth) !== show(lf.presented)) cls(td, "diff");
+        if (i === 4) {
+          cls(td, lf.status);
+          if ((lf.fault_ids || []).length) {
+            const f = document.createElement("span");
+            cls(f, "chip warn");
+            text(f, lf.fault_ids.join(" "));
+            td.append(f);
+          }
+        }
+        tr.append(td);
+      });
+      rows.push(tr);
+    }
   }
   body.replaceChildren(...rows);
 }
 $("state-filter").addEventListener("input", renderState);
+for (const id of ["state-diff", "state-faulted"])
+  $(id).addEventListener("change", renderState);
+
+/* a numeric, bool or enum row plots its truth series on the Timeline */
+$("state").addEventListener("click", (ev) => {
+  if (ev.target.closest("button")) return;      // a group toggle
+  const tr = ev.target.closest("tr[data-path]");
+  if (!tr) return;
+  const row = stateRows.find(([p]) => p === tr.dataset.path);
+  const k = row && typeof row[1].truth;
+  if (k !== "number" && k !== "boolean" && k !== "string") return;
+  tlAddTruth(tr.dataset.path);
+  location.hash = "timeline" +
+    (TL.view ? "/v=" + encodeURIComponent(TL.view) : "");
+});
 
 /* ---- detectors tab: instrument.detector.* / instrument.rotb.* ---- */
 function renderDet() {
@@ -1855,6 +2180,19 @@ function tlAddSeries() {
   if (!p.series.includes(id)) p.series.push(id);
   tlApply();
 }
+
+/* the State tab's click-to-timeline hook (D4): the leaf's truth series
+   into the expanded panel, or a new one; the caller switches tab */
+function tlAddTruth(path) {
+  const id = "truth:" + path;
+  if (TL.active < 0 || !TL.panels[TL.active]) {
+    TL.panels.push({ title: "state", series: [] });
+    TL.active = TL.panels.length - 1;
+  }
+  const p = TL.panels[TL.active];
+  if (!p.series.includes(id)) p.series.push(id);
+  tlApply();
+}
 async function tlSave() {
   const name = $("tl-save-name").value.trim();
   if (!name) { toast("a view name is needed to save", true); return; }
@@ -2022,11 +2360,11 @@ function onRecord(r) {
   const box = $("events");
   const [c, s] = summary(r);
   const line = document.createElement("div");
-  line.dataset.topic = topicOf(r.kind);
+  line.dataset.topic = topicOf(r);
   cls(line, c);
-  line.hidden = !shown(line.dataset.topic);
   text(line, fmtS(r.sim_time).padStart(13) + "  #" + r.seq + " b" + r.boot_id + "  " +
        r.kind.padEnd(6) + " " + s);
+  line.hidden = !logVisible(line);    // after the text: the search reads it
   box.append(line);
   trim(box);
   follow(box, "follow");
@@ -2036,12 +2374,30 @@ function onRecord(r) {
 const TOPIC = { cmd: "cmd", result: "cmd", state: "state", power: "state",
                 fault: "fault", force: "fault", debug: "log",
                 sample: "sample" };
-function topicOf(kind) { return TOPIC[kind] || kind; }
+/* heartbeat (D3): the tm records whose decoded APID is 0x5E5, which the
+   tm chip then excludes */
+function topicOf(r) {
+  const d = r.data || {};
+  if (r.kind === "tm" && d.decoded && d.decoded.heartbeat)
+    return "heartbeat";
+  return TOPIC[r.kind] || r.kind;
+}
+
+/* the text search over the rendered lines (D3), case-insensitive, on
+   top of the topic chips; new lines are filtered too */
+let logQuery = "";
+function logVisible(line) {
+  if (!shown(line.dataset.topic)) return false;
+  return !logQuery || line.textContent.toLowerCase().includes(logQuery);
+}
+function refilterLog() {
+  logQuery = $("log-search").value.trim().toLowerCase();
+  for (const l of $("events").children) l.hidden = !logVisible(l);
+}
+$("log-search").addEventListener("input", refilterLog);
 
 for (const t of document.querySelectorAll(".topic")) {
-  t.addEventListener("change", () => {
-    for (const l of $("events").children) l.hidden = !shown(l.dataset.topic);
-  });
+  t.addEventListener("change", refilterLog);
 }
 
 async function backfill(seq) {

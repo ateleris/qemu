@@ -2,8 +2,11 @@
 """The hardware state tree (platform plan D-PLo).
 
 Leaves are {truth, presented, reported, unit, index_space, t_sim,
-status, fault_ids}. PL-3 fills them from the two `hw-state` JSONs and
-the controller's own platform state; `reported` (TM) is PL-8.
+t_changed, status, fault_ids}. PL-3 fills them from the two
+`hw-state` JSONs and the controller's own platform state; `reported`
+(TM) is PL-8. `t_changed` is the t_sim of the leaf's last
+truth/presented change (UI plan D4): set when `_update` stores a new
+value, kept while it holds.
 
 Change detection skips the volatile leaves (clocks and counters that
 move on every sample), so a `state` record means a real change.
@@ -33,7 +36,8 @@ def leaf(truth, presented=None, unit=None, index_space=None, t_sim=0,
     return {"truth": truth,
             "presented": truth if presented is None else presented,
             "reported": None, "unit": unit, "index_space": index_space,
-            "t_sim": t_sim, "status": status, "fault_ids": []}
+            "t_sim": t_sim, "t_changed": t_sim, "status": status,
+            "fault_ids": []}
 
 
 def leaves_from_hw(ctrl, spw, t_sim):
@@ -171,7 +175,7 @@ class StateTree:
                 old = self.leaves.get(p)
                 if old is not None and old["truth"] == lf["truth"] and \
                         old["presented"] == lf["presented"]:
-                    old["t_sim"] = lf["t_sim"]
+                    old["t_sim"] = lf["t_sim"]   # t_changed is kept
                     continue
                 self.leaves[p] = lf
                 if p not in VOLATILE:
