@@ -2658,6 +2658,92 @@ def t_det_burst(env):
         ctl.shutdown()
 
 
+def t_flashlib(env):
+    """FF plan Task 4: the flash library — save/list/load on temp dirs
+    with a small sparse file standing in for flash.bin, the name rules,
+    the too-dense copy refusal, and the verbs' power-state rules."""
+    from . import flashlib
+    root = os.path.join(env.tmp, "libroot-%d" % env.n)
+    cfg = env.cfg(retention={"run_root": root})
+    lib = flashlib.library_dir(cfg)
+    check(lib == os.path.join(root, "flash-library"),
+          "the library dir: %s" % lib)
+    rd = env.run_dir()
+    flash = os.path.join(rd, "flash.bin")
+    with open(flash, "wb") as f:
+        f.write(b"\xa5" * 8192)
+        f.truncate(4 << 20)
+    rec = flashlib.save(cfg, rd, "run-a", {"elf": "/e/asw.elf"})
+    check(rec["name"] == "run-a" and rec["allocated_kib"] <= 64 and
+          rec["source_run_dir"] == rd and rec["elf"] == "/e/asw.elf" and
+          rec["created_utc"].endswith("Z"), "the save record: %r" % rec)
+    lst = flashlib.listing(cfg)
+    check(len(lst) == 1 and lst[0]["name"] == "run-a" and
+          lst[0]["allocated_kib"] == rec["allocated_kib"],
+          "the listing shows it: %r" % lst)
+    e = raises(FileExistsError, flashlib.save, cfg, rd, "run-a", {})
+    check("exists" in str(e), "a second save of a name: %s" % e)
+    # load replaces run_dir/flash.bin with identical bytes
+    os.unlink(flash)
+    check(flashlib.load(cfg, rd, "run-a") == rec, "load's record")
+    with open(flash, "rb") as f:
+        check(f.read(8192) == b"\xa5" * 8192 and
+              f.seek(0, 2) == 4 << 20, "the loaded flash.bin bytes")
+    # the name rules (review focus 5)
+    for bad in ("../x", "/abs", "", ".hidden", "a" * 65, "a/b", "a b",
+                "a,b"):
+        raises(ValueError, flashlib.check_name, bad)
+    for good in ("a", "X-9._y", "a" * 64):
+        flashlib.check_name(good)
+    # a too-dense copy is refused and deleted (A6)
+    cfg1 = env.cfg(retention={"run_root": root},
+                   power={"sparse_limit_mb": 1})
+    rd1 = env.run_dir()
+    with open(os.path.join(rd1, "flash.bin"), "wb") as f:
+        f.write(os.urandom(2 << 20))
+        f.truncate(4 << 20)
+    e = raises(flashlib.FlashLibError, flashlib.save, cfg1, rd1, "dense",
+               {})
+    check("not sparse" in str(e), "the dense copy: %s" % e)
+    check(not os.path.exists(os.path.join(lib, "dense.bin")),
+          "the dense copy is deleted")
+    # the verbs' power-state rules
+    ctl = env.controller(retention={"run_root": root})
+    try:
+        cmd = ctl.command
+        r = cmd("platform.flash.list", {})
+        check(r["dir"] == lib and
+              [x["name"] for x in r["library"]] == ["run-a"],
+              "flash.list: %r" % r)
+        e = raises(VerbError, cmd, "platform.flash.save", {"name": "nope"})
+        check(e.status == 409, "no flash.bin yet: %s" % e)
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        e = raises(VerbError, cmd, "platform.flash.save", {"name": "x1"})
+        check(e.status == 409 and "paused" in str(e),
+              "save while running: %s" % e)
+        e = raises(VerbError, cmd, "platform.flash.load",
+                   {"name": "run-a"})
+        check(e.status == 409, "load while on: %s" % e)
+        e = raises(VerbError, cmd, "platform.flash.save",
+                   {"name": "../evil"})
+        check(e.status == 400, "a bad name: %s" % e)
+        cmd("sim.pause", {})
+        r = cmd("platform.flash.save", {"name": "paused-save"})
+        check(r["name"] == "paused-save" and r["allocated_kib"] <= 64 and
+              r["elf"] == "/dev/null" and len(r["elf_sha256"]) == 64 and
+              r["qemu"] == env.bins["new"] and "sim_time" in r and
+              r["boot_id"] == 1, "a save while paused: %r" % r)
+        cmd("platform.power.off", {})
+        r = cmd("platform.flash.load", {"name": "paused-save"})
+        check(r["name"] == "paused-save", "the load after off: %r" % r)
+        e = raises(VerbError, cmd, "platform.flash.load",
+                   {"name": "no-such"})
+        check(e.status == 404, "no such flash: %s" % e)
+    finally:
+        ctl.shutdown()
+
+
 def t_faults(env):
     """D-PLq: the catalogue validates; inject/clear are fault records with
     seeds; forcing is re-applied after a warm reset."""
@@ -3314,6 +3400,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
          ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
          ("detector burst verb (FF)", t_det_burst),
+         ("flash library (FF)", t_flashlib),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
          ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),

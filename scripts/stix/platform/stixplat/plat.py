@@ -9,10 +9,12 @@ a warm guest reset and before `cont` after a cold power-on (D-PLf); so
 are the active device-state faults (PL-11a, D-PSa).
 """
 
+import hashlib
 import json
 import threading
 
 from . import faults as faults_mod
+from . import flashlib
 from . import tcbuild
 from .dispatch import VerbError
 from .force import Forcing
@@ -30,6 +32,7 @@ class Platform:
         self.ctl = ctl
         cfg = ctl.cfg
         self.cfg = cfg
+        self.run_dir = ctl.run_dir
         self.log = ctl.log
         self.clock = ctl.clock
         self.power = ctl.power
@@ -168,6 +171,16 @@ class Platform:
                     "fine": {"type": "integer", "min": 0, "max": 0xFFFF,
                              "default": 0}},
               doc="jump the platform OBT (obt mode only)")
+        d.add("platform.flash.save", self.v_flash_save,
+              args={"name": {"type": "string", "required": True}},
+              doc="save flash.bin into the flash library under this "
+                  "name (a sparse copy; power off or paused)")
+        d.add("platform.flash.load", self.v_flash_load,
+              args={"name": {"type": "string", "required": True}},
+              doc="replace flash.bin with that library entry (a sparse "
+                  "copy; power off only)")
+        d.add("platform.flash.list", self.v_flash_list,
+              doc="the flash library's records, sorted by name")
         d.add("platform.timesync.send", self.v_timesync,
               args={"coarse": {"type": ["string", "integer"],
                                "default": "auto"}},
@@ -284,6 +297,58 @@ class Platform:
                     "rotb_count": int(out["rotb_count"])}
         except (KeyError, ValueError):
             raise VerbError(500, "det-rotb-burst-status %r" % status)
+
+    def v_flash_save(self, name):
+        """FF plan: save flash.bin into the flash library. Only while
+        the FSW cannot be writing it: power off, or on and paused (the
+        device fflush()es each page before its completion IRQ, so a
+        paused flash file is consistent)."""
+        if self.power.state not in ("off", "paused"):
+            raise VerbError(409, "flash save needs power off or paused "
+                            "(STIX is %s and may be writing the flash)"
+                            % self.power.state)
+        q = self.cfg["qemu"]
+        h = hashlib.sha256()
+        try:
+            with open(q["elf"], "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+        except OSError as e:
+            raise VerbError(409, "cannot hash %s: %s" % (q["elf"], e))
+        meta = {"elf": q["elf"], "elf_sha256": h.hexdigest(),
+                "qemu": q["binary"], "sim_time": self.clock.exact_sim(),
+                "boot_id": self.clock.boot_id}
+        try:
+            return flashlib.save(self.cfg, self.run_dir, name, meta)
+        except FileExistsError as e:
+            raise VerbError(409, str(e))
+        except ValueError as e:
+            raise VerbError(400, str(e))
+        except flashlib.FlashLibError as e:
+            raise VerbError(409, str(e))
+        except OSError as e:
+            raise VerbError(500, str(e))
+
+    def v_flash_load(self, name):
+        """FF plan: replace flash.bin from the flash library; power off
+        only (QEMU must not have the file open)."""
+        if self.power.state != "off":
+            raise VerbError(409, "flash load needs power off (STIX is "
+                            "%s)" % self.power.state)
+        try:
+            return flashlib.load(self.cfg, self.run_dir, name)
+        except FileNotFoundError as e:
+            raise VerbError(404, str(e))
+        except ValueError as e:
+            raise VerbError(400, str(e))
+        except flashlib.FlashLibError as e:
+            raise VerbError(409, str(e))
+        except OSError as e:
+            raise VerbError(500, str(e))
+
+    def v_flash_list(self):
+        return {"dir": flashlib.library_dir(self.cfg),
+                "library": flashlib.listing(self.cfg)}
 
     def v_tc_platform(self, hex):
         try:

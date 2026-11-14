@@ -2,7 +2,9 @@
 """The run dir (platform plan D-PLl): the guard, the sparse preflight,
 the second-line sparse check and `fresh`.
 
-The controller never writes flash.bin itself; QEMU makes it.
+The controller never writes flash.bin itself; QEMU makes it. The one
+exception is the flash library's load (FF plan): with the power off it
+replaces flash.bin with a sparse copy of a saved one.
 """
 
 import ctypes

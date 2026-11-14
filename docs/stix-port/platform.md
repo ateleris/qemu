@@ -176,6 +176,9 @@ lists exactly these verbs and arguments.
 | `platform.timecode.once` | | one correct code at the next rollover (409 while the link is down or TR = 0) |
 | `platform.timecode.inject` | `timecnt` | one code now with this TIMECNT (0..63), a wrong-value tool |
 | `platform.obt.set` | `coarse`, `fine` | jump the platform OBT (`obt` mode only) |
+| `platform.flash.save` | `name` | copy `flash.bin` sparse into the flash library (`<retention.run_root>/flash-library`) under `name`; power off, or on and paused |
+| `platform.flash.load` | `name` | replace `flash.bin` with that library entry's sparse copy (its record is the answer); power off only |
+| `platform.flash.list` | | the library's records, sorted by name |
 | `platform.timesync.send` | `coarse` | TC(9,129) timed to the next code; `"auto"` or an explicit coarse (warned when its 6 LSBs miss); 409 while one is pending |
 | `platform.keepalive.set` | `enabled`, `period_s` | the TC(20,128) keep-alive, paced on bench time |
 | `force.set` | `path`, `value` | force a presented value: `instrument.hk_adc.<ch>` (adc-inject) |
@@ -457,6 +460,40 @@ Two knobs get to "an hour of observation" without waiting it out
     FULL, so a burst overwrites the oldest blocks instead of stopping;
     with `drop-new` it stops at the first chunk that does not fit.
 
+## The flash library
+
+`platform.flash.save {name}` copies the run dir's `flash.bin` sparse
+(`cp --sparse=always`) into `<retention.run_root>/flash-library/` as
+`<name>.bin`, next to a record `<name>.json`: the meta (the ELF path
+and its sha256, the QEMU binary, the sim time and boot_id of the save)
+plus `name`, `created_utc`, `allocated_kib` and `source_run_dir`.
+`platform.flash.load {name}` replaces the run dir's `flash.bin` with
+that entry (sparse; the record is the answer) — the FSW rebuilds its
+file-system state from flash at boot, so the next boot continues from
+the saved state. `platform.flash.list` shows the records, sorted by
+name. A name is 1..64 of `A-Za-z0-9._-` and does not start with a dot
+(`../x`, `/abs`, empty, `.hidden` and over-long names are a 400); an
+existing name is a 409; an unknown one a 404.
+
+- **When a save is allowed**: power off, or on and paused. The device
+  fflush()es each page before its completion IRQ
+  (grlib_stixflash.c:535), so a paused flash file is consistent;
+  while the FSW runs it may be mid-page, so the save is refused (409).
+  A load is power-off only: QEMU must not have the file open.
+- **A copy stays sparse**: a copy whose real blocks reach
+  `power.sparse_limit_mb` is deleted and the verb fails, like the run
+  dir's own check. Never a plain `cp` (see Troubleshooting): the flash
+  is 16.5 GB apparent.
+- **The workflow**: fill the ROTB on a fast profile (`qemu.icount_shift`
+  high, `qemu.pace = "fast"`), save, then load the entry on the
+  calibrated profile and boot. What the FSW keeps only in RAM (the
+  archive's chunk history, the RCR table) is not in the flash and
+  starts over.
+
+The library lives under the run root, outside the per-run dirs; the
+retention cleanup only ever touches `runs/`, so saved flashes stay
+until removed by hand.
+
 ## Security
 
 There is no authentication, so the controller is localhost-only:
@@ -487,7 +524,8 @@ There is no authentication, so the controller is localhost-only:
 
 The run dir holds:
 
-- `flash.bin` (made by QEMU, sparse);
+- `flash.bin` (made by QEMU, sparse; the flash library's load replaces
+  it while the power is off);
 - `uart.raw`, `qemu.log`, `qmp.sock`, `log.jsonl` and, with the relay,
   `tm.jsonl`; run mode adds `runs/<stamp>-<scenario>[.<variant>]/` and
   `reports/` under its run root.
