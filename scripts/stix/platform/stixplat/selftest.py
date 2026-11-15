@@ -2786,6 +2786,10 @@ def t_tapes_crud(env):
               "an invalid tape wrote nothing")
         # the other schema refusals (T1's list), through the module
         for tape, why in ((dict(TAPE, api=2), "api"),
+                          (dict(TAPE, name="flare, Q1"), "comma"),
+                          (dict(TAPE, steps=[dict(TAPE["steps"][0],
+                                                  label="a\tb")]),
+                           "control"),
                           (dict(TAPE, steps=[dict(TAPE["steps"][0],
                                                   pix_mask=0x1000)]),
                            "pix_mask"),

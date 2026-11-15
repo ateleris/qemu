@@ -83,11 +83,8 @@ def _step(step, i):
         raise VerbError(400, "%s: unknown kind %r (one of %s)"
                         % (where, kind, "|".join(KINDS)))
     _num_in(step.get("for_s"), MIN_FOR_S, MAX_FOR_S, "for_s", where)
-    label = step.get("label")
-    if label is not None and (not isinstance(label, str) or
-                              not 1 <= len(label) <= MAX_NAME):
-        raise VerbError(400, "%s: label %r is not a string of 1..%d"
-                        % (where, label, MAX_NAME))
+    if step.get("label") is not None:
+        _text(step["label"], "%s: label" % where)
     align = step.get("align")
     if align is not None and not isinstance(align, bool):
         raise VerbError(400, "%s: align %r is not a boolean" % (where, align))
@@ -134,6 +131,17 @@ def _background(bg):
     _int_in(bg.get("cps", 0), 0, MAX_CPS, "cps", "background")
 
 
+def _text(v, what):
+    """The model's name/label rule (stix_det_tape_line_text): 1..MAX_NAME
+    bytes, no comma (the status line separator), no control char."""
+    if not isinstance(v, str) or not 1 <= len(v.encode()) <= MAX_NAME:
+        raise VerbError(400, "%s %r: a string of 1..%d bytes"
+                        % (what, v, MAX_NAME))
+    if any(c == "," or ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+        raise VerbError(400, "%s %r holds a comma or a control character"
+                        % (what, v))
+
+
 def validate(tape):
     """The tape object against the model's schema (T1); VerbError(400)
     with the reason (the step index for a bad step)."""
@@ -141,10 +149,7 @@ def validate(tape):
         raise VerbError(400, "a tape is a JSON object")
     if tape.get("api") != 1:
         raise VerbError(400, "tape api %r is not 1" % (tape.get("api"),))
-    name = tape.get("name")
-    if not isinstance(name, str) or not 1 <= len(name) <= MAX_NAME:
-        raise VerbError(400, "tape name %r: a string of 1..%d"
-                        % (name, MAX_NAME))
+    _text(tape.get("name"), "tape name")
     for k in ("align", "adc_mode", "loop"):
         if k in tape and not isinstance(tape[k], bool):
             raise VerbError(400, "tape %s %r is not a boolean" % (k, tape[k]))

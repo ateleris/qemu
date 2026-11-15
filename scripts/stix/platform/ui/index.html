@@ -1852,7 +1852,12 @@ $("stim-pix").addEventListener("change", () => {
 });
 function stimPixMask() {
   const v = $("stim-pix").value;
-  if (v === "one") return (1 << Number($("stim-pix-one").value || 0)) & 0xFFF;
+  if (v === "one") {
+    const p = Number($("stim-pix-one").value || 0);
+    if (!Number.isInteger(p) || p < 0 || p > 11)
+      return null;              // the callers refuse it (no silent pix 0)
+    return 1 << p;
+  }
   return parseInt(v, 16);
 }
 
@@ -1867,13 +1872,16 @@ $("stim-add").addEventListener("click", () => {
     toast("a tape holds at most 64 steps", true);
     return;
   }
-  tape.steps.push(stimStep());
+  const st = stimStep();
+  if (st.pix_mask == null) { toast("one pixel: 0..11", true); return; }
+  tape.steps.push(st);
   stimRender();
 });
 $("stim-send").addEventListener("click", async () => {
   const t = blankTape();
   t.name = "send-now";
   t.steps = [stimStep()];
+  if (t.steps[0].pix_mask == null) { toast("one pixel: 0..11", true); return; }
   try {
     await post("det.tape.save", { name: "send-now", tape: t });
     const r = await post("det.tape.play", { name: "send-now",
