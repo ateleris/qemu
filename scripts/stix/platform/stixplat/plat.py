@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """The platform module (platform plan PL-4, D-PLk): the SpW link, the
-time codes, the OBT, TC(9,129), TC(20,128), forcing, faults, and the
-TM relay + TC proxy, behind the platform.*, force.*, fault.* and tc.*
-verbs.
+time codes, the OBT, TC(9,129), TC(20,128), forcing, faults, the FSW
+parameters (fsw-params plan), and the TM relay + TC proxy, behind the
+platform.*, force.*, fault.*, tc.* and param.* verbs.
 
 What a device reset clears (link-down, adc-inject) is re-applied after
 a warm guest reset and before `cont` after a cold power-on (D-PLf); so
@@ -16,6 +16,7 @@ import threading
 from . import faults as faults_mod
 from . import flashlib
 from . import idb as idb_mod
+from . import params as params_mod
 from . import tcbuild
 from .dispatch import VerbError
 from .force import Forcing
@@ -56,11 +57,18 @@ class Platform:
                                  self.relay.send_unit, self.can_send,
                                  self._next_seq14,
                                  autostart=cfg["timesync"]["autostart"])
+        # the FSW parameters (fsw-params plan T2): same seq_gs counter
+        # and GS link rule as tc.gs.send
+        self.params = params_mod.Params(
+            self.power, self.relay, self.log, self.clock, cfg,
+            ctl.elf_sha256, next_seq=self._next_seq_gs,
+            link_ok=self.gs_link_ok)
         self.forcing = Forcing(self.log, self.qmp)
         self.faults = faults_mod.Faults(
             faults_mod.load(cfg["faults"]["catalogue"] or None),
             self.log, self.clock, self._fault_actions())
-        self.relay.listeners += [self.keepalive.on_tm, self.timesync.on_tm]
+        self.relay.listeners += [self.keepalive.on_tm, self.timesync.on_tm,
+                                 self.params.on_tm]
         ctl.trace_filters.append(self.keepalive.trace_filter)
         self.power.hooks.append(self._on_power)
 
@@ -85,6 +93,12 @@ class Platform:
         with self.lock:
             s = self.seq14
             self.seq14 = (self.seq14 + 1) & 0x3FFF
+            return s
+
+    def _next_seq_gs(self):
+        with self.lock:
+            s = self.seq_gs
+            self.seq_gs = (self.seq_gs + 1) & 0x3FFF
             return s
 
     def can_send(self):
@@ -235,6 +249,45 @@ class Platform:
               doc="GS emulation: an operator TC from source 121 "
                   "(allow_gs_emulation)",
               enabled=self._gs_enabled)
+        # the FSW parameters (fsw-params plan T3-T5): the TC-carrying
+        # verbs sit behind the same operator-TC gate as tc.gs.send
+        d.add("param.refresh", self.params.refresh,
+              doc="a RAM snapshot of the parameters' current values "
+                  "(one QMP memsave into the run dir); 409 while STIX "
+                  "is off")
+        d.add("param.read", self.params.read,
+              args={"index": {"type": "integer", "required": True,
+                              "min": 0, "max": 65535},
+                    "sub": {"type": "integer", "min": 0, "max": 2,
+                            "default": 0}},
+              doc="read one parameter back with TC(237,19) and wait up "
+                  "to 2 s for its TM(237,20); sub 0 = value, 1 = min, "
+                  "2 = max",
+              enabled=self._gs_enabled)
+        d.add("param.read_all", self.params.read_all,
+              args={"only_changed": {"type": "boolean",
+                                     "default": True}},
+              doc="read rows back one by one: only the rows whose "
+                  "value differs from the ELF default unless "
+                  "only_changed is false; progress every 32",
+              enabled=self._gs_enabled, locked=False)
+        d.add("param.set", self.params.set,
+              args={"index": {"type": "integer", "required": True,
+                              "min": 0, "max": 65535},
+                    "value": {"type": "integer", "required": True,
+                              "min": 0, "max": 0xFFFFFFFF},
+                    "sub": {"type": "integer", "min": 0, "max": 2,
+                            "default": 0}},
+              doc="set a parameter with TC(237,18); delivered false "
+                  "with the reason when the TC cannot go out",
+              enabled=self._gs_enabled)
+        d.add("param.reset_all", self.params.reset_all,
+              args={"only_changed": {"type": "boolean",
+                                     "default": True}},
+              doc="TC(237,18) the ELF default of every row whose known "
+                  "value differs (all known rows when only_changed is "
+                  "false)",
+              enabled=self._gs_enabled, locked=False)
 
     def v_link(self, state):
         down = state == "down"
@@ -409,9 +462,7 @@ class Platform:
             payload = bytes.fromhex(data)
         except ValueError:
             raise VerbError(400, "data is not hexadecimal")
-        with self.lock:
-            seq = self.seq_gs
-            self.seq_gs = (self.seq_gs + 1) & 0x3FFF
+        seq = self._next_seq_gs()
         sp = tcbuild.tc_packet(tcbuild.APID_TC, seq, service, subtype,
                                payload, ack=ack,
                                source=self.cfg["gs"]["emulation_source"])
@@ -509,7 +560,8 @@ class Platform:
                 "keepalive": self.keepalive.status(),
                 "timesync": self.timesync.status(),
                 "tm_count": self.relay.tm_count,
-                "held_tcs": len(self.relay.held)}
+                "held_tcs": len(self.relay.held),
+                "params": self.params.summary()}
 
     def close(self):
         self.relay.close()

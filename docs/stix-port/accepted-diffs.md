@@ -4387,6 +4387,54 @@ test-run-qemu-gs.sh` runs the script against an argv-recording stub
 (no QEMU): 11 cases; RED against the pre-PL-2 script, the two tcp
 accept cases fail with "STIX_GS_QMP must be an absolute path".
 
+## P-2. FSW parameters table: defaults, names and Applies from the running ELF (baseline: none)
+
+Controller feature (`docs/stix-port/2026-11-15-fsw-params-plan.md`);
+no model, config or FSW change.
+
+**Baseline:** no parameter table anywhere in the bench. The operator
+sent TC(237,18)/(237,19) blind — bare parameter ids, no names, no
+defaults, no min/max — and had no way to see current values except
+TC(237,19) round trips.
+
+**What the controller adds** (`stixplat/params.py`, stdlib only — the
+controller image has no binutils):
+
+- The **ELF file image is the single authority** (owner decision
+  2026-11-15): the `.symtab` symbol matching
+  `ParamMgmt_parameters.<n>` (LOCAL, per-build numeric suffix) locates
+  the table, the covering PT_LOAD yields defaults/min/max (the initial
+  image has `value == default`), and the DWARF `E_PARAM_ID_*`
+  enumeration in `.debug_info` yields the names. The FSW source and
+  the IDB are never read at runtime; a broken or ambiguous ELF
+  degrades to an empty table plus warnings and one `params.elf` log
+  record, never an exception.
+- **Current** comes from one QMP `memsave` of the table's virtual
+  range per refresh (`param.refresh`), parsed in the controller;
+  **read-back** stays TC(237,19) → TM(237,20) (`param.read`,
+  `param.read_all`) and **writes stay TC(237,18)** (`param.set`,
+  `param.reset_all`) — the TCs remain the only write/read-back path;
+  the controller builds and relays them through the existing
+  GS-emulation proxy and never writes guest memory or pokes the FSW
+  directly. The TC-carrying verbs share the `[gs] emulation` gate.
+- `param` records (kind/topic `param`, `param:<index>` series) log
+  every change; `GET /params` serves the table and `--view-run`
+  replays a run's records onto its own ELF (from `controller.start`).
+
+**Risk:** read-only over the guest (RAM reads are snapshots; torn u32s
+accepted), and the TCs are the same ones the GS could always send. The
+"Applies" labels are static text derived from FSW greps, never read at
+runtime.
+
+**Evidence:** the self-test's synthetic-ELF cases (`params_elf_parse`,
+`params_elf_symbol_rules`, `params_dwarf_missing`), the controller
+cases (`params_api`, `params_refresh_ram`, `params_readback`,
+`params_readback_dropped`, `params_set`, `params_reset_all`,
+`params_viewrun`) and, when `~/dev/stix-elf` is present, the real-ELF
+case (`params_real_elf`: baseline count 482 at 0x40080908, prof 483)
+plus the reviewer-run `tests/params_smoke.py` against a live
+controller.
+
 ## 42. NAND flash latency: ops complete from a timer (baseline: synchronous inside the cmdSta write)
 
 Plan: `2026-11-11-flash-latency-plan.md` (section number: the next free

@@ -11,7 +11,8 @@ leon3: cont/stop/quit, the RESUME/STOP/SHUTDOWN/RESET events, qom-get
 vclock-ns, obt and both hw-state JSONs (the ctrl one carries the
 attenuator, edac, det and rotb sections, PL-11b/PL-11c), qom-set obt,
 the upset verbs on the EDAC (they move the hw-state's poisons and
-counters), the det-rotb-burst pair (the FF plan's burst), and the
+counters), the det-rotb-burst pair (the FF plan's burst), memsave (the
+fsw-params RAM snapshot: zeros into the asked file, in the cwd), and the
 test-only x-fake-guest-reset, which behaves per -no-reboot / -action
 like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
@@ -371,6 +372,14 @@ class Fake:
             raise KeyError("Property '%s' not found" % prop)
         if ex == "x-fake-set-log":
             return [list(x) for x in self.set_log]
+        if ex == "memsave":
+            # the real memsave writes @size bytes of guest memory at
+            # virtual @val into @filename, relative to the cwd (the run
+            # dir). The fake writes zeros: the rows whose ELF default
+            # is non-zero then differ on the controller's next refresh.
+            with open(a.get("filename") or "params-ram.bin", "wb") as f:
+                f.write(bytes(int(a.get("size") or 0)))
+            return {}
         if ex == "x-fake-guest-reset":
             threading.Timer(0.05, self.guest_reset).start()
             return {}

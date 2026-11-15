@@ -58,6 +58,13 @@ def decode(unit):
         d["sid"] = app[0]
         if d["apid"] == APID_HK and d["sid"] in (1, 2) and len(app) >= 2:
             d["mode"] = app[1] & 0x0F
+    elif d["type"] == 237 and d["subtype"] == 20 and len(app) >= 7:
+        # the parameter read-back answer (fsw-params plan T4), the
+        # mirror of the TC(237,18) label: PIX00016 index u16, PIX00017
+        # sub-id u8, PIX00018 value u32, big-endian (TM_237.c:29-48)
+        d["param"] = {"index": int.from_bytes(app[0:2], "big"),
+                      "sub": app[2],
+                      "value": int.from_bytes(app[3:7], "big")}
     if d["apid"] == APID_HEARTBEAT:
         d["heartbeat"] = True
     return d

@@ -134,6 +134,7 @@ The path prefix is `/api/v1`. Read endpoints:
 | `GET /log?since=<seq>&kinds=a,b` | a JSONL slice of the record ring |
 | `GET /stream?topics=a,b` | SSE: `id` = seq, `event` = topic, `data` = the record line; resume with `Last-Event-ID` |
 | `GET /faults` | the fault catalogue and the active faults |
+| `GET /params` | the FSW parameters table: symbol, count, differ, warnings, and the rows (index, name, default, min, max, current, read-back, applies) |
 | `GET /verbs` | the command vocabulary with argument schemas |
 | `GET /scenarios` | the scenario dir's files: name, variants, description, or the load error |
 
@@ -191,6 +192,11 @@ lists exactly these verbs and arguments.
 | `fault.clear` | `id` | clear an active, reversible fault, or disarm an armed one |
 | `tc.platform.send` | `hex` | a raw platform TC space packet: source 14, services 9 and 20 only (403 otherwise); TC(9,129) gets 409 while a sync is pending |
 | `tc.gs.send` | `service`, `subtype`, `data`, `ack` | GS emulation: an operator TC from source 121, labelled GS-EMULATION; needs `[gs] emulation` (on in run mode by default) |
+| `param.refresh` | | a RAM snapshot of the parameters' current values (one QMP `memsave` of the table into the run dir); 409 while STIX is off |
+| `param.read` | `index`, `sub` | read one parameter back with TC(237,19) and wait up to 2 s for its TM(237,20); `sub` 0 = value, 1 = min, 2 = max; 409 while the link is down or STIX is off, 500 on timeout |
+| `param.read_all` | `only_changed` | read rows back one by one: only the rows whose value differs from the ELF default unless `only_changed` is false; a progress record every 32 |
+| `param.set` | `index`, `value`, `sub` | set a parameter with TC(237,18) (`sub` 0 = value, 1 = min, 2 = max) and wait ≤ 2 s for TM(1,7)/TM(1,8): `verified` completed / failed (+`fid`, `reason`) / timeout; `delivered: false` with the reason when the TC cannot go out (still a 200) |
+| `param.reset_all` | `only_changed` | TC(237,18) the ELF default of every row whose known value differs (all known rows when `only_changed` is false), FSW-maintained rows excluded; `reset` counts completed sets; 409 while another read_all/reset_all runs |
 | `scenario.run` | `file`, `variant` | run a scenario file from the scenario dir (`[run] scenario_dir`) in this controller, one at a time (409); `variant` is required when the scenario declares variants; verdicts are `expect` records, progress is `status.scenario` |
 | `scenario.abort` | | abort the running scenario: open checks and steps not started become `error`, the teardown still runs |
 | `view.save` | `name`, `view` | save a timeline view (`name`, `window`, `markers`, `panels`) as `<name>.json` in the views dir; an existing name is replaced, the generated `everything` is a 409 |
@@ -216,7 +222,7 @@ self-test checks that it matches the table above.
 ```
 {"v":1,"seq":N,"sim_time":<ns>,"boot_id":B,"vclock_ns":<ns|null>,
  "wall_time":"...Z","source":"ctl|qemu|fsw|tm|tc|scn|api",
- "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|uart|log|debug|sample",
+ "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|uart|log|debug|sample|param",
  "path":"<state path or verb>","data":{...}}
 ```
 
@@ -237,6 +243,9 @@ self-test checks that it matches the table above.
   arguments and its return or error) and `result` records.
 - A refused command (bad arguments) is still logged: `cmd`, then a
   `result` with `ok: false`.
+- A `param` record (its own topic) is one FSW parameter's value change
+  — `path` `param.<index>`, `data` `{index, name, how: ram|readback,
+  old, new}`; see FSW parameters below.
 - Topics: `cmd` and `result` map to `cmd`; `state` and `power` map to
   `state`; `fault` and `force` map to `fault`; `debug` maps to `log`.
   Every other kind is its own topic.
@@ -585,6 +594,79 @@ HK and markers on one bench clock, for the plots and for
   `view`; every verb except `view.*` is refused with 403. The views dir
   and the IDB come from the run's own `controller.start` record.
 
+## FSW parameters (IDPU & FSW tab)
+
+The FSW keeps one static table `ParamMgmt_parameters[E_PARAM_ID_MAX]`
+of 16-byte rows `{defaultValue, value, minValue, maxValue}`
+(ParamMgmt.h:37-43). The controller reads it from the **running FSW's
+ELF file image** (`[qemu] elf`; `GET /params`, `stixplat/params.py`,
+stdlib only — the controller image has no binutils):
+
+- **Defaults, names, min/max and the row count** come from the ELF
+  file alone: the `.symtab` symbol matching `ParamMgmt_parameters.<n>`
+  (LOCAL, a per-build numeric suffix) locates the table, the covering
+  `PT_LOAD` holds the initial image (`value` starts == default, so the
+  file image already carries the defaults), and the `E_PARAM_ID_*`
+  names come from the DWARF enumeration in `.debug_info`. The FSW
+  source and the IDB are never read at runtime: the IDB's TC(237,18)/
+  (237,19) JSON has no per-id enumeration, and `ParamMgmtDef.h`'s
+  `PARAM_INT32(` macro order does not match a build's table rows.
+- **Current** is a snapshot of guest RAM: `param.refresh` runs one QMP
+  `memsave` of the table's virtual range (`cpu-index` omitted = CPU 0;
+  identical to `pmemsave` with the MMU off) into `params-ram.bin` in
+  the run dir and parses `value` per row. Torn u32s of a running guest
+  are accepted; nothing polls faster than the UI's 2 s. It works
+  paused and needs no TC.
+- **Read-back** is `param.read {index, sub}`: TC(237,19)
+  `[u16 id][u8 sub]` from the GS-emulation source, then the matching
+  TM(237,20) `[u16 id][u8 sub][u32 value]` (APID 0x5A8) within 2 s —
+  409 at once when the link is down or STIX is off (with the relay's
+  drop reason), 500 on timeout. `param.read_all {only_changed}` walks
+  the rows one by one (default: only the rows whose value differs from
+  the ELF default; the mockup's "Read all back" button sends
+  `only_changed: false`).
+- **Set** is TC(237,18) `[u16 id][u8 sub][u32 value]` (sub 0/1/2 =
+  value/min/max): `param.set` returns `delivered: false` with the
+  reason when the TC cannot go out, else waits up to 2 s for the FSW's
+  verdict: `verified: completed` (TM(1,7)), `failed` with `tm`, `fid`
+  and `reason` (TM(1,2)/TM(1,8); the FSW refuses TC(237,18) in SAFE
+  with FID 48301 "wrong operation mode", TCVerifDynamic.c:172, so
+  enter CONFIGURATION first) or `timeout`. `param.reset_all` sends the
+  ELF default of every row whose known value differs and counts only
+  completed sets as reset (`first_failure` names the first refusal).
+  **FSW-maintained rows** (`maintained: true`: the TC sequence
+  counters `SSC_for_*` and `LAST_ACCEPTED_SSC`, rewritten by the FSW
+  per accepted TC, TCData.c:197-218, TCBuffer.c:297) differ by design:
+  they are not counted in `differ`, not highlighted and never reset in
+  bulk (a reset could make the FSW refuse the next TC as a sequence
+  error); a single explicit `param.set` still works. The TC-carrying `param.*` verbs share the single
+  `[gs] emulation` operator-TC gate with `tc.gs.send`.
+- **Applies** says when the FSW picks the value up. The labels are
+  static, from owner-verified FSW greps (evidence in the
+  `stixplat/params.py` docstring): on set (ATT_*_PWM_LEVEL,
+  ENABLED_SSID_*, CONFIG_CURRENT_*), at the next NOMINAL entry
+  (NOMINAL_/CONFIG_/ASIC_/RCR_/IMAGING_/SPECTRO_/FLARE_SEL_ — the
+  config block in setMode and the RCR re-init), at the next
+  calibration start (CALIB_*), at boot (CONFIG_SCRUB_SDRAM), on the
+  NOMINAL entry *and* at boot (ASPECT_SUMMED_VALUES), or unknown. Row
+  notes: TC(237,13) applies NOMINAL_ACCU_MIN/MAX_INTEGRATION,
+  NOMINAL_ACCU_MAX_COUNTS and NOMINAL_SUMEMASK/SUMDMASK immediately,
+  and TC(237,10) applies RCR_* — a bare TC(237,18) does not.
+- Each change (refresh or read-back) is one `param` record per row
+  (`param:<index>` series); the panel's status line "N parameters
+  differ from default" is `status.platform.params`.
+- **value may differ from default without any operator set**: at boot
+  the FSW can overlay flash-context values onto the table
+  (ContextMgmt.c:2341-2344), so the panel says "N parameters differ",
+  never "N were changed by hand".
+- **Degraded modes**: a missing, stripped or ambiguous ELF never fails
+  the API — one `params.elf` log record with the reason, `/params`
+  answers `params: []` with `warnings`, and names fall back to
+  `param <idx>` when the DWARF enumeration is missing or uses an
+  unsupported form (never silently wrong names). `--view-run` replays
+  the run's `param` records onto the run's own ELF (its
+  `controller.start` record carries the path and the digest).
+
 ## Security
 
 There is no authentication, so the controller is localhost-only:
@@ -760,9 +842,10 @@ An Active-now list shows the active and armed faults with their time
 and params, clear per row and a clear-all (one confirm, one
 `fault.clear` each, the 409s reported per row); forcings list the
 active ones with clear per row. The Logs chips are tm, heartbeat, tc,
-cmd, fault, state, expect, mismatch, sample, log (heartbeat = the TM
-records of APID 0x5E5, which the tm chip then excludes; sample and
-heartbeat off by default; UART stays in its own panel) plus a
+cmd, fault, state, expect, mismatch, sample, log, param (heartbeat =
+the TM
+records of APID 0x5E5, which the tm chip then excludes; sample,
+heartbeat and param off by default; UART stays in its own panel) plus a
 case-insensitive text search over the rendered lines that also applies
 to new ones. The State tab groups the leaves by parent path
 (collapsible, open by default) with the columns leaf, truth, presented

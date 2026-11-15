@@ -191,6 +191,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, ctl.time_info())
         if path == PREFIX + "/faults":
             return self._send(200, ctl.plat.faults.catalogue())
+        if path == PREFIX + "/params":
+            return self._send(200, ctl.params.snapshot())
         if path == PREFIX + "/verbs":
             return self._send(200, {"verbs": ctl.dispatcher.describe()})
         if path == PREFIX + "/series/catalogue":

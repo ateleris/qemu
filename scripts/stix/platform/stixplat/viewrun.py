@@ -7,9 +7,10 @@ then log.jsonl are streamed line by line into a RecordLog without a
 file (the run's own seq space, nothing appended to the run dir; the
 ring keeps the newest 20000 records) and into a SeriesIndex, which
 sees every record. Served on --port (default 8081, next to a live
-controller). Every verb except view.* is refused (403); the views dir
-and the IDB come from the run's own controller.start record, taken
-while streaming, so the same views apply.
+controller). Every verb except view.* is refused (403); the views dir,
+the IDB and the FSW parameters' ELF come from the run's own
+controller.start record, taken while streaming, so the same views
+apply and GET /params replays the run's own table.
 """
 
 import gzip
@@ -25,6 +26,7 @@ from . import api as api_mod
 from . import config as config_mod
 from . import idb as idb_mod
 from . import log as log_mod
+from . import params as params_mod
 from . import series as series_mod
 from . import views as views_mod
 from .dispatch import Dispatcher, VerbError
@@ -67,6 +69,8 @@ class ViewRun:
         self.stopping = threading.Event()
         self.skipped = 0
         self.cfg = None             # from controller.start, mid-stream
+        self.elf_sha256 = None      # ditto, for the parameters replay
+        self._param_recs = []       # the param records, in log order
         self.state = _NoState()
         self.plat = types.SimpleNamespace(faults=types.SimpleNamespace(
             catalogue=lambda: {"catalogue": [], "active": {}}))
@@ -81,6 +85,7 @@ class ViewRun:
         if self.cfg is None:        # no controller.start record
             self.cfg = config_mod.load()
             self.series.set_idb(self._idb())
+        self.params = self._replay_params()
         self.dispatcher = Dispatcher(self.log)
         self.dispatcher.add("view.save", self._view_save,
                             args={"name": {"type": "string",
@@ -98,6 +103,18 @@ class ViewRun:
         labels are then the codes) and no record is emitted."""
         return idb_mod.load(self.cfg["timeline"]["idb_json"],
                             self.cfg["timeline"]["idb_sqlite"])
+
+    def _replay_params(self):
+        """The run's FSW parameters table (fsw-params plan T2): the ELF
+        from the run's own controller.start config ([qemu] elf plus the
+        elf_sha256 recorded next to it), the param records replayed on
+        top; an absent or unreadable ELF degrades like live."""
+        q = self.cfg.get("qemu") if isinstance(self.cfg, dict) else None
+        q = q if isinstance(q, dict) else {}
+        elf, sha = q.get("elf"), self.elf_sha256
+        table = params_mod.replay(self._param_recs, elf, sha)
+        return types.SimpleNamespace(
+            snapshot=lambda: table.snapshot(elf, sha))
 
     # -- streaming the log -----------------------------------------------------
     def _stream(self):
@@ -121,6 +138,8 @@ class ViewRun:
                         except ValueError:
                             self.skipped += 1
                             continue
+                        if obj.get("kind") == "param":
+                            self._param_recs.append(obj)
                         self._take_cfg(obj)
                         self._last_sim = obj["sim_time"]
                         self._last_boot = obj["boot_id"]
@@ -131,16 +150,18 @@ class ViewRun:
             raise ViewRunError("no log.jsonl in %s" % self.run_dir)
 
     def _take_cfg(self, obj):
-        """The run's own [timeline] and [retention] config, from its
-        controller.start record (the first one), so the views dir and
-        the IDB are known mid-stream; the defaults without one (or a
-        config a newer controller would refuse)."""
+        """The run's own [timeline], [retention] and [qemu] config, from
+        its controller.start record (the first one), so the views dir,
+        the IDB and the parameters' ELF are known mid-stream; the
+        defaults without one (or a config a newer controller would
+        refuse)."""
         if self.cfg is not None or obj.get("kind") != "log" or \
                 obj.get("path") != "controller.start":
             return
-        cfg = (obj.get("data") or {}).get("config")
+        data = obj.get("data") or {}
+        cfg = data.get("config")
         if isinstance(cfg, dict):
-            over = {k: cfg[k] for k in ("timeline", "retention")
+            over = {k: cfg[k] for k in ("timeline", "retention", "qemu")
                     if isinstance(cfg.get(k), dict)}
             try:
                 self.cfg = config_mod.merged(config_mod.load(), over)
@@ -148,6 +169,9 @@ class ViewRun:
                 pass
         if self.cfg is None:
             self.cfg = config_mod.load()
+        sha = data.get("elf_sha256")
+        if isinstance(sha, str) or sha is None:
+            self.elf_sha256 = sha
         self.series.set_idb(self._idb())
 
     # -- the only allowed verbs -----------------------------------------------

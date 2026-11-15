@@ -15,6 +15,7 @@ import random
 import re
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -27,6 +28,7 @@ from . import decode
 from . import faults as faults_mod
 from . import idb as idb_mod
 from . import keepalive as keepalive_mod
+from . import params as params_mod
 from . import series as series_mod
 from . import tcbuild
 from . import timeline as timeline_mod
@@ -3219,10 +3221,16 @@ UI_VERBS = {"platform.power.on", "platform.power.boot", "platform.power.off",
 # the verbs the tabbed page (timeline plan B1/B2) adds to UI_VERBS
 UI_VERBS_ADDED = {"tc.gs.send", "det.rotb.burst", "platform.flash.save",
                   "platform.flash.load", "platform.flash.list"}
+# fsw-params plan T8: the params verbs the IDPU tab uses
+UI_PARAMS_VERBS = {"param.refresh", "param.set", "param.read_all",
+                   "param.reset_all"}
+# fsw-params plan T8: the ids the FSW parameters panel must have
+UI_PARAMS_IDS = {"params", "params-find", "params-nondef",
+                 "params-readall", "params-reset", "params-body"}
 UI_TABS = ("overview", "platform", "idpu", "detectors", "faults",
            "scenarios", "logs", "state", "setup", "timeline")
-UI_ENDPOINTS = {"status", "time", "faults", "verbs", "state", "log",
-                "stream", "scenarios", "cmd", "series", "views"}
+UI_ENDPOINTS = {"status", "time", "faults", "params", "verbs", "state",
+                "log", "stream", "scenarios", "cmd", "series", "views"}
 # timeline plan C1: the ids the plotter panel must have
 UI_TIMELINE_IDS = {"tl-view", "tl-window", "tl-search", "tl-hits",
                    "tl-add", "tl-save", "tl-save-name", "tl-delete",
@@ -4131,6 +4139,709 @@ def t_tc_237_18_label(env):
         ctl.shutdown()
 
 
+# -- FSW parameters (fsw-params plan T1-T8) --------------------------------
+def _uleb(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _param_elf(path, defaults=(0, 9, 7, 0), mins=(0, 0, 100, 0),
+               maxs=(100, 0xFFFF, 5, 0), symtab=True, dwarf=True,
+               sym_size=None, vaddrs=(0x40080908,)):
+    """A synthetic 32-bit big-endian ELF (the fsw-params fixture): one
+    PT_LOAD at 0x40080908 holding the 4x16-byte ParamMgmt_parameters
+    image (row i = default, value==default, min, max, big-endian), one
+    LOCAL symbol per vaddr (st_size 64 unless @sym_size), and, unless
+    @dwarf is false, a .debug_info enumeration with 6 enumerators:
+    E_PARAM_ID_NONE (7, outside 0..3), the four row names (values
+    0..3) and E_PARAM_ID_MAX (= 4)."""
+    table = b"".join(struct.pack(">4I", d, d, lo, hi) for d, lo, hi in
+                     zip(defaults, mins, maxs))
+    strtab = b"\x00" + b"\x00".join(
+        n.encode() for n in ("ParamMgmt_parameters.145875",
+                             "ParamMgmt_parameters.145876", "t.c",
+                             "E_PARAM_ID")) + b"\x00"
+    off_strtab = {}
+    shstr = b"\x00"
+    names = ["", ".shstrtab", ".data", ".debug_abbrev", ".debug_info",
+             ".debug_str"]
+    if symtab:
+        names += [".symtab", ".strtab"]
+    for n in names[1:]:
+        off_strtab[n] = len(shstr)
+        shstr += n.encode() + b"\x00"
+    sym_name_off = 1                     # after the leading NUL
+    sym2_off = 1 + len("ParamMgmt_parameters.145875") + 1
+    sh_name_ = {n: off_strtab[n] for n in names[1:]}
+
+    def sec(name, blob, typ, addr=0, link=0, entsize=0):
+        return {"name": name, "type": typ, "addr": addr, "blob": blob,
+                "link": link, "entsize": entsize}
+
+    secs = [sec(".data", table, 1, 0x40080908)]
+    abbrev = info = dbgstr = b""
+    if dwarf:
+        # .debug_abbrev: 1 = compile_unit (children, name strp),
+        # 2 = enumeration_type (children, name strp),
+        # 3 = enumerator (no children, name strp, const_value udata)
+        abbrev = _uleb(1) + _uleb(0x11) + b"\x01" + \
+            _uleb(0x03) + _uleb(0x0e) + b"\x00\x00" + \
+            _uleb(2) + _uleb(0x04) + b"\x01" + \
+            _uleb(0x03) + _uleb(0x0e) + b"\x00\x00" + \
+            _uleb(3) + _uleb(0x28) + b"\x00" + \
+            _uleb(0x03) + _uleb(0x0e) + _uleb(0x1c) + _uleb(0x0f) + \
+            b"\x00\x00" + b"\x00"
+        dbgstr += b"t.c\x00E_PARAM_ID\x00"
+        enums_off = len(dbgstr)
+        enum_names_ = ("E_PARAM_ID_NONE", "E_PARAM_ID_FOO_A",
+                       "E_PARAM_ID_FOO_B", "E_PARAM_ID_FOO_C",
+                       "E_PARAM_ID_FOO_D", "E_PARAM_ID_MAX")
+        dbgstr += b"".join(n.encode() + b"\x00" for n in enum_names_)
+        cu = _uleb(1) + struct.pack(">I", 0)        # "t.c" at 0
+        enum = _uleb(2) + struct.pack(">I", enums_off)
+        pos = enums_off
+        for nm, v in (("NONE", 7), ("FOO_A", 0), ("FOO_B", 1),
+                      ("FOO_C", 2), ("FOO_D", 3), ("MAX", 4)):
+            enum += _uleb(3) + struct.pack(">I", pos) + _uleb(v)
+            pos += len("E_PARAM_ID_" + nm) + 1
+        dies = cu + enum + b"\x00\x00"              # enum, CU terminators
+        info = struct.pack(">IHIB", 7 + len(dies), 4, 0, 4) + dies
+    syms = b""
+    if symtab:
+        for i, vaddr in enumerate(vaddrs):
+            npos = sym_name_off if i == 0 else sym2_off
+            syms += struct.pack(">IIIBBH", npos, vaddr,
+                                sym_size if sym_size is not None else 64,
+                                0x01, 0, 1)          # LOCAL OBJECT
+        syms += b"\x00" * 16                         # the null symbol
+    secs += [sec(".debug_abbrev", abbrev, 1), sec(".debug_info", info, 1),
+             sec(".debug_str", dbgstr, 3)]
+    if symtab:
+        secs += [sec(".symtab", syms, 2, entsize=16),
+                 sec(".strtab", strtab, 3)]
+    secs += [sec(".shstrtab", shstr, 3)]
+    ehdr_len = 52
+    phnum = 1
+    off = ehdr_len + phnum * 32
+    layout = []
+    for s in secs:
+        layout.append((s, off))
+        off += len(s["blob"])
+    shoff = off
+    symtab_idx = next((i for i, (s, _) in enumerate(layout)
+                       if s["name"] == ".symtab"), 0)
+    strtab_idx = next((i for i, (s, _) in enumerate(layout)
+                       if s["name"] == ".strtab"), 0)
+    shstr_idx = next((i for i, (s, _) in enumerate(layout)
+                      if s["name"] == ".shstrtab"), 0)
+    with open(path, "wb") as f:
+        f.write(b"\x7fELF" + bytes((1, 2, 1, 0)) + b"\x00" * 8 +
+                struct.pack(">HHIIIIIHHHHHH", 2, 40, 1, 0x40000000,
+                            ehdr_len, shoff, 0, 52, 32, phnum, 40,
+                            len(layout), shstr_idx))
+        f.write(struct.pack(">8I", 1, layout[0][1], 0x40080908, 0x40080908,
+                            len(table), len(table), 7, 16))
+        for s, o in layout:
+            f.seek(o)
+            f.write(s["blob"])
+        f.seek(shoff)
+        for s, o in layout:
+            f.write(struct.pack(">10I", sh_name_.get(s["name"], 0),
+                                s["type"], 0, s["addr"], o, len(s["blob"]),
+                                strtab_idx if s["name"] == ".symtab"
+                                else s["link"], 0, 4, s["entsize"]))
+    return path
+
+
+def t_params_elf_parse(env):
+    """T1: the fixture ELF parses; the table is found; the DWARF enum
+    names the four rows (the sentinels attach to no row); the
+    min>max row warns; load() serves it all."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"))
+    elf = params_mod.elf32.read(p)
+    check(elf["warnings"] == [], "a clean read: %r" % elf["warnings"])
+    t = params_mod.find_table(elf)
+    check(t["count"] == 4 and t["vaddr"] == 0x40080908 and
+          t["size"] == 64 and t["symbol"] == "ParamMgmt_parameters.145875",
+          "the table: %r" % t)
+    rws = params_mod.rows(elf, t)
+    check(rws[1] == (9, 9, 0, 0xFFFF), "row 1: %r" % (rws[1],))
+    names = params_mod.dwarf.enum_names(elf)
+    check(len(names) == 6 and names[0] == "E_PARAM_ID_FOO_A" and
+          names[7] == "E_PARAM_ID_NONE" and names[4] == "E_PARAM_ID_MAX",
+          "the enum: %r" % names)
+    tab = params_mod.load(p, "sha")
+    check(tab.count == 4 and [r["name"] for r in tab.rows] ==
+          ["FOO_A", "FOO_B", "FOO_C", "FOO_D"],
+          "the names, sentinels attached to no row: %r" %
+          [r["name"] for r in tab.rows])
+    row = tab.rows[1]
+    check(row["default"] == 9 and row["min"] == 0 and
+          row["max"] == 0xFFFF, "row 1 static: %r" % row)
+    check(row["value"] is None and row["readback"] is None and
+          row["applies"] == "unknown",
+          "a fixture row without a known prefix: %r" % row)
+    check(any("min > max" in w and "#2" in w for w in tab.warnings),
+          "the min>max warning: %r" % tab.warnings)
+    check(not any("E_PARAM_ID_MAX" in w for w in tab.warnings),
+          "E_PARAM_ID_MAX == count: no warning")
+    # an unsupported DWARF form is a DwarfError naming the form, and
+    # load() degrades to param <idx> names with a warning
+    p2 = _param_elf(os.path.join(env.tmp, "asw-badform.elf"))
+    with open(p2, "r+b") as f:      # const_value udata -> addrx (0x1a)
+        blob = f.read()
+        i = blob.find(_uleb(0x1c) + _uleb(0x0f))
+        f.seek(i)
+        f.write(_uleb(0x1c) + _uleb(0x1a))
+    e = raises(params_mod.DwarfError, params_mod.dwarf.enum_names,
+               params_mod.elf32.read(p2))
+    check("0x1a" in str(e), "the form is named: %s" % e)
+    tab2 = params_mod.load(p2, "sha")
+    check([r["name"] for r in tab2.rows] == ["param 0", "param 1",
+                                             "param 2", "param 3"] and
+          tab2.rows[1]["default"] == 9 and tab2.warnings,
+          "degraded names, defaults kept: %r" % (tab2.warnings,))
+    # an ATT_*_PWM_LEVEL name applies on set; ASPECT_SUMMED_VALUES at
+    # both pickup points; anything else unknown
+    check(params_mod.applies_for("ATT_MAX_PWM_LEVEL") ==
+          ("on set", None) and
+          params_mod.applies_for("ASPECT_SUMMED_VALUES") ==
+          ("on NOMINAL entry and at boot", None) and
+          params_mod.applies_for("RCR_ENABLED") ==
+          ("next NOMINAL entry", params_mod.NOTE_237_10) and
+          params_mod.applies_for("NOMINAL_SUMEMASK") ==
+          ("next NOMINAL entry", params_mod.NOTE_237_13) and
+          params_mod.applies_for("WHATEVER") == ("unknown", None),
+          "the applies seed")
+
+
+def t_params_elf_symbol_rules(env):
+    """T1: no symtab, a non-row-multiple size, an out-of-RAM vaddr ->
+    no table with the reason warned; two candidates -> the largest
+    kept, both listed."""
+    p = _param_elf(os.path.join(env.tmp, "nosymtab.elf"), symtab=False)
+    tab = params_mod.load(p, "sha")
+    check(tab.count == 0 and tab.rows == [] and tab.warnings and
+          any("symtab" in w for w in tab.warnings),
+          "no symtab: %r" % tab.warnings)
+    p = _param_elf(os.path.join(env.tmp, "misaligned.elf"), sym_size=30)
+    tab = params_mod.load(p, "sha")
+    check(tab.count == 0 and any("multiple" in w for w in tab.warnings),
+          "size %% 16: %r" % tab.warnings)
+    p = _param_elf(os.path.join(env.tmp, "two.elf"),
+                   vaddrs=(0x40080908, 0x40080948))
+    with open(p, "r+b") as f:       # the second symbol: 6 rows (96 B)
+        blob = bytearray(f.read())
+        off = blob.find(struct.pack(">II", 0x40080948, 64))  # value, size
+        check(off > 0, "the second symbol's entry")
+        blob[off + 4:off + 8] = struct.pack(">I", 96)
+        f.seek(0)
+        f.write(blob)
+    elf = params_mod.elf32.read(p)
+    t = params_mod.find_table(elf)
+    check(t["count"] == 6 and t["symbol"] == "ParamMgmt_parameters.145876"
+          and any("kept the largest" in w and "145875" in w
+                  for w in elf["warnings"]),
+          "two candidates: %r" % elf["warnings"])
+    p = _param_elf(os.path.join(env.tmp, "outside.elf"),
+                   defaults=(0,) * 16, mins=(0,) * 16, maxs=(100,) * 16,
+                   vaddrs=(0x100,))
+    tab = params_mod.load(p, "sha")
+    check(tab.count == 0 and any("outside RAM" in w for w in tab.warnings),
+          "vaddr outside RAM: %r" % tab.warnings)
+    p = os.path.join(env.tmp, "junk.elf")
+    with open(p, "wb") as f:
+        f.write(b"not an elf at all")
+    tab = params_mod.load(p, "sha")
+    check(tab.count == 0 and tab.warnings, "junk degrades: %r"
+          % tab.warnings)
+
+
+def t_params_dwarf_missing(env):
+    """T1: the same ELF without .debug_* -> names param 0..3 with a
+    named warning, defaults still served."""
+    p = _param_elf(os.path.join(env.tmp, "nodwarf.elf"), dwarf=False)
+    tab = params_mod.load(p, "sha")
+    check([r["name"] for r in tab.rows] == ["param 0", "param 1",
+                                            "param 2", "param 3"],
+          "fallback names: %r" % [r["name"] for r in tab.rows])
+    check(tab.rows[1]["default"] == 9 and tab.rows[1]["min"] == 0 and
+          tab.rows[1]["max"] == 0xFFFF, "defaults kept")
+    check(any("names" in w for w in tab.warnings),
+          "the reason is named: %r" % tab.warnings)
+    check(tab.rows[0]["applies"] == "unknown",
+          "no name, no applies label")
+
+
+def t_params_api(env):
+    """T2: GET /params's shape and the status summary on a fixture
+    controller; a junk ELF answers params: [] with warnings, never an
+    exception; the table is cached by the (path, sha256) pair."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"),
+                   mins=(0, 0, 0, 0), maxs=(100, 100, 100, 0))
+    ctl = env.controller(qemu={"elf": p})
+    try:
+        s = ctl.params.snapshot()
+        check(set(s) == {"elf", "elf_sha256", "symbol", "count", "differ",
+                         "warnings", "at_sim", "params"},
+              "the shape: %r" % sorted(s))
+        with open(p, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        check(s["count"] == 4 and s["differ"] == 0 and
+              s["symbol"] == {"name": "ParamMgmt_parameters.145875",
+                              "address": 0x40080908, "size": 64} and
+              s["elf_sha256"] == sha,
+              "the header: %r" % {k: s[k] for k in ("count", "differ",
+                                                    "symbol")})
+        check(set(s["params"][0]) == {"index", "name", "default", "value",
+                                      "value_at", "readback",
+                                      "readback_at", "min", "max",
+                                      "applies", "applies_note",
+                                      "maintained"},
+              "the row shape: %r" % sorted(s["params"][0]))
+        check(ctl.status()["platform"]["params"] == {"count": 4,
+                                                     "differ": 0,
+                                                     "warnings": []},
+              "the status summary: %r" % ctl.status()["platform"]["params"])
+        check(ctl.params.table() is ctl.params.table(),
+              "the table is cached")
+    finally:
+        ctl.shutdown()
+    ctl = env.controller(qemu={"elf": "/dev/null"})
+    try:
+        s = ctl.params.snapshot()
+        check(s["params"] == [] and s["count"] == 0 and s["warnings"] and
+              s["symbol"] is None and s["at_sim"] is None,
+              "junk ELF: %r" % s)
+        check(ctl.status()["platform"]["params"]["count"] == 0,
+              "the degraded summary")
+        check(any(r.obj["path"] == "params.elf" for r in ctl.log.since(0)),
+              "one params.elf record")
+    finally:
+        ctl.shutdown()
+
+
+def t_params_series(env):
+    """T2: a param record feeds the param:<index> series with the name
+    as the label."""
+    si = series_mod.SeriesIndex()
+    si.feed(_srec("param", 100, "param.312",
+                  {"index": 312, "name": "NOMINAL_ACCU_MIN_INTEGRATION",
+                   "how": "ram", "old": 9, "new": 0}))
+    cat = {e["id"]: e for e in si.catalogue()}
+    check(cat.get("param:312", {}).get("label") ==
+          "NOMINAL_ACCU_MIN_INTEGRATION" and
+          cat["param:312"]["source"] == "param" and
+          cat["param:312"]["kind"] == "number",
+          "the catalogue: %r" % cat.get("param:312"))
+    q = si.query(["param:312"], max_points=10)
+    check(q["param:312"]["t"] == [100] and q["param:312"]["v"] == [0],
+          "the point: %r" % q["param:312"])
+
+
+def t_params_refresh_ram(env):
+    """T3: param.refresh over the fake's memsave: rows 1 and 2 differ
+    from the initial image -> two param records, differ 2, at_sim set;
+    a second refresh of the same image adds no records; off -> 409."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"), defaults=(0, 5, 7, 0),
+                   mins=(0, 0, 0, 0), maxs=(100, 100, 100, 0))
+    ctl = env.controller(qemu={"elf": p})
+    try:
+        e = raises(VerbError, ctl.command, "param.refresh", {})
+        check(e.status == 409, "off: %s" % e)
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        r = ctl.command("param.refresh", {})
+        check(r["count"] == 4 and r["differ"] == 2 and
+              r["at_sim"] is not None, "the snapshot: %r" %
+              {k: r[k] for k in ("count", "differ", "at_sim")})
+        recs = [x.obj for x in ctl.log.since(0) if x.kind == "param"]
+        check([(x["data"]["index"], x["data"]["old"], x["data"]["new"])
+               for x in recs] == [(1, 5, 0), (2, 7, 0)] and
+              all(x["data"]["how"] == "ram" and x["data"]["name"] and
+                  x["path"] == "param.%d" % x["data"]["index"]
+                  for x in recs), "the records: %r" % recs)
+        check(os.path.isfile(os.path.join(ctl.run_dir, "params-ram.bin")),
+              "the memsave file is in the run dir")
+        last = ctl.log.seq
+        r2 = ctl.command("param.refresh", {})
+        check(r2["differ"] == 2 and
+              not [x for x in ctl.log.since(last) if x.kind == "param"],
+              "the same image again: no records")
+        ctl.command("platform.power.off", {})
+        e = raises(VerbError, ctl.command, "param.refresh", {})
+        check(e.status == 409, "off again: %s" % e)
+    finally:
+        ctl.shutdown()
+
+
+def t_tc_237_20_label(env):
+    """T4: a TM(237,20) record carries decoded.param {index, sub,
+    value}; a short app data carries none."""
+    ctl = env.controller()
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        tm = ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"])
+        snd.sendto(_tm_unit(0x5A8, 237, 20, struct.pack(">HBI", 312, 0, 9)),
+                   tm)
+        wait_for(lambda: any(
+            (r.obj["data"].get("decoded") or {}).get("param") ==
+            {"index": 312, "sub": 0, "value": 9}
+            for r in ctl.log.since(0)), what="the labelled TM(237,20)")
+        snd.sendto(_tm_unit(0x5A8, 237, 20, b"\x01\x38\x00"), tm)
+        wait_for(lambda: sum(r.kind == "tm" for r in ctl.log.since(0)) == 2,
+                 what="the short TM")
+        rec = [r for r in ctl.log.since(0) if r.kind == "tm"][-1]
+        check("param" not in rec.obj["data"]["decoded"],
+              "7 app bytes minimum: %r" % rec.obj["data"]["decoded"])
+    finally:
+        snd.close()
+        ctl.shutdown()
+
+
+def t_params_readback(env):
+    """T4: param.read sends TC(237,19) (its record shows the service),
+    the delivered TM(237,20) answers it, the row and a param record
+    carry the read-back; a wrong index is a 400."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"), defaults=(0, 5, 7, 0),
+                   mins=(0, 0, 0, 0), maxs=(100, 100, 100, 0))
+    ctl = env.controller(qemu={"elf": p}, gs={"emulation": "on"})
+    qemu_tc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    qemu_tc.bind(("127.0.0.1", ctl.cfg["ports"]["qemu_tc"]))
+    qemu_tc.settimeout(2)
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        out = {}
+        th = threading.Thread(target=lambda: out.update(
+            r=ctl.command("param.read", {"index": 1})))
+        th.start()
+        u = qemu_tc.recvfrom(4096)[0]
+        apid, seq, svc, sub, src, ack, ok = tcbuild.parse_tc(u[4:])
+        check((svc, sub) == (237, 19) and src == 121 and ok and
+              u[4:][10:13] == b"\x00\x01\x00",
+              "the TC(237,19): %s" % u[4:].hex())
+        snd.sendto(_tm_unit(0x5A8, 237, 20, struct.pack(">HBI", 1, 0, 42)),
+                   ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"]))
+        th.join(5)
+        check(not th.is_alive() and out["r"]["value"] == 42 and
+              out["r"]["sub"] == 0 and out["r"]["index"] == 1 and
+              out["r"]["at_sim"] is not None,
+              "the answer: %r" % out.get("r"))
+        row = ctl.params.snapshot()["params"][1]
+        check(row["readback"] == 42 and row["readback_at"] is not None,
+              "the row: %r" % row)
+        recs = [x.obj for x in ctl.log.since(0) if x.kind == "param"]
+        check(recs and recs[-1]["data"] == {"index": 1, "name": "FOO_B",
+                                            "how": "readback", "old": None,
+                                            "new": 42},
+              "the readback record: %r" % recs[-1]["data"])
+        tc_recs = [x.obj["data"] for x in ctl.log.since(0)
+                   if x.kind == "tc" and x.obj["path"] == "param.read"]
+        check(tc_recs and tc_recs[-1]["service"] == 237 and
+              tc_recs[-1]["subtype"] == 19 and tc_recs[-1]["delivered"],
+              "the tc record: %r" % tc_recs[-1])
+        e = raises(VerbError, ctl.command, "param.read", {"index": 99})
+        check(e.status == 400, "a wrong index: %s" % e)
+    finally:
+        for sk in (qemu_tc, snd):
+            sk.close()
+        ctl.shutdown()
+
+
+def t_params_readback_dropped(env):
+    """T4: the link down refuses a read with the relay's drop reason
+    immediately, without waiting for a TM that never leaves the bench."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"))
+    ctl = env.controller(qemu={"elf": p}, gs={"emulation": "on"})
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        ctl.command("platform.spw.link", {"state": "down"})
+        t0 = time.monotonic()
+        e = raises(VerbError, ctl.command, "param.read", {"index": 1})
+        check(e.status == 409 and "link is down" in str(e) and
+              time.monotonic() - t0 < 0.5,
+              "immediate 409 with the reason: %s (%.2f s)"
+              % (e, time.monotonic() - t0))
+    finally:
+        ctl.shutdown()
+
+
+def t_params_maintained(env):
+    """FSW-maintained rows (the TC sequence counters, TCData.c:197-218,
+    TCBuffer.c:297) never count as differ and Reset all skips them."""
+    check(params_mod.fsw_maintained("SSC_for_PID49_CAT12_SYSCTRL") and
+          params_mod.fsw_maintained("LAST_ACCEPTED_SSC") and
+          not params_mod.fsw_maintained("NOMINAL_ACCU_MIN_INTEGRATION")
+          and not params_mod.fsw_maintained("LAST_ACCEPTED_SSCX")
+          and not params_mod.fsw_maintained(None), "the name rule")
+    rows = [{"index": 0, "name": "SSC_for_other", "default": 0,
+             "value": 11, "maintained": True},
+            {"index": 1, "name": "FOO", "default": 0, "value": 3,
+             "maintained": False}]
+    tab = params_mod.ParamsTable(2, rows, [])
+    check(tab.differ() == 1, "only FOO differs: %d" % tab.differ())
+
+
+def _param_auto_verify(ctl, subtype=7, fid=None):
+    """Answer every param.set TC like the FSW: TM(1,7), or TM(1,8)
+    with @fid, fed to the params listener right after the send."""
+    real = ctl.params.relay.gs_tc
+
+    def gs_tc(sp, **kw):
+        ok = real(sp, **kw)
+        apid, seq = tcbuild.parse_tc(sp)[:2]
+        dec = {"apid": 0x5A1, "type": 1, "subtype": subtype,
+               "tc": {"apid": apid, "seq": seq}}
+        if fid is not None:
+            dec["fid"] = fid
+        threading.Timer(0.01, ctl.params.on_tm, (None, dec)).start()
+        return ok
+    gs_tc.real = getattr(real, "real", real)   # unwrap a previous one
+    ctl.params.relay.gs_tc = gs_tc
+
+
+def t_params_set(env):
+    """T5: param.set builds the TC(237,18) with its label, sub 1/2 are
+    accepted, a wrong index is a 400, the gate off is a 403."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"))
+    ctl = env.controller(qemu={"elf": p}, gs={"emulation": "on"})
+    qemu_tc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    qemu_tc.bind(("127.0.0.1", ctl.cfg["ports"]["qemu_tc"]))
+    qemu_tc.settimeout(2)
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        _param_auto_verify(ctl)
+        r = ctl.command("param.set", {"index": 1, "value": 7})
+        check(r == {"index": 1, "sub": 0, "value": 7, "delivered": True,
+                    "verified": "completed"},
+              "the answer: %r" % r)
+        u = qemu_tc.recvfrom(4096)[0]
+        apid, seq, svc, sub, src, ack, ok = tcbuild.parse_tc(u[4:])
+        check((svc, sub) == (237, 18) and src == 121 and ok and
+              u[4:][10:17] == b"\x00\x01\x00\x00\x00\x00\x07",
+              "the TC(237,18): %s" % u[4:].hex())
+        tc = [x.obj["data"] for x in ctl.log.since(0)
+              if x.kind == "tc" and x.obj["path"] == "param.set"][-1]
+        check(tc["param"] == {"index": 1, "sub": 0, "value": 7},
+              "the label: %r" % tc)
+        r = ctl.command("param.set", {"index": 1, "value": 1, "sub": 2})
+        check(r["delivered"] and r["sub"] == 2, "sub 2 accepted: %r" % r)
+        qemu_tc.recvfrom(4096)
+        # the FSW refuses (SAFE): the answer says so, never "done"
+        ctl.params.relay.gs_tc = ctl.params.relay.gs_tc.real
+        _param_auto_verify(ctl, subtype=8, fid=48301)
+        r = ctl.command("param.set", {"index": 1, "value": 3})
+        check(r["verified"] == "failed" and r["fid"] == 48301 and
+              r["reason"] == "wrong operation mode" and
+              r["tm"] == "TM(1,8)", "a refused set: %r" % r)
+        qemu_tc.recvfrom(4096)
+        e = raises(VerbError, ctl.command, "param.set",
+                   {"index": 99, "value": 1})
+        check(e.status == 400, "a wrong index: %s" % e)
+        e = raises(VerbError, ctl.command, "param.set",
+                   {"index": 1, "value": -1})
+        check(e.status == 400, "a negative value: %s" % e)
+    finally:
+        qemu_tc.close()
+        ctl.shutdown()
+    ctl = env.controller(qemu={"elf": p})     # the gate off (interactive)
+    try:
+        e = raises(VerbError, ctl.command, "param.set",
+                   {"index": 1, "value": 7})
+        check(e.status == 403 and "emulation" in str(e),
+              "the gate: %s" % e)
+    finally:
+        ctl.shutdown()
+
+
+def t_params_reset_all(env):
+    """T5: reset_all TC(237,18)s the defaults of the differing rows,
+    one worker at a time, and nothing to do is reset: 0."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"), defaults=(0, 5, 7, 0),
+                   mins=(0, 0, 0, 0), maxs=(100, 100, 100, 0))
+    ctl = env.controller(qemu={"elf": p}, gs={"emulation": "on"})
+    qemu_tc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    qemu_tc.bind(("127.0.0.1", ctl.cfg["ports"]["qemu_tc"]))
+    qemu_tc.settimeout(2)
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        r = ctl.command("param.reset_all", {})
+        check(r == {"reset": 0, "failed": 0},
+              "no known values, nothing to reset: %r" % r)
+        ctl.command("param.refresh", {})     # rows 1 and 2 differ
+        _param_auto_verify(ctl)
+        last = ctl.log.seq
+        r = ctl.command("param.reset_all", {})
+        check(r == {"reset": 2, "failed": 0}, "the reset: %r" % r)
+        tcs = [x.obj["data"] for x in ctl.log.since(last)
+               if x.kind == "tc" and x.obj["path"] == "param.set"]
+        check([(t["param"]["index"], t["param"]["value"]) for t in tcs] ==
+              [(1, 5), (2, 7)],
+              "two TC(237,18) with the defaults: %r" % tcs)
+        ctl.params._worker.acquire()         # a worker holds the slot
+        try:
+            e = raises(VerbError, ctl.command, "param.reset_all", {})
+            check(e.status == 409, "a second worker: %s" % e)
+            e = raises(VerbError, ctl.command, "param.read_all", {})
+            check(e.status == 409, "read_all shares the slot: %s" % e)
+        finally:
+            ctl.params._worker.release()
+    finally:
+        qemu_tc.close()
+        ctl.shutdown()
+
+
+def t_params_viewrun(env):
+    """T2: --view-run replays the param records onto the run's own ELF
+    (from controller.start); a run whose ELF is gone degrades to
+    params: [] with warnings, never an exception."""
+    p = _param_elf(os.path.join(env.tmp, "asw.elf"))
+    d = os.path.realpath(os.path.join(env.tmp, "run-params"))
+    os.makedirs(d)
+    t = [0.0]
+    lg = log_mod.RecordLog(None, lambda: (int(t[0]), 1, None, True))
+    with open(p, "rb") as f:
+        sha = hashlib.sha256(f.read()).hexdigest()
+    lg.emit("ctl", "log", "controller.start",
+            {"run_dir": d, "config": {
+                "timeline": {"views_dir": "", "idb_json": "",
+                             "idb_sqlite": "", "sample_paths": [],
+                             "sample_s": 0.0},
+                "retention": {"run_root": env.tmp},
+                "qemu": {"elf": p}},
+             "elf_sha256": sha})
+    t[0] = 100.0
+    lg.emit("ctl", "param", "param.1", {"index": 1, "name": "FOO_B",
+                                        "how": "ram", "old": 9, "new": 0})
+    t[0] = 200.0
+    lg.emit("ctl", "param", "param.2", {"index": 2, "name": "FOO_C",
+                                        "how": "readback", "old": None,
+                                        "new": 42})
+    recs = lg.since(0)
+    lg.close()
+    with open(os.path.join(d, "log.jsonl"), "w") as f:
+        for r in recs:
+            f.write(r.line + "\n")
+    vr = viewrun_mod.ViewRun(d)
+    srv = api_mod.make_server(vr, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/api/v1/params")
+        s = json.loads(body)
+        check(st == 200 and s["count"] == 4 and s["elf"] == p,
+              "the header: %r" % {k: s[k] for k in ("count", "elf")})
+        check(s["params"][1]["value"] == 0 and
+              s["params"][1]["value_at"] == 100 and
+              s["params"][1]["default"] == 9,
+              "the replayed value: %r" % s["params"][1])
+        check(s["params"][2]["readback"] == 42 and
+              s["params"][2]["readback_at"] == 200,
+              "the replayed readback: %r" % s["params"][2])
+        check(s["at_sim"] == 100,     # the last RAM record (readback is not one)
+              "at_sim: %r" % s["at_sim"])
+        st, _, body = _http(port, "GET", "/api/v1/status")
+        check(st == 200 and "params" not in json.loads(body),
+              "the view status keeps no params key")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    d2 = os.path.realpath(os.path.join(env.tmp, "run-params2"))
+    os.makedirs(d2)
+    with open(os.path.join(d2, "log.jsonl"), "w") as f:
+        for r in recs:
+            obj = dict(r.obj)
+            if obj["path"] == "controller.start":
+                obj["data"]["config"]["qemu"] = {
+                    "elf": "/nonexistent/no-such.elf"}
+            f.write(json.dumps(obj) + "\n")
+    vr = viewrun_mod.ViewRun(d2)
+    srv = api_mod.make_server(vr, "127.0.0.1", 0)
+    try:
+        st, _, body = _http(srv.server_address[1], "GET",
+                            "/api/v1/params")
+        s = json.loads(body)
+        check(st == 200 and s["params"] == [] and s["warnings"],
+              "the degraded shape: %r" % s)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def t_params_real_elf(env):
+    """T7: the owner-verified symbol facts against the real ELFs
+    (skipped with a note when the baseline ELF is absent); the
+    ParamMgmtDef.h cross-anchors are the cited values
+    (ParamMgmtDef.h:343, :382-383, :386)."""
+    for name, path, count, vaddr in (
+            ("baseline", "~/dev/stix-elf/ASW_em_baseline.elf", 482,
+             0x40080908),
+            ("prof", "~/dev/stix-elf/ASW_em_prof.elf", 483, 0x40059a68)):
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            if name == "baseline":
+                print("     (skipped: no FSW ELF at %s)" % path)
+                return
+            continue
+        tab = params_mod.load(path, None)
+        check(tab.count == count, "%s: %d rows" % (name, tab.count))
+        check(tab.symbol["address"] == vaddr and
+              tab.symbol["size"] == count * 16,
+              "%s: symbol %r" % (name, tab.symbol))
+        by = {r["name"]: r for r in tab.rows}
+        check(len(by) == len(tab.rows), "%s: names unique" % name)
+        check(by["NOMINAL_ACCU_MIN_INTEGRATION"]["default"] == 9 and
+              by["NOMINAL_ACCU_MIN_INTEGRATION"]["min"] == 0 and
+              by["NOMINAL_ACCU_MIN_INTEGRATION"]["max"] == 0xFFFF,
+              "%s: NOMINAL_ACCU_MIN_INTEGRATION %r"
+              % (name, by["NOMINAL_ACCU_MIN_INTEGRATION"]))
+        check(by["RCR_ENABLED"]["default"] == 1,
+              "%s: RCR_ENABLED %r" % (name, by["RCR_ENABLED"]))
+
+
+def t_ui_params(env):
+    """fsw-params plan T8: the FSW parameters panel on the IDPU tab —
+    the ids are there, the params verbs are used, the page rules still
+    hold, and "params" is a served endpoint."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    page = body.decode()
+    p = _UiParser()
+    p.feed(page)
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check(UI_PARAMS_IDS <= ids, "params ids missing %r"
+          % sorted(UI_PARAMS_IDS - ids))
+    used = {v for v, _ in p.verbs}
+    check(UI_PARAMS_VERBS <= used, "the params verbs missing %r"
+          % sorted(UI_PARAMS_VERBS - used))
+    for tag, a in p.attrs:
+        on = [k for k in a if k.startswith("on")]
+        check(not on and "style" not in a, "<%s %r>: inline handler or "
+              "style attribute" % (tag, a))
+    for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
+        check(bad not in page.lower(), "the page uses %s" % bad)
+    check("params" in UI_ENDPOINTS, "the endpoint is registered")
+
+
 # -- timeline series, views, view-run (A4, A5, A6) -------------------------
 def _srec(kind, t, path="", data=None):
     """A minimal record dict for SeriesIndex.feed."""
@@ -4600,6 +5311,21 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("GS side security (SF6)", t_gs_security),
          ("platform TCs (9/20, R2)", t_platform_tcs),
          ("TC(237,18) label (A3)", t_tc_237_18_label),
+         ("FSW params: ELF parse (T1)", t_params_elf_parse),
+         ("FSW params: symbol rules (T1)", t_params_elf_symbol_rules),
+         ("FSW params: no DWARF (T1)", t_params_dwarf_missing),
+         ("FSW params: API (T2)", t_params_api),
+         ("FSW params: series (T2)", t_params_series),
+         ("FSW params: view-run (T2)", t_params_viewrun),
+         ("FSW params: RAM refresh (T3)", t_params_refresh_ram),
+         ("TM(237,20) label (T4)", t_tc_237_20_label),
+         ("FSW params: read-back (T4)", t_params_readback),
+         ("FSW params: read-back dropped (T4)", t_params_readback_dropped),
+    ("FSW params: FSW-maintained rows", t_params_maintained),
+         ("FSW params: set (T5)", t_params_set),
+         ("FSW params: reset all (T5)", t_params_reset_all),
+         ("FSW params: real ELF (T7)", t_params_real_elf),
+         ("UI: FSW parameters (T8)", t_ui_params),
          ("record log: listeners (A4)", t_log_listeners),
          ("series: decimation keeps spikes (A4)",
           t_series_decimate_keeps_spikes),

@@ -33,6 +33,9 @@
     --tl1: #7aa2ff; --tl2: #4cc47f; --tl3: #e0a339; --tl4: #ff6b60;
     --tl5: #c9a6ff; --tl6: #62d0e0; --tl7: #d9a184; --tl8: #98a1b3;
   }
+  tr.p-group th { background: #232936; }
+  tr.p-diff td { background: #3a2c1f; }
+  tr.p-diff .p-cur { color: #ffab91; }
 }
 * { box-sizing: border-box; }
 body {
@@ -135,6 +138,18 @@ tbody th { position: static; }   /* group headers scroll, thead sticks */
 .tl-sw6 { background: var(--tl7); }
 .tl-sw7 { background: var(--tl8); }
 #tl-hover { min-height: 1.4em; max-height: 7em; overflow: auto; }
+/* FSW parameters (fsw-params plan T8): the mockup's grid as a fixed
+   table, the differing rows highlighted */
+#params table { min-width: 900px; table-layout: fixed; }
+#params .p-ix { width: 70px; }
+#params .p-def, #params .p-cur { width: 110px; }
+#params .p-new { width: 130px; }
+#params .p-app { width: 150px; }
+#params .p-act { width: 130px; }
+tr.p-group th { background: #f8fafc; font-weight: 600; }
+tr.p-diff td { background: #fff7ed; }
+tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
+.k-param { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -292,6 +307,53 @@ tbody th { position: static; }   /* group headers scroll, thead sticks */
 </div>
 
 <div class="tab" data-tab-panel="idpu" hidden>
+<section id="params" class="wide">
+  <h2>FSW parameters
+    <input id="params-find" class="wide"
+           placeholder="Find by index or name…">
+    <label class="muted"><input type="checkbox" id="params-nondef"
+      checked> only non-default</label>
+  </h2>
+  <div class="ctl">
+    <span id="params-status" class="desc"></span>
+    <button data-verb="param.refresh" data-only="">refresh</button>
+    <button data-verb="param.read_all" id="params-readall"
+            data-args='{"only_changed": false}'>Read all back</button>
+    <button data-verb="param.reset_all" id="params-reset"
+            class="danger"
+            data-confirm="Set every differing parameter back to its ELF default?">Reset all…</button>
+  </div>
+  <div class="desc">Set sends TC(237,18) and reads back with
+    TC(237,19). Highlighted rows differ from the ELF default. Applies
+    says when the FSW picks the value up.</div>
+  <div class="scroll tall">
+    <table id="params-table">
+      <colgroup>
+        <col class="p-ix"><col><col class="p-def"><col class="p-cur">
+        <col class="p-new"><col class="p-app"><col class="p-act">
+      </colgroup>
+      <thead><tr><th>Index</th><th>Name</th><th>Default</th>
+        <th>Current</th><th>New value</th><th>Applies</th>
+        <th>Set/Reset</th></tr></thead>
+      <tbody id="params-body"></tbody>
+    </table>
+  </div>
+  <template id="t-param-row">
+    <tr>
+      <td class="p-ix"></td>
+      <td class="p-name"></td>
+      <td class="p-def"></td>
+      <td class="p-cur"></td>
+      <td><input type="number" class="p-inp"></td>
+      <td class="p-app"></td>
+      <td>
+        <button data-verb="param.set">Set</button>
+        <button data-verb="param.set">Reset</button>
+      </td>
+    </tr>
+  </template>
+</section>
+
 <section>
   <h2>TC send (GS emulation)</h2>
   <div class="desc">tc.gs.send: an operator TC from source 121; needs
@@ -436,6 +498,7 @@ tbody th { position: static; }   /* group headers scroll, thead sticks */
       <label><input type="checkbox" class="topic" value="mismatch" checked> mismatch</label>
       <label><input type="checkbox" class="topic" value="log"> log</label>
       <label><input type="checkbox" class="topic" value="sample"> sample</label>
+      <label><input type="checkbox" class="topic" value="param"> param</label>
       <label><input type="checkbox" id="follow" checked> follow</label>
     </span>
   </h2>
@@ -625,6 +688,18 @@ function collect(scope, args, only) {
    button carries the fault id, inject also takes the row's params and,
    on the "at…" button, the row's guest-seconds input */
 function argsOf(btn) {
+  if (btn.dataset.idx != null) {   // a params table row (fsw-params):
+    const args = { index: Number(btn.dataset.idx) };  // Set takes the
+    if (btn.dataset.value != null) {                  // row's input
+      args.value = Number(btn.dataset.value);         // Reset: default
+      return args;
+    }
+    const inp = btn.closest("tr") && btn.closest("tr").querySelector("input");
+    const v = inp ? parseInt(inp.value, 10) : NaN;
+    if (!isFinite(v)) throw new Error("param.set: enter a new value first");
+    args.value = v;
+    return args;
+  }
   if (btn.dataset.id) {
     const args = { id: btn.dataset.id };
     if (btn.dataset.verb === "fault.inject") {
@@ -676,6 +751,7 @@ document.addEventListener("click", async (ev) => {
     showResult(btn, res);
     if (verb === "platform.flash.save" || verb === "platform.flash.load")
       loadFlash();  // the library table shows the new state
+    if (verb.startsWith("param.")) paramsRefresh();  // ditto the params
   } catch (e) {
     toast(String(e.message || e), true);
   } finally {
@@ -696,6 +772,7 @@ function showTab(id) {
     // Setup visit
     loadFlash().then((ok) => { flashLoaded = ok; });
   }
+  if (id === "idpu") paramsRefresh();   // the FSW parameters panel
   if (id === "timeline") tlDraw();
 }
 function tabFromHash() {
@@ -766,6 +843,91 @@ function renderFlash(box, r) {
   box.replaceChildren(head, tb);
 }
 
+/* ---- FSW parameters (fsw-params plan T8): defaults and names from
+   the running ELF, Current from guest RAM (param.refresh, on tab open
+   and every 2 s while visible), Set/Reset over TC(237,18) ---- */
+let paramsRows = [];
+let paramsCount = 0;
+let paramsWarn = "";
+async function paramsRefresh() {
+  try {
+    const r = await getJSON("params");
+    paramsRows = r.params || [];
+    paramsCount = r.count || 0;
+    paramsWarn = (r.warnings || []).join(" · ");
+    renderParams();
+  } catch (e) {
+    toast(String(e.message || e), true);   // the refusal, not a dead table
+  }
+}
+function renderParams() {
+  if (paramsWarn) text($("params-status"), paramsWarn);
+  const flt = $("params-find").value.trim().toLowerCase();
+  const onlyND = $("params-nondef").checked;
+  const groups = new Set();
+  const rows = [];
+  for (const row of paramsRows) {
+    // FSW-maintained rows (TC sequence counters) differ by design:
+    // never highlighted, counted or reset in bulk; shown when found
+    const diff = row.value != null && row.value !== row.default &&
+      !row.maintained;
+    if (onlyND && !diff && !(flt && row.maintained)) continue;
+    if (flt && !String(row.index).includes(flt) &&
+        !row.name.toLowerCase().includes(flt)) continue;
+    const g = row.name.split("_")[0];
+    if (!groups.has(g)) {          // the bold group-name header row
+      groups.add(g);
+      const gh = document.createElement("tr");
+      cls(gh, "p-group");
+      const th = document.createElement("th");
+      th.colSpan = 7;
+      text(th, g);
+      gh.append(th);
+      rows.push(gh);
+    }
+    rows.push(paramsRow(row, diff));
+  }
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 7;
+    text(td, paramsCount ? "no rows match" :
+         "no parameter table" + (paramsWarn ? ": " + paramsWarn : ""));
+    tr.append(td);
+    rows.push(tr);
+  }
+  $("params-body").replaceChildren(...rows);
+}
+function paramsRow(row, diff) {
+  const tr = $("t-param-row").content.firstElementChild.cloneNode(true);
+  if (diff) cls(tr, "p-diff");
+  const cells = tr.children;
+  text(cells[0], row.index);
+  text(cells[1], row.name);
+  text(cells[2], row.default == null ? "—" : String(row.default));
+  const age = row.readback == null ? "" : " · " +
+    Math.max(0, Math.round(((TL.now || 0) - (row.readback_at || 0)) /
+                           1e9)) + "s";
+  text(cells[3], row.value == null ? "—" : String(row.value) + age);
+  if (diff) cls(cells[3], "p-cur");
+  const inp = tr.querySelector("input");   // New value, prefilled
+  if (row.min != null) inp.min = row.min;
+  if (row.max != null) inp.max = row.max;
+  inp.value = row.value == null ? "" : row.value;
+  inp.setAttribute("aria-label", "New value for " + row.name);
+  inp.title = "New value for " + row.name;
+  text(cells[5], row.maintained ? "FSW-maintained (TC sequence counter)"
+       : row.applies + (row.applies_note ? " — " + row.applies_note : ""));
+  const btns = tr.querySelectorAll("button");
+  btns[0].dataset.idx = row.index;         // Set takes the row's input
+  btns[1].dataset.idx = row.index;         // Reset sends the ELF default
+  btns[1].dataset.value = row.default;
+  btns[1].disabled = !diff;                // grey when the row does not differ
+  return tr;
+}
+$("params-find").addEventListener("input", renderParams);
+$("params-nondef").addEventListener("change", renderParams);
+
 /* ---- status strip and the per-panel status ---- */
 function fmtS(ns) { return ns == null ? "?" : (ns / 1e9).toFixed(3) + " s"; }
 function fmtObt(cuc) {
@@ -812,6 +974,13 @@ async function refresh() {
   $("hdr-run").children[1].hidden = run || st.power !== "paused";
   renderFaultState(st.faults || {});
   renderForcings(st.forcings || {});
+  const pp = p.params;   // the FSW parameters summary (status.params);
+  if (pp) {              // hidden in view mode (no params key there)
+    $("params-status").hidden = false;
+    text($("params-status"), pp.differ + " parameters differ from default");
+  } else {
+    $("params-status").hidden = true;
+  }
   const fa = Object.values(st.faults || {});
   text($("ov-platform"), (st.power || "?") + " · link " + (p.link || "?"));
   text($("ov-idpu"), (p.timecodes === false ? "time codes off" :
@@ -2373,7 +2542,7 @@ function onRecord(r) {
 
 const TOPIC = { cmd: "cmd", result: "cmd", state: "state", power: "state",
                 fault: "fault", force: "fault", debug: "log",
-                sample: "sample" };
+                sample: "sample", param: "param" };
 /* heartbeat (D3): the tm records whose decoded APID is 0x5E5, which the
    tm chip then excludes */
 function topicOf(r) {
@@ -2409,7 +2578,7 @@ async function backfill(seq) {
 
 function stream() {
   const es = new EventSource(API + "stream?since=" + lastSeq);
-  const topics = ["cmd", "state", "tm", "tc", "fault", "expect", "mismatch", "uart", "log", "sample"];
+  const topics = ["cmd", "state", "tm", "tc", "fault", "expect", "mismatch", "uart", "log", "sample", "param"];
   for (const t of topics) {
     es.addEventListener(t, (ev) => onRecord(JSON.parse(ev.data)));
   }
@@ -2433,6 +2602,10 @@ async function main() {
   setInterval(refresh, 1000);
   setInterval(loadState, 2000);
   setInterval(loadScenarios, 10000);
+  setInterval(() => {   // the FSW parameters' RAM snapshot, but only
+    if (!document.querySelector('[data-tab-panel="idpu"]').hidden)
+      paramsRefresh();  // while the IDPU tab is visible (never faster)
+  }, 2000);
 }
 showTab(tabFromHash());
 main();

@@ -5,8 +5,9 @@ can refuse a scenario with a mistyped verb before it starts anything
 
 VERBS = frozenset({
     "debug.qmp", "det.rotb.burst", "fault.clear", "fault.inject",
-    "force.clear", "force.set", "log.mark", "platform.flash.list",
-    "platform.flash.load", "platform.flash.save",
+    "force.clear", "force.set", "log.mark", "param.read",
+    "param.read_all", "param.refresh", "param.reset_all", "param.set",
+    "platform.flash.list", "platform.flash.load", "platform.flash.save",
     "platform.keepalive.set", "platform.obt.set",
     "platform.power.boot", "platform.power.cycle", "platform.power.off",
     "platform.power.on", "platform.spw.link", "platform.timecode.enable",

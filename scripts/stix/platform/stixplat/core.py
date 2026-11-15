@@ -72,6 +72,7 @@ class Controller:
         self.plat = Platform(self)
         self.plat.register(self.dispatcher)
         self.state.fault_ids = self.plat.faults.active_targets
+        self.params = self.plat.params   # GET /params (fsw-params plan)
         # A4: the series index, fed by a record-log listener (called
         # after the ring append, outside the log lock)
         self.series = series_mod.SeriesIndex(idb=self.plat.relay.idb)
@@ -90,9 +91,12 @@ class Controller:
             self.sampler.start()
             self.power.hooks.append(self._sampler_power)
         views_mod.ensure_starters(cfg)      # A5: only when missing
+        # elf_sha256 rides next to the config so --view-run can replay
+        # the FSW parameters table from the same ELF (fsw-params T2)
         self.log.emit("ctl", "log", "controller.start",
                       {"run_dir": self.run_dir, "fresh_removed":
-                       self.removed, "config": _public(cfg)})
+                       self.removed, "config": _public(cfg),
+                       "elf_sha256": self.elf_sha256})
         self._power_changed()
 
     # -- verbs --

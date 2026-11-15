@@ -18,7 +18,9 @@ Series ids:
 - marker kinds `fault`, `force`, `tc`, `event`, `mode`, `power`,
   `scenario` — one point per record, the label is the hover text
   (`TC(237,18) param 312 = 0`, `EID 0x0021 mode change`, ...);
-  `scenario` = log/expect records whose path starts with `scenario.`.
+  `scenario` = log/expect records whose path starts with `scenario.`;
+- `param:<index>` — a `param` record's new value (the FSW parameters
+  table's changes, fsw-params plan T2), the label is the name.
 
 Values: bool as 0/1 (kind "bool"), int/float as-is (kind "number"),
 str as the index in the order first seen (kind "enum", `values` lists
@@ -121,6 +123,14 @@ class SeriesIndex:
             pass    # the TC(20,128) summaries every 10 s: noise, not events
         elif kind in ("fault", "force", "tc", "power"):
             self._marker(kind, t, obj, data)
+        elif kind == "param":
+            idx, new = data.get("index"), data.get("new")
+            if isinstance(idx, int) and not isinstance(idx, bool) and \
+                    isinstance(new, (int, float)) and \
+                    not isinstance(new, bool):
+                self._add_num("param:%d" % idx,
+                              str(data.get("name") or "param %d" % idx),
+                              None, "param", "number", t, new)
         elif kind in ("log", "expect") and \
                 str(obj.get("path") or "").startswith("scenario."):
             label = obj["path"]
