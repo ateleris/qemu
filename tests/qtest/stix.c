@@ -9581,6 +9581,21 @@ static void test_det_tape_props(void)
     g_assert_cmpstr(name, ==, "keeper");    /* the previous tape intact */
     g_clear_pointer(&name, g_free);
 
+    /* review: a fractional background cps is refused (not truncated);
+     * a loaded tape without steps is refused at play */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", "
+                           "\"background\": {\"cps\": 100.5}, "
+                           "\"steps\": []}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"empty\", "
+                           "\"steps\": []}");
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_clear_pointer(&desc, g_free);
+    desc = det_tape_play(qts, true);
+    g_assert_nonnull(desc);
+    g_assert_nonnull(strstr(desc, "no steps"));
     g_string_free(s, true);
     qtest_quit(qts);
     stix_qtest_cleanup();

@@ -2877,9 +2877,10 @@ static void stix_det_tape_load_set(Object *obj, Visitor *v, const char *name,
         if (!stix_det_tape_num(bg, "cps", &bg_cps, errp, UINT32_MAX)) {
             return;
         }
-        if (bg_cps < 0 || bg_cps > STIX_DET_CPS_MAX) {
-            error_setg(errp, "det-tape-load: background cps %g is "
-                       "outside 0..%u", bg_cps, STIX_DET_CPS_MAX);
+        if (bg_cps < 0 || bg_cps > STIX_DET_CPS_MAX ||
+            bg_cps != floor(bg_cps)) {
+            error_setg(errp, "det-tape-load: background cps %g is not "
+                       "an integer in 0..%u", bg_cps, STIX_DET_CPS_MAX);
             return;
         }
     }
@@ -2897,21 +2898,18 @@ static void stix_det_tape_load_set(Object *obj, Visitor *v, const char *name,
             if (n_steps == STIX_DET_TAPE_MAX_STEPS) {
                 error_setg(errp, "det-tape-load: more than %u steps",
                            STIX_DET_TAPE_MAX_STEPS);
-                return;
-            }
-            if (!so) {
+            } else if (!so) {
                 error_setg(errp, "det-tape-load: step %u is not an "
                            "object", n_steps);
-                return;
+            } else if (stix_det_tape_parse_step(d, so, &steps[n_steps],
+                                                n_steps, errp)) {
+                n_steps++;
+                continue;
             }
-            if (!stix_det_tape_parse_step(d, so, &steps[n_steps], n_steps,
-                                          errp)) {
-                while (n_steps--) {     /* the parsed labels leak not */
-                    g_free(steps[n_steps].label);
-                }
-                return;
+            while (n_steps--) {         /* the parsed labels leak not */
+                g_free(steps[n_steps].label);
             }
-            n_steps++;
+            return;
         }
     }
 
@@ -2953,6 +2951,10 @@ static void stix_det_tape_play_set(Object *obj, Visitor *v, const char *name,
         if (d->tape_state == STIX_DET_TAPE_IDLE) {
             error_setg(errp, "%s: no tape loaded (det-tape-load first)",
                        name);
+            return;
+        }
+        if (!d->tape_n_steps) {
+            error_setg(errp, "%s: the loaded tape has no steps", name);
             return;
         }
         if (d->source != STIX_DET_SOURCE_SYNTHETIC) {
