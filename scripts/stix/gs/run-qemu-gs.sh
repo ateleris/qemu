@@ -35,7 +35,8 @@ done
     exit 2
 }
 QEMU="$1"
-. "$(dirname "${BASH_SOURCE[0]}")/../lib/paths.sh"
+# POSIX sh: $0, not ${BASH_SOURCE[0]} (dash: "Bad substitution")
+. "$(dirname "$0")/../lib/paths.sh"
 ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
 RUN="${STIX_GS_RUN_DIR:-/tmp/stix-gs-run}"
 PORT="${STIX_GS_TM_PORT:-21500}"
