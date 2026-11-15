@@ -111,6 +111,21 @@ steps above the `off` step's, and the off-window samples are exactly 0
 ON/OFF/OFF_END are the rate-step start, the `off`-step start and its
 end, in seconds of NOMINAL (sample i covers [4 i, 4 i + 4) s).
 
+--ssid32-peak MAP [MARGIN] is the S2 spectrum-bin check (spectra plan
+U5): MAP is SUBCOL:EBIN[,SUBCOL:EBIN...] (0-based ebin; byte N of a
+sample is ebin N - 1). In the last SSID 32 dump, each listed sample's
+byte at EBIN is non-zero and at least MARGIN (default 8) compressed
+steps above every other ebin byte of the same sample. Each listed
+sample's 32 bytes, its argmax and its top two bytes are printed.
+
+--ssid32-line SUBCOLS EBINS [MARGIN] is the S2 spectrum-line check:
+every sample whose detector byte is in the comma-separated SUBCOLS has
+one dominant ebin (its top byte at least MARGIN, default 8, steps
+above its second); every other sample's bytes at the comma-separated
+EBINS stay below 0x10 (the background floor, the --ssid32-subcols
+bound) and none of them is that sample's argmax (a non-zero byte not
+below every other byte of the sample). Printed as for --ssid32-peak.
+
 Usage:
   ql-check.py DUMP [--samples] [--expect-zero-flush SECONDS]
               [--expect-sky-flush SECONDS] [--lc-contrast ON OFF]
@@ -118,6 +133,8 @@ Usage:
               [--expect-tape-flush SECONDS] [--ssid32-subcols SUBCOLS]
               [--ssid32-byte SUBCOL EBIN [MIN MAX]]
               [--tape-lc ON OFF OFF_END]
+              [--ssid32-peak MAP [MARGIN]]
+              [--ssid32-line SUBCOLS EBINS [MARGIN]]
   ql-check.py --self-test
 Exit codes: 0 decoded (and the check passed), 1 a decode error or a
 failed check, 2 bad usage or an unreadable file. stdlib only.
@@ -763,6 +780,108 @@ def check_ssid32_byte(products, subcol, ebin, min_c=0, max_c=0xFF,
     return fails
 
 
+SPEC_FLOOR = 0x10      # the background floor (TAPE_MAX_UNMASKED)
+
+
+def ssid32_top(sample):
+    """(argmax ebin, top byte, second byte) of one SSID 32 sample; the
+    argmax is the lowest ebin holding the top byte."""
+    b = sample["ebin"]
+    top = max(b)
+    arg = b.index(top)
+    second = max(b[:arg] + b[arg + 1:])
+    return arg, top, second
+
+
+def ssid32_print(prod, subcols, what, out):
+    """Print each listed sample's 32 bytes, its argmax and top two."""
+    if out is None:
+        return
+    smp = {s["subcol"]: s for s in prod["samples"]}
+    for sc in subcols:
+        s = smp.get(sc)
+        if s is None:
+            continue
+        arg, top, second = ssid32_top(s)
+        print(f"QL-CHECK SSID 32 {what} subcol {sc}: "
+              f"{' '.join('%02x' % x for x in s['ebin'])} argmax ebin "
+              f"{arg} top 0x{top:02x} second 0x{second:02x}", file=out)
+
+
+def check_ssid32_peak(products, want, margin=8, out=None):
+    """The S2 spectrum-bin check on the last SSID 32 dump: @want maps a
+    subcol to a 0-based ebin; that sample's byte there is non-zero and
+    at least @margin compressed steps above every other ebin byte of
+    the sample. Returns a list of failures."""
+    prod, fails = one_ssid32(products, "--ssid32-peak")
+    if prod is None:
+        return fails
+    ssid32_print(prod, sorted(want), "peak", out)
+    for sc in sorted(want):
+        ebin = want[sc]
+        tgt = [s for s in prod["samples"] if s["subcol"] == sc]
+        if len(tgt) != 1:
+            fails.append(f"SSID 32: {len(tgt)} samples with subcol {sc}, "
+                         f"want 1")
+            continue
+        b = tgt[0]["ebin"]
+        arg, top, _ = ssid32_top(tgt[0])
+        byte = b[ebin]
+        other = max(b[:ebin] + b[ebin + 1:])
+        if byte == 0:
+            fails.append(f"SSID 32: subcol {sc} ebin {ebin} byte is 0 "
+                         f"(argmax ebin {arg}, 0x{top:02x})")
+        elif byte < other + margin:
+            fails.append(f"SSID 32: subcol {sc} ebin {ebin} byte "
+                         f"0x{byte:02x} is not {margin} steps above the "
+                         f"rest (max other 0x{other:02x}; argmax ebin "
+                         f"{arg}, 0x{top:02x})")
+    return fails
+
+
+def check_ssid32_line(products, masked, ebins, margin=8, out=None):
+    """The S2 spectrum-line check on the last SSID 32 dump: every
+    sample in @masked has one dominant ebin (top byte >= second +
+    @margin); every other sample's bytes at @ebins stay below
+    SPEC_FLOOR and none of them is its argmax (non-zero and >= every
+    other byte). Returns a list of failures."""
+    prod, fails = one_ssid32(products, "--ssid32-line")
+    if prod is None:
+        return fails
+    ssid32_print(prod, sorted(masked), "line", out)
+    smp = {s["subcol"]: s for s in prod["samples"]}
+    if out is not None:
+        got = ", ".join("%d:%s" % (sc, "/".join(
+            "0x%02x" % smp[sc]["ebin"][e] for e in ebins))
+            for sc in sorted(smp) if sc not in masked)
+        print(f"QL-CHECK SSID 32 unmasked bytes at ebins "
+              f"{','.join(map(str, ebins))}: {got}", file=out)
+    for sc in range(NUM_SUBCOL):
+        s = smp.get(sc)
+        if s is None:
+            fails.append(f"SSID 32: no sample with subcol {sc}")
+            continue
+        arg, top, second = ssid32_top(s)
+        b = s["ebin"]
+        if sc in masked:
+            if top == 0 or top < second + margin:
+                fails.append(f"SSID 32: masked subcol {sc} has no "
+                             f"dominant ebin (argmax ebin {arg} 0x{top:02x}"
+                             f", second 0x{second:02x}, margin {margin})")
+            continue
+        for e in ebins:
+            byte = b[e]
+            rest = max(b[:e] + b[e + 1:])
+            if byte >= SPEC_FLOOR:
+                fails.append(f"SSID 32: unmasked subcol {sc} ebin {e} "
+                             f"byte 0x{byte:02x}, want < "
+                             f"0x{SPEC_FLOOR:02x} (the background floor)")
+            elif byte != 0 and byte >= rest:
+                fails.append(f"SSID 32: unmasked subcol {sc} ebin {e} "
+                             f"byte 0x{byte:02x} is the sample's argmax")
+    return fails
+
+
 def check_tape_lc(products, on_s, off_s, off_end_s, out=None):
     """The --tape SSID 30 rule, one verdict: the rate step's band-0
     median is >= 8 compressed steps above the `off` step's, and the
@@ -1028,6 +1147,7 @@ def self_test():
     self_test_sky(zero_lines, secs, n4, n8)
     self_test_inject()
     self_test_tape(zero_lines, secs, n4, n8)
+    self_test_spec()
     print("QL-CHECK SELF-TEST: PASS")
     return 0
 
@@ -1227,6 +1347,57 @@ def self_test_inject():
     assert f == ["SSID 32: 0 products, want 1"], f
 
 
+def self_test_spec():
+    """The S2 checks (spectra plan U5): --ssid32-peak passes a lone peak,
+    fails a margin miss, a peak at the wrong ebin (naming the argmax),
+    an all-zero sample and two equal top bytes; --ssid32-line fails an
+    unmasked 0x12 at a checked ebin and passes its own background line
+    at ebin 18."""
+    def prods(sp_at):
+        spectra = [(sc, sp_at.get(sc, [0] * 32)) for sc in range(32)]
+        return decode_lines([build_packet(ssid32_body(spectra)).hex()])
+
+    def at(**kw):
+        b = [0] * 32
+        for k, v in kw.items():
+            b[int(k[1:])] = v
+        return b
+
+    assert check_ssid32_peak(prods({0: at(e12=0x40)}), {0: 12}) == []
+    f = check_ssid32_peak(prods({0: at(e12=0x40, e13=0x39)}), {0: 12})
+    assert len(f) == 1 and "not 8 steps above" in f[0], f
+    f = check_ssid32_peak(prods({0: at(e21=0x40)}), {0: 12})
+    assert len(f) == 1 and "argmax ebin 21" in f[0], f
+    f = check_ssid32_peak(prods({}), {0: 12})
+    assert len(f) == 1 and "byte is 0" in f[0], f
+    f = check_ssid32_peak(prods({0: at(e12=0x40, e21=0x40)}), {0: 12})
+    assert len(f) == 1 and "not 8 steps above" in f[0], f
+    f = check_ssid32_peak(prods({0: at(e12=0x40)}),
+                          {0: 12, 3: 12})   # subcol 3 is all zero
+    assert len(f) == 1 and "subcol 3" in f[0], f
+
+    line = {0: at(e12=0x40, e18=0x10), 5: at(e21=0x3c)}
+    assert check_ssid32_line(prods(line), {0, 5}, [12, 21]) == []
+    bad = dict(line)
+    bad[7] = at(e12=0x12, e18=0x30)
+    f = check_ssid32_line(prods(bad), {0, 5}, [12, 21])
+    assert len(f) == 1 and "unmasked subcol 7 ebin 12" in f[0] and \
+        "background floor" in f[0], f
+    ok = dict(line)
+    ok[7] = at(e12=0x02, e18=0x30)    # its background line at ebin 18
+    assert check_ssid32_line(prods(ok), {0, 5}, [12, 21]) == []
+    arg = dict(line)
+    arg[7] = at(e21=0x05)             # the background's argmax at 21
+    f = check_ssid32_line(prods(arg), {0, 5}, [12, 21])
+    assert len(f) == 1 and "argmax" in f[0], f
+    tie = dict(line)
+    tie[5] = at(e12=0x3c, e21=0x3c)   # two equal top bytes
+    f = check_ssid32_line(prods(tie), {0, 5}, [12, 21])
+    assert len(f) == 1 and "masked subcol 5 has no dominant" in f[0], f
+    f = check_ssid32_line(prods({0: line[0]}), {0, 5}, [12, 21])
+    assert len(f) == 1 and "masked subcol 5" in f[0], f
+
+
 def int_arg(s):
     """int() accepting 0x hex (the gate passes S0 bytes in hex)."""
     return int(s, 0)
@@ -1284,6 +1455,18 @@ def main():
                          "ON/OFF/OFF_END are the rate-step start, the "
                          "off-step start and its end, in seconds of "
                          "NOMINAL")
+    ap.add_argument("--ssid32-peak", nargs="+", metavar="ARG",
+                    help="the S2 spectrum-bin check: MAP [MARGIN], MAP "
+                         "= SUBCOL:EBIN[,SUBCOL:EBIN...]; each listed "
+                         "sample's byte at EBIN is non-zero and >= "
+                         "MARGIN (default 8) steps above its other "
+                         "bytes")
+    ap.add_argument("--ssid32-line", nargs="+", metavar="ARG",
+                    help="the S2 spectrum-line check: SUBCOLS EBINS "
+                         "[MARGIN]; each listed sample has one dominant "
+                         "ebin (MARGIN steps, default 8), every other "
+                         "sample's bytes at EBINS stay < 0x10 and are "
+                         "not its argmax")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -1339,6 +1522,46 @@ def main():
         fails += check_ssid32_byte(products, subcol, ebin, mn, mx,
                                    out=sys.stdout)
         passed.append(f"SSID 32 byte (subcol {subcol}, ebin {ebin})")
+    if args.ssid32_peak is not None:
+        try:
+            if len(args.ssid32_peak) not in (1, 2):
+                raise ValueError
+            want = {}
+            for item in args.ssid32_peak[0].split(","):
+                sc, eb = item.split(":")
+                sc, eb = int_arg(sc), int_arg(eb)
+                if not (0 <= sc < NUM_SUBCOL and 0 <= eb < NUM_EBIN) \
+                        or sc in want:
+                    raise ValueError
+                want[sc] = eb
+            margin = (int_arg(args.ssid32_peak[1])
+                      if len(args.ssid32_peak) == 2 else 8)
+        except ValueError:
+            print("QL-CHECK: ERROR (--ssid32-peak wants "
+                  "SUBCOL:EBIN[,SUBCOL:EBIN...] [MARGIN], subcol and "
+                  "ebin in 0..31, each subcol once)")
+            return 2
+        fails += check_ssid32_peak(products, want, margin, out=sys.stdout)
+        passed.append(f"SSID 32 peak ({args.ssid32_peak[0]}, margin "
+                      f"{margin})")
+    if args.ssid32_line is not None:
+        try:
+            if len(args.ssid32_line) not in (2, 3):
+                raise ValueError
+            masked = [int_arg(x) for x in args.ssid32_line[0].split(",")]
+            ebins = [int_arg(x) for x in args.ssid32_line[1].split(",")]
+            if any(not 0 <= x < NUM_SUBCOL for x in masked + ebins):
+                raise ValueError
+            margin = (int_arg(args.ssid32_line[2])
+                      if len(args.ssid32_line) == 3 else 8)
+        except ValueError:
+            print("QL-CHECK: ERROR (--ssid32-line wants SUBCOLS EBINS "
+                  "[MARGIN], comma lists in 0..31)")
+            return 2
+        fails += check_ssid32_line(products, set(masked), ebins, margin,
+                                   out=sys.stdout)
+        passed.append(f"SSID 32 line (masked {masked}, ebins {ebins}, "
+                      f"margin {margin})")
     if args.tape_lc is not None:
         fails += check_tape_lc(products, *args.tape_lc, out=sys.stdout)
         passed.append("SSID 30 tape rate/off contrast")

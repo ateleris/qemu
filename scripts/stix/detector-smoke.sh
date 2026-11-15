@@ -115,6 +115,40 @@
 # window for chunk-trace-check, whose 200-tick quiet rule is the flare
 # mode's; the ROTB path stays witnessed by uart-chunk.
 # --tape combines with neither --flare nor --no-rotb.
+# --spectrum (detector stimulus S2, spectra plan U5) plays a spectrum
+# tape after a wrong-but-honoured ELUT upload: QEMU runs with
+# det-replay-file=<run>/dssevs.spec (32 0xE setup words, base
+# 1800 + 10 d, no events; the calibration is dss-linear),
+# det-replay-trigger=qmp (the replay engine stays idle) and
+# det-quiet-cps=0, and traces stixdet_spectrum, stixdet_tape_step and
+# stixdet_align too. Before the boot the host derives the base-0 CSV
+# (elut-derive.py derive --base, every row's edges at 128 k) and
+# encodes it (elut-upload.py encode --t0 64: 96 x TC(237,7) at
+# 64 + 0.75 k, TC(237,8) at ~141). The times after @62 shift by 85 s:
+# @64.. the upload, @155 NOMINAL (T_nom), @160 det-tape-load + play
+# of gate-det-spectrum (tape align false, 20 cps background; step 0
+# "kev Q1" 12 s 2000 cps on fpga_det 0-7, line_kev 62 with the step's
+# align true; step 1 "adc Q3" 12 s 2000 cps on fpga_det 16-23,
+# line_adc 1600; an off step of 30 s), @166 and @180 qom-get
+# det-align-status (during step 0 and step 1), @300 CONF (T_exit) and
+# the flush; the probe runs the default duration + 85 s. Checks: the
+# base ones (the flush with --expect-tape-flush, uart incl. a new
+# uart-elut: exactly 4 "problem erasing LUT type=3," lines and none of
+# align-smoke's forbidden LUT lines; trace-verif; uart-chunk; the D-5
+# chunk check skipped as in --tape), spectrum-status (the @166 return
+# ends preimage_miss=0; the @180 one starts mode=off and holds
+# fallback=0,honoured=384 and calibration=dss-linear), spectrum-trace
+# (stixdet_spectrum "step 0: line_kev=62 align" and "step 1:
+# line_adc=1600" after the enabling FSM strobe), spectrum-line
+# (ql-check --ssid32-line: the 16 masked subcols each have one dominant
+# ebin, the other 16 stay < 0x10 at ebins 12 and 21), spectrum-bin
+# (--ssid32-peak: Q1's aligned keV line at ebin 12 = floor(32 62/160),
+# preimage 1600 in the base-0 row) and spectrum-adc (--ssid32-peak:
+# Q3's line_adc 1600 at ebin 12, align-independent). --spectrum
+# --negative drops step 0's align: the keV line arrives unaligned at
+# adc b + floor((4096 - b) 62/160 + 0.5) = 2690..2733, ebin 21
+# (spectrum-arrival, negative only), so exactly spectrum-bin fails.
+# --spectrum combines with none of --flare, --tape, --no-rotb.
 # ROTB science chunks (D-5), in every mode: QEMU also traces
 # stixdet_scene, stixdet_nominal_swap, stixdet_chunk, stixdet_chunk_drop
 # and stixctrl_rotb_cmd into the same trace file, and
@@ -185,18 +219,20 @@
 # TMTC port, <run dir>-s<k>, and slot=k busy= load= on the verdict.
 #
 # Usage: detector-smoke.sh <qemu-binary> [--flare] [--negative]
-#                           [--no-rotb] [--tape] [--dry-run]
-#                           [--check-guard]
+#                           [--no-rotb] [--tape] [--spectrum]
+#                           [--dry-run] [--check-guard]
 #   (--flare carries the D-6 det-inject deposit at @85; see above)
 #   --no-rotb combines with neither --flare nor --negative.
 #   --tape combines with neither --flare nor --no-rotb.
+#   --spectrum combines with none of --flare, --tape, --no-rotb.
 #   STIX_ASW_ELF            as in tc-smoke.sh
 #   STIX_DETECTOR_RUN_DIR   run dir (default /tmp/stix-detector-run).
 #                           Canonicalised, then anything at or above
 #                           /tmp/stix-uprev-run or /tmp/stix-baseline-run
 #                           (or /) is refused, as in nominal-smoke.sh.
 #                           Each mode adds its suffix (-neg, -flare,
-#                           -flareneg, -norotb; none for the positive),
+#                           -flareneg, -norotb, -tape, -tapeneg,
+#                           -spec, -specneg; none for the positive),
 #                           then slot
 #                           mode -s<k>. A run that did not PASS leaves
 #                           .unfinished; the next run moves that dir aside
@@ -219,11 +255,13 @@
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: detector-smoke.sh <qemu-binary> \
-[--flare] [--negative] [--no-rotb] [--tape] [--dry-run] [--check-guard]}"
+[--flare] [--negative] [--no-rotb] [--tape] [--spectrum] [--dry-run] \
+[--check-guard]}"
 NEGATIVE=0
 FLARE=0
 NO_ROTB=0
 TAPE=0
+SPECTRUM=0
 DRY_RUN=0
 CHECK_GUARD=0
 for a in "${@:2}"; do
@@ -240,6 +278,10 @@ for a in "${@:2}"; do
         --tape)
             [ "$TAPE" -eq 0 ] || { echo "--tape given twice"; exit 2; }
             TAPE=1 ;;
+        --spectrum)
+            [ "$SPECTRUM" -eq 0 ] || {
+                echo "--spectrum given twice"; exit 2; }
+            SPECTRUM=1 ;;
         --dry-run)
             [ "$DRY_RUN" -eq 0 ] || { echo "--dry-run given twice"; exit 2; }
             DRY_RUN=1 ;;
@@ -260,6 +302,11 @@ then
     echo "--tape combines with neither --flare nor --no-rotb"
     exit 2
 fi
+if [ "$SPECTRUM" -eq 1 ] && { [ "$FLARE" -eq 1 ] || [ "$TAPE" -eq 1 ] ||
+        [ "$NO_ROTB" -eq 1 ]; }; then
+    echo "--spectrum combines with none of --flare, --tape, --no-rotb"
+    exit 2
+fi
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/paths.sh"
 ASW_ELF="${STIX_ASW_ELF:-$STIX_DEFAULT_ELF}"
@@ -270,6 +317,8 @@ PROBE="${STIX_TMTC_PROBE:-$REPO_ROOT/scripts/stix/tmtc-probe.py}"
 QLCHECK="$REPO_ROOT/scripts/stix/ql-check.py"
 TRACECHECK="$REPO_ROOT/scripts/stix/idefx-trace-check.py"
 CHUNKCHECK="$REPO_ROOT/scripts/stix/chunk-trace-check.py"
+ELUT_TOOL="$REPO_ROOT/scripts/stix/elut-upload.py"
+DERIVE="$REPO_ROOT/scripts/stix/elut-derive.py"
 # Slot mode (STIX_PORT_BASE, scripts/stix/lib/slot.sh): the slot's port
 # and run dir <dir>-s<k>; unset = legacy, 20000+uid and the dir as is.
 . "$REPO_ROOT/scripts/stix/lib/slot.sh"
@@ -324,6 +373,8 @@ MODE_SFX=""
 [ "$NO_ROTB" -eq 1 ] && MODE_SFX="-norotb"
 [ "$TAPE" -eq 1 ] && MODE_SFX="-tape"
 [ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-tapeneg"
+[ "$SPECTRUM" -eq 1 ] && MODE_SFX="-spec"
+[ "$SPECTRUM" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-specneg"
 RUN_DIR="$(stix_slot_dir "$RUN_DIR$MODE_SFX")"
 guard_shared
 QMP_SOCK="$RUN_DIR/qmp.sock"
@@ -366,6 +417,16 @@ TC_S20="40 02 00 00 1D AC C0 02 00 09 19 EC 06 00 07 04 00 00 AF BA"
 TC_VERIF="40 02 00 00 1D AC C0 03 00 09 19 EC 06 00 02 02 00 1E 8A E9"
 TC_NOM="40 02 00 00 1D AC C0 04 00 07 19 EC 01 00 05 00 0E 3C"
 TC_CONF2="40 02 00 00 1D AC C0 05 00 07 19 EC 01 00 04 00 D6 2E"
+# the NOMINAL / CONF send times and the probe's --seconds; --spectrum
+# shifts everything after @62 by 85 s (the ELUT upload runs @64..141)
+AT_NOM=70
+AT_CONF2=215
+PROBE_SECS="$DURATION"
+if [ "$SPECTRUM" -eq 1 ]; then
+    AT_NOM=155
+    AT_CONF2=300
+    PROBE_SECS=$((DURATION + 85))
+fi
 
 # D-4: the flare switch over QMP (--flare). The negative sends false at
 # @135, so nothing flips but the QMP path and the timing stay the same.
@@ -417,11 +478,101 @@ if [ "$TAPE" -eq 1 ]; then
     )
 fi
 
+# --spectrum (spectra plan U5). The helpers below are copied from
+# align-smoke.sh (write_adc_dssevs, the BASE0 JSON, encode_args,
+# qom_get, align_status, the applied-UART LUT rule); keep in step with
+# align-smoke.sh.
+qom_get() {  # path property
+    printf '{"execute": "qom-get", "arguments": %s' \
+        "{\"path\": \"$1\", \"property\": \"$2\"}}"
+}
+BASE_LO=1800            # the synthetic baselines: 1800 + 10 * dss_det
+BASE_STEP=10
+SPEC_DSSEVS="$RUN_DIR/dssevs.spec"
+write_adc_dssevs() {  # path: 32 0xE setup words, no events
+    python3 - "$1" "$BASE_LO" "$BASE_STEP" <<'EOF'
+import struct, sys
+path, base0, step = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(path, "wb") as f:
+    for d in range(32):
+        f.write(struct.pack(">I", ((base0 + step * d) << 20)
+                            | (0xE << 16) | (d << 11)))
+EOF
+}
+encode_args() {  # csv t0 -> probe args in ELUT_ARGS, record in ELUT_RECORD
+    local csv="$1" t0="$2" out err
+    out="$(mktemp)"; err="$(mktemp)"
+    if ! python3 "$ELUT_TOOL" encode --csv "$csv" --lut-id 1 \
+            --first-seq 0x010 --t0 "$t0" --pace 0.75 --emit probe-args \
+            > "$out" 2> "$err"; then
+        cat "$err"; rm -f "$out" "$err"
+        echo "DETECTOR-SMOKE: ERROR (elut-upload.py encode failed on $csv)"
+        exit 2
+    fi
+    mapfile -t ELUT_ARGS < "$out"
+    ELUT_RECORD="$(cat "$err")"
+    rm -f "$out" "$err"
+}
+# the probe log's det-align-status returns, in order (the probe logs
+# every --qmp-cmd with its return)
+align_status() {  # probe-log
+    grep -F '"property": "det-align-status' "$1" || true
+}
+# the base-0 JSON of the wrong-but-honoured CSV (align-smoke's C3 one)
+BASE0="{"
+for d in $(seq 0 31); do
+    [ "$d" -eq 0 ] || BASE0="$BASE0, "
+    BASE0="$BASE0\"$d\": 0"
+done
+BASE0="$BASE0}"
+SPEC_STEP0='{"kind": "rate", "label": "kev Q1", "for_s": 12, "cps": 2000,'
+SPEC_STEP0+=' "fpga_det_mask": 255, "spec": {"line_kev": 62}'
+# the negative drops step 0's align (the tape's align is false: the
+# step override is what the positive exercises)
+[ "$NEGATIVE" -eq 1 ] || SPEC_STEP0+=', "align": true'
+SPEC_STEP0+='}'
+SPEC_STEP1='{"kind": "rate", "label": "adc Q3", "for_s": 12, "cps": 2000,'
+SPEC_STEP1+=' "fpga_det_mask": 16711680, "spec": {"line_adc": 1600}}'
+SPEC_STEP2='{"kind": "off", "for_s": 30, "fpga_det_mask": 4294967295}'
+SPEC_JSON='{"api": 1, "name": "gate-det-spectrum", "align": false,'
+SPEC_JSON+=' "background": {"cps": 20}, "steps": ['
+SPEC_JSON+="$SPEC_STEP0, $SPEC_STEP1, $SPEC_STEP2]}"
+SPEC_ESC="$(printf '%s' "$SPEC_JSON" | sed 's/"/\\"/g')"
+SPEC_ARGS=()
+ELUT_ARGS=()
+ELUT_RECORD=""
+SPEC_TMP=""
+if [ "$SPECTRUM" -eq 1 ]; then
+    # host side, before the run dir exists: derive + encode in a temp
+    # dir; the CSV and its record move into the run dir before the boot
+    SPEC_TMP="$(mktemp -d)"
+    if ! python3 "$DERIVE" derive --base "$BASE0" \
+            --out "$SPEC_TMP/wrong-base0.csv" > "$SPEC_TMP/derive.log" 2>&1
+    then
+        cat "$SPEC_TMP/derive.log"; rm -rf "$SPEC_TMP"
+        echo "DETECTOR-SMOKE: ERROR (the base-0 derive failed)"
+        exit 2
+    fi
+    encode_args "$SPEC_TMP/wrong-base0.csv" 64
+    SPEC_ARGS=(
+        --qmp "$QMP_SOCK"
+        --send-at 160
+        --qmp-cmd "$(qom_set /machine/stixctrl det-tape-load \
+            "\"$SPEC_ESC\"")"
+        --send-at 160
+        --qmp-cmd "$(qom_set /machine/stixctrl det-tape-play true)"
+        --send-at 166
+        --qmp-cmd "$(qom_get /machine/stixctrl det-align-status)"
+        --send-at 180
+        --qmp-cmd "$(qom_get /machine/stixctrl det-align-status)"
+    )
+fi
+
 # TM(5,x) on 0x5A7, the subtype from the EID's severity nibble (1 ->
 # TM(5,1), 5 -> TM(5,2), 9 -> TM(5,3)); TM(21,6) QL on 0x5DC, matched
 # on the SSID (the first application byte).
 PROBE_ARGS=(
-    --port "$TMTC_PORT" --seconds "$DURATION" --window 20
+    --port "$TMTC_PORT" --seconds "$PROBE_SECS" --window 20
     --dump-apid "0x5DC:$RUN_DIR/ql.dump.hex"
     --expect "0x5A7:5:3:8030@50"
     --expect "0x5A7:5:1:002200000008000000@50"
@@ -438,7 +589,8 @@ PROBE_ARGS=(
     --send-at 62 --send-hex "$TC_VERIF"
     --expect "0x5A1:1:1:1DACC003"
     --expect "0x5A1:1:7:1DACC003"
-    --send-at 70 --send-hex "$TC_NOM"
+    ${ELUT_ARGS[@]+"${ELUT_ARGS[@]}"}
+    --send-at "$AT_NOM" --send-hex "$TC_NOM"
     --expect "0x5A1:1:1:1DACC004"
     --expect "0x5A7:5:1:00210405@10"
     --expect "0x5A1:1:7:1DACC004"
@@ -454,7 +606,8 @@ PROBE_ARGS=(
     --forbid "0x5A7:5:1:142e"
     ${FLARE_ARGS[@]+"${FLARE_ARGS[@]}"}
     ${TAPE_ARGS[@]+"${TAPE_ARGS[@]}"}
-    --send-at 215 --send-hex "$TC_CONF2"
+    ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
+    --send-at "$AT_CONF2" --send-hex "$TC_CONF2"
     --expect "0x5A1:1:1:1DACC005"
     --expect "0x5A7:5:1:00210504@10"
     --expect "0x5A1:1:7:1DACC005"
@@ -482,10 +635,18 @@ if [ "$FLARE" -eq 0 ]; then
     # quiet rate 0: the only sky is the tape's
     if [ "$TAPE" -eq 1 ]; then
         QEMU_ARGS+=(-global grlib-stixctrl.det-quiet-cps=0)
+    elif [ "$SPECTRUM" -eq 1 ]; then
+        # the spectrum tape's sky only; the .dssevs realizes the 0xE
+        # baselines, the replay engine stays idle (trigger qmp, never
+        # triggered)
+        QEMU_ARGS+=(-global grlib-stixctrl.det-quiet-cps=0
+                    -global "grlib-stixctrl.det-replay-file=$SPEC_DSSEVS"
+                    -global grlib-stixctrl.det-replay-trigger=qmp)
     else
         QEMU_ARGS+=(-global grlib-stixctrl.det-source=zero)
     fi
-    if [ "$NEGATIVE" -eq 1 ] && [ "$TAPE" -eq 0 ]; then
+    if [ "$NEGATIVE" -eq 1 ] && [ "$TAPE" -eq 0 ] &&
+            [ "$SPECTRUM" -eq 0 ]; then
         # the plain negative's CmdReady-0 run; --tape --negative keeps
         # det-idefx on (like --flare --negative) so it fails exactly
         # the tape check
@@ -500,10 +661,17 @@ MODE="positive"
 [ "$FLARE" -eq 1 ] && MODE="flare $MODE"
 [ "$NO_ROTB" -eq 1 ] && MODE="no-rotb"
 [ "$TAPE" -eq 1 ] && MODE="tape $MODE"
+[ "$SPECTRUM" -eq 1 ] && MODE="spectrum $MODE"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY RUN — the commands detector-smoke would run ($MODE):"
-    printf '(cd %s && timeout %s %s ' "$RUN_DIR" "$((DURATION + 30))" \
+    if [ "$SPECTRUM" -eq 1 ]; then
+        echo "# $(head -1 "$SPEC_TMP/derive.log")"
+        echo "# $ELUT_RECORD"
+        echo "# the tape: $SPEC_JSON"
+        rm -rf "$SPEC_TMP"
+    fi
+    printf '(cd %s && timeout %s %s ' "$RUN_DIR" "$((PROBE_SECS + 30))" \
         "$QEMU_BIN"
     printf '%q ' "${QEMU_ARGS[@]}"
     printf '> qemu-stdout.detector.log 2>&1)\n'
@@ -514,6 +682,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
 fi
 
 [ -f "$ASW_ELF" ] || {
+    [ -z "$SPEC_TMP" ] || rm -rf "$SPEC_TMP"
     echo "SKIP: ASW ELF absent ($ASW_ELF); set STIX_ASW_ELF to enable"
     exit 77
 }
@@ -542,8 +711,18 @@ touch .unfinished
 rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
       ql.contrast.log ql.inject.log ql.tape.log trace.check.log \
-      chunk.check.log chunk-flare.check.log qmp.sock
+      chunk.check.log chunk-flare.check.log qmp.sock \
+      dssevs.spec wrong-base0.csv derive.spec.log ql.spec-line.log \
+      ql.spec-bin.log ql.spec-adc.log ql.spec-arrival.log
 truncate -s 17716740096 flash.bin
+if [ "$SPECTRUM" -eq 1 ]; then
+    write_adc_dssevs "$SPEC_DSSEVS"
+    mv -- "$SPEC_TMP/wrong-base0.csv" wrong-base0.csv
+    mv -- "$SPEC_TMP/derive.log" derive.spec.log
+    rm -rf "$SPEC_TMP"
+    echo "spectrum: $(head -1 derive.spec.log)"
+    echo "spectrum: $ELUT_RECORD"
+fi
 # the trace events: the IDeF-X words, and the FSM strobes that mark the
 # NOMINAL window in the same file (one -trace option: a second one would
 # reset the trace file); for the D-5 chunk checks the scene (the flare
@@ -551,6 +730,9 @@ truncate -s 17716740096 flash.bin
 printf '%s\n' stixdet_idefx_cmd stixdet_fsm_strobe stixdet_scene \
     stixdet_nominal_swap stixdet_chunk stixdet_chunk_drop \
     stixctrl_rotb_cmd > idefx.events
+[ "$SPECTRUM" -eq 0 ] ||
+    printf '%s\n' stixdet_spectrum stixdet_tape_step stixdet_align \
+        >> idefx.events
 
 PROBE_PID=""
 QEMU_PID=""
@@ -584,11 +766,11 @@ print(f"{time.time():.3f} {time.monotonic():.3f}")'
 CLOCK_START="$(clock_pair)"
 # The probe starts first: it retries the TMTC connect until QEMU binds
 # the port, then stays on the connection for the whole run (--hold).
-timeout "$((DURATION + 30))" python3 -u "$PROBE" "${PROBE_ARGS[@]}" \
+timeout "$((PROBE_SECS + 30))" python3 -u "$PROBE" "${PROBE_ARGS[@]}" \
     > detector.probe.log 2>&1 &
 PROBE_PID=$!
 
-timeout "$((DURATION + 30))" "$QEMU_BIN" "${QEMU_ARGS[@]}" \
+timeout "$((PROBE_SECS + 30))" "$QEMU_BIN" "${QEMU_ARGS[@]}" \
     > qemu-stdout.detector.log 2>&1 &
 QEMU_PID=$!
 
@@ -719,6 +901,8 @@ QL_FLUSH_ARG=--expect-zero-flush
 if [ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 0 ]; then
     QL_FLUSH_ARG=--expect-tape-flush
 fi
+# --spectrum: the tape's sky in both legs
+[ "$SPECTRUM" -eq 0 ] || QL_FLUSH_ARG=--expect-tape-flush
 if [ -z "$NOM_SECONDS" ]; then
     echo "CHECK ql: FAIL (no NOMINAL window: 0021 04 05 or 0021 05 04" \
         "not seen)"
@@ -864,6 +1048,103 @@ if [ "$TAPE" -eq 1 ]; then
     fi
 fi
 
+# 2e. --spectrum (spectra plan U5): the align status returns, the
+# spectrum traces, and the SSID 32 line / bin / adc (/ arrival) rules
+spec_ql() {  # check log ql-check-args... : one ql-check verdict
+    local check="$1" log="$2" rc
+    shift 2
+    if [ ! -s ql.dump.hex ]; then
+        echo "CHECK $check: FAIL (no 0x5DC packet dumped)"
+        FAILED+=("$check")
+        add_why "$check" "no 0x5DC packet dumped"
+        return
+    fi
+    set +e
+    python3 "$QLCHECK" ql.dump.hex "$@" > "$log" 2>&1
+    rc=$?
+    set -e
+    grep -E '^QL-CHECK' "$log" || true
+    if [ "$rc" -eq 0 ]; then
+        echo "CHECK $check: ok ($*)"
+    else
+        echo "CHECK $check: FAIL ($(ql_why "$log"); ql-check rc=$rc;" \
+            "see $log)"
+        FAILED+=("$check")
+        add_why "$check" "$(ql_why "$log")"
+    fi
+}
+if [ "$SPECTRUM" -eq 1 ]; then
+    # spectrum-status: @166 (step 0) and @180 (step 1)
+    mapfile -t ST < <(align_status detector.probe.log |
+        sed -n 's/.* -> return "\([^"]*\)".*/\1/p')
+    ST0="${ST[0]:-}"
+    ST1="${ST[1]:-}"
+    echo "spectrum: det-align-status @166 (step 0): '${ST0}'"
+    echo "spectrum: det-align-status @180 (step 1): '${ST1}'"
+    if [ "${#ST[@]}" -ne 2 ]; then
+        echo "CHECK spectrum-status: FAIL (${#ST[@]} det-align-status" \
+            "returns in the probe log, want 2)"
+        FAILED+=(spectrum-status)
+    elif [[ "$ST0" == *,preimage_miss=0 ]] && [[ "$ST1" == mode=off,* ]] &&
+            [[ "$ST1" == *,fallback=0,honoured=384,* ]] &&
+            [[ "$ST1" == *,calibration=dss-linear,* ]]; then
+        echo "CHECK spectrum-status: ok (step 0 preimage_miss=0; step 1" \
+            "mode=off, fallback=0, honoured=384, dss-linear)"
+    else
+        echo "CHECK spectrum-status: FAIL (want step 0 ending" \
+            "preimage_miss=0 and step 1 mode=off,... with" \
+            "fallback=0,honoured=384 and calibration=dss-linear)"
+        FAILED+=(spectrum-status)
+    fi
+
+    # spectrum-trace: the two builds after the enabling FSM strobe
+    # (trace order, never a time)
+    STROBE_N="$(grep -n 'stixdet_fsm_strobe .* enable=1 ' idefx.trace \
+        2>/dev/null | head -1 | cut -d: -f1)" || true
+    SPEC0_WANT='stixdet_spectrum spectrum step 0: line_kev=62 align at '
+    [ "$NEGATIVE" -eq 0 ] ||
+        SPEC0_WANT='stixdet_spectrum spectrum step 0: line_kev=62 at '
+    SPEC1_WANT='stixdet_spectrum spectrum step 1: line_adc=1600 at '
+    S0_N="$(grep -n -F -- "$SPEC0_WANT" idefx.trace 2>/dev/null |
+        head -1 | cut -d: -f1)" || true
+    S1_N="$(grep -n -F -- "$SPEC1_WANT" idefx.trace 2>/dev/null |
+        head -1 | cut -d: -f1)" || true
+    S0_ALIGN=0
+    if [ "$NEGATIVE" -eq 1 ] && grep -q \
+            'stixdet_spectrum spectrum step 0: .* align at ' \
+            idefx.trace 2>/dev/null; then
+        S0_ALIGN=1
+    fi
+    grep -m4 'stixdet_spectrum ' idefx.trace 2>/dev/null || true
+    if [ -n "$STROBE_N" ] && [ -n "$S0_N" ] && [ -n "$S1_N" ] &&
+            [ "$S0_N" -gt "$STROBE_N" ] && [ "$S1_N" -gt "$STROBE_N" ] &&
+            [ "$S0_ALIGN" -eq 0 ]; then
+        echo "CHECK spectrum-trace: ok ('${SPEC0_WANT% at }' at line" \
+            "$S0_N, '${SPEC1_WANT% at }' at line $S1_N, after the" \
+            "enabling strobe at line $STROBE_N)"
+    else
+        echo "CHECK spectrum-trace: FAIL (enabling strobe line" \
+            "'${STROBE_N}', step 0 line '${S0_N}', step 1 line" \
+            "'${S1_N}', an aligned step 0 in the negative: $S0_ALIGN)"
+        FAILED+=(spectrum-trace)
+    fi
+
+    # the SSID 32 rules: the 16 masked subcols are
+    # SUBCOL_FROM_FPGA_DET[f] for f 0-7 (Q1) and 16-23 (Q3)
+    spec_ql spectrum-line ql.spec-line.log --ssid32-line \
+        0,1,5,6,4,10,11,12,30,31,25,26,21,27,19,20 12,21 8
+    spec_ql spectrum-bin ql.spec-bin.log --ssid32-peak \
+        0:12,1:12,5:12,6:12,4:12,10:12,11:12,12:12 8
+    spec_ql spectrum-adc ql.spec-adc.log --ssid32-peak \
+        30:12,31:12,25:12,26:12,21:12,27:12,19:12,20:12 8
+    if [ "$NEGATIVE" -eq 1 ]; then
+        # unaligned: adc = b + floor((4096 - b) 62/160 + 0.5), b = 1800 +
+        # 10 f -> 2690..2733 for f 0..7, all floor(adc/128) = 21
+        spec_ql spectrum-arrival ql.spec-arrival.log --ssid32-peak \
+            0:21,1:21,5:21,6:21,4:21,10:21,11:21,12:21 8
+    fi
+fi
+
 # 3. the UART, NULs stripped
 tr -d '\000' < uart.detector.raw > uart.detector.txt
 UART_BASE_OK=1
@@ -899,6 +1180,29 @@ else
     echo "CHECK uart-idefx: FAIL ($IDEFX_W write timeouts, $IDEFX_R read" \
         "failures; expected 0)"
     FAILED+=(uart-idefx)
+fi
+# --spectrum: the applied-ELUT UART rule of align-smoke.sh (keep in
+# step): exactly 4 "problem erasing LUT type=3," lines (one per copy),
+# none of the LUT write/read/cancel/setElut lines
+if [ "$SPECTRUM" -eq 1 ]; then
+    ELUT_BAD=""
+    for t in "problem writing LUT" "problem reading LUT (type=3" \
+             "ELUT update got cancelled" "DetectorsApi_setElut("; do
+        if grep -qF -- "$t" uart.detector.txt; then
+            grep -m1 -F -- "$t" uart.detector.txt
+            ELUT_BAD="$t"
+        fi
+    done
+    ELUT_ERASE="$(grep -c 'problem erasing LUT type=3,' uart.detector.txt \
+        || true)"
+    if [ -z "$ELUT_BAD" ] && [ "$ELUT_ERASE" -eq 4 ]; then
+        echo "CHECK uart-elut: ok (4 'problem erasing LUT type=3' lines," \
+            "no LUT write/read error)"
+    else
+        echo "CHECK uart-elut: FAIL ($ELUT_ERASE 'problem erasing LUT" \
+            "type=3' lines, want 4; forbidden line: '${ELUT_BAD}')"
+        FAILED+=(uart-elut)
+    fi
 fi
 # D-5: the first chunk reached the archive, which drops it with this
 # TRACE_ERROR (ArchiveManager.c:140); later chunks are archived silently
@@ -940,7 +1244,7 @@ fi
 # negatives take the positive branch here.
 IDEFX_NEG=0
 [ "$NEGATIVE" -eq 1 ] && [ "$FLARE" -eq 0 ] && [ "$TAPE" -eq 0 ] && \
-    IDEFX_NEG=1
+    [ "$SPECTRUM" -eq 0 ] && IDEFX_NEG=1
 # Neither branch compares a time with another clock: the runs are
 # placed in NOMINAL by the FSM strobes' order in the same trace.
 TRACE_ARGS=(idefx.trace)
@@ -974,8 +1278,8 @@ fi
 # integrations have no scene flare window for chunk-trace-check (its
 # 200-tick quiet rule is the flare mode's); the ROTB path stays
 # witnessed by uart-chunk.
-if [ "$TAPE" -eq 1 ]; then
-    echo "CHECK chunk: skipped (--tape: the rate step's 1 s" \
+if [ "$TAPE" -eq 1 ] || [ "$SPECTRUM" -eq 1 ]; then
+    echo "CHECK chunk: skipped (--tape/--spectrum: the rate step's 1 s" \
         "integrations are not the D-5 quiet cadence; chunk-trace-check" \
         "has no tape window)"
 else
@@ -1064,6 +1368,21 @@ if [ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
         "'${GOT}', want 'tape'$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
+if [ "$SPECTRUM" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
+    # PASS only when exactly spectrum-bin fails: the unaligned keV line
+    # arrived at ebin 21 (spectrum-arrival passed); the line, adc,
+    # status, trace, flush, probe, UART and trace-verif checks passed
+    if [ "$GOT" = "spectrum-bin" ]; then
+        echo "DETECTOR-SMOKE (spectrum negative): PASS (failed exactly" \
+            "as planned: the unaligned keV line arrived at ebin 21, not" \
+            "12; everything else passed)${STIX_SLOT_TAG}"
+        pass_cleanup
+        exit 0
+    fi
+    echo "DETECTOR-SMOKE (spectrum negative): FAIL (failed checks:" \
+        "'${GOT}', want 'spectrum-bin'$WHY_QL)${STIX_SLOT_TAG}"
+    exit 1
+fi
 if [ "$NO_ROTB" -eq 1 ]; then
     # PASS only when exactly the two chunk checks fail as planned
     if [ "$GOT" = "uart-chunk chunk" ]; then
@@ -1103,6 +1422,7 @@ fi
 TAG="DETECTOR-SMOKE"
 [ "$FLARE" -eq 1 ] && TAG="DETECTOR-SMOKE ($MODE)"
 [ "$TAPE" -eq 1 ] && TAG="DETECTOR-SMOKE (tape)"
+[ "$SPECTRUM" -eq 1 ] && TAG="DETECTOR-SMOKE (spectrum)"
 if [ -n "$GOT" ]; then
     echo "$TAG: FAIL (failed checks: $GOT$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
