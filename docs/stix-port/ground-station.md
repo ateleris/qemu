@@ -596,6 +596,49 @@ and fixes it:
    the miscount with the synthetic sky is its `--adc` mode (§56, and
    "The ADC-faithful sky recipe" in the ELUT section).
 
+### Spectrum recipe (a keV line through the loaded ELUT)
+
+A tape `rate` step can carry a spectrum instead of the quiet template
+(`accepted-diffs.md` §57): `{"line_adc": A}`, `{"line_kev": E}`,
+`{"flat_kev": [k1, k2]}` or `{"file": "<path>"}` (a CSV with header
+`adc,weight` or `kev,weight`). The counts are binned through the ELUT
+the FSW loaded, so a wrong ELUT mis-bins them as on hardware; a keV
+spec with `"align": true` lands in its intended science bin
+`floor(32·keV/K)` whatever ELUT is loaded (K = `det-cal-kev-full`,
+default 160).
+
+1. **Baselines**: start QEMU with `-global
+   grlib-stixctrl.det-replay-file=<file>.dssevs` (the 0xE setup words
+   give each detector's base; without one the base is 0) and
+   `-global grlib-stixctrl.det-replay-trigger=qmp` (the replay stays
+   idle), `-global grlib-stixctrl.det-quiet-cps=0` for a clean sky.
+2. **Enter NOMINAL** (CONF, S20 = 0, NOMINAL; the tape only advances
+   while FSM Enable = 1), then load and play a tape — e.g. a 62 keV
+   line on Q1, aligned:
+   ```
+   qom_set $RUN/qmp.sock /machine/stixctrl det-tape-load \
+     '"{\"api\": 1, \"name\": \"kev62\", \"steps\": [{\"kind\": \"rate\", \"for_s\": 30, \"cps\": 2000, \"fpga_det_mask\": 255, \"spec\": {\"line_kev\": 62}, \"align\": true}]}"'
+   qom_set $RUN/qmp.sock /machine/stixctrl det-tape-play true
+   ```
+   On the platform the same tape is saved with `det.tape.save` and
+   played with `det.tape.play`; a `file` spec there names a bare
+   `<name>.csv` in `<tapes_dir>/spectra/` (filled by hand; listed as
+   `"spectra"` in `GET /api/v1/tapes`) and is resolved to an absolute
+   path at play. The UI's Stimulus board has a Spectrum chip for it.
+3. **Check it**: each row build is traced `stixdet_spectrum` ("spectrum
+   step 0: line_kev=62 align at vclock_ns=…", at the step start and
+   every QL swap); `qom_get $RUN/qmp.sock /machine/stixctrl
+   det-align-status` ends `,preimage_miss=N` — the number of
+   (`fpga_det`, `pix`, `ebin`) whose honoured ELUT row has no adc for
+   the wanted ebin (that mass is dropped). `mode=` there is the
+   `det-align` knob, so it reads `mode=off` unless you set it. In the
+   SSID 32 quick-look the line sits at the ebin byte `ebin + 1` of the
+   `subcol` samples of the masked detectors (`ql-check.py
+   --ssid32-peak SUBCOL:EBIN`). An ELUT rewrite takes effect at the
+   next QL swap. The gate is `detector-smoke.sh --spectrum` (with a
+   deliberately wrong ELUT, so `--negative` — no `align` — shows the
+   line at its unaligned bin).
+
 ### Index spaces (TM detector and pixel indices)
 
 Detector and pixel numbers are renamed several times between the ASIC

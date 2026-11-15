@@ -3122,7 +3122,8 @@ decisions D-Db, D-Df, D-Dd, D-Dj; "Index spaces").
   **This is a deliberate deviation** (plan Doc vs code 20): a gate that
   compares QL against real hardware with an empty flash must not use the
   synthetic sky. Except the tape's `align` option for science-space
-  steps (§54/§55) and the `det-adc-mode` sky of §56.
+  steps (§54/§55), the `det-adc-mode` sky of §56, and the tape's
+  spectrum steps of §57, which always bin through the loaded ELUT.
 
 **The scene properties (D-Db), on `/machine/stixctrl`:**
 - runtime class properties with setters (they also work before realize,
@@ -6099,6 +6100,14 @@ while FSM Enable = 1), saves and plays the tape via
 `instrument.detector.tape.step` = 2 within 70 s, stops and awaits
 `state=stopped`, and expects the `stim` record in the log.
 
+**Amended by S2 (§57):** `spec` values other than `"flat"`
+(`line_adc`, `line_kev`, `flat_kev`, `file`) are now accepted on `rate`
+steps, and a per-step `align` (bool, default the tape's) is a known
+step field; only kind `single` is still refused, with "kind \"single\"
+is unsupported in this build (S3)". The hw-state `det.tape` object
+gains `spec` (the running step's spectrum description, `""` without a
+tape).
+
 ## 55. ELUT alignment (baseline: none)
 
 Owner requirement (2026-11-15): "if I wanted to, that you could support
@@ -6163,6 +6172,13 @@ Three pieces:
 - **(a) The per-step `align` option**: fixed now (the tape field
   `"align"`, the `stix_det_align_adc` preimage helper), consumed by
   S2/S3's science-space stimuli.
+
+**Amended by S2 (§57):** piece (a) is consumed by §57's spectrum
+steps. `det-align-status` gains a trailing `,preimage_miss=N` (the line
+grows by one key; the gates match their status lines as substrings and
+stay green), and hw-state `det.align` gains `preimage_miss`. The
+classification also runs while a spectrum step plays, without
+`det-align` — so its status reads `mode=off` there.
 
 **The gate** (`scripts/stix/align-smoke.sh`, A3): one fresh-flash boot,
 the gate's own synthetic `.dssevs` (one 0xE word per `dss_det`, base
@@ -6255,3 +6271,127 @@ and golden unchanged; the mode adds no RNG draws and no folds when off
   uint32_t pix, uint32_t ebin)` — the preimage of the loaded ELUT row
   (the adc whose row maps to `ebin`), or −1 when the row is degenerate
   or no adc maps to it. Not called before S2.
+
+## 57. Detector stimulus S2: spectra (baseline: the quiet template only)
+
+Owner requirement (2026-11-15, "All of it, staged", §54): Stage S2 lets
+a tape `rate` step carry a spectrum instead of the quiet template. Plan:
+`2026-11-15-spectra-plan.md`, tasks U1-U6, decisions D1 (ADC-faithful
+sky), D4 (the CSV format), D5 (the keV law) and Q1-Q7.
+
+**What:** a spectrum is an ADC-domain stimulus binned through the ELUT
+the FSW loaded, exactly as DSS replay events are, so a misaligned ELUT
+mis-bins it as on hardware; a keV spectrum can opt into `align`, which
+puts it in the intended science bin whatever ELUT is loaded.
+
+- **The spec shapes and rules** (one table, the model's parser and the
+  platform's `tapes.py` both implement it; every error names the step
+  index, file errors also the path and line): `spec` absent or
+  `"flat"` (S1's template, any kind), or an object with exactly one of
+  `line_adc` (a JSON integer 0..4095; `1600.0` is refused),
+  `line_kev` (finite, ≥ 0), `flat_kev` (`[k1, k2]`, finite,
+  `0 <= k1 < k2`) or `file` (1..4095 bytes, no comma). A non-flat spec
+  is valid on kind `rate` only. The step's optional `align` (bool,
+  default the tape's) may be an explicit `true` only on `line_kev`,
+  `flat_kev` or a `kev,weight` file ("align applies to keV specs"); the
+  tape-level default is ignored for adc and flat specs.
+- **The CSV (D4):** ≤ 256 KiB (checked before reading), a first line
+  exactly `adc,weight` or `kev,weight`, then 1..4096 lines
+  `value,weight` — no spaces, an optional `\r` before `\n`, the final
+  newline optional, no blank or comment lines; numbers
+  `[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?` and finite (no sign, `inf`,
+  `nan`, `0x`); adc values `[0-9]+` in 0..4095; weights ≥ 0 with a
+  positive sum; repeated values are summed. The file is read once, at
+  `det-tape-load` (host I/O in the setter only, never in the tick);
+  later changes or a deletion do not affect the loaded tape. Relative
+  paths resolve against QEMU's working directory.
+- **The keV law (D5):** `adc = base + floor((4096 − base)·keV/K + 0.5)`
+  — half up, never a half-even round — with `base` the realized replay
+  table's 0xE baseline (0 without one) and `K` = `det-cal-kev-full`;
+  the science bin is `floor(32·keV/K)`. K is read when a row is built,
+  not at load (Q7): the load refuses only a negative or non-finite keV,
+  and mass at keV ≥ K is dropped as an ADC overflow on both paths
+  (unaligned: the adc is past 4095; aligned: no ebin — never clamped to
+  ebin 31). An overflow is not a preimage miss; it shows as missing
+  mass. The platform warns (save and play) when a keV is ≥ the current
+  K, without refusing.
+- **The per-spec row (approach 1(ii)):** while a spectrum step runs,
+  `spec_row[fpga_det][pix][ebin]` holds the fraction of the step's
+  counts the loaded ELUT row puts in each ebin, through one shared
+  adc → ebin lookup (`stix_det_adc_ebin`, the replay's honoured /
+  fallback lookup factored out; the replay tick uses it too): honoured
+  row value 32 (unassigned) and a degenerate row's `adc <= base` drop.
+  It is built at the step start (after a classification) and at each
+  QL swap (after the classification, before `materialize`), and traced
+  `stixdet_spectrum(step, desc, vclock_ns)` per build; `desc` is
+  `line_adc=1600`, `line_kev=62 align`, `flat_kev=40..60`,
+  `file=<basename> unit=adc|kev rows=N`. The sky tick adds a spectrum
+  pair's counts into a destination-ebin exposure (`spec_expo`,
+  `nom_spec_expo`) instead of the template exposure; the draw adds one
+  Poisson draw per cell for banks with spectrum exposure only, after
+  §56's fold. **Spectrum counts are ELUT-binned once and never pass
+  §56's C1 fold** (with `det-adc-mode` on only the template mass
+  folds).
+- **The ELUT pickup (decision Q5):** a TC(237,8) rewrite reaches the
+  spectrum at the next QL swap's rebuild, so the bank that swap closes
+  still shows the old binning — the replay's bank-1 precedent (§37),
+  deliberately unlike §56, whose C1 map is rebuilt before `materialize`
+  so that bank already folds with the new ELUT. Cost: a line spec is
+  384 lookups per build, a band or file spec at most 384 × 4096 per
+  build (the C1 bound); zero when no spectrum step runs.
+- **The RNG stream** changes only for banks with spectrum exposure: a
+  tape without spectrum steps (`spec` absent or `"flat"`) is
+  bit-identical to S1 (`det-tape-seed`, `det-adc-off` and the S1/C1
+  qtests unchanged; `det-spec-flat-ident` pins it, including the banks
+  before the first spectrum bank).
+- **`align`:** the step's value overrides the tape's; keV specs only.
+  On a honoured row the keV mass goes to ebins by the D5 law and each
+  ebin takes the preimage adc `stix_det_align_adc` (§56); a missing
+  preimage drops that mass and counts one `preimage_miss` per (pair,
+  ebin) — a gauge reset at every step start and every build, reported
+  as the trailing `preimage_miss=N` of `det-align-status` (§55) and as
+  hw-state `det.align.preimage_miss`. On a degenerate row align is a
+  no-op (the fallback is the calibration grid). `det-align-status`
+  reads `mode=` from the `det-align` knob only; the classification
+  also runs while a spectrum step plays, so its `mode=off` line is
+  fresh there.
+- **The pix gate:** spectrum counts pass the per-tick pix gate like
+  every pair. With the FSW only pix 0, 3, 6, 7, 8 count after quarter
+  power-on (R3 < 63), i.e. 0.475 of the configured cps — FSW
+  configuration, not a model loss; the gate's checks are relative.
+- **The platform's stricter file rule:** a saved tape names its CSV by
+  a bare name `<name>.csv` in `<tapes_dir>/spectra/` (no `/`), parsed
+  by `tapes.parse_spectrum_csv` at play (a bad or missing file is a 400
+  before any QMP) and passed to the model as an absolute path; the
+  saved tape is never rewritten. `align: true` on an `adc,weight` file
+  is refused at play (the unit is known only once the CSV is read).
+- **Deviations from the S2 outline.** (D-a) The negative fails exactly
+  `spectrum-bin`, the aligned keV check: a line at an adc cannot be
+  failed by turning `align` off, so the outline's line-at-adc check is
+  `spectrum-adc` and stays green in the negative. (D-b) The gate
+  uploads §56 C3's base-0 wrong ELUT instead of an A3-derived one: on
+  a derived (aligned) ELUT `align` is a no-op and the negative would be
+  vacuous.
+
+**The gate** (`scripts/stix/detector-smoke.sh --spectrum`, U5): the
+gate's own `.dssevs` (32 0xE words, base `1800 + 10·d`, no events;
+`det-replay-trigger=qmp`, so the replay engine stays idle),
+`det-quiet-cps=0`, the base-0 CSV uploaded @64..141 (96 × TC(237,7),
+TC(237,8)), NOMINAL @155, the tape @160 (20 cps background; step 0
+`line_kev 62` with `align: true` on Q1 = `fpga_det` 0-7, step 1
+`line_adc 1600` on Q3 = `fpga_det` 16-23, 12 s each at 2000 cps, then
+an `off` step), CONF @300. Checks: `spectrum-status` (step 0's
+`det-align-status` ends `preimage_miss=0`, step 1's reads `mode=off`,
+`fallback=0,honoured=384`, `calibration=dss-linear`),
+`spectrum-trace`, `uart-elut` (4 "problem erasing LUT type=3," lines),
+`spectrum-line` (`ql-check --ssid32-line`: every masked subcol has one
+dominant ebin, the 16 others stay below 0x10 at ebins 12 and 21),
+`spectrum-bin` (Q1's aligned line at ebin 12 = `floor(32·62/160)`,
+preimage 1600 in the base-0 row) and `spectrum-adc` (Q3's line at ebin
+12 = `floor(1600/128)`), each `--ssid32-peak` margin 8 compressed steps
+over every other ebin of the sample. `--negative` drops step 0's
+`align`: the line arrives at `b + floor((4096 − b)·62/160 + 0.5)` =
+2690..2733, ebin 21 (`spectrum-arrival`, negative only), and exactly
+`spectrum-bin` fails. Gate record: pending the first live run of both
+legs (the measured masked peak bytes and the unmasked ebin-12/21 bytes
+are logged in `ql.spec-*.log`).
