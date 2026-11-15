@@ -6392,6 +6392,9 @@ preimage 1600 in the base-0 row) and `spectrum-adc` (Q3's line at ebin
 over every other ebin of the sample. `--negative` drops step 0's
 `align`: the line arrives at `b + floor((4096 − b)·62/160 + 0.5)` =
 2690..2733, ebin 21 (`spectrum-arrival`, negative only), and exactly
-`spectrum-bin` fails. Gate record: pending the first live run of both
-legs (the measured masked peak bytes and the unmasked ebin-12/21 bytes
-are logged in `ql.spec-*.log`).
+`spectrum-bin` fails. Gate record (spec1 2026-11-15, 1 s
+integrations, 20 cps background): positive, every masked subcol peaks
+at ebin 12 with 0x5a-0x5b, second highest <= 0x20 (the background's
+ebin-18 line); the unmasked ebin-12/21 bytes stay <= 0x06. Negative,
+the line arrives at ebin 21 (0x5b) and exactly `spectrum-bin` fails.
+The bytes are logged in `ql.spec-*.log`.
