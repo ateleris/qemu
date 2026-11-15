@@ -4380,6 +4380,18 @@ def t_params_dwarf_missing(env):
           "no name, no applies label")
 
 
+def t_params_dwarf_indirect(env):
+    """A corrupt DW_FORM_indirect chain is a DwarfError (bounded), not
+    a RecursionError escaping load()."""
+    e = raises(params_mod.DwarfError, params_mod.dwarf._form,
+               b"\x16" * 5000, 0, 0x16, None, 4, None)
+    check("indirect" in str(e), "the chain: %s" % e)
+    v, pos = params_mod.dwarf._form(b"\x16\x0b\x2a", 0, 0x16, None, 4,
+                                    None)
+    check((v, pos) == (0x2a, 3), "a short chain still decodes: %r"
+          % ((v, pos),))
+
+
 def t_params_api(env):
     """T2: GET /params's shape and the status summary on a fixture
     controller; a junk ELF answers params: [] with warnings, never an
@@ -4645,6 +4657,24 @@ def t_params_set(env):
         check(r["verified"] == "failed" and r["fid"] == 48301 and
               r["reason"] == "wrong operation mode" and
               r["tm"] == "TM(1,8)", "a refused set: %r" % r)
+        qemu_tc.recvfrom(4096)
+        # a platform TC (timesync TC(9,129), seq14) sharing the seq:
+        # its TM(1,x) cannot be told apart, so the verdict says so
+        plat = ctl.params._plat_recent.__self__
+        s14 = plat._next_seq14()
+        check(plat.seq14_recent(s14, 2.0) and
+              not plat.seq14_recent((s14 + 1) & 0x3FFF, 2.0),
+              "seq14_recent marks only the seq it handed out")
+        ctl.params.relay.gs_tc = ctl.params.relay.gs_tc.real
+        _param_auto_verify(ctl)
+        real_recent = ctl.params._plat_recent
+        ctl.params._plat_recent = lambda seq, w: True
+        try:
+            r = ctl.command("param.set", {"index": 1, "value": 4})
+        finally:
+            ctl.params._plat_recent = real_recent
+        check(r["verified"] == "ambiguous" and "seq" in r["why"],
+              "a shared seq is ambiguous, not completed: %r" % r)
         qemu_tc.recvfrom(4096)
         e = raises(VerbError, ctl.command, "param.set",
                    {"index": 99, "value": 1})
@@ -5314,6 +5344,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("FSW params: ELF parse (T1)", t_params_elf_parse),
          ("FSW params: symbol rules (T1)", t_params_elf_symbol_rules),
          ("FSW params: no DWARF (T1)", t_params_dwarf_missing),
+         ("FSW params: DW_FORM_indirect bound", t_params_dwarf_indirect),
          ("FSW params: API (T2)", t_params_api),
          ("FSW params: series (T2)", t_params_series),
          ("FSW params: view-run (T2)", t_params_viewrun),

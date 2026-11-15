@@ -4402,7 +4402,8 @@ controller image has no binutils):
 
 - The **ELF file image is the single authority** (owner decision
   2026-11-15): the `.symtab` symbol matching
-  `ParamMgmt_parameters.<n>` (LOCAL, per-build numeric suffix) locates
+  `ParamMgmt_parameters[.<n>]` (LOCAL with a per-build numeric suffix in
+  the flight builds; GLOBAL and the bare name also accepted) locates
   the table, the covering PT_LOAD yields defaults/min/max (the initial
   image has `value == default`), and the DWARF `E_PARAM_ID_*`
   enumeration in `.debug_info` yields the names. The FSW source and

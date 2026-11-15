@@ -12,6 +12,7 @@ are the active device-state faults (PL-11a, D-PSa).
 import hashlib
 import json
 import threading
+import time
 
 from . import faults as faults_mod
 from . import flashlib
@@ -43,6 +44,7 @@ class Platform:
         self.timecodes = None           # None = QEMU's default
         self.seq14 = 0                  # source 14 on APID 0x5AC
         self.seq_gs = 0                 # GS emulation (source 121)
+        self._seq14_sent = {}           # seq -> monotonic send time
         # A2: the HK decoder is given to the relay before its threads
         # start; None (with one timeline.idb record) when the IDB JSON
         # is missing or broken
@@ -62,7 +64,7 @@ class Platform:
         self.params = params_mod.Params(
             self.power, self.relay, self.log, self.clock, cfg,
             ctl.elf_sha256, next_seq=self._next_seq_gs,
-            link_ok=self.gs_link_ok)
+            link_ok=self.gs_link_ok, platform_seq_recent=self.seq14_recent)
         self.forcing = Forcing(self.log, self.qmp)
         self.faults = faults_mod.Faults(
             faults_mod.load(cfg["faults"]["catalogue"] or None),
@@ -93,7 +95,20 @@ class Platform:
         with self.lock:
             s = self.seq14
             self.seq14 = (self.seq14 + 1) & 0x3FFF
+            self._seq14_sent[s] = time.monotonic()
+            if len(self._seq14_sent) > 256:     # keep the recent ones
+                cut = time.monotonic() - 60.0
+                self._seq14_sent = {k: v for k, v in
+                                    self._seq14_sent.items() if v >= cut}
             return s
+
+    def seq14_recent(self, seq, window_s):
+        """True when a platform TC (source 14, e.g. timesync's
+        TC(9,129)) took @seq within @window_s: it shares APID 0x5AC with
+        the GS counter, and a TM(1,x) echoes only the 14-bit seq."""
+        with self.lock:
+            t = self._seq14_sent.get(seq)
+        return t is not None and time.monotonic() - t <= window_s
 
     def _next_seq_gs(self):
         with self.lock:

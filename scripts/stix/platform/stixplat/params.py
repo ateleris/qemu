@@ -446,8 +446,13 @@ class dwarf:
             return True, pos
         if form == 0x21:                # implicit_const
             return implicit, pos
-        if form == 0x16:                # indirect
-            form, pos = _uleb(data, pos)
+        if form == 0x16:                # indirect: a loop, not recursion
+            hops = 0                    # (a corrupt chain stays bounded)
+            while form == 0x16:
+                hops += 1
+                if hops > 8:
+                    raise DwarfError("DW_FORM_indirect chain too long")
+                form, pos = _uleb(data, pos)
             return dwarf._form(data, pos, form, strs, addr_size, implicit)
         if form == 0x0e:                # strp: an offset into .debug_str
             (off,) = struct.unpack_from(">I", data, pos)
@@ -532,7 +537,8 @@ def load(path, sha256=None, log=None):
         return _broken(None, "no ELF configured", log)
     try:
         return _parse(path, log)
-    except (OSError, ValueError, IndexError, struct.error) as e:
+    except (OSError, ValueError, IndexError, struct.error,
+            RecursionError) as e:
         return _broken(path, "%s: %s" % (type(e).__name__, e), log)
 
 
@@ -545,13 +551,15 @@ def _parse(path, log):
                        log, warnings)
     try:
         raw = rows(elf, tab)
-    except (OSError, ValueError, IndexError, struct.error) as e:
+    except (OSError, ValueError, IndexError, struct.error,
+            RecursionError) as e:
         return _broken(path, "%s: %s" % (type(e).__name__, e), log,
                        warnings)
     names = {}
     try:
         names = dwarf.enum_names(elf)
-    except (OSError, ValueError, IndexError, struct.error) as e:
+    except (OSError, ValueError, IndexError, struct.error,
+            RecursionError) as e:
         warnings.append("parameter names unavailable: %s" % e)
     by_name = {n: v for v, n in names.items()}
     if by_name.get("E_PARAM_ID_MAX") not in (None, tab["count"]):
@@ -627,7 +635,7 @@ class Params:
     says why a GS TC cannot go out now (None when it can)."""
 
     def __init__(self, power, relay, log, clock, cfg, sha256,
-                 next_seq, link_ok):
+                 next_seq, link_ok, platform_seq_recent=None):
         self.power = power
         self.relay = relay
         self.log = log
@@ -636,6 +644,8 @@ class Params:
         self.sha256 = sha256
         self.next_seq = next_seq
         self.link_ok = link_ok
+        # (seq, window_s) -> True when a platform TC shares the seq
+        self._plat_recent = platform_seq_recent
         self.lock = threading.Lock()
         self._key = None
         self._table = None
@@ -742,8 +752,13 @@ class Params:
     def _on_verif(self, dec):
         """TM(1,7) completes, TM(1,2)/TM(1,8) fail a pending param.set."""
         with self._tm_lock:
-            slot = self._verif.get(dec["tc"].get("seq"))
+            seq = dec["tc"].get("seq")
+            slot = self._verif.get(seq)
             if slot is None or slot["result"] is not None:
+                return
+            if self._plat_recent is not None and \
+                    self._plat_recent(seq, VERIFY_TIMEOUT_S):
+                slot["ambiguous"] = True    # whose TM(1,x) is this?
                 return
             if dec.get("subtype") == 7:
                 slot["result"] = {"verified": "completed"}
@@ -801,7 +816,8 @@ class Params:
         if ans is None:
             raise VerbError(500, "no TM(237,20) for param %d" % index)
         value, at = ans
-        self._readback(index, value, at)
+        if sub == 0:            # sub 1/2 read min/max: not the value
+            self._readback(index, value, at)
         return {"index": index, "sub": sub, "value": value, "at_sim": at}
 
     def _readback(self, index, value, at):
@@ -876,6 +892,10 @@ class Params:
             # 48301) must not read as done
             if slot["event"].wait(VERIFY_TIMEOUT_S):
                 out.update(slot["result"])
+            elif slot.get("ambiguous"):
+                out["verified"] = "ambiguous"
+                out["why"] = ("a platform TC (timesync) shared seq %d; "
+                              "read the row back" % seq)
             else:
                 out["verified"] = "timeout"
             return out

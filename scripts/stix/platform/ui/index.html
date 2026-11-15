@@ -861,7 +861,6 @@ async function paramsRefresh() {
   }
 }
 function renderParams() {
-  if (paramsWarn) text($("params-status"), paramsWarn);
   const flt = $("params-find").value.trim().toLowerCase();
   const onlyND = $("params-nondef").checked;
   const groups = new Set();
@@ -977,7 +976,9 @@ async function refresh() {
   const pp = p.params;   // the FSW parameters summary (status.params);
   if (pp) {              // hidden in view mode (no params key there)
     $("params-status").hidden = false;
-    text($("params-status"), pp.differ + " parameters differ from default");
+    // one writer: the summary, with the table's warnings appended
+    text($("params-status"), pp.differ + " parameters differ from default" +
+         (paramsWarn ? " · " + paramsWarn : ""));
   } else {
     $("params-status").hidden = true;
   }

@@ -115,8 +115,7 @@ def main():
     # never as done; then CONFIGURATION (TC(236,1) 04 00) and the set
     res = post(base, "param.set", {"index": row["index"],
                                    "value": value})["result"]
-    if st.get("platform", {}).get("mode") in (None, "SAFE") and \
-            res.get("verified") == "completed":
+    if res.get("verified") == "completed":
         print("note: the FSW accepted the set before CONFIGURATION")
     elif res.get("verified") == "failed":
         print("set in SAFE: refused as expected (%s, fid %s %s)"

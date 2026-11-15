@@ -183,7 +183,8 @@ not run `nm`/`readelf` (sandbox), so task T7 re-verifies them live.
   program headers. Refuse non-BE/non-32-bit with `ElfError`.
 - [ ] `find_table(elf)` → `{vaddr, size, count, symbol, warnings}`:
   symbols matching `^ParamMgmt_parameters(\.\d+)?$`, LOCAL or GLOBAL,
-  `st_size % 16 == 0`, `16 <= count <= 8192`, vaddr in
+  `st_size % 16 == 0`, `1 <= count <= 8192` (impl: 1, not 16, so the
+  4-row fixture loads), vaddr in
   0x40000000..0x48000000; several candidates → keep the
   size-valid ones, list all in `warnings`, pick the largest.
 - [ ] `rows(elf, table)` → per row `(default, value, min, max)` read

@@ -195,7 +195,7 @@ lists exactly these verbs and arguments.
 | `param.refresh` | | a RAM snapshot of the parameters' current values (one QMP `memsave` of the table into the run dir); 409 while STIX is off |
 | `param.read` | `index`, `sub` | read one parameter back with TC(237,19) and wait up to 2 s for its TM(237,20); `sub` 0 = value, 1 = min, 2 = max; 409 while the link is down or STIX is off, 500 on timeout |
 | `param.read_all` | `only_changed` | read rows back one by one: only the rows whose value differs from the ELF default unless `only_changed` is false; a progress record every 32 |
-| `param.set` | `index`, `value`, `sub` | set a parameter with TC(237,18) (`sub` 0 = value, 1 = min, 2 = max) and wait ≤ 2 s for TM(1,7)/TM(1,8): `verified` completed / failed (+`fid`, `reason`) / timeout; `delivered: false` with the reason when the TC cannot go out (still a 200) |
+| `param.set` | `index`, `value`, `sub` | set a parameter with TC(237,18) (`sub` 0 = value, 1 = min, 2 = max) and wait ≤ 2 s for TM(1,7)/TM(1,8): `verified` completed / failed (+`fid`, `reason`) / ambiguous / timeout; `delivered: false` with the reason when the TC cannot go out (still a 200) |
 | `param.reset_all` | `only_changed` | TC(237,18) the ELF default of every row whose known value differs (all known rows when `only_changed` is false), FSW-maintained rows excluded; `reset` counts completed sets; 409 while another read_all/reset_all runs |
 | `scenario.run` | `file`, `variant` | run a scenario file from the scenario dir (`[run] scenario_dir`) in this controller, one at a time (409); `variant` is required when the scenario declares variants; verdicts are `expect` records, progress is `status.scenario` |
 | `scenario.abort` | | abort the running scenario: open checks and steps not started become `error`, the teardown still runs |
@@ -631,7 +631,10 @@ stdlib only — the controller image has no binutils):
   verdict: `verified: completed` (TM(1,7)), `failed` with `tm`, `fid`
   and `reason` (TM(1,2)/TM(1,8); the FSW refuses TC(237,18) in SAFE
   with FID 48301 "wrong operation mode", TCVerifDynamic.c:172, so
-  enter CONFIGURATION first) or `timeout`. `param.reset_all` sends the
+  enter CONFIGURATION first), `ambiguous` (a platform TC, e.g.
+  timesync's TC(9,129), took the same 14-bit seq on APID 0x5AC within
+  the window: a TM(1,x) echoes only the seq, so whose verdict it is
+  cannot be told; read the row back) or `timeout`. `param.reset_all` sends the
   ELF default of every row whose known value differs and counts only
   completed sets as reset (`first_failure` names the first refusal).
   **FSW-maintained rows** (`maintained: true`: the TC sequence
