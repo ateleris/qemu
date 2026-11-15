@@ -270,7 +270,9 @@ controller-scheduled.
    cached per-row bin-mass map: the tick keeps its ebin-space exposure
    and per-ebin Poisson draws; at the draw each ebin's mass folds
    through the loaded ELUT row by a precomputed 32×32 fraction table,
-   rebuilt once per ELUT/calibration change (one classify-sized pass),
+   rebuilt at each classification point while the mode is on (ELUT
+   writes are undetectable — no write hook — so "once per change" is
+   not implementable; one full 384 × 4096 pass, host ~ms),
    integer largest-remainder splits, no new RNG. Chosen. (iii)
    Poisson per destination ebin at the swap: rejected — it doubles the
    draws and loses the mode-off = mode-on total invariant the qtests
@@ -310,16 +312,18 @@ controller-scheduled.
 7. **The bin-mass map tracks the ELUT SRAM.** A stale map after a
    TC(237,8) apply would silently misbin — the bug class the mode
    exists to expose. Pinned: `det-adc-map-invalidate` (row rewritten
-   mid-run → the next swap moves) and C3's aligned leg (mismatch → 0
-   after derive/upload).
+   mid-run → the bank closed by the first swap after it moves; the
+   rebuild runs at the start of `ql_swap`, before `materialize`) and
+   C3's aligned leg (mismatch → 0 after derive/upload).
 8. **The map build stays in established contexts.** Guest-memory reads
    via `memory_region_get_ram_ptr` only where the classification
-   already reads (SetEnable edge, QL swap, the `replay_class_pending`
-   tick) under the tick's `mem_reentrancy_guard`; integer splits and
-   the existing PRNG only, so icount and wall-clock behaviour are
-   unchanged. Pinned: `det-adc-guard` (the `det-tape-guard` pattern
-   with the mode on) and C3's twice-run aligned leg (byte-identical
-   SSID 32 dumps).
+   already reads (SetEnable edge, QL swap, the replay tick's
+   `replay_class_pending` case — raised by the det-source setter,
+   not by a TC(237,8) apply) under the tick's `mem_reentrancy_guard`;
+   integer splits and the existing PRNG only, so icount and
+   wall-clock behaviour are unchanged. Pinned: `det-adc-guard` (the
+   `det-tape-guard` pattern with the mode on) and C3's twice-run
+   aligned leg (byte-identical SSID 32 dumps).
 
 ---
 
@@ -569,8 +573,11 @@ browser pass per platform.md's manual checklist.
 `scripts/stix/ql-check.py` (`--ssid32-subcols` check), create
 `scripts/stix/platform/scenarios/gate-det-tape.json`.
 
-- [ ] `--tape`: zero-sky base like the D-3 modes (det-source=zero, the
-  non---flare default), QlIntTime default; @75 QMP loads the gate's
+- [ ] `--tape`: synthetic zero-rate base — `det-source=synthetic`
+  with `det-quiet-cps=0` (the play setter refuses any other source,
+  T2, so the D-3 `det-source=zero` base cannot be used; quiet-cps 0
+  keeps the zero-sky contract: the only sky is the tape's),
+  QlIntTime default; @75 QMP loads the gate's
   tape (background 20 cps on all 32; steps: `rate` Q1+Q3 2000 cps for
   60 s → `off` 30 s), `det-tape-play true` (play lands inside the
   T_nom ± 10 s window, so the rate step covers the first 8 QL periods
@@ -587,14 +594,17 @@ browser pass per platform.md's manual checklist.
   quiet template, 0.10/11) ≥ 0x30 (2000 cps × 32 s ≈ 580 counts), and
   every unmasked subcol stays at the background floor, byte 4 < 0x10
   (20 cps × 32 s ≈ 6 counts, the ql-inject bound — not zero: the
-  background fills all 32). Plus the SSID 30 rule, pinned here because
+  background fills all 32). Plus the SSID 30 rule, part of the same
+  `tape` check (one verdict — pinned here because
   `check_lc_contrast`'s quiet-before-switch window does not exist
-  (play ≈ T_nom leaves no samples before the switch):
+  (play ≈ T_nom leaves no samples before the switch)):
   the rate step's band-0 median ≥ 8 compressed steps above the `off`
   step's band-0 median, and the `off`-window samples are exactly 0
   (the `off` step beats the background end to end through the FSW).
   `--tape --negative` plays only the `off` step and
-  fails exactly `tape` (no elevated subcol). Expected line
+  fails exactly `tape` (no elevated subcol, and the SSID 30 rule
+  fails too with no rate step — which is why it lives inside `tape`).
+  Expected line
   `DETECTOR-SMOKE (tape): PASS`; SKIP 77 without the ELF (house
   convention).
 - [ ] `gate-det-tape.json` (platform scenario, run mode): power on/boot,
@@ -636,7 +646,10 @@ extended) → pass.
   - `mismatch_cells`: over honoured (non-degenerate) rows only, the
     count of adc whose honoured ebin differs from the sim calibration's
     linear bin (base per dss_det from a loaded replay table; without
-    one, `calibration=none` and `mismatch_cells=0`). For the derived
+    one, `calibration=none` and `mismatch_cells=0` — `none` marks the
+    comparison as not computed, not a zero-mismatch verdict against a
+    base-0 calibration, which C1's fold still runs without a table;
+    read `calibration` first). For the derived
     CSV of A2 this is 0 by construction; for a flight ELUT it is large
     and is the "the ELUT does not match the DSS" signal.
   - `unassigned_cells`: adc with ELUT value 32 over honoured rows.
@@ -833,13 +846,27 @@ golden unchanged.
   destination `val[adc]`, 32 drops; degenerate row: the fallback's
   bin, adc ≤ base dropped), from the SRAM ram pointer
   (`memory_region_get_ram_ptr`, the `stix_det_replay_classify`
-  pattern). Rebuilt lazily at the next use, in the contexts that
-  already classify (the SetEnable edge, the QL swap, the
-  `replay_class_pending` tick — the signal the TC(237,8) apply
-  raises) plus a `det-cal-kev-full` change; never per tick, never per
-  event. **Cost:** one classify-sized pass (384 × 4096 ≈ 1.6 M byte
-  reads, host ~ms) per ELUT/calibration change at worst; zero at tick
-  and draw time beyond the fold itself.
+  pattern). Rebuilt at the SetEnable 0→1 edge and at the START of
+  `stix_det_ql_swap` — BEFORE `stix_det_sky_materialize` (`:200` vs
+  the classify at `:213-215`) — plus when a `det-cal-kev-full` change (or
+  the mode turning on) arms it; never per tick, never per event.
+  There is no write hook: a TC(237,8) apply is a guest CPU store into
+  plain RAM (`memory_region_init_ram`, `grlib_stixctrl.c:1330` — no
+  ops, no notifier) and notifies the model of nothing;
+  `replay_class_pending` is not the signal (only the det-source
+  setter raises it, `stix_det.c:2037-2040`). Pickup is purely the
+  swap/edge rebuild, like the replay classification. The
+  before-`materialize` placement is load-bearing: the bank closed by
+  the first swap after a mid-period rewrite must already fold with
+  the new map — unlike the replay's event-time lookup, where that
+  bank still shows the old binning (the `det-replay-elut` bank-1
+  precedent, `tests/qtest/stix.c:8935-8941`). **Cost:** while the
+  mode is on, one full 384 × 4096 walk (~1.6 M byte reads, host ~ms)
+  per rebuild point — per QL swap/edge, not per detected change
+  (changes are undetectable); the walk is always 4096 bytes/row, more
+  than the classify, which early-exits per honoured row
+  (`stix_det.c:1482-1487`). Zero while the mode is off; nothing at
+  draw time beyond the fold itself.
 - **The draw fold:** `stix_det_draw_acc` keeps its per-ebin Poisson
   draws (same loop order, same RNG stream shape); with the mode on,
   each drawn count n is split over the map row by largest remainder —
@@ -848,13 +875,20 @@ golden unchanged.
   nominal EACC chunk. The per-tick SUMCNT/LVAR lambdas use the
   map-folded SUMEMASK/VAREMASK shares (cached per profile with the
   map; the masks still read live; a 32×32 dot product per profile per
-  tick). Totals per (fpga_det, pix) are unchanged by the mode; only
-  the ebin distribution moves. Deposits (`det-inject`), replay events
+  tick). Totals per (fpga_det, pix) are unchanged by the mode except
+  where the row itself drops: a honoured row's 32-valued (unassigned)
+  cells, and — on a degenerate row — the fallback's adc ≤ base drop
+  (`stix_det.c:1597-1599`), which loses a 1/len₀ sliver of ebin 0
+  (adc = base = E(0) sits inside sim ebin 0's interval; 1/72 of it at
+  base 1800, 1/128 at base 0) — benign, ebin 0 is outside the LC
+  bands and the QLDetPerf mask (A2's note). Otherwise only the ebin
+  distribution moves. Deposits (`det-inject`), replay events
   and S3 `single` steps are science-space and stay out of the fold.
 - Trace `stixdet_adc_map(rows, nonidentity_rows, vclock_ns)` once per
   rebuild. hw-state `det.adc`: `{mode, kev_full, base_source:
-  replay|zero, map_rows}` — pure reads (PL-2), mapped to leaves in
-  C2.
+  replay|zero, map_rows}` — pure reads (PL-2): `map_rows` counts the
+  built rows and must not trigger the rebuild (QMP context is outside
+  the tick's `mem_reentrancy_guard`); mapped to leaves in C2.
 
 Determinism, guard, guest memory: every new draw reuses the
 xorshift64*/Poisson helpers in the established call order and the
@@ -874,13 +908,23 @@ and no wall clock.
   the round trip is mass-preserving and bin-exact, stronger than
   "within statistics".
 - [ ] qtest `det-adc-wrong`: mode on, one row deliberately wrong (the
-  base-0 edge grid while the file's baseline is 1800 — shifted) →
-  the target-ebin cell ≈ 0, the mass in lower ebins,
+  base-0 edge grid while the file's baseline is 1800 — shifted: the
+  drawn ebin-18 adc range, 3092–3163, lands in ebin 24) → the
+  target-ebin cell ≈ 0 and the mass arrives at ebin 24 (assert the
+  arrival, not only the loss — a mass-losing fold must fail),
   `det-align-status.mismatch_cells ≥ 1`, and the next ROTB chunk's
-  EACC cell shows the same misbin (the `det-inject-chunk` decode).
+  EACC cell shows the same misbin (the `det-inject-chunk` decode); a
+  `det-inject` deposit made during the run lands at its requested
+  ebin bit-exact — the fold splits only the Poisson part, `draw_acc`
+  adds `inj` after the draw (`stix_det.c:1648-1649`), so deposits
+  stay science-space.
 - [ ] qtest `det-adc-map-invalidate`: mode on with a matching row; a
   mid-run rewrite of that row (the `det-replay-elut` SRAM-write
-  pattern) moves the next swap's bank (no stale map), and back.
+  pattern) moves the bank closed by the FIRST swap after the rewrite
+  (the rebuild runs at the start of `ql_swap`, before `materialize` —
+  deliberately unlike the replay's bank-1 precedent,
+  `tests/qtest/stix.c:8935-8941`), and rewriting back moves the next
+  bank back.
 - [ ] qtest `det-adc-props`: `det-cal-kev-full` 0 refused; the tape
   `adc_mode` field overrides the knob while playing and reverts on
   stop (the `det-tape-rate` banks witness it); the status line
@@ -934,8 +978,11 @@ skeleton), `scripts/stix/ql-check.py` (the SSID 32 check gains an
   ebin 24 under the base-0 row); `det-align-status` has
   `mismatch_cells ≥ 1` and `calibration=dss-linear`; SSID 32 byte 19
   < 0x10 while the total still flows (the counts are in the wrong
-  bins — the AX miscount, end to end); the chunk's EACC cell is not
-  at ebin 18.
+  bins — the AX miscount, end to end); the counts arrive at ebin 24:
+  SSID 32 byte 25 (ebin 24) within 5σ of the leg-3 byte-19 reference
+  (the whole line moved, not lost — a mass-losing fold must fail)
+  and the chunk's EACC cell decodes at ebin 24, not merely "not at
+  ebin 18".
 - [ ] Leg 5 `adc-aligned`: the same as leg 4 but
   `elut-derive.py derive` + `elut-upload.py encode` (the A3 leg-2
   chain) first: `mismatch_cells = 0`; SSID 32 byte 19 within 5σ of
@@ -1054,8 +1101,9 @@ new at boot; `det-adc-mode` defaults off).
   steps and the `det-adc-mode` sky of §53").
 - New **§53 "ADC-faithful sky mode (baseline: off)"** (decision D1):
   the calibration law (base/gain per dss_det/pix, `K`), the cached
-  per-row bin-mass map and its cost (one classify-sized pass per
-  ELUT/calibration change, zero per event), the draw fold
+  per-row bin-mass map and its cost (one full 384 × 4096 pass per
+  classification point — per QL swap/edge — while the mode is on;
+  ELUT writes are undetectable, zero per event), the draw fold
   (largest-remainder splits, no new RNG), the EACC chunk path
   through the same fold, the off-bit-identical invariant, and the
   AX-miscount reproduction (C3's legs).
@@ -1211,3 +1259,63 @@ under `det-adc-mode`; A2 gains `--b0` (D6) and `check-dump
 and the accepted-diffs names (§53 new) updated; the open-questions
 section became the decisions record. No first-pass finding was
 reverted.
+
+## Re-review (2026-11-15)
+
+Second review pass: no blockers; all SHOULD-FIX items and nits 5–9
+applied in this file only (no code touched). Every corrected claim was
+re-verified against the worktree first (`replay_class_pending` set
+only by the det-source setter, `stix_det.c:2037-2040`; the ELUT SRAM
+is plain RAM, `grlib_stixctrl.c:1330`; `materialize` `:200` vs the
+swap classify `:213-215`; the classify early-exit `:1482-1487`, the
+fallback drop `:1597-1599`, the `inj` sum `:1648-1649`; the bank-1
+precedent `tests/qtest/stix.c:8935-8941`; PL-2 `:2647-2650`).
+Dispositions:
+
+- SF1 (C1 map invalidation: wrong signal + ordering) — **fixed**: the
+  "TC(237,8) apply raises `replay_class_pending`" claim removed (the
+  apply is a guest store into plain RAM and notifies nothing; the
+  pending flag belongs to the det-source setter); the rebuild is now
+  pinned to the START of `ql_swap`, before `materialize`, so the bank
+  closed by the first swap after a mid-period rewrite folds with the
+  new map — noted as deliberately unlike the replay's bank-1
+  precedent; `det-adc-map-invalidate` pins that exact swap; review
+  focus 7 aligned.
+- SF2 (C1 cost claim unimplementable) — **fixed**: the honest bound
+  is one full 384 × 4096 walk per classification point (per QL
+  swap/edge) while the mode is on — changes are undetectable — and
+  the walk is always 4096 bytes/row (the classify early-exits);
+  ~ms host per swap, zero when off. Approach 4(ii) and the §53
+  sketch aligned.
+- SF3 (totals invariant overbroad) — **fixed**: qualified — unchanged
+  except where the row itself drops (32-valued cells; the degenerate
+  fallback's adc ≤ base, a 1/len₀ sliver of ebin 0: 1/72 at base
+  1800, 1/128 at base 0), benign per A2's note.
+- SF4 (T6 base contradicts T2) — **fixed**: the `--tape` base is
+  `det-source=synthetic` with `det-quiet-cps=0` (the play setter
+  refuses `zero`).
+- N5 (deposits unpinned) — **fixed**: `det-adc-wrong` now asserts a
+  `det-inject` deposit lands at its requested ebin bit-exact while
+  the sky folds (`draw_acc` adds `inj` after the draw,
+  `stix_det.c:1648-1649`). While editing, the bullet's "the mass in
+  lower ebins" was corrected to "the mass arrives at ebin 24": the
+  base-0 row maps the drawn ebin-18 adc range 3092–3163 to val 24
+  (re-derived; same shift C3 leg 4 already recorded) — an extra fix
+  beyond the findings, flagged here.
+- N6 (C3 leg 4 mass-loss passes) — **fixed**: leg 4 also asserts
+  arrival at ebin 24 (SSID 32 byte 25 within 5σ of the leg-3
+  reference; the chunk cell at ebin 24).
+- N7 (hw-state rebuild) — **fixed**: `map_rows` counts built rows and
+  must not trigger the rebuild (PL-2; QMP context is unguarded).
+- N8 (T6 `--negative` scope) — **fixed**: the SSID 30 rule is now
+  stated as part of the `tape` check (one verdict), so the negative
+  — which fails it too, having no rate step — fails exactly `tape`.
+- N9 (calibration=none) — **fixed**: A1 states `none` marks the
+  comparison as not computed, not a zero-mismatch verdict (C1's fold
+  calibration still runs at base 0 without a table).
+
+Nothing rejected; the review's "verified sound" list needed no plan
+change. Reviewer runs stay per the task Verification lines
+(`scripts/stix/qt.sh all`, `elut-derive.py --self-test` and the gates
+post-implementation); the reviewer ran none, and neither did this
+edit pass.
