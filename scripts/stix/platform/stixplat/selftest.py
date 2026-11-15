@@ -3725,7 +3725,11 @@ UI_MOCKUP_IDS = {"faults", "fault-cats", "faults-active", "plat-faults",
 UI_STIMULUS_IDS = {"det-sub-status", "det-sub-stim", "stim-tapes",
                    "stim-loop", "stim-align", "stim-adc", "stim-steps",
                    "stim-now", "stim-progress", "stim-align-read",
-                   "stim-adc-read", "stim-selected"}
+                   "stim-adc-read", "stim-selected",
+                   # S2 U4: the Spectrum control
+                   "stim-kind-spec", "stim-spec", "stim-spec-adc",
+                   "stim-spec-kev", "stim-spec-k1", "stim-spec-k2",
+                   "stim-spec-file", "stim-spec-align"}
 
 
 def _csp_hashes(page, tag):
@@ -4059,6 +4063,29 @@ def t_ui_stimulus(env):
               "<%s %r>: style attribute or inline handler" % (tag, a))
     for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
         check(bad not in page.lower(), "the page uses %s" % bad)
+    # S2 U4: the Spectrum chip is enabled; the spec select's 5 options;
+    # the four inputs and the file select are typed/hidden; align a box
+    by_id = {a["id"]: (tag, a) for tag, a in p.attrs if "id" in a}
+    tag, a = by_id["stim-kind-spec"]
+    check(tag == "button" and "disabled" not in a and
+          "S2" not in (a.get("title") or ""),
+          "the Spectrum chip is enabled: %r" % (a,))
+    check(by_id["stim-spec"][0] == "select" and
+          by_id["stim-spec-file"][0] == "select", "the two selects")
+    m = re.search(r'<select id="stim-spec"[^>]*>(.*?)</select>', page,
+                  re.S)
+    opts = re.findall(r'<option value="([^"]+)">', m.group(1)) if m else []
+    check(opts == ["flat", "line_adc", "line_kev", "flat_kev", "file"],
+          "the spec options: %r" % opts)
+    check("template (flat)" in m.group(1), "flat is labelled template")
+    for i in ("stim-spec-adc", "stim-spec-kev", "stim-spec-k1",
+              "stim-spec-k2"):
+        tag, a = by_id[i]
+        check(tag == "input" and a.get("type") == "number" and
+              "hidden" in a, "%s: a hidden number input %r" % (i, a))
+    tag, a = by_id["stim-spec-align"]
+    check(tag == "input" and a.get("type") == "checkbox" and
+          "disabled" in a, "the align box starts disabled: %r" % (a,))
 
 
 SETUP_KEYS = {"binary", "elf", "elf_sha256", "icount_shift", "pace",

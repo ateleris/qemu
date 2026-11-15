@@ -475,9 +475,11 @@ section.bluebox { border-color: var(--accent); }
   <h2>Stimulus</h2>
   <div class="ctl">
     <span class="lbl">kind</span>
-    <button type="button" class="chip on">Rate</button>
-    <button type="button" class="chip" disabled
-            title="spectra arrive in stage S2">Spectrum</button>
+    <button type="button" class="chip on" id="stim-kind-rate"
+            title="the quiet template (spec flat)">Rate</button>
+    <button type="button" class="chip" id="stim-kind-spec"
+            title="a spectrum: a line or band at ADC or keV, or a CSV">
+      Spectrum</button>
     <button type="button" class="chip" disabled
             title="single events arrive in stage S3">Single events
     </button>
@@ -489,6 +491,28 @@ section.bluebox { border-color: var(--accent); }
     <span class="lbl">rate</span>
     <input type="number" id="stim-cps" min="0" max="1000000" value="20000"
            data-type="int" title="cps per detector, 0..1000000">
+    <span class="lbl">spectrum</span>
+    <select id="stim-spec" title="the step's spec (S2)">
+      <option value="flat">template (flat)</option>
+      <option value="line_adc">line at ADC…</option>
+      <option value="line_kev">line at keV…</option>
+      <option value="flat_kev">flat keV band…</option>
+      <option value="file">from file…</option>
+    </select>
+    <input type="number" id="stim-spec-adc" min="0" max="4095" value="1600"
+           data-type="int" hidden title="adc 0..4095">
+    <input type="number" id="stim-spec-kev" min="0" step="any" value="62"
+           data-type="number" hidden title="keV, >= 0">
+    <input type="number" id="stim-spec-k1" min="0" step="any" value="40"
+           data-type="number" hidden title="band start, keV">
+    <input type="number" id="stim-spec-k2" min="0" step="any" value="60"
+           data-type="number" hidden title="band end, keV (exclusive)">
+    <select id="stim-spec-file" hidden
+            title="a CSV in the spectra dir (adc,weight or kev,weight)">
+    </select>
+    <label class="muted"><input type="checkbox" id="stim-spec-align"
+      disabled title="keV specs: bin through the loaded ELUT's preimage">
+      align</label>
     <span class="lbl">duration</span>
     <input type="number" id="stim-dur" min="0.1" max="86400" step="0.1"
            value="120" data-type="number" title="for_s, seconds">
@@ -501,10 +525,10 @@ section.bluebox { border-color: var(--accent); }
 
 <section class="bluebox">
   <h2>Emulator support today vs needed</h2>
-  <div class="desc">Today: one quiet and one flare rate for all
-    detectors, and DSS sequence replay. Needed for this page:
-    per-detector and per-pixel rates, spectra, and single events —
-    detector-model work, planned separately.</div>
+  <div class="desc">Today: per-detector and per-pixel rates, spectra (a
+    line or flat band at ADC or keV, or a CSV from the spectra dir,
+    binned through the loaded ELUT; keV specs can align), and DSS
+    sequence replay. Still needed: single events (stage S3).</div>
 </section>
 
 <section>
@@ -1764,6 +1788,11 @@ async function loadTapes() {
   try {
     const r = await getJSON("tapes");
     tapeNames = r.tapes || [];
+    const fsel = $("stim-spec-file");
+    const fkeep = fsel.value;
+    const spectra = r.spectra || [];
+    fsel.replaceChildren(...spectra.map((n) => new Option(n, n)));
+    if (spectra.includes(fkeep)) fsel.value = fkeep;
     const sel = $("stim-tapes");
     const keep = sel.value;
     sel.replaceChildren(...tapeNames.map((n) => new Option(n, n)));
@@ -1861,10 +1890,71 @@ function stimPixMask() {
   return parseInt(v, 16);
 }
 
+/* S2: the Spectrum control — the spec select shows its inputs; align
+   is enabled for the keV options (a file may be kev,weight: the
+   platform refuses align on an adc,weight one at play) */
+function stimSpecUi() {
+  const v = $("stim-spec").value;
+  $("stim-spec-adc").hidden = v !== "line_adc";
+  $("stim-spec-kev").hidden = v !== "line_kev";
+  $("stim-spec-k1").hidden = v !== "flat_kev";
+  $("stim-spec-k2").hidden = v !== "flat_kev";
+  $("stim-spec-file").hidden = v !== "file";
+  const kev = v === "line_kev" || v === "flat_kev" || v === "file";
+  $("stim-spec-align").disabled = !kev;
+  if (!kev) $("stim-spec-align").checked = false;
+  cls($("stim-kind-rate"), v === "flat" ? "chip on" : "chip");
+  cls($("stim-kind-spec"), v === "flat" ? "chip" : "chip on");
+}
+$("stim-spec").addEventListener("change", stimSpecUi);
+$("stim-kind-rate").addEventListener("click", () => {
+  $("stim-spec").value = "flat";
+  stimSpecUi();
+});
+$("stim-kind-spec").addEventListener("click", () => {
+  if ($("stim-spec").value === "flat") $("stim-spec").value = "line_adc";
+  stimSpecUi();
+});
+/* the step's spec fields ({} for the template), or null when an input
+   is out of range (the callers refuse it) */
+function stimSpec() {
+  const v = $("stim-spec").value;
+  const num = (id) => {
+    const s = $(id).value;
+    return s === "" ? NaN : Number(s);
+  };
+  let spec;
+  if (v === "flat") return {};
+  if (v === "line_adc") {
+    const a = num("stim-spec-adc");
+    if (!Number.isInteger(a) || a < 0 || a > 4095) return null;
+    spec = { line_adc: a };
+  } else if (v === "line_kev") {
+    const k = num("stim-spec-kev");
+    if (!Number.isFinite(k) || k < 0) return null;
+    spec = { line_kev: k };
+  } else if (v === "flat_kev") {
+    const k1 = num("stim-spec-k1"), k2 = num("stim-spec-k2");
+    if (!Number.isFinite(k1) || !Number.isFinite(k2) || k1 < 0 ||
+        !(k1 < k2)) return null;
+    spec = { flat_kev: [k1, k2] };
+  } else {
+    const f = $("stim-spec-file").value;
+    if (!f) return null;
+    spec = { file: f };
+  }
+  const out = { spec };
+  if (!$("stim-spec-align").disabled && $("stim-spec-align").checked)
+    out.align = true;
+  return out;
+}
 function stimStep() {
-  return { kind: "rate", for_s: Number($("stim-dur").value) || 0.1,
-           fpga_det_mask: stimMask >>> 0, pix_mask: stimPixMask(),
-           cps: Number($("stim-cps").value) || 0 };
+  const sp = stimSpec();
+  if (sp == null) return null;
+  return Object.assign(
+    { kind: "rate", for_s: Number($("stim-dur").value) || 0.1,
+      fpga_det_mask: stimMask >>> 0, pix_mask: stimPixMask(),
+      cps: Number($("stim-cps").value) || 0 }, sp);
 }
 $("stim-add").addEventListener("click", () => {
   if (!tape) tape = blankTape();
@@ -1873,6 +1963,7 @@ $("stim-add").addEventListener("click", () => {
     return;
   }
   const st = stimStep();
+  if (st == null) { toast("spectrum: an input is out of range", true); return; }
   if (st.pix_mask == null) { toast("one pixel: 0..11", true); return; }
   tape.steps.push(st);
   stimRender();
@@ -1880,8 +1971,10 @@ $("stim-add").addEventListener("click", () => {
 $("stim-send").addEventListener("click", async () => {
   const t = blankTape();
   t.name = "send-now";
-  t.steps = [stimStep()];
-  if (t.steps[0].pix_mask == null) { toast("one pixel: 0..11", true); return; }
+  const st = stimStep();
+  if (st == null) { toast("spectrum: an input is out of range", true); return; }
+  t.steps = [st];
+  if (st.pix_mask == null) { toast("one pixel: 0..11", true); return; }
   try {
     await post("det.tape.save", { name: "send-now", tape: t });
     const r = await post("det.tape.play", { name: "send-now",
@@ -1928,9 +2021,24 @@ function stimTargetWord(s) {
   if (p !== 0xFFF) t += " · pix 0x" + p.toString(16);
   return t;
 }
+/* the spec as the settings column shows it: " · line_adc 1600",
+   " · line_kev 62 (align)", " · flat_kev 40..60", " · file s.csv" */
+function stimSpecWord(s) {
+  const sp = s.spec;
+  if (!sp || sp === "flat") return "";
+  let w = "spec";
+  if (typeof sp === "object") {
+    if (sp.line_adc != null) w = "line_adc " + sp.line_adc;
+    else if (sp.line_kev != null) w = "line_kev " + sp.line_kev;
+    else if (Array.isArray(sp.flat_kev))
+      w = "flat_kev " + sp.flat_kev[0] + ".." + sp.flat_kev[1];
+    else if (sp.file != null) w = "file " + sp.file;
+  }
+  return " · " + w + (s.align === true ? " (align)" : "");
+}
 function stimSettings(s) {
   if (s.kind === "rate") return (s.cps == null ? "?" : s.cps) + " cps" +
-    (s.spec && s.spec !== "flat" ? " · spec" : "");
+    stimSpecWord(s);
   if (s.kind === "off") return "0 cps";
   if (s.kind === "replay") return (s.file || "") + " @" +
     (s.offset_ms == null ? 0 : s.offset_ms) + " ms";
@@ -2004,7 +2112,8 @@ function stimReadout() {
               name: leafTruth("instrument.detector.tape.name"),
               step: leafTruth("instrument.detector.tape.step"),
               n: leafTruth("instrument.detector.tape.n_steps"),
-              label: leafTruth("instrument.detector.tape.label") };
+              label: leafTruth("instrument.detector.tape.label"),
+              spec: leafTruth("instrument.detector.tape.spec") };
   if (t.state == null) text($("stim-now"), "idle");
   else if (t.state === "playing")
     text($("stim-now"), "now playing: tape '" + (t.name || "?") +
@@ -2013,7 +2122,8 @@ function stimReadout() {
   else text($("stim-now"), "tape " + t.state +
          (t.name ? ": " + t.name : ""));
   text($("stim-progress"), t.state == null ? "–" :
-       t.step + " / " + t.n);
+       t.step + " / " + t.n +
+       (t.spec && t.state === "playing" ? " · " + t.spec : ""));
   const chips = $("stim-tape-row").children.length > 1
     ? [...$("stim-tape-row").children[1].children] : [];
   chips.forEach((d, i) =>
@@ -2023,10 +2133,12 @@ function stimReadout() {
                hon: leafTruth("instrument.detector.align.honoured"),
                fb: leafTruth("instrument.detector.align.fallback"),
                mm: leafTruth("instrument.detector.align.mismatch_cells"),
-               cal: leafTruth("instrument.detector.align.calibration") };
+               cal: leafTruth("instrument.detector.align.calibration"),
+               miss: leafTruth("instrument.detector.align.preimage_miss") };
   text($("stim-align-read"), al.mode == null ? "–" :
        al.mode + " · honoured " + al.hon + " · fallback " + al.fb +
-       " · mismatch " + al.mm + " · " + al.cal);
+       " · mismatch " + al.mm + " · " + al.cal +
+       (al.miss == null ? "" : " · preimage_miss " + al.miss));
   const adc = leafTruth("instrument.detector.adc.mode");
   text($("stim-adc-read"), adc == null ? "–" : (adc ? "on" : "off"));
 }
