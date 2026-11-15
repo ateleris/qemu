@@ -131,6 +131,8 @@ static void stix_det_tape_stop(StixDetState *d, const char *why);
 /* S1 per-pair rate: the tape step's cps or the background's */
 static uint32_t stix_det_tape_pair_cps(const StixDetState *d,
                                        uint32_t fpga_det, uint32_t pix);
+/* S2: the tape step spectrum (parsed with the tape) */
+static void stix_det_spec_free(StixDetSpec *sp);
 /* A1: the ELUT row classification gate (the pass itself is
  * stix_det_replay_classify, extended with the summary and the C1 map) */
 static bool stix_det_classify_wanted(const StixDetState *d);
@@ -2437,6 +2439,7 @@ static void stix_det_tape_clear(StixDetState *d)
 
     for (i = 0; i < d->tape_n_steps; i++) {
         g_free(d->tape_steps[i].label);
+        stix_det_spec_free(&d->tape_steps[i].spec);
     }
     d->tape_n_steps = 0;
     d->tape_step = 0;
@@ -2622,13 +2625,14 @@ static bool stix_det_tape_uint(QDict *obj, const char *key, uint64_t hi,
 static bool stix_det_tape_bool(QDict *obj, const char *key, bool def,
                                bool *out, Error **errp, uint32_t idx)
 {
-    QBool *b = qobject_to(QBool, qdict_get(obj, key));
+    QObject *o = qdict_get(obj, key);
+    QBool *b = qobject_to(QBool, o);
 
-    if (!b) {
+    if (!o) {
         *out = def;
         return true;
     }
-    if (qobject_type(QOBJECT(b)) != QTYPE_QBOOL) {
+    if (!b) {
         if (idx == UINT32_MAX) {
             error_setg(errp, "det-tape-load: '%s' is not a boolean", key);
         } else {
@@ -2641,6 +2645,352 @@ static bool stix_det_tape_bool(QDict *obj, const char *key, bool def,
     return true;
 }
 
+/* ---- S2: the spectrum spec (det-tape-load) ---- */
+
+static void stix_det_spec_free(StixDetSpec *sp)
+{
+    g_free(sp->pts);
+    g_free(sp->desc);
+    memset(sp, 0, sizeof(*sp));
+}
+
+static const char *stix_det_spec_desc(const StixDetSpec *sp)
+{
+    return sp->desc ? sp->desc : "flat";
+}
+
+/*
+ * One CSV number (S2 rule table): [0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?,
+ * or [0-9]+ only with @int_only; finite. No sign, no inf/nan, no 0x, no
+ * spaces: the grammar is checked by hand before g_ascii_strtod sees the
+ * text, so the libc's wider syntax never applies.
+ */
+static bool stix_det_spec_csv_num(const char *s, size_t len, bool int_only,
+                                  double *out)
+{
+    g_autofree char *txt = NULL;
+    char *end;
+    size_t i = 0, n;
+
+    for (n = 0; i < len && g_ascii_isdigit(s[i]); i++, n++) {
+        /* integer part */
+    }
+    if (!n) {
+        return false;
+    }
+    if (!int_only && i < len && s[i] == '.') {
+        for (i++, n = 0; i < len && g_ascii_isdigit(s[i]); i++, n++) {
+            /* fraction */
+        }
+        if (!n) {
+            return false;
+        }
+    }
+    if (!int_only && i < len && (s[i] == 'e' || s[i] == 'E')) {
+        i++;
+        if (i < len && (s[i] == '+' || s[i] == '-')) {
+            i++;
+        }
+        for (n = 0; i < len && g_ascii_isdigit(s[i]); i++, n++) {
+            /* exponent */
+        }
+        if (!n) {
+            return false;
+        }
+    }
+    if (i != len) {
+        return false;
+    }
+    txt = g_strndup(s, len);
+    *out = g_ascii_strtod(txt, &end);
+    return end == txt + len && isfinite(*out);
+}
+
+static int stix_det_spec_pt_cmp(const void *a, const void *b)
+{
+    double va = ((const StixDetSpecPoint *)a)->value;
+    double vb = ((const StixDetSpecPoint *)b)->value;
+
+    return va < vb ? -1 : va > vb;
+}
+
+/*
+ * Read a spectrum CSV (D4) once, host-side, in the det-tape-load setter
+ * (never in the tick): the size is checked before reading (<= 256 KiB),
+ * the first line is exactly "adc,weight" or "kev,weight", then 1..4096
+ * lines "value,weight" (no spaces, an optional \r before \n, the final
+ * newline optional, no blank or comment lines); adc values are
+ * integers 0..4095, keV values numbers (no K bound at load, decision
+ * Q7: @kev_full is not consulted, K is read at the row build); weights
+ * >= 0 with a sum > 0; repeated values are summed. The parsed points
+ * are owned by @sp: a later change or deletion of the file does not
+ * affect the loaded tape. Every error names the step, the path and the
+ * line.
+ */
+static bool stix_det_spec_file_load(const char *path, uint32_t kev_full,
+                                    StixDetSpec *sp, uint32_t idx,
+                                    Error **errp)
+{
+    g_autofree char *text = NULL, *base = NULL;
+    g_autofree StixDetSpecPoint *pts = NULL;
+    GError *gerr = NULL;
+    GStatBuf stb;
+    gsize len;
+    const char *p, *end;
+    uint32_t lineno = 0, rows = 0, n, i;
+    bool kev = false;
+    double sum = 0;
+
+    (void)kev_full;     /* Q7: K is read when the row is built */
+    if (g_stat(path, &stb) < 0) {
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s': %s",
+                   idx, path, g_strerror(errno));
+        return false;
+    }
+    if (!S_ISREG(stb.st_mode)) {
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s' is "
+                   "not a regular file", idx, path);
+        return false;
+    }
+    if (stb.st_size > STIX_DET_SPEC_MAX_FILE) {
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s' is "
+                   "%" PRId64 " bytes, past the %u KiB cap", idx, path,
+                   (int64_t)stb.st_size, STIX_DET_SPEC_MAX_FILE / 1024u);
+        return false;
+    }
+    if (!g_file_get_contents(path, &text, &len, &gerr)) {
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s': %s",
+                   idx, path, gerr->message);
+        g_error_free(gerr);
+        return false;
+    }
+    if (len > STIX_DET_SPEC_MAX_FILE) {     /* it grew since the stat */
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s' is "
+                   "past the %u KiB cap", idx, path,
+                   STIX_DET_SPEC_MAX_FILE / 1024u);
+        return false;
+    }
+    pts = g_new(StixDetSpecPoint, STIX_DET_SPEC_MAX_POINTS);
+    p = text;
+    end = text + len;
+    while (p < end || lineno == 0) {
+        const char *eol = memchr(p, '\n', end - p);
+        size_t ll = (eol ? eol : end) - p;
+        const char *comma;
+        double v, w;
+
+        lineno++;
+        if (eol && ll && p[ll - 1] == '\r') {
+            ll--;
+        }
+        if (lineno == 1) {
+            if (ll == 10 && !memcmp(p, "adc,weight", 10)) {
+                kev = false;
+            } else if (ll == 10 && !memcmp(p, "kev,weight", 10)) {
+                kev = true;
+            } else {
+                error_setg(errp, "det-tape-load: step %u: spectrum file "
+                           "'%s' line 1: the header must be exactly "
+                           "\"adc,weight\" or \"kev,weight\"", idx, path);
+                return false;
+            }
+        } else {
+            if (rows == STIX_DET_SPEC_MAX_POINTS) {
+                error_setg(errp, "det-tape-load: step %u: spectrum file "
+                           "'%s' line %u: more than %u data rows", idx,
+                           path, lineno, STIX_DET_SPEC_MAX_POINTS);
+                return false;
+            }
+            comma = ll ? memchr(p, ',', ll) : NULL;
+            if (!comma ||
+                !stix_det_spec_csv_num(p, comma - p, !kev, &v) ||
+                !stix_det_spec_csv_num(comma + 1, p + ll - comma - 1, false,
+                                       &w) ||
+                (!kev && v > STIX_DET_N_ADC - 1)) {
+                error_setg(errp, "det-tape-load: step %u: spectrum file "
+                           "'%s' line %u: not \"%s,weight\" (%s, weight "
+                           "a number >= 0; no spaces, no blank lines)",
+                           idx, path, lineno, kev ? "kev" : "adc",
+                           kev ? "keV a number" : "adc an integer 0..4095");
+                return false;
+            }
+            pts[rows].value = v;
+            pts[rows].weight = w;
+            sum += w;
+            rows++;
+        }
+        p = eol ? eol + 1 : end;
+    }
+    if (!rows) {
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s': no "
+                   "data rows (1..%u)", idx, path, STIX_DET_SPEC_MAX_POINTS);
+        return false;
+    }
+    if (!(sum > 0)) {
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s': the "
+                   "weights sum to 0", idx, path);
+        return false;
+    }
+    /* repeated values are summed: sort, then merge equal neighbours */
+    qsort(pts, rows, sizeof(*pts), stix_det_spec_pt_cmp);
+    for (i = 1, n = 1; i < rows; i++) {
+        if (pts[i].value == pts[n - 1].value) {
+            pts[n - 1].weight += pts[i].weight;
+        } else {
+            pts[n++] = pts[i];
+        }
+    }
+    sp->kind = kev ? STIX_DET_SPEC_FILE_KEV : STIX_DET_SPEC_FILE_ADC;
+    sp->n_pts = n;
+    sp->pts = g_renew(StixDetSpecPoint, g_steal_pointer(&pts), n);
+    base = g_path_get_basename(path);
+    sp->desc = g_strdup_printf("file=%s unit=%s rows=%u", base,
+                               kev ? "kev" : "adc", rows);
+    return true;
+}
+
+/*
+ * The step's "spec" and "align" into st->spec (S2 rule table): absent
+ * or "flat" on any kind (the S1 template), else an object with exactly
+ * one key of line_adc (an integer 0..4095), line_kev (a finite number
+ * >= 0), flat_kev ([k1, k2], 0 <= k1 < k2) or file (a path, 1..4095
+ * bytes, no comma; read here) — only on kind rate. keV values have no K
+ * bound at load (decision Q7). The step's align defaults to the tape's
+ * @tape_align; an explicit true is only valid on a keV spec, the tape
+ * default is ignored for adc and flat specs. Called last in the step
+ * parse, so no later refusal leaves a loaded spec behind; on an error
+ * st->spec is left empty.
+ */
+static bool stix_det_spec_parse(StixDetState *d, QDict *step,
+                                bool tape_align, StixDetTapeStep *st,
+                                uint32_t idx, Error **errp)
+{
+    static const char spec_err[] = "'spec' must be \"flat\" or an object "
+                                   "with exactly one key of line_adc, "
+                                   "line_kev, flat_kev, file";
+    StixDetSpec *sp = &st->spec;
+    QObject *o = qdict_get(step, "spec");
+    QDict *sd = qobject_to(QDict, o);
+    QString *str = qobject_to(QString, o);
+    bool align_set = qdict_haskey(step, "align");
+    bool align, kev;
+
+    memset(sp, 0, sizeof(*sp));
+    if (!stix_det_tape_bool(step, "align", tape_align, &align, errp, idx)) {
+        return false;
+    }
+    if (!o || (str && !strcmp(qstring_get_str(str), "flat"))) {
+        sp->kind = STIX_DET_SPEC_FLAT;
+    } else if (!sd || qdict_size(sd) != 1) {
+        error_setg(errp, "det-tape-load: step %u: %s", idx, spec_err);
+        return false;
+    } else if (st->kind != STIX_DET_TAPE_RATE) {
+        error_setg(errp, "det-tape-load: step %u: a non-flat spec is only "
+                   "valid on kind rate", idx);
+        return false;
+    } else {
+        const char *key = qdict_entry_key(qdict_first(sd));
+        QObject *val = qdict_get(sd, key);
+        QNum *n = qobject_to(QNum, val);
+
+        if (!strcmp(key, "line_adc")) {
+            int64_t v;
+
+            if (!n || !qnum_get_try_int(n, &v) || v < 0 ||
+                v > STIX_DET_N_ADC - 1) {
+                error_setg(errp, "det-tape-load: step %u: 'line_adc' is "
+                           "not an integer in 0..%u", idx,
+                           STIX_DET_N_ADC - 1);
+                return false;
+            }
+            sp->kind = STIX_DET_SPEC_LINE_ADC;
+            sp->v0 = v;
+        } else if (!strcmp(key, "line_kev")) {
+            double v = n ? qnum_get_double(n) : -1;
+
+            if (!n || !isfinite(v) || v < 0) {
+                error_setg(errp, "det-tape-load: step %u: 'line_kev' is "
+                           "not a finite number >= 0 (keV)", idx);
+                return false;
+            }
+            sp->kind = STIX_DET_SPEC_LINE_KEV;
+            sp->v0 = v;
+        } else if (!strcmp(key, "flat_kev")) {
+            QList *l = qobject_to(QList, val);
+            const QListEntry *e0 = l && qlist_size(l) == 2 ?
+                                   qlist_first(l) : NULL;
+            QNum *n0 = e0 ? qobject_to(QNum, qlist_entry_obj(e0)) : NULL;
+            QNum *n1 = n0 ? qobject_to(QNum,
+                                       qlist_entry_obj(qlist_next(e0)))
+                          : NULL;
+            double k1 = n1 ? qnum_get_double(n0) : -1;
+            double k2 = n1 ? qnum_get_double(n1) : -1;
+
+            if (!n1 || !isfinite(k1) || !isfinite(k2) || k1 < 0 ||
+                !(k1 < k2)) {
+                error_setg(errp, "det-tape-load: step %u: 'flat_kev' is "
+                           "not [k1, k2] with 0 <= k1 < k2 (keV)", idx);
+                return false;
+            }
+            sp->kind = STIX_DET_SPEC_FLAT_KEV;
+            sp->v0 = k1;
+            sp->v1 = k2;
+        } else if (!strcmp(key, "file")) {
+            QString *fs = qobject_to(QString, val);
+            const char *path = fs ? qstring_get_str(fs) : NULL;
+            size_t len = path ? strlen(path) : 0;
+
+            if (!path || !len || len > 4095 || strchr(path, ',')) {
+                error_setg(errp, "det-tape-load: step %u: 'file' is not a "
+                           "path of 1..4095 bytes without a comma", idx);
+                return false;
+            }
+            if (!stix_det_spec_file_load(path, d->adc_kev_full, sp, idx,
+                                         errp)) {
+                stix_det_spec_free(sp);
+                return false;
+            }
+        } else {
+            error_setg(errp, "det-tape-load: step %u: %s (not '%s')", idx,
+                       spec_err, key);
+            return false;
+        }
+    }
+    kev = sp->kind == STIX_DET_SPEC_LINE_KEV ||
+          sp->kind == STIX_DET_SPEC_FLAT_KEV ||
+          sp->kind == STIX_DET_SPEC_FILE_KEV;
+    if (align_set && align && !kev) {
+        error_setg(errp, "det-tape-load: step %u: align applies to keV "
+                   "specs (line_kev, flat_kev, a kev,weight file)", idx);
+        stix_det_spec_free(sp);
+        return false;
+    }
+    sp->align = kev && align;
+    switch (sp->kind) {
+    case STIX_DET_SPEC_FLAT:
+        sp->desc = g_strdup("flat");
+        break;
+    case STIX_DET_SPEC_LINE_ADC:
+        sp->desc = g_strdup_printf("line_adc=%u", (uint32_t)sp->v0);
+        break;
+    case STIX_DET_SPEC_LINE_KEV:
+        sp->desc = g_strdup_printf("line_kev=%g", sp->v0);
+        break;
+    case STIX_DET_SPEC_FLAT_KEV:
+        sp->desc = g_strdup_printf("flat_kev=%g..%g", sp->v0, sp->v1);
+        break;
+    default:
+        break;      /* the file loader wrote it */
+    }
+    if (sp->align) {
+        char *desc = g_strconcat(sp->desc, " align", NULL);
+
+        g_free(sp->desc);
+        sp->desc = desc;
+    }
+    return true;
+}
+
 /*
  * One step dict into @st. Every error names the step index @idx; masks
  * are fpga_det/pix indexed and a subcol key is refused by name. Kinds
@@ -2649,14 +2999,13 @@ static bool stix_det_tape_bool(QDict *obj, const char *key, bool def,
  * them.
  */
 static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
-                                     StixDetTapeStep *st, uint32_t idx,
-                                     Error **errp)
+                                     bool tape_align, StixDetTapeStep *st,
+                                     uint32_t idx, Error **errp)
 {
     const char *kind;
     char *label;
     uint64_t u64;
     double for_s;
-    QString *spec;
     const QDictEntry *e;
 
     memset(st, 0, sizeof(*st));
@@ -2679,7 +3028,7 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
         st->kind = STIX_DET_TAPE_OFF;
     } else if (!strcmp(kind, "single")) {
         error_setg(errp, "det-tape-load: step %u: kind \"single\" is "
-                   "unsupported in this build (S2/S3)", idx);
+                   "unsupported in this build (S3)", idx);
         return false;
     } else {
         error_setg(errp, "det-tape-load: step %u: unknown kind '%s' "
@@ -2727,14 +3076,6 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
         }
         st->cps = (uint32_t)u64;
     }
-    spec = qobject_to(QString, qdict_get(obj, "spec"));
-    if (qdict_haskey(obj, "spec") &&
-        (!spec || strcmp(qstring_get_str(spec), "flat"))) {
-        g_free(label);
-        error_setg(errp, "det-tape-load: step %u: spec values other than "
-                   "\"flat\" are unsupported in this build (S2/S3)", idx);
-        return false;
-    }
     if (st->kind == STIX_DET_TAPE_REPLAY) {
         const char *file = qdict_get_try_str(obj, "file");
         QNum *off = qobject_to(QNum, qdict_get(obj, "offset_ms"));
@@ -2777,7 +3118,7 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
         const char *key = qdict_entry_key(e);
         static const char *const known[] = {
             "kind", "for_s", "label", "fpga_det_mask", "pix_mask", "cps",
-            "spec", "file", "offset_ms",
+            "spec", "file", "offset_ms", "align",
         };
         size_t k;
 
@@ -2792,6 +3133,12 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
                        "field '%s'", idx, key);
             return false;
         }
+    }
+    /* S2: the spec last, so no later refusal leaves a loaded spec */
+    if (!stix_det_spec_parse(d, obj, tape_align, st, idx, errp)) {
+        g_free(label);
+        stix_det_spec_free(&st->spec);
+        return false;
     }
     if (label[0]) {
         st->label = g_steal_pointer(&label);
@@ -2901,13 +3248,15 @@ static void stix_det_tape_load_set(Object *obj, Visitor *v, const char *name,
             } else if (!so) {
                 error_setg(errp, "det-tape-load: step %u is not an "
                            "object", n_steps);
-            } else if (stix_det_tape_parse_step(d, so, &steps[n_steps],
-                                                n_steps, errp)) {
+            } else if (stix_det_tape_parse_step(d, so, align,
+                                                &steps[n_steps], n_steps,
+                                                errp)) {
                 n_steps++;
                 continue;
             }
-            while (n_steps--) {         /* the parsed labels leak not */
+            while (n_steps--) {     /* the parsed labels/specs leak not */
                 g_free(steps[n_steps].label);
+                stix_det_spec_free(&steps[n_steps].spec);
             }
             return;
         }
@@ -3025,12 +3374,13 @@ static void stix_det_align_status_get(Object *obj, Visitor *v,
 
     value = g_strdup_printf("mode=%s,rows=%u,fallback=%u,honoured=%u,"
                             "mismatch_cells=%u,unassigned_cells=%u,"
-                            "calibration=%s",
+                            "calibration=%s,preimage_miss=%u",
                             d->align ? "on" : "off", d->align_rows,
                             d->align_fallback, d->align_honoured,
                             d->align_mismatch_cells,
                             d->align_unassigned_cells,
-                            d->align_has_table ? "dss-linear" : "none");
+                            d->align_has_table ? "dss-linear" : "none",
+                            d->spec_preimage_miss);
     visit_type_str(v, name, &value, errp);
     g_free(value);
 }
@@ -3890,6 +4240,8 @@ void stix_det_hw_state(StixDetState *d, QDict *det)
                   st ? stix_det_tape_kind_name[st->kind] : "");
     qdict_put_bool(tape, "loop", d->tape_loop);
     qdict_put_bool(tape, "align", d->tape_align);
+    /* S2: the running (or previewed) step's spectrum */
+    qdict_put_str(tape, "spec", st ? stix_det_spec_desc(&st->spec) : "");
     qdict_put(det, "tape", tape);
 
     /* A1: the classification report */
@@ -3901,6 +4253,7 @@ void stix_det_hw_state(StixDetState *d, QDict *det)
     qdict_put_int(align, "unassigned_cells", d->align_unassigned_cells);
     qdict_put_str(align, "calibration",
                   d->align_has_table ? "dss-linear" : "none");
+    qdict_put_int(align, "preimage_miss", d->spec_preimage_miss);
     qdict_put(det, "align", align);
 
     /* C1: the ADC sky */

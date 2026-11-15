@@ -116,9 +116,44 @@ typedef enum StixDetTapeKind {
     STIX_DET_TAPE_KIND__MAX,
 } StixDetTapeKind;
 
+/*
+ * S2: a rate step's spectrum. FLAT is the S1 quiet template (the wire
+ * name "flat"); the others are ADC-domain stimuli binned through the
+ * loaded ELUT (line at an adc, line or flat band in keV, or a weighted
+ * CSV read once at det-tape-load). keV specs go through the D5 law
+ * (adc = base + floor(gain * keV + 0.5), gain = (4096 - base) / K), or,
+ * with align, through the preimage of the loaded ELUT.
+ */
+typedef enum StixDetSpecKind {
+    STIX_DET_SPEC_FLAT,         /* the quiet template (S1 "flat") */
+    STIX_DET_SPEC_LINE_ADC,
+    STIX_DET_SPEC_LINE_KEV,
+    STIX_DET_SPEC_FLAT_KEV,
+    STIX_DET_SPEC_FILE_ADC,     /* CSV header adc,weight */
+    STIX_DET_SPEC_FILE_KEV,     /* CSV header kev,weight */
+    STIX_DET_SPEC__MAX,
+} StixDetSpecKind;
+
+typedef struct StixDetSpecPoint {
+    double value;               /* adc (integer) or keV */
+    double weight;              /* >= 0, relative */
+} StixDetSpecPoint;
+
+typedef struct StixDetSpec {
+    uint8_t kind;               /* StixDetSpecKind */
+    bool align;                 /* effective: the step's, else the tape's */
+    double v0, v1;              /* line: v0; flat_kev: [v0, v1) keV */
+    StixDetSpecPoint *pts;      /* file: owned copy, 1..4096 points */
+    uint32_t n_pts;
+    char *desc;                 /* trace/hw-state text (no comma) */
+} StixDetSpec;
+
+#define STIX_DET_SPEC_MAX_POINTS 4096u
+#define STIX_DET_SPEC_MAX_FILE (256u * 1024u)
+
 /* one tape step (S1): kind rate|replay|off (single is S3), fpga_det/pix
  * masks, cps; label is optional. The fpga_det_mask/pix_mask bits are
- * fpga_det/pix indexed (plan T1). */
+ * fpga_det/pix indexed (plan T1). S2: spec (zero = FLAT). */
 typedef struct StixDetTapeStep {
     uint8_t kind;               /* StixDetTapeKind */
     double for_s;               /* 0.1..86400 s on guest time */
@@ -126,6 +161,7 @@ typedef struct StixDetTapeStep {
     uint32_t pix_mask;          /* 0..0xFFF, pix bits */
     uint32_t cps;               /* counts/s per fpga_det (rate steps) */
     char *label;                /* optional, <= 64 chars */
+    StixDetSpec spec;           /* S2: the rate step's spectrum */
 } StixDetTapeStep;
 
 /* the tape's state word (det-tape-status, hw-state det.tape.state) */
@@ -350,6 +386,13 @@ typedef struct StixDetState {
     bool adc_map_armed;         /* rebuild at the next classification point */
     double adc_map[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
                   [STIX_DET_N_EBIN][STIX_DET_N_EBIN];
+    /*
+     * S2: the aligned keV specs' preimage misses of the running step's
+     * last row build — one per (pair, ebin) whose honoured row has no
+     * adc for that ebin (the mass is dropped). A gauge: reset at every
+     * step start and at each build (det-align-status preimage_miss).
+     */
+    uint32_t spec_preimage_miss;
 } StixDetState;
 
 bool stix_det_realize(StixDetState *d, STIXCTRL *owner, stixCtrlRegs_s *reg,

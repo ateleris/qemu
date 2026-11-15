@@ -75,6 +75,7 @@ stixdet_tape_load(const char *name, uint32_t n_steps, int loop, int align, int64
 stixdet_tape_step(uint32_t index, const char *kind, const char *label, int64_t vclock_ns) "tape step %u kind=%s label='%s' at vclock_ns=%" PRId64
 stixdet_align(uint32_t rows, uint32_t fallback, uint32_t honoured, uint32_t mismatch_cells, int64_t vclock_ns) "ELUT align: rows=%u fallback=%u honoured=%u mismatch_cells=%u at vclock_ns=%" PRId64
 stixdet_adc_map(uint32_t rows, uint32_t nonidentity_rows, int64_t vclock_ns) "ADC bin-mass map: rows=%u nonidentity_rows=%u at vclock_ns=%" PRId64
+stixdet_spectrum(uint32_t step, const char *spec, int64_t vclock_ns) "spectrum step %u: %s at vclock_ns=%" PRId64
 
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"

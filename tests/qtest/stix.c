@@ -9538,8 +9538,8 @@ static void test_det_tape_props(void)
     json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
                            "[{\"kind\": \"rate\", \"for_s\": 0.1, "
                            "\"fpga_det_mask\": 1, \"cps\": 1, "
-                           "\"spec\": {\"line_adc\": 1000}}]}");
-    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* S2 spec */
+                           "\"spec\": {\"line_adc\": 4096}}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* S2 range */
     g_free(json);
     json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
                            "[{\"kind\": \"single\", \"for_s\": 0.1, "
@@ -9998,13 +9998,13 @@ static void test_det_align_status(void)
     g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
                     "mode=on,rows=384,fallback=0,honoured=0,"
                     "mismatch_cells=0,unassigned_cells=0,calibration="
-                    "none");
+                    "none,preimage_miss=0");
     idefx_power_all(qts);
     sky_start(qts, 9, 0xFFF);           /* the edge classifies */
     g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
                     "mode=on,rows=384,fallback=384,honoured=0,"
                     "mismatch_cells=0,unassigned_cells=0,calibration="
-                    "none");
+                    "none,preimage_miss=0");
 
     /* one honoured row: the next swap classifies it honoured */
     memset(row, 0, 4096);
@@ -10014,7 +10014,7 @@ static void test_det_align_status(void)
     g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
                     "mode=on,rows=384,fallback=383,honoured=1,"
                     "mismatch_cells=0,unassigned_cells=0,calibration="
-                    "none");
+                    "none,preimage_miss=0");
     qtest_quit(qts);
     stix_qtest_cleanup();
 
@@ -10032,7 +10032,18 @@ static void test_det_align_status(void)
     g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
                     "mode=off,rows=384,fallback=0,honoured=0,"
                     "mismatch_cells=0,unassigned_cells=0,calibration="
-                    "none");
+                    "none,preimage_miss=0");
+    {
+        /* S2: the line is exactly 8 key=value fields */
+        g_autofree char *line = sky_get_str(qts, "det-align-status");
+        g_auto(GStrv) kv = g_strsplit(line, ",", -1);
+        guint k;
+
+        g_assert_cmpuint(g_strv_length(kv), ==, 8);
+        for (k = 0; kv[k]; k++) {
+            g_assert_nonnull(strchr(kv[k], '='));
+        }
+    }
     qtest_quit(qts);
     stix_qtest_cleanup();
     unlink(log);
@@ -10500,6 +10511,261 @@ static void test_det_adc_guard(void)
     stix_qtest_cleanup();
 }
 
+/* ---- S2: spectra (2026-11-15-spectra-plan.md) ---- */
+
+/* qom-set det-tape-load; returns the QMP error desc (NULL on success) */
+static char *det_spec_load(QTestState *qts, const char *json)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'det-tape-load', 'value': %s}}",
+                            SKY_CTRL_PATH, json);
+    QDict *err = qdict_get_qdict(resp, "error");
+    char *desc = err ? g_strdup(qdict_get_try_str(err, "desc")) : NULL;
+
+    qobject_unref(resp);
+    return desc;
+}
+
+/* a spectrum CSV @name in @dir holding @text (@len bytes, -1 = strlen) */
+static char *det_spec_csv(const char *dir, const char *name,
+                          const char *text, gssize len)
+{
+    char *path = g_build_filename(dir, name, NULL);
+
+    g_assert_true(g_file_set_contents(path, text, len, NULL));
+    return path;
+}
+
+/* a one-step rate tape (fpga_det 0, 1 cps) with the step's extra
+ * @fields (its spec/align), tape align @tape_align */
+static char *det_spec_tape1(bool tape_align, const char *fields)
+{
+    return g_strdup_printf("{\"api\": 1, \"name\": \"spec\", \"align\": "
+                           "%s, \"steps\": [{\"kind\": \"rate\", "
+                           "\"for_s\": 0.1, \"fpga_det_mask\": 1, "
+                           "\"cps\": 1, %s}]}",
+                           tape_align ? "true" : "false", fields);
+}
+
+/*
+ * det-spec-props (U1): the S2 rule table at load. Every rejected
+ * vector is a failed det-tape-load naming the step, and leaves the
+ * previous tape intact (det-tape-status unchanged); every accepted one
+ * loads (state=ready). The vectors are shared with the platform's
+ * tapes_spec / tapes_spec_csv self-tests, same order.
+ * RED on the parent binary: every S2 shape is refused there.
+ */
+static void test_det_spec_props(void)
+{
+    static const char *const bad_json[] = {
+        "\"spec\": {\"line\": 1}",
+        "\"spec\": {\"line_adc\": 1600, \"line_kev\": 62}",
+        "\"spec\": {}",
+        "\"spec\": \"line\"",
+        "\"spec\": [1]",
+        "\"spec\": {\"line_adc\": 4096}",
+        "\"spec\": {\"line_adc\": -1}",
+        "\"spec\": {\"line_adc\": 1600.0}",
+        "\"spec\": {\"line_adc\": \"1600\"}",
+        "\"spec\": {\"line_kev\": -1}",
+        "\"spec\": {\"line_kev\": \"62\"}",
+        "\"spec\": {\"flat_kev\": [60, 40]}",
+        "\"spec\": {\"flat_kev\": [40]}",
+        "\"spec\": {\"flat_kev\": [-1, 5]}",
+        "\"spec\": {\"line_kev\": 62}, \"align\": \"yes\"",
+        "\"spec\": {\"line_adc\": 1600}, \"align\": true",
+        "\"spec\": \"flat\", \"align\": true",
+        "\"spec\": {\"file\": \"\"}",
+    };
+    /* the file vectors: content, NULL = the special cases below */
+    static const char *const bad_csv[] = {
+        "energy,weight\n1600,1\n",
+        "1600,1\n",
+        "adc,weight\n",
+        "adc,weight\n1600,1,2\n",
+        "adc,weight\n1600, 1\n",
+        "adc,weight\n1600,nan\n",
+        "adc,weight\n1600,inf\n",
+        "adc,weight\n1600,1e999\n",
+        "adc,weight\n0x10,1\n",
+        "adc,weight\n+5,1\n",
+        "adc,weight\n1600,-1\n",
+        "adc,weight\n1600,0\n2000,0\n",
+        "adc,weight\n4096,1\n",
+        "adc,weight\n1600,1\n\n2000,1\n",
+    };
+    static const char *const good_json[] = {
+        "\"spec\": \"flat\"",
+        "\"spec\": {\"line_adc\": 0}",
+        "\"spec\": {\"line_adc\": 4095}",
+        "\"spec\": {\"line_kev\": 0}",
+        "\"spec\": {\"line_kev\": 159.9}",
+        "\"spec\": {\"line_kev\": 170}",
+        "\"spec\": {\"flat_kev\": [40, 161]}",
+        "\"spec\": {\"flat_kev\": [0, 160]}",
+        "\"spec\": {\"line_kev\": 62}, \"align\": true",
+    };
+    static const char *const good_csv[] = {
+        "kev,weight\n160,1\n",
+        "kev,weight\r\n62,1\r\n121,1\r\n",
+        "adc,weight\n1600,1",
+    };
+    QTestState *qts = stix_qtest_new();
+    g_autofree gchar *dir = g_dir_make_tmp("stix-det-spec-XXXXXX", NULL);
+    g_autofree char *keeper = NULL, *status0 = NULL, *path = NULL;
+    g_autofree char *big = NULL;
+    GString *rows = g_string_new("adc,weight\n");
+    char *json, *desc, *fields, *st;
+    size_t i;
+
+    g_assert_nonnull(dir);
+    keeper = g_strdup_printf("{\"api\": 1, \"name\": \"keeper\", "
+                             "\"steps\": [%s]}",
+                             det_tape_rate_step("4095", 100, "1"));
+    g_assert_null(det_spec_load(qts, keeper));
+    status0 = sky_get_str(qts, "det-tape-status");
+
+#define DET_SPEC_REFUSE(json_) do { \
+        desc = det_spec_load(qts, (json_)); \
+        g_assert_nonnull(desc); \
+        g_test_message("refused: %s", desc); \
+        g_assert_nonnull(strstr(desc, "step 0")); \
+        st = sky_get_str(qts, "det-tape-status"); \
+        g_assert_cmpstr(st, ==, status0); \
+        g_free(st); \
+    } while (0)
+
+    /* the JSON vectors */
+    for (i = 0; i < ARRAY_SIZE(bad_json); i++) {
+        json = det_spec_tape1(false, bad_json[i]);
+        DET_SPEC_REFUSE(json);
+        g_free(desc);
+        g_free(json);
+    }
+    /* a line_adc spec on an off step */
+    DET_SPEC_REFUSE("{\"api\": 1, \"name\": \"t\", \"steps\": [{\"kind\": "
+                    "\"off\", \"for_s\": 0.1, \"fpga_det_mask\": 1, "
+                    "\"spec\": {\"line_adc\": 1600}}]}");
+    g_free(desc);
+
+    /* align true on an adc,weight file (the model sees the unit) */
+    path = det_spec_csv(dir, "adc.csv", "adc,weight\n1600,1\n", -1);
+    fields = g_strdup_printf("\"spec\": {\"file\": \"%s\"}, \"align\": "
+                             "true", path);
+    json = det_spec_tape1(false, fields);
+    DET_SPEC_REFUSE(json);
+    g_assert_nonnull(strstr(desc, "align applies to keV specs"));
+    g_free(desc);
+    g_free(json);
+    g_free(fields);
+    g_unlink(path);
+    g_clear_pointer(&path, g_free);
+
+    /* a missing path: the error names it */
+    path = g_build_filename(dir, "missing.csv", NULL);
+    fields = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", path);
+    json = det_spec_tape1(false, fields);
+    DET_SPEC_REFUSE(json);
+    g_assert_nonnull(strstr(desc, path));
+    g_free(desc);
+    g_free(json);
+    g_free(fields);
+    g_clear_pointer(&path, g_free);
+
+    /* a 262145-byte file (one past the cap), refused before reading */
+    big = g_malloc(262145);
+    memset(big, '1', 262145);
+    memcpy(big, "adc,weight\n", 11);
+    path = det_spec_csv(dir, "big.csv", big, 262145);
+    fields = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", path);
+    json = det_spec_tape1(false, fields);
+    DET_SPEC_REFUSE(json);
+    g_assert_nonnull(strstr(desc, "256 KiB"));
+    g_free(desc);
+    g_free(json);
+    g_free(fields);
+    g_unlink(path);
+    g_clear_pointer(&path, g_free);
+
+    /* 4097 rows */
+    for (i = 0; i < 4097; i++) {
+        g_string_append(rows, "1,1\n");
+    }
+    path = det_spec_csv(dir, "rows.csv", rows->str, rows->len);
+    fields = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", path);
+    json = det_spec_tape1(false, fields);
+    DET_SPEC_REFUSE(json);
+    g_assert_nonnull(strstr(desc, "line 4098"));
+    g_free(desc);
+    g_free(json);
+    g_free(fields);
+    g_unlink(path);
+    g_clear_pointer(&path, g_free);
+
+    /* the content vectors */
+    for (i = 0; i < ARRAY_SIZE(bad_csv); i++) {
+        path = det_spec_csv(dir, "bad.csv", bad_csv[i], -1);
+        fields = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", path);
+        json = det_spec_tape1(false, fields);
+        DET_SPEC_REFUSE(json);
+        g_assert_nonnull(strstr(desc, path));
+        g_free(desc);
+        g_free(json);
+        g_free(fields);
+        g_unlink(path);
+        g_clear_pointer(&path, g_free);
+    }
+
+    /* a path holding a comma (the file itself is valid) */
+    path = det_spec_csv(dir, "a,b.csv", "adc,weight\n1600,1\n", -1);
+    fields = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", path);
+    json = det_spec_tape1(false, fields);
+    DET_SPEC_REFUSE(json);
+    g_free(desc);
+    g_free(json);
+    g_free(fields);
+    g_unlink(path);
+    g_clear_pointer(&path, g_free);
+#undef DET_SPEC_REFUSE
+
+    /* the accepted vectors */
+    for (i = 0; i < ARRAY_SIZE(good_json); i++) {
+        json = det_spec_tape1(false, good_json[i]);
+        desc = det_spec_load(qts, json);
+        g_assert_null(desc);
+        st = det_tape_field(qts, "state");
+        g_assert_cmpstr(st, ==, "ready");
+        g_free(st);
+        g_free(json);
+    }
+    for (i = 0; i < ARRAY_SIZE(good_csv); i++) {
+        path = det_spec_csv(dir, "good.csv", good_csv[i], -1);
+        fields = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", path);
+        json = det_spec_tape1(false, fields);
+        desc = det_spec_load(qts, json);
+        g_assert_null(desc);
+        g_free(json);
+        g_free(fields);
+        g_unlink(path);
+        g_clear_pointer(&path, g_free);
+    }
+    /* tape align true with a line_adc step: ignored there */
+    json = det_spec_tape1(true, "\"spec\": {\"line_adc\": 1600}");
+    desc = det_spec_load(qts, json);
+    g_assert_null(desc);
+    st = det_tape_field(qts, "align");
+    g_assert_cmpstr(st, ==, "true");
+    g_free(st);
+    g_free(json);
+
+    g_string_free(rows, true);
+    g_rmdir(dir);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
 static void stix_det_tape_register(void)
 {
     /* S1: the mix tape */
@@ -10520,6 +10786,8 @@ static void stix_det_tape_register(void)
                    test_det_adc_map_invalidate);
     qtest_add_func("/sparc/stix/det-adc-props", test_det_adc_props);
     qtest_add_func("/sparc/stix/det-adc-guard", test_det_adc_guard);
+    /* S2: spectra */
+    qtest_add_func("/sparc/stix/det-spec-props", test_det_spec_props);
 }
 
 
