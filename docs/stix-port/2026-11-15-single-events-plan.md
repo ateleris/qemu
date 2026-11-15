@@ -119,7 +119,8 @@ Read in this worktree unless marked UNVERIFIED.
   0-based ebin (`:101-106`); an SSID 32 sample is the subcol byte,
   then ebins 0..31, trigger, offset (`:155`, `:270-279`), so "byte 3"
   is **ebin 2**. The S0 compressor (`:165-175`):
-  `s0_compress(1000) = 0x47`, `s0_compress(500) = 0x3F`.
+  `s0_compress(1000) = 0x3F` (decodes to [960, 1024)), `s0_compress(500) = 0x37`
+  (ql-check.py:165-184; §36's 250-count deposit measured 0x2F).
 - **The gate's ELUT (lesson 1 continued).** The outline's gate ebin is
   ebin 2 for `det(22, 0, 2200)`: that holds **only** for the
   degenerate-row state with the gate's dssevs baselines
@@ -206,9 +207,9 @@ setters store fields only and the tick applies them;
   open otherwise). Nothing is changed about F6.
 - **Lesson 6 (evidence, relative thresholds).** A single step draws
   no RNG: its counts are exact, and so is the compressed byte —
-  `s0_compress(1000) = 0x47` — but the gate's threshold stays the
-  outline's `0x3F` = S0 of `n/2` (robust to the background's ≈ 3
-  counts; the measured byte is logged). `single-chunk`'s window
+  `s0_compress(1000) = 0x3F` — but the gate's floor is `0x37` = S0 of
+  `n/2` (robust to the background's ≈ 3 counts; the measured byte,
+  expected 0x3F, is logged). `single-chunk`'s window
   `[1000, 1250]` derives from n and the background's worst nominal
   integration (bounded and logged). Every check logs the bytes,
   status lines and trace lines it decides on; a failed live run is
@@ -328,7 +329,7 @@ setters store fields only and the tick applies them;
   | `adc` / `ebin` | exactly one required: `adc` a JSON integer 0..4095, `ebin` a JSON integer 0..31; both present or both absent refused |
   | `n` | required, JSON integer 1..1000000 |
   | `wait_us` | optional, JSON integer 1..10000, default 20 |
-  | `for_s` | the common 0.1..86400 rule **plus** the coverage rule `for_s ≥ n·wait_us / 1e6` (error "for_s %g s does not cover n·wait_us = %g s"; orchestrator call, open question 1) |
+  | `for_s` | the common 0.1..86400 rule **plus** the coverage rule against the quantized duration: `n·wait_us ≤ stix_det_tape_step_ticks(for_s)·100000` (error "for_s %g s (%u ticks) does not cover n·wait_us = %g s"; orchestrator call, open question 1) |
   | `spec` | refused on single (any value, `"flat"` included: "a single step takes no spec") |
   | `align` | optional bool, default the tape's; an explicit `true` only with `ebin` ("align applies to ebin singles") |
   | `label` | the common rule (≤ 64 bytes, no comma) |
@@ -338,9 +339,12 @@ setters store fields only and the tick applies them;
   S2).
 - `StixDetState` gains `uint32_t single_next, single_dropped;` (the
   schedule cursor and the pix-gate drop gauge; `single_next` ≤ 1e6
-  fits). Both reset at every step start in
+  fits). `single_next` resets at every step start in
   `stix_det_tape_apply_step` (next to the `spec_preimage_miss`
-  reset, `:2823`).
+  reset, `:2823`); `single_dropped` resets only when playback starts
+  (`det-tape-play true` applied at the tick, and at a loop restart),
+  so it sums the whole play and a status read after the burst's step
+  still holds it (plan review M2).
 - `det-tape-status` gains a trailing `,dropped=%u` (formatter
   `:3680`); hw-state `det.tape` gains `dropped` (`:4581-4608`). Both
   additive (lesson 2's consumer list).
@@ -361,6 +365,7 @@ Steps:
     `align: true` with `adc`; `align: "yes"`;
   - coverage: `n` 1000000, `wait_us` 10000, `for_s` 0.1 (needs
     10000 s); `n` 6000, `wait_us` 20, `for_s` 1 (needs 1.2 s);
+    `n` 6000, `wait_us` 20, `for_s` 0.12 (rounds to 1 tick, needs 2);
   - accepted (each loads, `state=ready`): the outline's mono hint
     `{"fpga_det": 22, "pix": 0, "adc": 1000, "n": 1000}`;
     `n` 1000000 with `for_s` 10000, `wait_us` 10000; `wait_us`
@@ -469,14 +474,15 @@ on the tick after a swap as `det-tape-rate` does):
   - step 2 `{"fpga_det": 22, "pix": 0, "adc": 2200, "n": 20000,
     "wait_us": 20, "for_s": 0.5}`: the trace holds four lines with
     n 5000 each; the bank holds 20000 at the same cell; LTRG grp 11
-    = 25000.
-  - step 3 `{"fpga_det": 2, "pix": 0, "ebin": 7, "for_s": 0.2}`
+    = 25000 (4 × (5·5000+2)/4; the test pins a QL period that holds
+    all four burst ticks, `det_start(qts, 39)` as det-inject-chunk).
+  - step 3 `{"fpga_det": 2, "pix": 0, "ebin": 7, "n": 1000, "for_s": 0.2}`
     (align off, the wrong row): the bank holds ebin 7 = n (a direct
     science-space deposit — the det-inject semantics; with
     `det-adc-mode` on it still lands at 7, single counts never
     fold).
-  - step 4 `{"fpga_det": 2, "pix": 0, "ebin": 12, "align": true,
-    "for_s": 0.2}` (the no-12 row: no adc maps to ebin 12): nothing
+  - step 4 `{"fpga_det": 2, "pix": 0, "ebin": 12, "n": 1000,
+    "align": true, "for_s": 0.2}` (the no-12 row: no adc maps to ebin 12): nothing
     lands, `det-align-status` ends `preimage_miss=1` and starts
     `mode=off` (lesson 2); the trace line carries ebin −1, n = the
     step's n.
@@ -489,9 +495,11 @@ on the tick after a swap as `det-tape-rate` does):
     bank is unchanged (the deposit is added after the fold; no
     double fold).
 - [ ] qtest `det-single-gated` (RED on the V1 binary): as step 1 but
-  with R3 = 63 written for pix 1's `asic_ch` on fpga_det 22
-  (`idefx_write_reg(qts, 9, 0, 3, r3, sizeof(r3))`, the
-  `det-counts-r3` pattern) and the step on pix 1: the bank total is
+  with R3 = 63 written for pix 1's `asic_ch` (15,
+  `utils_pixelId2channelId[1]`) on fpga_det 22's grp 11
+  (`sky_r3_wire(r3, 15, 63)` then
+  `idefx_write_reg(qts, 11, 0, 3, r3, sizeof(r3))` — grp 11, not
+  det-inject-gated's grp 9) and the step on pix 1: the bank total is
   exactly 0, `det-tape-status` (read while the step runs) ends
   `dropped=<n>`, the trace still holds the batch line with ebin −1
   (the schedule ran; the gate dropped the mass). A control run with
@@ -616,8 +624,9 @@ no change: `--ssid32-inject` is the byte check).
   `det-quiet-cps=0`; the trace events list adds `stixdet_single`,
   `stixdet_tape_step`, `stixdet_chunk`.
 - **The timeline** (seconds from the TMTC connect; the default
-  mode's times, no shift): @50 CONF, @60 S20 = 0, @62 the
-  verification period, @70 NOMINAL (T_nom), @76 QMP `det-tape-load` +
+  mode's times, no shift, `AT_CONF2=215`, probe `DURATION` 240 s):
+  @50 CONF, @60 S20 = 0, @62 the
+  verification period, @70 NOMINAL (T_nom ∈ [70, 80]), @76 QMP `det-tape-load` +
   `det-tape-play true` (inside the T_nom ± 10 s window, so the burst
   is inside the first 8 QL periods the SSID 32 dump sums):
   `{"api": 1, "name": "gate-det-single", "background": {"cps": 20},
@@ -628,27 +637,28 @@ no change: `--ssid32-inject` is the byte check).
   The 20 cps background exists for the flush evidence only (lesson
   4: `--expect-tape-flush` needs SSID 31 and 33 non-zero; a one-pair
   burst never lights them); its ebin-2 share on any sample is ≈ 3
-  counts (S0 ≤ 0x03), stated in the check's comment. @78 QMP
-  `qom-get det-tape-status` (during the step: the burst landed in
-  the start tick, the gauge holds). @300 CONF (T_exit) + the
-  five-product flush; hold to the default duration (240 s).
+  counts (S0 ≤ 0x03), stated in the check's comment. @100 QMP
+  `qom-get det-tape-status` (T_nom ≤ 80, so by @100 the 4 s burst
+  step has run and the 30 s off step is playing: `step=2/2`;
+  `dropped` sums the whole play). @215 CONF (T_exit) + the
+  five-product flush; the probe ends at the default 240 s.
 - **Checks** (each echoes what it decided on):
   - base: probe, UART, `trace-verif`, `uart-chunk`, and the flush
     with `--expect-tape-flush (T_exit − T_nom)`; the D-5 chunk
     checks are skipped as in the tape modes.
-  - `single-status`: the @78 return ends `dropped=0` (negative:
-    `dropped=1000`) and holds `state=playing`, `step=1/2`; echoed.
+  - `single-status`: the @100 return ends `dropped=0` (negative:
+    `dropped=1000`) and holds `state=playing`, `step=2/2`; echoed.
   - `single-trace`: the trace file holds `stixdet_tape_step 0
     kind=single` after the enabling `stixdet_fsm_strobe`, and the
     `stixdet_single` lines after it sum to n = 1000 with
     `fpga_det 22 pix 0 adc 2200` and ebin 2 (negative: ebin −1; the
     sum is still 1000).
-  - `single-byte`: `ql-check.py --ssid32-inject 19 2 0x3F 0x10` on
+  - `single-byte`: `ql-check.py --ssid32-inject 19 2 0x37 0x10` on
     the exit dump — subcol 19 = `SUBCOL_FROM_FPGA_DET[22]`
     (verified, lesson 1), ebin 2 (byte 3; the degenerate-row
     fallback with base 2020 puts adc 2200 there:
-    `floor(180·32/2076) = 2`), the floor 0x3F = S0 of n/2 (the
-    exact expected byte is 0x47 = S0 of 1000, logged), every other
+    `floor(180·32/2076) = 2`), the floor 0x37 = S0 of n/2 (the
+    exact expected byte is 0x3F = S0 of 1000, logged), every other
     sample's ebin-2 byte < 0x10 (the background floor, ≈ 3 counts).
   - `single-chunk`: in the trace, the first `stixdet_chunk` line
     after the last `stixdet_single` line has
@@ -676,7 +686,7 @@ no change: `--ssid32-inject` is the byte check).
   ebin 2 or the chunk — the intended evidence, never vacuous
   (lesson 3).
 - `--dry-run --single` prints the QEMU and probe lines (the @76 tape
-  JSON and the @78 status read visible); the reviewer runs both
+  JSON and the @100 status read visible); the reviewer runs both
   legs.
 
 Steps:
@@ -765,7 +775,7 @@ step).
   counts" is asserted cell-exactly in `det-single-land`'s chunk leg;
   in the gate the chunk payload is not TM-visible, so the evidence
   is the `stixdet_chunk` trace's `eacc_events` window (V4), and the
-  outline's SSID 32 byte check is `--ssid32-inject 19 2 0x3F 0x10`
+  outline's SSID 32 byte check is `--ssid32-inject 19 2 0x37 0x10`
   (the D-6 check reused with new numbers).
 - **D-c.** The coverage rule (`for_s ≥ n·wait_us`, refused at load)
   is an orchestrator call the outline is silent on (open question
@@ -810,3 +820,36 @@ step).
    mass in the trace's ebin −1 (recommended; a mixed gauge would
    blur the F6 evidence); (b) yes, with the trace distinguishing
    the two (a second trace field or a second gauge).
+
+## Plan review (2026-11-15, GLM, findings folded in)
+
+- B1 (blocker): the unshifted mode's CONF is @215 with a 240 s probe
+  (`detector-smoke.sh:422-428`); the V4 timeline now says so (was
+  "@300 CONF … hold 240 s"). The gates2 legs keep 300 s as margin.
+- M2: T_nom is only bounded to [70, 80]; the @78 status read could see
+  `state=ready`. Fixed by reading @100 and resetting `single_dropped`
+  at play start, not at step start (the burst stays DSS-faithful:
+  1000 × 20 µs in one tick).
+- M3: S0 constants corrected (`s0(1000) = 0x3F`, `s0(500) = 0x37`);
+  the byte floor is 0x37.
+- M4: the coverage rule is checked against the quantized tick count
+  (`stix_det_tape_step_ticks` rounds to nearest); the UI/DSS composer
+  sets `for_s = max(0.1, ceil(n·wait_us / 100000) / 10)`.
+- M5: V1/V3 must carve single out of S2's "align applies to keV specs"
+  refusal (`stix_det_spec_parse` `stix_det.c:3309-3314`, run after the
+  single branch; `tapes.py _spec` `:118-121`): on a single step `align`
+  is decided by V1's table, and `spec` is refused before `_spec` runs.
+- M6: det-single-gated writes grp 11 / asic_ch 15 (fixed above).
+- m7: det-single-land steps 3/4 gain `n`; step 2 pins the QL period.
+- m8: the SSID 32 window: the live records (D-3's exit dump, §36's
+  T_nom+5..15 deposit seen at exit) say the exit dump holds one
+  offset-0 sample per subcol summing from T_nom; statically
+  `QLSpectra.c:127-181` could restart accumulation, which would make
+  `--ssid32-inject` (exactly one product) fail. The live gate is the
+  evidence; a failure there is investigated against that code, not
+  re-timed blindly.
+- m9: the kind-name table is `stix_det.c:2731-2736` (already reports
+  `single`); `tapes.py` must refuse adc+ebin both present (today it
+  ignores the second); `spec` on single is refused before `_spec`;
+  `det.tape.dropped` goes into `state.py`'s VOLATILE set so the live
+  readout does not lag.
