@@ -2,15 +2,19 @@
 
 > For agentic workers: implement task by task; steps use `- [ ]`.
 > Workers cannot build or run anything: write code + self-test cases,
-> the reviewer runs them and commits. S1 and the alignment track are
-> written in full; S2/S3 are outlined with their wire interfaces fixed
-> (the keV ↔ ebin calibration is open question 5).
+> the reviewer runs them and commits. S1, the alignment track and the
+> ADC-faithful sky mode (stage C) are written in full; S2/S3 are
+> outlined with their wire interfaces fixed (the keV ↔ adc law is the
+> stage-C calibration, decisions D1/D5).
 
 **Goal:** the Detectors → Stimulus board gets per-detector and per-pixel
 rate stimulus driven by JSON "mix tapes" played on guest time, and —
 opt-in, first-class — ELUT alignment between the flight software's
 loaded ELUT and the detector simulation, so ADC-domain counts land in
-the intended science bins whatever ELUT the FSW loaded.
+the intended science bins whatever ELUT the FSW loaded. An optional
+ADC-faithful sky mode (`det-adc-mode`, default off, stage C) draws the
+synthetic sky and the ROTB chunk fill through the loaded ELUT, so a
+misaligned ELUT miscounts the sky exactly as on hardware.
 
 **Architecture:** the tape engine and the per-(fpga_det, pix) rate state
 live in `stix_det.c` on the existing 100 ms tick (absolute virtual-clock
@@ -22,7 +26,9 @@ writes an ELUT CSV from the sim's per-detector baseline law for the
 existing `elut-upload.py` chain, (c) an alignment classification + report
 in the model exposed through hw-state and a gate, and (a) a per-step
 `align` option that converts science-space (ebin/keV) stimuli to ADC
-through the preimage of the loaded ELUT (consumed by S2/S3).
+through the preimage of the loaded ELUT (consumed by S2/S3); stage C
+folds the drawn sky through the loaded ELUT with a cached per-row
+bin-mass map (default off).
 
 **Spec/inputs (owner decisions, 2026-11-15, verbatim):**
 
@@ -39,6 +45,12 @@ through the preimage of the loaded ELUT (consumed by S2/S3).
   simulation. Because right now, as I've seen in the test I did for the
   rotating fill level, if the flight software doesn't have the properly
   configured ELUT that matches the DSS, I don't count properly."
+
+Second pass (2026-11-15, recorded as decisions D1–D7 in "Owner
+decisions"): the ADC-faithful sky is approved as an optional mode
+(default off; the synthetic sky and the ROTB chunk path draw ADC
+values through a per-pixel simulation calibration, then bin through
+the loaded FPGA ELUT); DG1–DG4 are dropped from the board.
 
 Other inputs: the mockup boards (scratchpad copies outside the repo:
 `/tmp/claude-1000/-home-laszlo-dev-qemu/4272697f-b4b3-4e8f-ab5f-
@@ -73,9 +85,9 @@ subcol), the scene panel (Source synthetic/zero/replay-dss, quiet/
 flare cps, Flare on, Apply / Apply at…), the DSS replay panel (file
 select, Start/Stop, "idle · events 0 · dropped 0 · unsupported 0"),
 the detector map whose pair tiles repeat a per-quarter group digit 1-4
-(detector 22's side panel reads "Detector group DG3" — see open
-question 2), and the pixel panel "pixel / ASIC channel (DSS
-numbering)" with "0/26"-style labels. Docs:
+(detector 22's side panel reads "Detector group DG3" — mockup-only
+labels; the board drops DG, decision D2), and the pixel panel "pixel /
+ASIC channel (DSS numbering)" with "0/26"-style labels. Docs:
 `2026-11-11-detector-plan.md` (index spaces, D-Df/D-Dk),
 `2026-11-11-elut-plan.md` (E-1/E-2/E-4), `accepted-diffs.md` §34–§38,
 §40, `platform.md` (state tree, verbs, timeline),
@@ -186,9 +198,9 @@ identity), `subcol` 0-31 (ICD number − 1, the TM index), `pix` 0-11,
 `quarter` = grp/4. Q1+Q3 = grp 0-3, 8-11 = fpga_det 0-7, 16-23 = mask
 0x00FF00FF (16 detectors, the mockup's example). The UI numbering
 toggle (DSS / FSW / sub-collimator, `Detectors.dc.html:114-118`) maps
-DSS = fpga_det, FSW/sub-collimator = subcol. **UNVERIFIED:** the
-DG1–DG4 → fpga_det grouping (front-end detector groups; no DG concept
-exists in the FSW) — open question 2.
+DSS = fpga_det, FSW/sub-collimator = subcol. DG1–DG4: the mockup's
+front-end group chips have no FSW concept behind them (the only 4×8
+grouping is the quarters) — the board drops them (decision D2).
 
 **Performance context.** icount 7 + the AX-like CPU is the calibrated
 bench (Amendment C.6, `2026-11-14-rotb-fill-plan.md:569-596`); at
@@ -210,10 +222,10 @@ controller-scheduled.
   fields only; no MMIO dispatch from timer or QMP context.
 - Guest-time scheduling only: no wall clock in model or gate timing
   (the §41 monotonic-stamp rule for gates).
-- The synthetic sky stays an ebin-space source (§34 deviation stands);
-  alignment never changes its default path, only opt-in per tape. (An
-  optional ADC-domain sky mode is open question 1 — default off, not
-  planned until the owner answers.)
+- The synthetic sky stays an ebin-space source by default (§34
+  deviation stands); alignment never changes its default path, only
+  opt-in per tape. The ADC-faithful sky (stage C, decision D1) is
+  opt-in and default off: no existing gate or golden changes.
 - Tapes and derived CSVs live in run dirs / the tapes dir; the user's
   `.dssevs` is never copied into the repo; CSVs are referenced by path
   (D-Ed).
@@ -237,7 +249,7 @@ controller-scheduled.
    table per step: exact but makes tapes huge and the UI unusable.
    (ii) `fpga_det_mask` + `pix_mask` + one cps per step, with the
    background layer filling unmasked pairs (recommended; the UI
-   translates Q1-Q4/DG/pixel picks into masks). Chosen.
+   translates Q1-Q4/pixel picks into masks). Chosen.
 3. **Which alignment pieces.** (a) only — model converts science-space
    stimuli through the inverse loaded ELUT: helps only *specified*
    stimuli, does nothing for the replay, and silently mis-bins if used
@@ -251,6 +263,18 @@ controller-scheduled.
    fields `"align"` (tape-level default) and per-step science-space
    `spec`/`ebin`; platform verb `det.align.set {enabled}`; gate
    `align-smoke.sh`. The ebin-space sky stays as recorded in §34.
+4. **How the ADC-faithful sky draws (decision D1, stage C).** (i) A
+   per-event adc draw in the tick: rejected — the tick's cost is per
+   (fpga_det, pix, profile) exposure, and 20000 cps over 384 pairs is
+   ~2 M draws per guest second, with a changed RNG stream. (ii) A
+   cached per-row bin-mass map: the tick keeps its ebin-space exposure
+   and per-ebin Poisson draws; at the draw each ebin's mass folds
+   through the loaded ELUT row by a precomputed 32×32 fraction table,
+   rebuilt once per ELUT/calibration change (one classify-sized pass),
+   integer largest-remainder splits, no new RNG. Chosen. (iii)
+   Poisson per destination ebin at the swap: rejected — it doubles the
+   draws and loses the mode-off = mode-on total invariant the qtests
+   pin.
 
 ## Review focus (each pinned to a task's test)
 
@@ -276,7 +300,26 @@ controller-scheduled.
    across subcol make D-Eg exit 2 ("cannot detect a mapping bug"). The
    gate's synthetic file therefore uses distinct per-detector baselines,
    and `elut-derive.py --self-test` pins the predicted differing-row
-   counts. Pinned: `test-elut-derive.sh` case 4.
+   counts. Real uniform-baseline files are checked with the new
+   explicit `check-dump --skip-sensitivity` (decision D7). Pinned:
+   `test-elut-derive.sh` case 4.
+6. **ADC mode default-off is load-bearing.** §34 and every gate assume
+   the sky bypasses the ELUT; the mode must add no RNG draws and no
+   folds when off. Pinned: `det-adc-off` (the `det-counts-seed`
+   stimulus, same bank values; knob changes do not perturb it).
+7. **The bin-mass map tracks the ELUT SRAM.** A stale map after a
+   TC(237,8) apply would silently misbin — the bug class the mode
+   exists to expose. Pinned: `det-adc-map-invalidate` (row rewritten
+   mid-run → the next swap moves) and C3's aligned leg (mismatch → 0
+   after derive/upload).
+8. **The map build stays in established contexts.** Guest-memory reads
+   via `memory_region_get_ram_ptr` only where the classification
+   already reads (SetEnable edge, QL swap, the `replay_class_pending`
+   tick) under the tick's `mem_reentrancy_guard`; integer splits and
+   the existing PRNG only, so icount and wall-clock behaviour are
+   unchanged. Pinned: `det-adc-guard` (the `det-tape-guard` pattern
+   with the mode on) and C3's twice-run aligned leg (byte-identical
+   SSID 32 dumps).
 
 ---
 
@@ -292,6 +335,7 @@ controller-scheduled.
 - `det-tape-load` (write-only str, JSON) on `/machine/stixctrl`, added
   in `stix_det_class_init` like the scene knobs. Tape JSON:
   `{"api": 1, "name": <str 1..64>, "align": <bool, default false>,
+    "adc_mode": <bool, optional, default = the det-adc-mode knob>,
     "loop": <bool, default false>,
     "background": <rate layer, no for_s, unmasked>,
     "steps": [<step>, ...]}` with ≤ 64 steps, ≤ 64 KiB total.
@@ -304,7 +348,9 @@ controller-scheduled.
   det-replay-file), "n"/"wait_us"/"adc"/"ebin" (single, S3)}`.
   Kinds `single` and spec values other than `"flat"` parse (the shape
   is fixed now) but are **rejected at load with "unsupported in this
-  build (S2/S3)"** so S1 never half-implements them. Every error names
+  build (S2/S3)"** so S1 never half-implements them; so is
+  `"adc_mode": true` ("unsupported in this build (ADC sky is stage
+  C)") until C1 lands. Every error names
   the step index. Masks are `fpga_det`/`pix` indexed; `subcol`-keyed
   steps are refused (`"subcol_mask" is not a tape field; use
   fpga_det_mask (dss_det = fpga_det)`). The background is unmasked by
@@ -341,7 +387,8 @@ controller-scheduled.
 
 - [ ] qtest `det-tape-props`: every rejection above (bad JSON, > 64
   steps, > 64 KiB, `for_s` 0, unknown kind, `pix_mask` > 0xFFF,
-  `cps` > 1000000, `spec` `{"line_adc": 1000}` in S1, `subcol_mask`,
+  `cps` > 1000000, `spec` `{"line_adc": 1000}` in S1, `adc_mode` true
+  in S1, `subcol_mask`,
   a masked background, play without a tape, replay step with no
   realized table or without trigger=qmp); a rejected
   load leaves the previous tape intact (`det-tape-status` unchanged).
@@ -493,8 +540,8 @@ verb list needs the new verbs.
 
 - [ ] Detectors tab gains the Status/Stimulus sub-view (mockup
   `Stimulus.dc.html`): Target chips (All 32, Q1-Q4, pick-on-map rows
-  from the existing detector map; DG1-DG4 render disabled/greyed until
-  open question 2 is answered — the FSW has no DG concept), pixel
+  from the existing detector map; DG1-DG4 are not rendered at all —
+  dropped, decision D2), pixel
   select ("all 12 / large only (0–7) / small only (8–11) / one
   pixel…"), "cps per detector" + duration inputs, Send now /
   Add to tape (S1: rate steps only; the Spectrum, Single-events and
@@ -578,7 +625,8 @@ extended) → pass.
   `det-source`).
 - The ELUT row classification (today only while `det-source=replay-dss`,
   `stix_det.c:1556-1571`) runs at the SetEnable edge and each QL swap
-  whenever `det-align` is on **or** the source is replay-dss; it emits
+  whenever `det-align` is on, `det-adc-mode` is on (C1), or the source
+  is replay-dss; it emits
   one summary trace `stixdet_align(rows, fallback, honoured,
   mismatch_cells, vclock_ns)` per classification (closes the E-4
   vacuity gap: the classification itself becomes visible).
@@ -620,12 +668,24 @@ stixdet_align hw/sparc/trace-events` ≥ 1.
 
 **Files:** create `scripts/stix/elut-derive.py` (stdlib only),
 `scripts/stix/tests/test-elut-derive.sh`; modify
+`scripts/stix/elut-upload.py` (two additive changes, below),
 `docs/stix-port/ground-station.md` (ELUT section: the derive recipe).
 
 **Interfaces — produces:**
 - `derive --dssevs PATH --out CSV` (reads only the 0xE setup words;
   the file stays where it is) or `--base JSON` (32 numbers keyed by
   `dss_det`); `--self-test`.
+- `derive --b0[=B]` (decision D6, additive): writes B into the CSV's
+  offset column — with no value, each row's own DSS baseline. Default:
+  the flag absent, offset column 0, output byte-identical to today
+  (D-Eb stands). `elut-upload.py` then reads the CSV's offset column
+  for B[0] when it is non-zero (today it hardwires B[0] = 0; with 0
+  the encoded bytes are unchanged), so sub-baseline adc becomes
+  unassigned — dropped, like the DSS — instead of ebin 0.
+- `check-dump --skip-sensitivity` (decision D7): skips the D-Eg
+  sensitivity self-check (the exit-2 path) for uniform-baseline files
+  and says so on the record line; without the flag, behaviour is
+  unchanged.
 - The sim calibration is the D-7 linear law per detector: bin width
   `W = 4096 − base`, edge `e[k] = base + ceil((k+1)·W/32)`, k = 0..30,
   written for every `(subcol = SUBCOL_FROM_FPGA_DET[f], pix)` row
@@ -650,8 +710,8 @@ stixdet_align hw/sparc/trace-events` ≥ 1.
   rounding went down (base 1800: `e[2] = 2015` → honoured 3, fallback
   `floor(215·32/2296) = 2`). Known, documented nuance: adc ≤ base bins
   to `ebin` 0 under B0 = 0 while the fallback drops it — ebin 0 is
-  outside the LC bands (1-27) and the QLDetPerf mask (1-30); recorded,
-  not engineered around (open question 6).
+  outside the LC bands (1-27) and the QLDetPerf mask (1-30); resolved
+  additively by D6's `--b0` (default stays B0 = 0).
 - Chain: `elut-derive.py derive` → `elut-upload.py encode --csv` →
   probe → TC(237,8) → `elut-upload.py check-dump --csv` PASS.
 
@@ -664,7 +724,11 @@ stixdet_align hw/sparc/trace-events` ≥ 1.
   distinguishes identity vs wrong-direction mappings (exact differing
   row counts asserted, so `check-dump` exits 0/1 not 2); (5) an
   `encode --emit hex` unit round-trips through a Python copy of
-  `processELUT` (the E-1 self-test 2 pattern).
+  `processELUT` (the E-1 self-test 2 pattern); (6) `--b0`: with base b
+  the oracle marks adc ≤ b unassigned and the encoded B[0] byte
+  carries b, while without the flag the output is byte-identical to
+  the D-Eb encoding; (7) `--skip-sensitivity` on an identity-row dump
+  exits 0/1 (not 2) and prints the skip (D7).
 - [ ] `test-elut-derive.sh` (bash, temp dir): runs the self-test; builds
   a synthetic ELUT dump from the derived CSV the way
   `test-elut-upload.sh` does and asserts `check-dump` exit 0; flips the
@@ -724,7 +788,171 @@ needs a `--ebin` variant, `docs/stix-port/ground-station.md`.
 build/qemu-system-sparc` → `ALIGN-SMOKE: PASS` (about 7 min);
 `--negative` → PASS (failed as planned).
 
-## Stage S2 — spectra (outlined; wire interfaces fixed — the keV law is open question 5)
+## Stage C — the ADC-faithful sky mode (decision D1)
+
+When the mode is on (`det-adc-mode`, or a tape's `adc_mode` field),
+the drawn sky — the synthetic background and the tape's rate steps,
+both profiles, LACC and the nominal EACC — is generated through the
+loaded FPGA ELUT exactly like replay events: the tick keeps its
+ebin-space exposure, and at each draw the per-ebin mass is folded
+through the row's ELUT via a cached bin-mass map. A misaligned ELUT
+then miscounts the sky exactly as it miscounts the replay (the AX
+rotating-fill symptom, reproduced on demand); A1's report shows where
+and A2's derive + upload fixes it. Default off: §34, every gate and
+golden unchanged.
+
+### Task C1: calibration, bin-mass map, the ADC sky path (model)
+
+**Files:** modify `hw/sparc/stix_det.c`, `hw/sparc/stix_det.h`,
+`hw/sparc/trace-events` (add `stixdet_adc_map`), `tests/qtest/stix.c`.
+
+**Interfaces — produces:**
+- `det-adc-mode` (bool scene knob on `/machine/stixctrl`, default
+  false, survives a device reset — bench intent, like `det-source`).
+  Effective while the synthetic sky draws (`det-source=synthetic`);
+  inert otherwise. A tape's `adc_mode` field (T1) overrides the knob
+  while the tape plays and reverts on stop/done.
+- `det-cal-kev-full` (uint32 scene knob, default 160, range 1..4096):
+  the keV full scale `K` the calibration maps to adc 4096 — a
+  documented sim anchor, not instrument truth. A change re-arms the
+  map rebuild.
+- **The sim calibration (the law, fixed here):** per (dss_det, pix),
+  linear `adc(keV) = base + gain·keV` with `base` = the dss_det's 0xE
+  baseline from the realized replay table (0 without one — the status
+  reports `base_source=zero`) and `gain = (4096 − base)/K`, identical
+  across pix by default. The ebin grid it defines: ebin e covers adc
+  `[E(e), E(e+1))` with `E(e) = base + ceil(e·W/32)`, `W = 4096 −
+  base` — exactly the D-7 fallback grid and exactly the edges
+  `elut-derive.py` writes, so the derived ELUT and the fallback agree
+  with the calibration by construction (D1). In keV, ebin e ↔
+  `[e·K/32, (e+1)·K/32)`; S2's keV specs convert through it (D5).
+- **The bin-mass map** (`stix_det.h`): per (fpga_det, pix) a
+  `double map[STIX_DET_N_EBIN][STIX_DET_N_EBIN]` + a valid flag;
+  `map[s][t]` = the fraction of ebin s's mass the row puts in ebin t —
+  built by one walk over the row's 4096 ELUT bytes (honoured row:
+  destination `val[adc]`, 32 drops; degenerate row: the fallback's
+  bin, adc ≤ base dropped), from the SRAM ram pointer
+  (`memory_region_get_ram_ptr`, the `stix_det_replay_classify`
+  pattern). Rebuilt lazily at the next use, in the contexts that
+  already classify (the SetEnable edge, the QL swap, the
+  `replay_class_pending` tick — the signal the TC(237,8) apply
+  raises) plus a `det-cal-kev-full` change; never per tick, never per
+  event. **Cost:** one classify-sized pass (384 × 4096 ≈ 1.6 M byte
+  reads, host ~ms) per ELUT/calibration change at worst; zero at tick
+  and draw time beyond the fold itself.
+- **The draw fold:** `stix_det_draw_acc` keeps its per-ebin Poisson
+  draws (same loop order, same RNG stream shape); with the mode on,
+  each drawn count n is split over the map row by largest remainder —
+  deterministic integer arithmetic, no new RNG — into the cell's
+  destination ebins, for LACC and, through the same function, the
+  nominal EACC chunk. The per-tick SUMCNT/LVAR lambdas use the
+  map-folded SUMEMASK/VAREMASK shares (cached per profile with the
+  map; the masks still read live; a 32×32 dot product per profile per
+  tick). Totals per (fpga_det, pix) are unchanged by the mode; only
+  the ebin distribution moves. Deposits (`det-inject`), replay events
+  and S3 `single` steps are science-space and stay out of the fold.
+- Trace `stixdet_adc_map(rows, nonidentity_rows, vclock_ns)` once per
+  rebuild. hw-state `det.adc`: `{mode, kev_full, base_source:
+  replay|zero, map_rows}` — pure reads (PL-2), mapped to leaves in
+  C2.
+
+Determinism, guard, guest memory: every new draw reuses the
+xorshift64*/Poisson helpers in the established call order and the
+splits are integer arithmetic, so runs stay icount-stable and the
+mode-off path consumes no RNG at all; the map build reads the ELUT
+SRAM only where the classification already reads it, under the tick's
+`mem_reentrancy_guard` (`stix_det.c:233-238`), with no MMIO dispatch
+and no wall clock.
+
+- [ ] qtest `det-adc-off`: mode off (default) gives the
+  `det-counts-seed` stimulus the bank values that test asserts
+  (bit-identical: no RNG draws, no folds); setting and changing
+  `det-cal-kev-full` does not perturb them.
+- [ ] qtest `det-adc-derived`: mode on, the test writes every ELUT
+  row from the calibration's edges (the A2 law) → every LACC and EACC
+  cell equals the mode-off run exactly (same seed, reset between):
+  the round trip is mass-preserving and bin-exact, stronger than
+  "within statistics".
+- [ ] qtest `det-adc-wrong`: mode on, one row deliberately wrong (the
+  base-0 edge grid while the file's baseline is 1800 — shifted) →
+  the target-ebin cell ≈ 0, the mass in lower ebins,
+  `det-align-status.mismatch_cells ≥ 1`, and the next ROTB chunk's
+  EACC cell shows the same misbin (the `det-inject-chunk` decode).
+- [ ] qtest `det-adc-map-invalidate`: mode on with a matching row; a
+  mid-run rewrite of that row (the `det-replay-elut` SRAM-write
+  pattern) moves the next swap's bank (no stale map), and back.
+- [ ] qtest `det-adc-props`: `det-cal-kev-full` 0 refused; the tape
+  `adc_mode` field overrides the knob while playing and reverts on
+  stop (the `det-tape-rate` banks witness it); the status line
+  `mode=off|on,kev_full=...,base_source=...,map_rows=...` parses with
+  the `plat.py` splitter.
+- [ ] qtest `det-adc-guard`: with the mode on and steps changing under
+  `clock_step`, every CTRL MMIO path still answers (the
+  `det-tape-guard` pattern).
+
+**Verification:** `scripts/stix/qt.sh all` — the suite grows by these
+six; each RED on the parent binary (unknown property `det-adc-mode`).
+
+### Task C2: ADC mode on the platform (verb, leaves, sampler, UI)
+
+**Files:** modify `stixplat/verbs.py` (+`det.adc.set`),
+`stixplat/plat.py` (handler, `d.add` entry), `stixplat/state.py`
+(`det.adc` → `instrument.detector.adc.{mode,kev_full,base_source,
+map_rows}`), `stixplat/config.py` (sample_paths +=
+`"instrument.detector.adc.*"`), `stixplat/selftest.py`,
+`ui/index.html`, `docs/stix-port/platform.md`.
+
+- [ ] Self-test `adc_verb` (the fake-QMP verb pattern): `det.adc.set
+  {enabled}` → `qom-set det-adc-mode` + the parsed status; 409 while
+  STIX is off.
+- [ ] Self-test `adc_leaves`: the four leaves exist with the right
+  shapes; the sampler glob matches them and nothing else new (the
+  `sampler_paths` pattern).
+- [ ] UI: an "ADC sky" checkbox in the Mix tape panel next to the
+  align box (writes the tape's `adc_mode` field on save) and the
+  `instrument.detector.adc.mode` readout; the page-rules suite still
+  passes.
+
+**Verification:** `python3 stixplat.py --self-test` → PASS.
+
+### Task C3: the ADC gate legs (align-smoke `--adc`)
+
+**Files:** modify `scripts/stix/align-smoke.sh` (three legs on the A3
+skeleton), `scripts/stix/ql-check.py` (the SSID 32 check gains an
+`--expect-ebin-byte` parameter if the byte-19 comparison needs it),
+`scripts/stix/tests/test-align-smoke.sh` (host-only parts),
+`docs/stix-port/ground-station.md` (the ADC recipe).
+
+- [ ] Leg 3 `adc-reference`: fresh flash (the A3 distinct baselines),
+  `det-source=synthetic`, quiet cps 200, mode off; CONF @T; SSID 32's
+  masked subcol byte 19 (ebin 18 + 1, the quiet template's 45 % line)
+  captured as the reference bound, and the next ROTB chunk's EACC
+  cell (pix 0, fpga_det 0) decoded at ebin 18.
+- [ ] Leg 4 `adc-mismatch`: the same, mode on, plus a deliberately
+  wrong ELUT uploaded first (the CSV derived from base 0 — shifted:
+  the drawn ebin-18 adc range, 3092–3163 for base 1800, lands in
+  ebin 24 under the base-0 row); `det-align-status` has
+  `mismatch_cells ≥ 1` and `calibration=dss-linear`; SSID 32 byte 19
+  < 0x10 while the total still flows (the counts are in the wrong
+  bins — the AX miscount, end to end); the chunk's EACC cell is not
+  at ebin 18.
+- [ ] Leg 5 `adc-aligned`: the same as leg 4 but
+  `elut-derive.py derive` + `elut-upload.py encode` (the A3 leg-2
+  chain) first: `mismatch_cells = 0`; SSID 32 byte 19 within 5σ of
+  the leg-3 reference; the chunk's EACC cell back at ebin 18. Run
+  twice: the two SSID 32 dumps byte-identical (guest-time
+  determinism of the fold). `--negative`: skip the upload → leg 5
+  fails exactly `adc-aligned` (byte 19 stays low); SKIP 77 without
+  the ELF.
+- [ ] Host-only parts (`--dry-run`, `--check-guard`, the
+  derive/encode pipeline with the base-0 CSV) run without QEMU in
+  `test-align-smoke.sh`.
+
+**Verification:** `STIX_PORT_BASE=auto scripts/stix/align-smoke.sh
+build/qemu-system-sparc --adc` → `ALIGN-SMOKE (adc): PASS` (about
++5 min over A3's 7); `--negative` → PASS (failed as planned).
+
+## Stage S2 — spectra (outlined; wire interfaces fixed — the keV law is the stage-C calibration, decision D5)
 
 ### Task U1: spectrum specs + the adc-domain sky path
 
@@ -737,30 +965,30 @@ build/qemu-system-sparc` → `ALIGN-SMOKE: PASS` (about 7 min);
 `{"line_adc": <adc 0..4095>}` | `{"line_kev": <keV>}` |
 `{"flat_kev": [k1, k2]}` | `{"file": <path>}`; per-step
 `"align": true|false` overriding the tape's `"align"` (default false).
-Semantics: adc/keV/file specs make the sky tick draw per-event adc
-values from the spectrum and bin them exactly like the replay
-(`stix_det_replay_elut_ebin` / fallback, shared helper). A keV spec
-needs a keV ↔ adc/ebin calibration; the model has none today (D-7 is
-adc-only, `2026-11-11-detector-plan.md:877`), so the keV → ebin law
-is open question 5: until the owner names it, `line_kev`/`flat_kev`
-parse but are rejected at load like the S3 kinds ("unsupported in
-this build (no keV calibration)"). Once a law exists: keV → target
-ebin via it, then — with `align`
-on — to adc via `stix_det_align_adc` (T1/A1's fixed helper) so the
-ELUT lookup returns the intended bin; with `align` off it bins
-directly in ebin space (today's §34 rule). `{"file"}` CSV format
-(`adc,cps` vs `kev,cps`, header line) is settled with the owner before
-U1 lands (open question 4). `det-align-status` gains
+Semantics: adc/keV/file specs fold the step's exposure through the
+loaded ELUT exactly like the replay path
+(`stix_det_replay_elut_ebin` / fallback, shared helper) — as a
+per-spec bin-mass map (C1's mechanism, one row), never per-event
+draws: a `line_adc`/`line_kev` spec is a one-adc map, a file/flat_kev
+spec a 32-column row of the same shape. The keV law is decided (D5):
+keV → ebin `floor(32·keV/K)` with `K` = `det-cal-kev-full`; a
+`line_kev` draws at adc `base + round(gain·keV)`; no load-time
+rejection remains for keV specs. `{"file"}` format (decision D4): a
+two-column CSV, first line `adc,weight` or `kev,weight`, rows
+`value,weight`, stdlib parsing; weights are relative shares. With
+`align` on, science-space specs still convert through the preimage
+`stix_det_align_adc` (T1/A1's fixed helper) so the ELUT lookup
+returns the intended bin. `det-align-status` gains
 `preimage_miss=N`. Traces `stixdet_spectrum(step, spec, vclock_ns)`.
 
 - [ ] qtests: `det-spec-line` (line_adc lands in the ELUT's ebin for
-  that adc; the keV / align-preimage legs wait for open question 5);
-  `det-spec-file` (a two-column CSV weights the draw);
+  that adc; line_kev via the D5 law; the align-preimage leg as
+  written); `det-spec-file` (a two-column CSV weights the draw);
   `det-spec-props` (bad spec values rejected at load).
 - [ ] U2 gate: `detector-smoke.sh --spectrum` on the A3-derived flash:
   a line step at the adc whose ebin is 12 → SSID 32 peaks at byte 13 of
-  the masked subcols (the keV-flavoured variant waits for open
-  question 5); `--spectrum --negative` (align off) fails exactly
+  the masked subcols (a keV-flavoured variant rides the same leg);
+  `--spectrum --negative` (align off) fails exactly
   the `spectrum-bin` check. Expected `DETECTOR-SMOKE (spectrum): PASS`.
 
 ## Stage S3 — single events (outlined; wire interfaces fixed)
@@ -802,101 +1030,105 @@ the mockup's mono hint). Trace
 
 T1 → T2 → (T3, T4 parallel) → T5 → T6; A1 → A2 → A3 independent of
 T* (touches classification + tools only) — align first if the owner
-wants the fix before the tape. Each task: qtests RED on the parent,
-suite green after; each stage: its own gate (`--tape`/scenario,
-`align-smoke.sh`, `--spectrum`, `--single`); UART goldens unchanged
-everywhere (nothing new at boot).
+wants the fix before the tape; C1 → C2 → C3 after A1 (C1 reuses the
+classification hooks and the hw-state pattern; C3 reuses A2's
+derive/encode chain and the align-smoke skeleton). Each task: qtests
+RED on the parent, suite green after; each stage: its own gate
+(`--tape`/scenario, `align-smoke.sh` incl. its `--adc` legs,
+`--spectrum`, `--single`); UART goldens unchanged everywhere (nothing
+new at boot; `det-adc-mode` defaults off).
 
 ## Accepted-diffs / docs updates
 
 - New **§51 "Detector stimulus: per-pair rates and the mix tape"**
-  (baseline: one uniform rate, no tape): the tape schema, tick rules,
-  step/background precedence, the replay-step constraint
-  (`det-replay-file` is realize-time), markers, gate record.
+  (baseline: one uniform rate, no tape): the tape schema (incl. the
+  `adc_mode` field), tick rules, step/background precedence, the
+  replay-step constraint (`det-replay-file` is realize-time),
+  markers, gate record.
 - New **§52 "ELUT alignment (baseline: none)"**: the three pieces
   ((a)/(b)/(c)), the derived-CSV round-trip theorem and its B0
-  nuance, the classification exposure, `align-smoke` gate record, and
-  the statement that the ebin-space sky still bypasses the ELUT
-  (amends §34's "No ELUT" bullet with "the tape's `align` option is
-  the opt-in exception for science-space steps").
+  nuance (resolved additively by D6's `--b0`), the classification
+  exposure, `align-smoke` gate record, and the statement that the
+  ebin-space sky still bypasses the ELUT (amends §34's "No ELUT"
+  bullet with "except the tape's `align` option for science-space
+  steps and the `det-adc-mode` sky of §53").
+- New **§53 "ADC-faithful sky mode (baseline: off)"** (decision D1):
+  the calibration law (base/gain per dss_det/pix, `K`), the cached
+  per-row bin-mass map and its cost (one classify-sized pass per
+  ELUT/calibration change, zero per event), the draw fold
+  (largest-remainder splits, no new RNG), the EACC chunk path
+  through the same fold, the off-bit-identical invariant, and the
+  AX-miscount reproduction (C3's legs).
 - Amend **§37/§40** with one line each: the classification now also
-  runs under `det-align` and traces `stixdet_align` (the E-4 vacuity
-  note gains its per-classification summary).
+  runs under `det-align` and `det-adc-mode` and traces
+  `stixdet_align` (the E-4 vacuity note gains its
+  per-classification summary); §40 gains the additive `--b0` (D6,
+  amends D-Eb) and `check-dump --skip-sensitivity` (D7).
 - Amend **§38** (known limits): drop "the optional `--replay` gate is
   not built" once T6/A3 land? — no: §38's replay-gate bullet is about
   `detector-smoke --replay` and stays; add the tape/align limits
-  (SAFE freezes playback, sub-baseline adc bins to 0, DG mapping).
-- `platform.md`: verb-table rows (`det.tape.*`, `det.align.set`),
-  state-tree leaves (`instrument.detector.tape.*`, `.align.*`), a
-  "Tapes" section next to "Timeline", `[timeline] tapes_dir` in the
-  config table, `stim` in the record kinds/topics.
+  (SAFE freezes playback, sub-baseline adc bins to 0 unless `--b0`).
+- `platform.md`: verb-table rows (`det.tape.*`, `det.align.set`,
+  `det.adc.set`), state-tree leaves (`instrument.detector.tape.*`,
+  `.align.*`, `.adc.*`), a "Tapes" section next to "Timeline",
+  `[timeline] tapes_dir` in the config table, `stim` in the record
+  kinds/topics.
 - `ground-station.md`: "Detector scene" gains the tape recipe and the
   alignment recipe (derive → upload → align-status); the ELUT section
-  gains the derive sub-recipe and the check-dump sensitivity caveat.
+  gains the derive sub-recipe, the `--b0`/`--skip-sensitivity` flags
+  and the check-dump sensitivity caveat, plus the ADC-mode recipe
+  (`det-adc-mode` → wrong-ELUT miscount → derive/upload fix).
 
-## Open questions for the owner (do not block)
+## Owner decisions (2026-11-15, second pass — all resolved)
 
-1. **ADC-faithful sky (option; default off).** Today the synthetic sky
-   and the ROTB chunks are generated directly in ebin space, so a
-   wrong FSW ELUT changes nothing in the emulator — unlike the
-   hardware, where the FPGA applies the ELUT before every accumulator
-   (you saw the miscounts on AX in the rotating-fill test). Should the
-   sky (and the chunk fill) optionally be generated in ADC space —
-   draw an adc per event from a per-pixel simulation calibration, then
-   bin through the loaded FPGA ELUT (the replay's lookup) — so a
-   misaligned ELUT miscounts exactly as on hardware, and the
-   alignment tools (b)/(c) (A2's derive + A1's report) fix it like any
-   other source? It would be a per-tape opt-in
-   (`"sky_domain": "adc"`, default `"ebin"`); when off, §34 and every
-   gate in this plan stay exactly as written. If yes, S2+ would add
-   (outline only, pending your answer, not scheduled): (i) the
-   per-(fpga_det, pix) sim-calibration draw law (the D-7 inverse —
-   pick a bin from the ebin template shares, then an adc inside it;
-   the law's parameter source needs defining); (ii) background and
-   rate steps feed the drawn adc through
-   `stix_det_replay_elut_ebin`/fallback instead of the template's
-   ebin split; (iii) the chunk fill (`stix_det_draw_acc`'s nom_expo
-   path) uses the same drawn bins; (iv) qtests: adc-sky banks equal
-   the ebin-sky banks under the A2-derived ELUT and differ (misbinned)
-   under a mismatched one — the AX miscount, reproduced on demand;
-   (v) a `--tape --adc-sky` gate leg: the misbin with the wrong ELUT,
-   the fix after derive/upload.
-2. **DG1–DG4 mapping.** The mockup's target chips need DG → fpga_det,
-   and the FSW has no DG concept at all: the only 4×8 grouping is
-   `utils_deteInQuarter[4][8]` (the quarters — Q1 = fpga_det 0-7, Q3 =
-   fpga_det 16-23, exactly the plan's Q1+Q3 mask 0x00FF00FF), and the
-   FSW's "detector group" is the 16 fpga pairs (`dete_data.groupFPGA =
-   fpga_det/2`, `UTILS_SUBCOLID2GROUPID`), not 4 groups. The mockup
-   hints at 8-detector groups (its map's pair tiles repeat a group
-   digit 1-4 across the quarters; detector 22's panel reads
-   "Detector group DG3") but that table is not in the FSW; the earlier
-   `fe_sc` proposal (`utils_oldSubcolIdToFpgaId` exists, with no DG
-   semantics) is dropped. Give the DG1–DG4 → fpga_det table (or say DG
-   = Q); until then the board greys DG1-DG4 out.
-3. **Tape playback outside NOMINAL.** The step clock rides the FSM
-   tick, so SAFE/paused freezes a tape. Proposal: keep (tapes are
-   NOMINAL test drivers); a "run anyway" mode would need a second
-   timer and is not planned.
-4. **Spectrum "from file" format.** Proposal: a two-column CSV with a
-   first line `unit=adc` or `unit=kev`, rows `value,cps`, stdlib
-   parsing; confirm or name the DSS tool's export format to match.
-5. **keV calibration.** The S2 keV specs (`line_kev`, `flat_kev`)
-   need a keV ↔ adc/ebin law; the model has none (D-7 is adc-only,
-   `2026-11-11-detector-plan.md:877`) and the plan will not invent
-   one. Options: (i) you provide a table (per detector or global —
-   e.g. the Ba-133 line energies anchoring the template's line ebins
-   18/19/27); (ii) a documented linear law you name; (iii) drop keV
-   specs from S2 and keep adc/file only. Until answered, keV specs
-   parse but are refused at load ("unsupported in this build").
-6. **Sub-baseline adc.** With the derived ELUT and B0 = 0 (D-Eb), adc
-   ≤ the DSS baseline bins to `ebin` 0 where the DSS would drop it.
-   Proposal: keep B0 = 0 and document; if you want the drop, we add a
-   per-row `--b0` to `elut-upload.py` (additive, default unchanged).
-7. **Uniform baselines.** If your real `.dssevs` has one baseline for
-   all 32 detectors, the derived CSV's rows are identical and
-   `check-dump`'s D-Eg sensitivity check exits 2 by design; the gate
-   uses distinct baselines. Proposal: accept, and verify such runs via
-   `det-align-status` + SSID 32 instead of `check-dump`.
+Numbered D1–D7, in the order of the first pass's open questions 1–7.
+D1–D2 are the owner's answers; D3, D4, D6, D7 are orchestrator calls
+recorded here as decided, with reasons; D5 follows from D1.
+
+- **D1 — ADC-faithful sky: YES, as an optional mode, default off
+  (owner).** The synthetic sky and the ROTB chunk (EACC) path draw
+  ADC values through a per-pixel simulation calibration, then bin
+  through the FPGA ELUT the FSW loaded (`val[pix][fpga_det][adc]` at
+  0xE0000000), so a misaligned ELUT miscounts exactly as on hardware;
+  the alignment report (c) shows where and `elut-derive` +
+  `elut-upload` (b) fixes it. Default off, so §34 and every existing
+  gate/golden stay unchanged. Tasks C1–C3; deviation section §53.
+- **D2 — DG1–DG4: dropped from the board (owner).** No DG buttons and
+  no DG → fpga_det mapping question: the FSW has no DG concept and
+  the mockup's group table is not in it. The chips do not render
+  (not even greyed out); targeting is All 32 / Q1–Q4 / pick-on-map.
+- **D3 — playback outside NOMINAL stays frozen (orchestrator).** The
+  step clock rides the FSM tick, which only runs while Enable = 1;
+  tapes are NOMINAL test drivers, and a "run anyway" mode would need
+  a second timer for no user. SAFE/paused freezes playback, as
+  written in T1/T6.
+- **D4 — S2 spectrum file format: two-column CSV with a header line
+  (orchestrator).** First line `adc,weight` or `kev,weight`, rows
+  `value,weight`; the unit is explicit per file and stdlib-parseable;
+  keV weights convert through the D5 calibration. U1 implements it.
+- **D5 — the keV ↔ adc calibration (follows from D1).** The ADC
+  mode's calibration is the single keV law for the sky and the S2
+  keV specs: linear `adc = base + gain·keV` per (dss_det, pix),
+  base from the 0xE word, `gain = (4096 − base)/K`, `K` =
+  `det-cal-kev-full` (default 160 keV full scale, a documented sim
+  anchor). Defaults match the D-7 law, so `elut-derive` and the
+  fallback agree (C1).
+- **D6 — sub-baseline adc: the additive `--b0` option on
+  `elut-derive` (orchestrator).** Absent by default → B0 = 0, output
+  byte-identical to today (D-Eb stands); with `--b0` the CSV's offset
+  column carries the baseline and `elut-upload.py` honours it
+  additively, so sub-baseline adc is unassigned — dropped, like the
+  DSS — instead of ebin 0. Amends D-Eb additively.
+- **D7 — uniform baselines: `check-dump --skip-sensitivity`
+  (orchestrator).** Identical rows make D-Eg exit 2 by design; the
+  explicit, documented flag skips that self-check (and says so), so a
+  real uniform-baseline run can still be dump-checked. The gates keep
+  distinct baselines; such runs can also be verified via
+  `det-align-status` + SSID 32 as before.
+
+Nothing remains blocked on the owner. Optional, not scheduled: real
+per-detector/pixel baseline-gain tables, if a DSS export ever
+provides them — they would become `det-cal-*` overrides.
 
 ## Plan review (2026-11-15)
 
@@ -960,3 +1192,22 @@ honoured 3 vs fallback 2. Dispositions:
   recorded as open question 6's nuance; OQ5 stands as open question 7.
   No finding rejected. New owner items: open question 1 (ADC-faithful
   sky, first, with the task outline) and open question 5 (keV law).
+
+## Second pass (2026-11-15, owner answers applied)
+
+Edit pass over this file only; no code touched. The owner answered
+D1 (ADC-faithful sky, YES as an optional mode) and D2 (DG dropped);
+the orchestrator recorded D3/D4/D6/D7, and D5 follows from D1.
+Changes: the outline of open question 1 became stage C (C1–C3, full
+S1-level tasks with the bin-mass-map performance design, the
+determinism/guard/guest-memory rules, and the off-bit-identical /
+derived-equal / wrong-ELUT qtests and gate legs); the DG chips are
+gone (T5, the mockup notes, the index-space paragraph); the tape
+schema gains `adc_mode` (rejected at load until C1, T1); U1's keV and
+file-format blockers are resolved (D4/D5) and its spectra fold
+per-spec maps, not per-event draws; A1's classification also runs
+under `det-adc-mode`; A2 gains `--b0` (D6) and `check-dump
+--skip-sensitivity` (D7); review focus gained items 6–8; merge order
+and the accepted-diffs names (§53 new) updated; the open-questions
+section became the decisions record. No first-pass finding was
+reverted.
