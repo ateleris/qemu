@@ -93,6 +93,9 @@ DEFAULTS = {
                              "telemetry/stix_idb_tlm.json",
                  "idb_sqlite": "", "views_dir": ""},
     "log": {"max_log_mb": 50, "max_log_files": 5, "ring": 20000},
+    # run bundles (2026-11-15 run-bundles plan): the manifest +
+    # decisions writer, and the HK fields that yield hk_step decisions
+    "bundle": {"enabled": True, "hk_codes": ["NIXD0501", "NIXD0023"]},
     "retention": {"run_root": "/tmp/stix-plat/runs-root", "keep_runs": 10,
                   "keep_failed_days": 7, "max_total_mb": 2048,
                   "min_free_mb": 1024, "keep_flash": "failed"},
@@ -228,6 +231,8 @@ def _check(cfg):
                           "or 0.5..60")
     if not all(isinstance(x, str) for x in cfg["timeline"]["sample_paths"]):
         raise ConfigError("timeline.sample_paths is a list of globs")
+    if not all(isinstance(x, str) for x in cfg["bundle"]["hk_codes"]):
+        raise ConfigError("bundle.hk_codes is a list of strings")
 
 
 def merged(cfg, *overs):

@@ -84,7 +84,13 @@ class RecordLog:
         self.listeners = []
         self._listener_failing = set()  # reported, until a success re-arms
         self._tls = threading.local()
+        # the byte size of the log file when this session opened it:
+        # seqs restart at 1 per session while the file appends, so a
+        # session (run bundle S2) is the file from this offset on
+        self.start_offset = 0
         if path is not None:
+            self.start_offset = (os.path.getsize(path)
+                                 if os.path.exists(path) else 0)
             self.fh = open(path, "a", encoding="utf-8")
 
     def emit(self, source, kind, path, data=None, sim_est=None):

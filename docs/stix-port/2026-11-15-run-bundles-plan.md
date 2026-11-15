@@ -527,7 +527,8 @@ import format.)
 flag), `selftest.py`, platform.md.
 
 - Input: `bundle.inputs(run_dir)` — log.jsonl from the manifest's
-  `start_seq` on (a reused interactive dir's log.jsonl also holds
+  `start_offset` byte on (implementation finding: seqs restart at 1 per
+  session, so `start_seq` cannot scope it) (a reused interactive dir's log.jsonl also holds
   earlier sessions, log.py:88) passed through `classify`, ordered by
   seq, each `{seq, sim_time, boot_id,
   input, verb|hex|id+params+trigger+seed|path+value, replay, why}`;

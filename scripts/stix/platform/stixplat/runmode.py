@@ -25,6 +25,7 @@ import signal
 import threading
 import time
 
+from . import bundle as bundle_mod
 from . import config as config_mod
 from . import core
 from . import retention
@@ -172,7 +173,8 @@ def run_all(cfg, out=print, now=time.time):
         f.write("exit %d (%d runs)\n" % (worst, len(runs)))
     try:
         retention.cleanup(root, rc, now(), emit=lambda p, why, dry:
-                          out("retention: removed %s (%s)" % (p, why)))
+                          out("retention: removed %s (%s)" % (p, why)),
+                          warn=out)
     except OSError as e:
         out("retention: %s" % e)
     out("reports: %s" % rdir)
@@ -199,6 +201,7 @@ def _batch(cfg, plan, root, rdir, stamp, now, out, term, runs):
                    os.path.join(rdir, name + ".jsonl"))
         retention.finish_run(run_dir, res["verdict"] == "pass",
                              rc["keep_flash"], now())
+        bundle_mod.set_verdict(run_dir, res["verdict"])
         bad = [s for s in res["steps"] if s["verdict"] != "pass"]
         line = "%-4s %s  %s" % (
             {"pass": "PASS", "fail": "FAIL"}.get(res["verdict"], "ERR"),

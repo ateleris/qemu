@@ -137,6 +137,9 @@ The path prefix is `/api/v1`. Read endpoints:
 | `GET /params` | the FSW parameters table: symbol, count, differ, warnings, and the rows (index, name, default, min, max, current, read-back, applies) |
 | `GET /verbs` | the command vocabulary with argument schemas |
 | `GET /scenarios` | the scenario dir's files: name, variants, description, or the load error |
+| `GET /runs` | the run bundles under `<retention.run_root>/runs` (plus the live dir): run_id, started/ended, verdict, ELF and QEMU identity, icount, length, input and decision counts; newest first, a broken manifest listed with its error |
+| `GET /runs/<run_id>` | one bundle's manifest plus its file sizes, the baseline mark and the retention marker |
+| `GET /runs/<run_id>/manifest` | the raw `manifest.json` bytes |
 
 `GET /` serves the web UI (below).
 
@@ -201,6 +204,10 @@ lists exactly these verbs and arguments.
 | `scenario.abort` | | abort the running scenario: open checks and steps not started become `error`, the teardown still runs |
 | `view.save` | `name`, `view` | save a timeline view (`name`, `window`, `markers`, `panels`) as `<name>.json` in the views dir; an existing name is replaced, the generated `everything` is a 409 |
 | `view.delete` | `name` | delete a saved timeline view (404 unknown, 409 `everything`) |
+| `run.baseline` | `name` | mark that run bundle (its run dir) as the comparison baseline; the previous holder's mark moves; 404 unknown |
+| `run.baseline.clear` | | remove the baseline mark |
+| `run.open` | `name`, `port` | serve a finished run bundle read-only (the `--view-run` pair) on 127.0.0.1 in-process; one slot (409 while one is open); the answer is `{url, port}`, `port` 1024..65535 or a free one |
+| `run.close` | `port` | close the open run viewer (409 when none, or when `port` is not the open one) |
 | `debug.qmp` | `command`, `arguments` | one raw `qom-get` or `qom-set` on `/machine/stixspw` or `/machine/stixctrl`, or `query-status`; refused (403) unless `[debug] raw_qmp = true`, and in run mode also `[debug] allow_in_run = true`; every call is a `debug` record and sets the sticky `status.debug_used` taint (dev and gate use only) |
 <!-- verbs:end -->
 
@@ -277,6 +284,7 @@ over the gate scenarios). The keys most often set:
 | `clock.snapshot_s` | 10.0 | the full state record cadence (0 = off) |
 | `timeline.sample_s`, `.sample_paths`, `.idb_json`, `.views_dir` | -1, the volatile leaves, the GS's IDB JSON, `""` | the truth sampler's period (-1 = by mode: 1 s interactive, off in run mode; 0 = off; else 0.5..60), its globs, the HK decoder's `stix_idb_tlm.json` and the views dir (`""` = `<retention.run_root>/views`) |
 | `retention.*` | see `config.py` | run mode's run root and cleanup (D-PLl) |
+| `bundle.enabled`, `.hk_codes` | true, `["NIXD0501", "NIXD0023"]` | the run-bundle writer (manifest.json + decisions.jsonl in the run dir) and the HK fields that yield `hk_step` decisions |
 | `faults.catalogue` | `""` (the v1 catalogue) | a JSON catalogue path |
 | `run.scenario_dir`, `.scenarios`, `.variants` | `""` (shipped), [], [] | run mode's inputs |
 | `debug.raw_qmp`, `.allow_in_run` | false, false | the `debug.qmp` gate |
@@ -524,6 +532,65 @@ The library lives under the run root, outside the per-run dirs; the
 retention cleanup only ever touches `runs/`, so saved flashes stay
 until removed by hand.
 
+## Run bundles (S1)
+
+Every platform run is a **bundle**: the run dir it already is, plus two
+derived files the controller writes in it — nothing is copied, and
+`--view-run` and retention keep working unchanged
+(`2026-11-15-run-bundles-plan.md`).
+
+- `manifest.json` — rewritten atomically at controller start and close.
+  `{"v": 1, "kind": "run", "run_id", "dir", "mode", "scenario", 
+  "started_utc", "start_seq", "start_offset", "ended_utc", "open", "t0",
+  "final_sim_time", "final_seq", "length_s", "verdict" (run mode),
+  "fsw": {elf, sha256}, "qemu": {binary, sha256, commit, dirty,
+  describe, argv}, "config": {…the launch config…}, "flash": {start:
+  {source: library|carried|fresh, name, sha256, record}, end: {present,
+  allocated_kib}}, "outputs": {log_records, log_bytes, tm_bytes,
+  uart_bytes}, "inputs": {counts: {verb: {name: n}, tc, fault, force},
+  not_replayable}, "decisions": {counts: {event, ack, hk_step}}}`.
+  Readers key on `"v"` and ignore unknown fields. `qemu.commit` /
+  `dirty` / `describe` come from the git tree that holds the binary
+  (`build/` inside a worktree), null outside git; the controller's own
+  tree is recorded apart as `qemu.platform: {commit, dirty, describe}`
+  (the two are often different worktrees). `start_offset` (the
+  byte size of log.jsonl when this session opened it) scopes the log
+  slice for a replay: log.jsonl opens in append mode, so a reused
+  interactive dir holds earlier sessions too, and seqs restart at 1 in
+  every session (`start_seq` alone cannot tell sessions apart).
+- `decisions.jsonl` — one decision per line, appended live by a
+  record-log listener: `{"v": 1, "seq", "sim_time", "boot_id", "kind",
+  "key", "class", "detail"}`. Kinds: `event` (a TM(5,x), key `0x%04X`,
+  class mode/keepalive/timesync/fdir/other), `ack` (a TM(1,x) whose
+  (apid, seq) matches a TC the run really sent — keep-alive summaries
+  carry no hex and match nothing), and `hk_step` (a watched
+  `[bundle] hk_codes` field that changed since the previous HK report
+  of the same SID, key `hk:<sid>:<code>`, the series id space).
+
+**The interactive caveat**: the interactive run dir is reused across
+sessions, and `run_dir.fresh` removes only the controller's named
+files — so the writer truncates `decisions.jsonl` and rewrites
+`manifest.json` at every controller start: a dir's bundle is always
+its *latest* session. Run mode keeps every session in its own
+`<stamp>-<name>[.<variant>]/` dir (retention keeps the last N).
+
+**Baseline and retention**: `run.baseline {name}` writes a
+`.stixplat-baseline` mark into that run dir (one at a time,
+`run.baseline.clear` removes it). Retention never deletes a
+marker-carrying dir that holds the baseline mark — but its size still
+counts toward `max_total_mb`: past the budget `plan()` warns, naming
+the dir, and keeps it.
+
+**run.open / run.close**: `run.open {name, port?}` serves a finished
+bundle read-only in-process — exactly the `--view-run` objects
+(`viewrun.ViewRun` behind the same API/page), on 127.0.0.1, `port`
+1024..65535 or a free one, one slot (a second `run.open` is a 409).
+`run.close {port?}` stops it. In a `--view-run` server every `run.*`
+verb is refused like any other non-`view.*` verb. `GET /runs`,
+`GET /runs/<run_id>` (also the live dir, `live: true`) and
+`GET /runs/<run_id>/manifest` feed the Runs board in the web UI
+(filter, per-row baseline/open, a header close-viewer button).
+
 ## Timeline (sampler, series, views, view-run)
 
 The timeline plan (`2026-11-14-timeline-design.md`) puts truth, decoded
@@ -706,6 +773,12 @@ The run dir holds:
   `tm.jsonl`; run mode adds `runs/<stamp>-<scenario>[.<variant>]/` and
   `reports/` under its run root.
 
+With run bundles (S1) the run dir also holds `manifest.json` and
+`decisions.jsonl` (see Run bundles above). `run_dir.fresh = true`
+removes only the controller's named files, so the bundle writer
+truncates its own files at every start; `log.jsonl` opens in append
+mode and the manifest's `start_seq` scopes the session's slice.
+
 The controller refuses the gates' run dirs (`/tmp/stix-*-run` and the
 persistent master `~/dev/stix-state/uprev-run`, i.e.
 `scripts/stix/lib/paths.sh`'s `STIX_UPREV_DIR` and
@@ -815,11 +888,20 @@ no CDN. It is only an API client:
 
 **Web UI tabs** (timeline plan B1/B2): the page is a tab bar (the state
 is the URL hash, default `#overview`): Overview, Platform, IDPU & FSW,
-Detectors, Faults & forcings, Scenarios, Logs, State, Setup, Timeline.
-Overview shows a health word per subsystem (power, link, mode, active
-faults, the ROTB fill) and the last TM(5,x) events. Detectors shows the
-ROTB fill as a bar, the `instrument.detector.*` and `instrument.rotb.*`
-leaves as a state table, and the burst control. Setup is read-only:
+Detectors, Faults & forcings, Scenarios, Logs, State, Runs, Setup,
+Timeline. Overview shows a health word per subsystem (power, link,
+mode, active faults, the ROTB fill) and the last TM(5,x) events.
+Detectors shows the ROTB fill as a bar, the `instrument.detector.*`
+and `instrument.rotb.*` leaves as a state table, and the burst
+control. The Runs board (S1) lists the run bundles from `GET /runs`
+every 5 s while visible, with a case-insensitive filter over name, ELF,
+QEMU and verdict, the columns bundle (name, live/open badges, baseline
+mark), recorded, FSW ELF (name + the first 8 hex of its sha256), QEMU
+(describe, "+ dirty"), icount, length and tags (verdict, scenario,
+error), a baseline and an open action per row (open serves the bundle
+read-only and the page opens it in a new tab) and one header-level
+close-viewer button while a viewer is open; a row with an error shows
+the error instead of actions. Setup is read-only:
 the launch configuration from `status()["setup"]` (`binary`, `elf`,
 `elf_sha256`, `icount_shift`, `pace`, `memory`, `timecode_source`,
 `obt_continuity`, `on_guest_reset`, `sample_s`) in plain words, the

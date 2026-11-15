@@ -66,9 +66,13 @@ def list_runs(run_root):
     return out
 
 
-def plan(run_root, rc, now, sizes=None):
+def plan(run_root, rc, now, sizes=None, warn=None):
     """The deletions, as [(path, reason)], without deleting anything.
-    @sizes maps path -> bytes (the self-test); default du."""
+    @sizes maps path -> bytes (the self-test); default du. A dir holding
+    the run-bundle baseline marker (bundle.BASELINE) is never doomed,
+    like a running run; past the budget its size is still counted and
+    @warn names it once."""
+    from . import bundle as bundle_mod
     runs = list_runs(run_root)
     size = (lambda p: sizes[p]) if sizes is not None else du_bytes
     keep = set(p for _, p, _ in runs[-rc["keep_runs"]:]) \
@@ -78,7 +82,7 @@ def plan(run_root, rc, now, sizes=None):
     alive = []
     for name, p, m in runs:
         st = m.get("status")
-        if st == "running":
+        if st == "running" or bundle_mod.is_baseline(p):
             alive.append((name, p, m))
             continue
         if p in keep:
@@ -94,18 +98,27 @@ def plan(run_root, rc, now, sizes=None):
         for name, p, m in list(alive):
             if total <= cap:
                 break
-            if m.get("status") != want:
+            if m.get("status") != want or bundle_mod.is_baseline(p):
                 continue
             doomed.append((p, "over max_total_mb"))
             alive.remove((name, p, m))
             total -= size(p)
+    if total > cap:
+        for name, p, m in alive:
+            if bundle_mod.is_baseline(p):
+                if warn is not None:
+                    warn("retention: keeping the baseline run %s past "
+                         "max_total_mb" % p)
+                break
     return doomed
 
 
-def cleanup(run_root, rc, now, dry_run=False, emit=None, sizes=None):
+def cleanup(run_root, rc, now, dry_run=False, emit=None, sizes=None,
+            warn=None):
     """Apply plan(); each deletion is reported through @emit(path,
-    reason, dry_run). Returns the plan."""
-    doomed = plan(run_root, rc, now, sizes=sizes)
+    reason, dry_run), a kept baseline past the budget through
+    @warn(message). Returns the plan."""
+    doomed = plan(run_root, rc, now, sizes=sizes, warn=warn)
     for p, why in doomed:
         if emit is not None:
             emit(p, why, dry_run)

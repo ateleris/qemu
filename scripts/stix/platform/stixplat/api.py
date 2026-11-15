@@ -209,6 +209,21 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith(PREFIX + "/views/"):
             name = urllib.parse.unquote(path[len(PREFIX + "/views/"):])
             return self._send(200, views_mod.read(ctl.cfg, name))
+        if path == PREFIX + "/runs":
+            from . import bundle as bundle_mod
+            return self._send(200, bundle_mod.listing(
+                ctl.cfg, getattr(ctl, "run_dir", None)))
+        if path.startswith(PREFIX + "/runs/"):
+            from . import bundle as bundle_mod
+            rest = path[len(PREFIX + "/runs/"):]
+            if rest.endswith("/manifest"):
+                rid = urllib.parse.unquote(rest[:-len("/manifest")])
+                return self._send(200, bundle_mod.manifest_bytes(
+                    ctl.cfg, rid, getattr(ctl, "run_dir", None)),
+                    "application/json")
+            rid = urllib.parse.unquote(rest)
+            return self._send(200, bundle_mod.detail(
+                ctl.cfg, rid, getattr(ctl, "run_dir", None)))
         if path == PREFIX + "/state" or path.startswith(PREFIX + "/state/"):
             sub = path[len(PREFIX + "/state"):].lstrip("/") or None
             tree = ctl.state.get(sub)

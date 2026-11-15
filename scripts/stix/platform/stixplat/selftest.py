@@ -23,6 +23,7 @@ import time
 import types
 
 from . import api as api_mod
+from . import bundle as bundle_mod
 from . import config as config_mod
 from . import decode
 from . import faults as faults_mod
@@ -3227,10 +3228,16 @@ UI_PARAMS_VERBS = {"param.refresh", "param.set", "param.read_all",
 # fsw-params plan T8: the ids the FSW parameters panel must have
 UI_PARAMS_IDS = {"params", "params-find", "params-nondef",
                  "params-readall", "params-reset", "params-body"}
+# run bundles (S1): the board's own verbs (built per row in JS, so the
+# parser only sees the static run.close button)
+UI_RUNS_VERBS = {"run.baseline", "run.open", "run.close"}
+UI_RUNS_IDS = {"runs-filter", "runs-table", "runs-refresh", "runs-note",
+               "runs-close-viewer"}
 UI_TABS = ("overview", "platform", "idpu", "detectors", "faults",
-           "scenarios", "logs", "state", "setup", "timeline")
+           "scenarios", "logs", "state", "runs", "setup", "timeline")
 UI_ENDPOINTS = {"status", "time", "faults", "params", "verbs", "state",
-                "log", "stream", "scenarios", "cmd", "series", "views"}
+                "log", "stream", "scenarios", "cmd", "series", "views",
+                "runs"}
 # timeline plan C1: the ids the plotter panel must have
 UI_TIMELINE_IDS = {"tl-view", "tl-window", "tl-search", "tl-hits",
                    "tl-add", "tl-save", "tl-save-name", "tl-delete",
@@ -5293,6 +5300,706 @@ def t_view_run(env):
            os.path.join(env.tmp, "no-such-run"))
 
 
+# -- run bundles (S1): classifier, extractor, writer, API, board ---------
+def _rec(kind, seq, path="", data=None, source="ctl"):
+    """A minimal record dict for classify()/decide()."""
+    return {"v": 1, "seq": seq, "sim_time": seq, "boot_id": 1,
+            "vclock_ns": None, "wall_time": "2026-11-15T10:11:12Z",
+            "source": source, "kind": kind, "path": path,
+            "data": data if data is not None else {}}
+
+
+def t_bundle_decisions(env):
+    """R1: the decisions extractor on synthetic records: events keyed
+    by EID with their class, one hk_step per value change, acks only
+    for TCs the run really sent, heartbeats nothing."""
+    st = bundle_mod.new_state(["NIXD0501", "NIXD0023"])
+    ev = _rec("tm", 5, "tm.0x5a7", {"decoded": {
+        "apid": 0x5A7, "type": 5, "subtype": 1, "eid": 0x21,
+        "eid_name": "mode change", "params": "02"}}, source="tm")
+    d = bundle_mod.decide(ev, st)
+    check(len(d) == 1 and d[0]["kind"] == "event" and
+          d[0]["class"] == "mode" and d[0]["key"] == "0x0021" and
+          d[0]["detail"] == {"name": "mode change", "params": "02"} and
+          d[0]["v"] == 1 and d[0]["seq"] == 5 and
+          d[0]["sim_time"] == 5 and d[0]["boot_id"] == 1,
+          "the mode event: %r" % d)
+    ev2 = _rec("tm", 6, "tm.0x5a7", {"decoded": {
+        "apid": 0x5A7, "type": 5, "subtype": 1, "eid": 0x542B}},
+        source="tm")
+    d = bundle_mod.decide(ev2, st)
+    check(len(d) == 1 and d[0]["class"] == "timesync" and
+          d[0]["key"] == "0x542B", "0x542B is a timesync EID: %r" % d)
+    d = bundle_mod.decide(_rec("tm", 7, "tm.0x5a7", {"decoded": {
+        "apid": 0x5A7, "type": 5, "subtype": 1, "eid": 0x9999}}),
+        bundle_mod.new_state())
+    check(d[0]["class"] == "other", "an unknown EID is other: %r" % d)
+    # hk_step: the first report only sets the previous
+    def hk(v, seq):
+        return _rec("tm", seq, "tm.0x5a4", {
+            "hk": {"NIXD0501": v},
+            "decoded": {"apid": 0x5A4, "type": 3, "subtype": 25,
+                        "sid": 2}}, source="tm")
+    st = bundle_mod.new_state(["NIXD0501"])
+    check(bundle_mod.decide(hk(3, 1), st) == [],
+          "the first report only sets the previous")
+    d = bundle_mod.decide(hk(5, 2), st)
+    check(len(d) == 1 and d[0]["kind"] == "hk_step" and
+          d[0]["key"] == "hk:2:NIXD0501" and
+          d[0]["detail"] == {"value": 5, "previous": 3},
+          "the step: %r" % d)
+    check(bundle_mod.decide(hk(5, 3), st) == [],
+          "no step without a change")
+    # ack: only when the tc record's (apid, seq) was seen in this run
+    st = bundle_mod.new_state()
+    check(bundle_mod.decide(_rec("tc", 1, "tc.gs.send", {
+        "hex": "1dacc0070002", "apid": 0x5AC, "seq": 7, "service": 17,
+        "subtype": 1, "source": 121, "delivered": True}),
+        bundle_mod.new_state()) == [], "a tc record decides nothing")
+    def ack(seq, tc_seq=7, sub=7):
+        return _rec("tm", seq, "tm.0x5a1", {"decoded": {
+            "apid": 0x5A1, "type": 1, "subtype": sub, "dest": 14,
+            "tc": {"packet_id": 0x1DAC, "apid": 0x5AC,
+                   "seq": tc_seq}}}, source="tm")
+    check(bundle_mod.decide(ack(2), st) == [], "no ack without its tc")
+    bundle_mod.decide(_rec("tc", 1, "tc.gs.send", {
+        "hex": "1dacc0070002", "apid": 0x5AC, "seq": 7,
+        "delivered": True}), st)
+    d = bundle_mod.decide(ack(3), st)
+    check(len(d) == 1 and d[0]["kind"] == "ack" and
+          d[0]["key"] == "0x05AC/7" and
+          d[0]["detail"] == {"subtype": 7, "fid": None},
+          "the ack: %r" % d)
+    check(bundle_mod.decide(ack(4, tc_seq=8), st) == [],
+          "another seq matches no tc: nothing")
+    check(bundle_mod.decide(_rec("tm", 5, "tm.0x5e5", {"decoded": {
+        "apid": 0x5E5, "heartbeat": True, "type": 3, "subtype": 25}}),
+        st) == [], "a heartbeat decides nothing")
+    check(bundle_mod.decide(_rec("tm", 6, "tm.0x5a4", {
+        "decoded": {"apid": 0x5A4, "type": 3, "subtype": 25,
+                    "sid": 2}}), st) == [],
+        "an HK report without data.hk decides nothing")
+
+
+def t_bundle_inputs(env):
+    """R1: the input classifier: replay verbs guest, the excluded ones
+    not_replayable with a reason, GS TCs wall, undelivered TCs never,
+    the armed/inject fault pair, forces."""
+    st = bundle_mod.new_state()
+
+    def cmd(verb, args=None, seq=1):
+        return _rec("cmd", seq, verb, {"args": args or {}}, source="api")
+    d = bundle_mod.classify(cmd("sim.pause"), st)
+    check(d == {"input": "verb", "verb": "sim.pause", "args": {},
+                "replay": "guest"}, "a replay verb: %r" % d)
+    d = bundle_mod.classify(cmd("scenario.run", {"file": "x"}), st)
+    check(d["input"] == "verb" and d["replay"] == "no" and d["why"],
+          "scenario.run is excluded with a reason: %r" % d)
+    d = bundle_mod.classify(cmd("platform.flash.load", {"name": "x"}),
+                            st)
+    check(d["replay"] == "no", "flash verbs are by reference: %r" % d)
+
+    def tc(**over):
+        data = {"hex": "1dacc0070002", "apid": 0x5AC, "seq": 2,
+                "service": 17, "subtype": 1, "source": "tc",
+                "delivered": True}
+        data.update(over)
+        return _rec("tc", 3, "tc.gs", data, source="tc")
+    d = bundle_mod.classify(tc(), st)
+    check(d == {"input": "tc", "hex": "1dacc0070002", "replay": "wall"},
+          "a real GS TC is wall-paced: %r" % d)
+    d = bundle_mod.classify(tc(delivered=False, dropped=True), st)
+    check(d["replay"] == "no" and d["why"] == "never reached the FSW",
+          "an undelivered TC: %r" % d)
+    d = bundle_mod.classify(_rec("tc", 4, "platform.timesync", {
+        "service": 9, "subtype": 129, "seq": 5, "coarse": 0x10000000,
+        "raw": False}), st)
+    check(d["input"] == "tc" and d["hex"] is None and d["seq"] == 5 and
+          d["coarse"] == 0x10000000 and d["replay"] == "guest",
+          "the manual TC(9,129): %r" % d)
+    check(bundle_mod.classify(_rec("tc", 5, "platform.keepalive", {
+        "summary": True, "sent": 80}), st) is None,
+        "a keep-alive summary is no input")
+    # faults
+    check(bundle_mod.classify(_rec("fault", 6, "fault.obt.jump",
+                                   {"action": "reapply"}), st) is None,
+          "reapply is automatic")
+    check(bundle_mod.classify(_rec("fault", 7, "fault.timecode.missing",
+                                   {"action": "armed",
+                                    "params": {"delta_s": 4},
+                                    "seed": 99,
+                                    "trigger": {"at": "at_sim",
+                                                "sim_time": 9}}),
+                              st) is None, "armed only arms")
+    d = bundle_mod.classify(_rec("fault", 8, "fault.timecode.missing",
+                                 {"action": "inject", "target": "t",
+                                  "mode": "jump", "params":
+                                  {"delta_s": 4}, "seed": 99}), st)
+    check(d == {"input": "fault", "id": "timecode.missing",
+                "params": {"delta_s": 4}, "seed": 99,
+                "trigger": {"at": "at_sim", "sim_time": 9},
+                "replay": "guest"},
+          "the armed twin gives the trigger: %r" % d)
+    d = bundle_mod.classify(_rec("fault", 9, "fault.obt.jump",
+                                 {"action": "inject",
+                                  "params": {"delta_s": 4},
+                                  "seed": 99}), st)
+    check(d["trigger"] == {"at": "now"} and
+          d["params"] == {"delta_s": 4} and d["seed"] == 99,
+          "an immediate inject: %r" % d)
+    d = bundle_mod.classify(_rec("force", 10, "instrument.hk_adc.3",
+                                 {"action": "set", "value": 123,
+                                  "ch": 3}), st)
+    check(d == {"input": "force", "path": "instrument.hk_adc.3",
+                "value": 123, "replay": "guest"}, "a forcing: %r" % d)
+    check(bundle_mod.classify(_rec("force", 11, "force.reapply",
+                                   {"why": "boot"}), st) is None,
+          "force.reapply is automatic")
+
+
+def t_bundle_run_id(env):
+    """R1: a run-mode basename is its stamp-prefixed name; an
+    interactive dir gets the start stamped on."""
+    check(bundle_mod.run_id("20261115T101112Z-gate-x",
+                            "2026-11-15T10:11:12.5Z") ==
+          "20261115T101112Z-gate-x", "the stamp basename")
+    got = bundle_mod.run_id("interactive", "2026-11-15T10:11:12.500000Z")
+    check(got == "interactive-20261115T101112500000Z",
+          "the compact stamp: %s" % got)
+    check(bundle_mod.run_id("20261115T101112Z-gate-x.1s",
+                            "2026-11-15T10:11:13Z") ==
+          "20261115T101112Z-gate-x.1s", "a variant dir keeps its name")
+
+
+def t_bundle_qemu_provenance(env):
+    """R2: the QEMU commit is the binary's own tree's, not the
+    controller's (they are often different worktrees); a binary
+    outside any git tree records None, never the controller's."""
+    import subprocess
+    with tempfile.TemporaryDirectory() as d:
+        subprocess.run(["git", "init", "-q", d], check=True)
+        subprocess.run(["git", "-C", d, "-c", "user.name=t",
+                        "-c", "user.email=t@t", "commit", "-q",
+                        "--allow-empty", "-m", "x"], check=True)
+        os.makedirs(os.path.join(d, "build"))
+        b = os.path.join(d, "build", "qemu-system-sparc")
+        open(b, "wb").write(b"\0")
+        want = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"],
+                              capture_output=True, text=True,
+                              check=True).stdout.strip()
+        q = bundle_mod._qemu_info(b, [])
+        check(q["commit"] == want, "binary tree commit: %s" % q["commit"])
+        ctl = bundle_mod.git_info()
+        if ctl:
+            check(q["platform"]["commit"] == ctl["commit"],
+                  "the controller tree recorded apart")
+            check(q["commit"] != ctl["commit"], "not the controller's")
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        b = os.path.join(d, "qemu-system-sparc")
+        open(b, "wb").write(b"\0")
+        q = bundle_mod._qemu_info(b, [])
+        check(q["commit"] is None, "outside git: %s" % q["commit"])
+
+
+def t_bundle_writer_lifecycle(env):
+    """R2: every controller writes a bundle in its run dir (manifest
+    fields, the ack decision from a synthetic TM), and a reused
+    interactive dir never mixes sessions: the writer truncates."""
+    cfg = env.cfg(timeline={"sample_s": 0.5}, gs={"emulation": "on"})
+    d = env.run_dir()
+    ctl = core_mod.Controller(cfg, run_dir=d)
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        cmd("fault.inject", {"id": "timecode.missing"})
+        cmd("tc.gs.send", {"service": 237, "subtype": 18,
+                           "data": "01383c00000000"})
+        # the fake QEMU never sends TM: a synthetic TM(1,7) whose
+        # (apid, seq) matches the GS TC's, via log.ingest
+        tcs = [x.obj for x in ctl.log.since(0) if x.kind == "tc" and
+               x.obj["path"] == "tc.gs.send"]
+        check(len(tcs) == 1 and tcs[0]["data"]["delivered"],
+              "the delivered GS TC: %r" % tcs)
+        apid, seq = tcs[0]["data"]["apid"], tcs[0]["data"]["seq"]
+        sim, boot, _, _ = ctl.clock.now()
+        ctl.log.ingest({"v": 1, "seq": ctl.log.seq + 1,
+                        "sim_time": sim, "boot_id": boot,
+                        "vclock_ns": None,
+                        "wall_time": log_mod.wall_now(),
+                        "source": "tm", "kind": "tm", "path": "tm.0x5a1",
+                        "data": {"decoded": {
+                            "apid": 0x5A1, "type": 1, "subtype": 7,
+                            "dest": 14,
+                            "tc": {"packet_id": 0x1DAC, "apid": apid,
+                                   "seq": seq}}}})
+        cmd("platform.power.off", {})
+    finally:
+        ctl.shutdown()
+    with open(os.path.join(d, "manifest.json")) as f:
+        m = json.load(f)
+    check(m["v"] == 1 and m["kind"] == "run" and m["open"] is False and
+          m["ended_utc"], "a closed v1 manifest")
+    check(m["run_id"] == os.path.basename(d) + "-" +
+          re.sub(r"[^0-9A-Za-z]", "", m["started_utc"]),
+          "an interactive run_id carries the start: %s" % m["run_id"])
+    check(m["fsw"]["sha256"] == hashlib.sha256(b"").hexdigest(),
+          "the /dev/null ELF sha")
+    check(m["qemu"]["argv"] and
+          m["qemu"]["argv"][0].endswith("qemu-new"),
+          "argv from the power record: %r" % m["qemu"]["argv"][:1])
+    check(m["inputs"]["counts"]["fault"] == 1, "one fault input: %r"
+          % m["inputs"])
+    check(m["inputs"]["counts"]["tc"] == 1, "one tc input")
+    check(m["decisions"]["counts"]["ack"] == 1, "the ack decision: %r"
+          % m["decisions"])
+    check(m["flash"]["start"]["source"] == "fresh", "a fresh flash start")
+    check(m["config"]["mode"] == "interactive" and
+          m["config"]["bundle"]["enabled"] is True,
+          "the config is in the manifest")
+    check(m["outputs"]["log_records"] > 0 and
+          m["outputs"]["log_bytes"] ==
+          os.path.getsize(os.path.join(d, "log.jsonl")),
+          "the outputs: %r" % m["outputs"])
+    check(m["start_seq"] > 0, "start_seq is the controller.start seq")
+    with open(os.path.join(d, "decisions.jsonl")) as f:
+        first_lines = [x for x in f if x.strip()]
+    check(len(first_lines) == 1 and json.loads(first_lines[0])["kind"]
+          == "ack", "one decision line: %r" % first_lines)
+    first = dict(m)
+    # the same run dir again: a new session, the old decisions gone
+    ctl2 = core_mod.Controller(cfg, run_dir=d)
+    ctl2.shutdown()
+    with open(os.path.join(d, "manifest.json")) as f:
+        m2 = json.load(f)
+    check(m2["started_utc"] != first["started_utc"] and
+          m2["start_offset"] > first["start_offset"] and
+          m2["start_seq"] == first["start_seq"],
+          "a new session: offset %r vs %r (seqs restart per session)"
+          % (m2["start_offset"], first["start_offset"]))
+    check(m2["flash"]["start"]["source"] == "carried",
+          "the flash survived the first session")
+    with open(os.path.join(d, "decisions.jsonl")) as f:
+        lines = [x for x in f if x.strip()]
+    check(not [x for x in lines
+               if json.loads(x)["seq"] <= first["final_seq"]],
+          "the old decisions are gone (truncated): %r" % lines)
+    check(retention.read_marker(d) is None,
+          "an interactive dir has no retention marker")
+
+
+def t_bundle_writer_rotation(env):
+    """R2: a rotated log loses the controller.start record; the
+    manifest still carries the config and the decisions keep their
+    order with none lost."""
+    cfg = env.cfg(timeline={"sample_s": 0},
+                  log={"max_log_mb": 1, "max_log_files": 5})
+    ctl = core_mod.Controller(cfg, run_dir=env.run_dir())
+    try:
+        for i in range(9000):
+            ctl.log.emit("ctl", "log", "spin", {"i": i, "pad": "x" * 80})
+            if i % 50 == 0:
+                sim, boot, _, _ = ctl.clock.now()
+                ctl.log.ingest({
+                    "v": 1, "seq": ctl.log.seq + 1, "sim_time": sim,
+                    "boot_id": boot, "vclock_ns": None,
+                    "wall_time": log_mod.wall_now(), "source": "tm",
+                    "kind": "tm", "path": "tm.0x5a4",
+                    "data": {"hk": {"NIXD0501": i % 7},
+                             "decoded": {"apid": 0x5A4, "type": 3,
+                                         "subtype": 25, "sid": 2}}})
+    finally:
+        ctl.shutdown()
+    check(os.path.exists(os.path.join(ctl.run_dir, "log.jsonl.1.gz")),
+          "the log rotated")
+    with open(os.path.join(ctl.run_dir, "manifest.json")) as f:
+        m = json.load(f)
+    check(m["config"]["log"]["max_log_mb"] == 1 and
+          m["config"]["timeline"]["sample_s"] == 0.0,
+          "the config survives the rotation")
+    check(m["outputs"]["log_records"] >= 9000, "every record seen: %r"
+          % m["outputs"])
+    seqs = []
+    with open(os.path.join(ctl.run_dir, "decisions.jsonl")) as f:
+        for ln in f:
+            seqs.append(json.loads(ln)["seq"])
+    check(len(seqs) == 179 and
+          all(b > a for a, b in zip(seqs, seqs[1:])),
+          "every hk_step, strictly ordered: %d" % len(seqs))
+
+
+def t_bundle_writer_concurrent(env):
+    """R2: 4 threads emit cmd/tm/fault records through one RecordLog
+    with the writer attached; every decisions.jsonl line loads alone
+    (no interleaved writes) and the seqs are strictly increasing (the
+    Writer's per-seq buffer orders what the listener rule leaves
+    unordered)."""
+    clk = SimClock()
+    lg = log_mod.RecordLog(None, clk.now)
+    d = env.run_dir()
+    w = bundle_mod.Writer(env.cfg(timeline={"sample_s": 0}), d, lg,
+                          "interactive", start_seq=lg.seq)
+    lg.listeners.append(w.on_record)
+    n = 500
+
+    def emit(k):
+        for i in range(n):
+            what = i % 4
+            if what == 0:
+                lg.emit("ctl", "cmd", "sim.pause", {"args": {}})
+            elif what == 1:
+                lg.emit("tm", "tm", "tm.0x5a7",
+                        {"decoded": {"apid": 0x5A7, "type": 5,
+                                     "subtype": 1,
+                                     "eid": 0x1000 + (k % 4) * 256 +
+                                     i % 256}}, sim_est=True)
+            elif what == 2:
+                lg.emit("api", "fault", "fault.x.y",
+                        {"action": "inject", "params": {"a": i},
+                         "seed": i})
+            else:
+                lg.emit("ctl", "log", "spin", {"i": i})
+    ts = [threading.Thread(target=emit, args=(k,)) for k in range(4)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    w.close()
+    lg.close()
+    seqs = []
+    with open(os.path.join(d, "decisions.jsonl")) as f:
+        for ln in f:
+            seqs.append(json.loads(ln)["seq"])
+    check(len(seqs) == 4 * (n // 4) and
+          all(b > a for a, b in zip(seqs, seqs[1:])),
+          "%d decisions, strictly ordered: %d" % (4 * (n // 4),
+                                                  len(seqs)))
+    with open(os.path.join(d, "manifest.json")) as f:
+        m = json.load(f)
+    check(m["decisions"]["counts"]["event"] == 4 * (n // 4),
+          "the manifest counts agree: %r" % m["decisions"])
+
+
+def t_bundle_flashlib_sha(env):
+    """R2: sparse_sha256 reads only the mapped extents and equals the
+    dense digest (a materialising walk would fill the disk); save()
+    records it."""
+    from . import flashlib
+    p = os.path.join(env.tmp, "sparse-%d.bin" % env.n)
+    with open(p, "wb") as f:
+        f.write(os.urandom(4096))
+        f.seek(32 << 20)
+        f.write(os.urandom(4096))
+        f.truncate(64 << 20)
+    with open(p, "rb") as f:
+        dense = hashlib.sha256(f.read()).hexdigest()
+    t0 = time.monotonic()
+    got = flashlib.sparse_sha256(p)
+    dt = time.monotonic() - t0
+    check(got == dense, "sparse == dense sha256")
+    check(dt < 2.0, "the walk is extent-only: %.2fs" % dt)
+    hole = os.path.join(env.tmp, "hole-%d.bin" % env.n)
+    with open(hole, "wb") as f:
+        f.truncate(1 << 20)
+    check(flashlib.sparse_sha256(hole) ==
+          hashlib.sha256(bytes(1 << 20)).hexdigest(), "holes are zeros")
+    empty = os.path.join(env.tmp, "empty-%d.bin" % env.n)
+    open(empty, "wb").close()
+    check(flashlib.sparse_sha256(empty) ==
+          hashlib.sha256(b"").hexdigest(), "an empty file")
+    rd = env.run_dir()
+    with open(os.path.join(rd, "flash.bin"), "wb") as f:
+        f.write(b"\xa5" * 8192)
+        f.truncate(4 << 20)
+    root = os.path.join(env.tmp, "libroot-s%d" % env.n)
+    rec = flashlib.save(env.cfg(retention={"run_root": root}), rd,
+                        "with-sha", {"elf": "/e/asw.elf"})
+    check(rec["sha256"] == flashlib.sparse_sha256(
+        os.path.join(rd, "flash.bin")) and len(rec["sha256"]) == 64,
+        "the save record carries sha256: %r" % sorted(rec))
+
+
+def t_bundle_runmode_verdict(env):
+    """R2: a finished run-mode manifest carries the scenario's
+    verdict (set_verdict, after finish_run)."""
+    from . import runmode
+    d = _scn_dir(env)
+    root = os.path.join(env.tmp, "runs-root-v%d" % env.n)
+    o = env.overrides()
+    o["mode"] = "run"
+    o.setdefault("run", {}).update(scenario_dir=d,
+                                   scenarios=["fake-pass.json"])
+    o["retention"] = {"run_root": root, "min_free_mb": 1}
+    out = []
+    check(runmode.run_all(config_mod.load(overrides=o), out=out.append)
+          == 0, "the run passed: %r" % out)
+    stamps = sorted(os.listdir(os.path.join(root, "reports")))
+    with open(os.path.join(root, "reports", stamps[-1],
+                           "summary.json")) as f:        # <stamp>/summary
+        runs = json.load(f)["runs"]
+    rd = runs[0]["run_dir"]
+    with open(os.path.join(rd, "manifest.json")) as f:
+        m = json.load(f)
+    check(m["verdict"] == "pass" and m["mode"] == "run" and
+          m["run_id"] == os.path.basename(rd),
+          "the finished manifest: %r" % {k: m.get(k) for k in
+                                         ("verdict", "run_id", "mode")})
+
+
+def _bundle_dir(env, root, name, manifest):
+    rd = os.path.join(root, "runs", name)
+    os.makedirs(rd)
+    with open(os.path.join(rd, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+    with open(os.path.join(rd, "log.jsonl"), "wb") as f:
+        f.write(b'{"v":1,"seq":1}\n' * 100)
+    return rd
+
+
+def t_bundle_api(env):
+    """R3: /runs lists the bundles (plus the live dir), /runs/<id> the
+    manifest with file sizes, /runs/<id>/manifest the raw bytes; the
+    run_id rule fires before any file access."""
+    root = os.path.join(env.tmp, "runs-root-api%d" % env.n)
+    sha = "ab" * 32
+    _bundle_dir(env, root, "20261115T101112Z-bundle-a", {
+        "v": 1, "kind": "run", "run_id": "20261115T101112Z-bundle-a",
+        "mode": "run", "open": False, "verdict": "pass",
+        "started_utc": "2026-11-15T10:11:12Z",
+        "ended_utc": "2026-11-15T10:11:42Z", "length_s": 30.0,
+        "scenario": {"file": "g.json", "name": "gate-x", "variant": "v"},
+        "fsw": {"elf": "/e/asw.elf", "sha256": sha},
+        "qemu": {"describe": "9c3d111", "dirty": False},
+        "config": {"qemu": {"icount_shift": 7, "pace": "fast"}},
+        "inputs": {"counts": {}, "not_replayable": 0},
+        "decisions": {"counts": {"event": 1, "ack": 0, "hk_step": 0}}})
+    broken = _bundle_dir(env, root, "20261115T101113Z-broken-b", {})
+    with open(os.path.join(broken, "manifest.json"), "w") as f:
+        f.write('{"v": 1, ')
+    os.makedirs(os.path.join(root, "runs", "20261115T101114Z-nomf"))
+    ctl = env.controller(retention={"run_root": root})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/api/v1/runs")
+        q = json.loads(body)
+        check(q["root"] == root, "the run root: %r" % q["root"])
+        rows = {x["run_id"]: x for x in q["runs"]}
+        a = rows.get("20261115T101112Z-bundle-a")
+        check(st == 200 and a and a["elf_sha256"] == sha and
+              a["icount_shift"] == 7 and a["pace"] == "fast" and
+              a["name"] == "gate-x" and a["verdict"] == "pass" and
+              a["baseline"] is False and a["live"] is False,
+              "the listing entry: %r" % a)
+        check("20261115T101113Z-broken-b" in rows and
+              rows["20261115T101113Z-broken-b"].get("error"),
+              "a broken manifest is an error entry")
+        check("20261115T101114Z-nomf" not in rows,
+              "no manifest, no row")
+        live = [x for x in q["runs"] if x["live"]]
+        check(len(live) == 1 and live[0]["dir"] == ctl.run_dir,
+              "the live controller's own dir: %r" % live)
+        st, _, body = _http(port, "GET",
+                            "/api/v1/runs/20261115T101112Z-bundle-a")
+        det = json.loads(body)
+        check(st == 200 and det["files"]["log_bytes"] ==
+              os.path.getsize(os.path.join(a["dir"], "log.jsonl")) and
+              det["baseline"] is False and "marker" in det,
+              "the detail with file sizes: %r" % det.get("files"))
+        st, _, body = _http(
+            port, "GET",
+            "/api/v1/runs/20261115T101112Z-bundle-a/manifest")
+        with open(os.path.join(a["dir"], "manifest.json"), "rb") as f:
+            check(st == 200 and body == f.read(),
+                  "the raw manifest bytes")
+        for bad in ("/api/v1/runs/../etc", "/api/v1/runs/a/b"):
+            st, _, _ = _http(port, "GET", bad)
+            check(st == 400, "%s -> %d" % (bad, st))
+        st, _, _ = _http(port, "GET", "/api/v1/runs/no-such-run")
+        check(st == 404, "an unknown id: %d" % st)
+        st, _, _ = _http(port, "GET", "/api/v1/runs/no-such/manifest")
+        check(st == 404, "an unknown id's manifest: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
+def t_bundle_baseline(env):
+    """R3: the baseline mark moves with run.baseline, /runs flags it,
+    and retention keeps the baseline dir past the budget, warning that
+    names it; set on an unknown id is a 404."""
+    root = os.path.join(env.tmp, "runs-root-b%d" % env.n)
+    for i, name in enumerate(("20261115T101112Z-b1",
+                              "20261115T101113Z-b2")):
+        rd = os.path.join(root, "runs", name)
+        os.makedirs(rd)
+        with open(os.path.join(rd, "manifest.json"), "w") as f:
+            json.dump({"v": 1, "run_id": name,
+                       "started_utc": "2026-11-15T10:11:1%dZ" % i}, f)
+        retention.write_marker(rd, "passed", ended=1_800_000_000)
+    ctl = env.controller(retention={"run_root": root})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/run.baseline",
+                         body=b'{"name": "20261115T101112Z-b1"}',
+                         headers=_post())
+        check(st == 200, "baseline set: %d" % st)
+        check(os.path.isfile(os.path.join(
+            root, "runs", "20261115T101112Z-b1", bundle_mod.BASELINE)),
+            "the marker file")
+        st, _, body = _http(port, "GET", "/api/v1/runs")
+        rows = {x["run_id"]: x for x in json.loads(body)["runs"]}
+        check(rows["20261115T101112Z-b1"]["baseline"] is True and
+              rows["20261115T101113Z-b2"]["baseline"] is False,
+              "only that row is flagged: %r" % rows)
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/run.baseline",
+                         body=b'{"name": "20261115T101113Z-b2"}',
+                         headers=_post())
+        check(st == 200, "moved")
+        st, _, body = _http(port, "GET", "/api/v1/runs")
+        rows = {x["run_id"]: x for x in json.loads(body)["runs"]}
+        check(rows["20261115T101112Z-b1"]["baseline"] is False and
+              rows["20261115T101113Z-b2"]["baseline"] is True,
+              "one baseline at a time: %r" % rows)
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/run.baseline.clear",
+                         body=b"{}", headers=_post())
+        check(st == 200, "cleared")
+        check(not os.path.exists(os.path.join(
+            root, "runs", "20261115T101113Z-b2", bundle_mod.BASELINE)),
+            "the marker is gone")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/run.baseline",
+                         body=b'{"name": "no-such"}', headers=_post())
+        check(st == 404, "set on an unknown id: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    # retention: the baseline is counted and kept past max_total_mb
+    p1 = os.path.join(root, "runs", "20261115T101112Z-b1")
+    p2 = os.path.join(root, "runs", "20261115T101113Z-b2")
+    open(os.path.join(p1, bundle_mod.BASELINE), "w").close()
+    rc = {"keep_runs": 1, "keep_failed_days": 7, "max_total_mb": 100,
+          "min_free_mb": 1, "keep_flash": "failed"}
+    warns = []
+    doomed = retention.plan(root, rc, 1_800_000_000,
+                            sizes={p1: 300 << 20, p2: 1 << 20},
+                            warn=warns.append)
+    check([p for p, _ in doomed] == [p2] and
+          any("20261115T101112Z-b1" in x for x in warns),
+          "the other run goes, the baseline is kept with a warning: "
+          "%r %r" % (doomed, warns))
+    os.unlink(os.path.join(p1, bundle_mod.BASELINE))
+    warns = []
+    doomed = retention.plan(root, rc, 1_800_000_000,
+                            sizes={p1: 300 << 20, p2: 1 << 20},
+                            warn=warns.append)
+    check([p for p, _ in doomed] == [p1] and not warns,
+          "without the mark the old policy holds: %r %r"
+          % (doomed, warns))
+
+
+def t_bundle_run_open(env):
+    """R3: run.open serves a finished bundle read-only in-process (the
+    exact --view-run pair), one slot, run.close stops it, and nothing
+    is written into the run dir."""
+    root = os.path.join(env.tmp, "runs-root-o%d" % env.n)
+    d = os.path.join(root, "runs", "20261115T101112Z-openable")
+    os.makedirs(d)
+    t = [0.0]
+    lg = log_mod.RecordLog(None, lambda: (int(t[0]), 0, None, True))
+    lg.emit("ctl", "log", "controller.start",
+            {"run_dir": d, "config": {
+                "timeline": {"views_dir": "", "idb_json": "",
+                             "idb_sqlite": "", "sample_paths": [],
+                             "sample_s": 0.0},
+                "retention": {"run_root": root}}})
+    for i in range(5):
+        t[0] += 1.0
+        lg.emit("ctl", "sample", "", {"instrument.rotb.count": i})
+    recs = lg.since(0)
+    lg.close()
+    with open(os.path.join(d, "log.jsonl"), "w") as f:
+        for r in recs:
+            f.write(r.line + "\n")
+    with open(os.path.join(d, "manifest.json"), "w") as f:
+        json.dump({"v": 1, "kind": "run",
+                   "run_id": "20261115T101112Z-openable", "dir": d,
+                   "open": False,
+                   "started_utc": "2026-11-15T10:11:12Z"}, f)
+    before = _dir_state(d)
+    ctl = env.controller(retention={"run_root": root})
+    try:
+        r = ctl.command("run.open", {"name": "20261115T101112Z-openable"})
+        port = r["port"]
+        check(r["url"] == "http://127.0.0.1:%d" % port and
+              1024 <= port <= 65535, "the viewer: %r" % r)
+        st, _, body = _http(port, "GET", "/api/v1/status")
+        s = json.loads(body)
+        check(st == 200 and s["mode"] == "view" and
+              s["view_run"] == os.path.realpath(d),
+              "view mode: %r" % s)
+        e = raises(VerbError, ctl.command, "run.open",
+                   {"name": "20261115T101112Z-openable"})
+        check(e.status == 409, "a second viewer: %s" % e)
+        r = ctl.command("run.close", {"port": port})
+        check(r["closed"] == port, "closed: %r" % r)
+        refused = False
+        try:
+            _http(port, "GET", "/api/v1/status")
+        except OSError:
+            refused = True
+        check(refused, "the port no longer accepts")
+        e = raises(VerbError, ctl.command, "run.close", {})
+        check(e.status == 409, "close without a viewer: %s" % e)
+        e = raises(VerbError, ctl.command, "run.open",
+                   {"name": "no-such-run"})
+        check(e.status == 404, "open on an unknown id: %s" % e)
+    finally:
+        ctl.shutdown()
+    check(_dir_state(d) == before, "nothing written into the run dir")
+
+
+def t_ui_runs(env):
+    """R4 (no browser): the Runs tab with its filter and table, the
+    board's verbs used and served, the page rules still holding."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+        st, _, rbody = _http(port, "GET", "/api/v1/verbs")
+        verbs = {v["verb"] for v in json.loads(rbody)["verbs"]}
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    page = body.decode()
+    p = _UiParser()
+    p.feed(page)
+    check("runs" in p.tabs and "runs" in p.panels,
+          "the runs tab and panel: %r" % sorted(p.tabs))
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check(UI_RUNS_IDS <= ids, "runs ids missing %r"
+          % sorted(UI_RUNS_IDS - ids))
+    js = "\n".join(p.scripts)
+    for verb in ("run.baseline", "run.open"):
+        check(verb in verbs, "%s is a served verb" % verb)
+        check('"%s"' % verb in js, "the board builds %s rows" % verb)
+    check("run.close" in verbs and 'data-verb="run.close"' in page,
+          "the header close-viewer is served")
+    check(UI_RUNS_VERBS <= verbs, "all board verbs served: %r"
+          % (UI_RUNS_VERBS - verbs))
+    for tag, a in p.attrs:
+        check("style" not in a and
+              not [k for k in a if k.startswith("on")],
+              "<%s %r>: style attribute or inline handler" % (tag, a))
+    for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
+        check(bad not in page.lower(), "the page uses %s" % bad)
+
+
 CASES = [("config", t_config), ("argv golden", t_argv),
          ("run-dir guard + sparse preflight", t_rundir),
          ("binary guard", t_binary_guard), ("retention", t_retention),
@@ -5368,6 +6075,18 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("series API: repeated ids (A4)", t_series_api_ids_repeat),
          ("views (A5)", t_views),
          ("view-run (A6)", t_view_run),
+         ("bundle: decisions (S1)", t_bundle_decisions),
+         ("bundle: inputs (S1)", t_bundle_inputs),
+         ("bundle: run ids (S1)", t_bundle_run_id),
+         ("bundle: qemu provenance (S1)", t_bundle_qemu_provenance),
+         ("bundle writer lifecycle (S1)", t_bundle_writer_lifecycle),
+         ("bundle writer rotation (S1)", t_bundle_writer_rotation),
+         ("bundle writer concurrent (S1)", t_bundle_writer_concurrent),
+         ("bundle: flashlib sparse sha (S1)", t_bundle_flashlib_sha),
+         ("bundle: runmode verdict (S1)", t_bundle_runmode_verdict),
+         ("bundle: runs API (S1)", t_bundle_api),
+         ("bundle: baseline (S1)", t_bundle_baseline),
+         ("bundle: run.open/close (S1)", t_bundle_run_open),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("faults: since_sim (D1)", t_faults_since_sim),
@@ -5386,6 +6105,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: the page (no browser)", t_ui_page),
          ("UI: tabs (timeline B1)", t_ui_tabs),
          ("UI: timeline (C1)", t_ui_timeline),
+         ("UI: runs board (S1)", t_ui_runs),
          ("UI: mockup port (D)", t_ui_mockup_d),
          ("setup status (timeline B2)", t_setup_status),
          ("UI: the live check (smokes)", t_ui_check)]

@@ -12,6 +12,7 @@ VERBS = frozenset({
     "platform.power.boot", "platform.power.cycle", "platform.power.off",
     "platform.power.on", "platform.spw.link", "platform.timecode.enable",
     "platform.timecode.inject", "platform.timecode.once",
-    "platform.timesync.send", "scenario.abort", "scenario.run",
+    "platform.timesync.send", "run.baseline", "run.baseline.clear",
+    "run.close", "run.open", "scenario.abort", "scenario.run",
     "sim.pause", "sim.resume", "tc.gs.send", "tc.platform.send",
     "view.delete", "view.save"})

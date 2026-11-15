@@ -5899,3 +5899,65 @@ run (sleep=on and off, the AX gates included), not only `--pace fast`.
 deadline, which is cheaper than the eventfd write it replaces. The
 `qemu_clock_notify` iteration over `clock->timerlists` without a lock
 is upstream's, unchanged. Upstreamable as is.
+
+## 51. Run bundles: retention keeps the baseline run (controller-side policy, no upstream analogue)
+
+**What:** run-dir retention (stixplat/retention.py) never dooms a dir
+that carries the run-bundle baseline marker
+(`.stixplat-baseline`, written by `run.baseline`), like a running run.
+Its size still counts toward `max_total_mb`: past the budget `plan()`
+deletes the other candidates first and, if still over, warns that it
+keeps the named baseline dir instead of deleting it (`cleanup` grew a
+`warn` callback for it; `runmode.run_all` prints the warning).
+
+**Why:** the record -> replay -> compare track (S3) compares a replay
+against a fixed origin bundle; retention's last-N and failed-days
+rules would otherwise delete that origin mid-work.
+
+**Risk:** controller-side only, one clause next to the existing
+"running is never deleted" rule; a baseline whose dir disappears
+(manual deletion) changes nothing — the marker goes with the dir.
+The budget is still enforced for everything else, and a past-budget
+baseline is visible in the Runs board and named in the warning.
+
+## 52. flashlib records gain sha256 (additive field, no upstream analogue)
+
+**What:** `platform.flash.save`'s library record
+(`<run_root>/flash-library/<name>.json`) gains `sha256`: the content
+digest of the saved flash, computed with a new sparse-aware
+`sparse_sha256()` (a FIEMAP walk — fcntl.ioctl + ctypes structs,
+Linux-only like rundir's fallocate — hashing only mapped extents and
+zeros for the holes, with a dense fallback where FIEMAP is missing).
+The hash runs only at an explicit save (power off/paused), never at
+controller start or close, and its cost is bounded by the sparse limit
+(real blocks <= power.sparse_limit_mb).
+
+**Why:** S2 replay and S3 compare pin the flash start state by
+reference (bundle manifests carry the library entry's name and
+sha256); a digest says whether two runs started from the same flash
+bytes.
+
+**Risk:** a new field only; readers key on the fields they know and
+ignore unknown ones (the v1 additive rule, D-PLn). The 16.5 GB
+apparent flash is never materialised: only its real blocks are read.
+
+## 53. The controller may serve one read-only viewer of another run dir in-process (no upstream analogue)
+
+**What:** the live controller gains `run.open {name, port?}` /
+`run.close {port?}` (verbs) plus `GET /runs`,
+`GET /runs/<run_id>`, `GET /runs/<run_id>/manifest` (reads): run.open
+builds the exact `--view-run` objects (`viewrun.ViewRun` behind
+`api.make_server`) inside the controller process, bound to 127.0.0.1
+on the given port (1024..65535) or a free one, and returns
+`{url, port}`. At most one viewer at a time (a second run.open is a
+409); run.close shuts it down. In a `--view-run` server the `run.*`
+verbs are refused by the existing non-`view.*` 403 rule, unchanged.
+
+**Why:** the Runs board opens a finished bundle without leaving the
+page and without a second process (the `--view-run` CLI stays for
+standalone use).
+
+**Risk:** the viewer serves one run dir read-only with the same
+D-PLj request filter, loopback bind and 403 rules as `--view-run`;
+nothing is written into the viewed run dir (self-tested). The one
+slot keeps the process's footprint bounded.

@@ -181,6 +181,7 @@ tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
   <button type="button" data-tab="scenarios">Scenarios</button>
   <button type="button" data-tab="logs">Logs</button>
   <button type="button" data-tab="state">State</button>
+  <button type="button" data-tab="runs">Runs</button>
   <button type="button" data-tab="setup">Setup</button>
   <button type="button" data-tab="timeline">Timeline</button>
 </nav>
@@ -529,6 +530,26 @@ tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
 </section>
 </div>
 
+<div class="tab" data-tab-panel="runs" hidden>
+<section class="wide">
+  <h2>Run bundles
+    <input id="runs-filter" placeholder="filter, e.g. gate" class="wide">
+    <button type="button" id="runs-refresh">refresh</button>
+    <button type="button" id="runs-close-viewer" data-verb="run.close"
+            hidden>close viewer</button>
+  </h2>
+  <div class="scroll tall">
+    <table>
+      <thead><tr><th>bundle</th><th>recorded</th><th>FSW ELF</th>
+        <th>QEMU</th><th>icount</th><th>length</th><th>tags</th>
+        <th>actions</th></tr></thead>
+      <tbody id="runs-table"></tbody>
+    </table>
+  </div>
+  <div class="desc" id="runs-note"></div>
+</section>
+</div>
+
 <div class="tab" data-tab-panel="setup" hidden>
 <section class="wide">
   <h2>Launch configuration</h2>
@@ -752,6 +773,10 @@ document.addEventListener("click", async (ev) => {
     if (verb === "platform.flash.save" || verb === "platform.flash.load")
       loadFlash();  // the library table shows the new state
     if (verb.startsWith("param.")) paramsRefresh();  // ditto the params
+    if (verb === "run.open" && res.result && res.result.url)
+      window.open(res.result.url, "_blank", "noopener");
+    if (verb === "run.baseline" || verb === "run.baseline.clear")
+      loadRuns();   // the baseline mark moved
   } catch (e) {
     toast(String(e.message || e), true);
   } finally {
@@ -774,6 +799,7 @@ function showTab(id) {
   }
   if (id === "idpu") paramsRefresh();   // the FSW parameters panel
   if (id === "timeline") tlDraw();
+  if (id === "runs") loadRuns();
 }
 function tabFromHash() {
   // the tab is the hash head; the timeline's view choice rides after it
@@ -926,6 +952,87 @@ function paramsRow(row, diff) {
 }
 $("params-find").addEventListener("input", renderParams);
 $("params-nondef").addEventListener("change", renderParams);
+/* ---- the runs board (S1): the bundles of this run root ---- */
+let runsCache = [];
+async function loadRuns() {
+  try {
+    const q = await getJSON("runs");
+    runsCache = q.runs || [];
+    renderRuns();
+    text($("runs-note"), (q.root || "") + " · " + runsCache.length +
+         " bundle" + (runsCache.length === 1 ? "" : "s"));
+  } catch (e) {
+    toast(String(e.message || e), true);
+  }
+}
+
+function runsHit(e, q) {
+  if (!q) return true;
+  return [e.name, e.elf, e.qemu_describe, e.verdict]
+    .some((v) => String(v == null ? "" : v).toLowerCase().includes(q));
+}
+
+function runsRow(e) {
+  const tr = document.createElement("tr");
+  const c1 = document.createElement("td");
+  text(c1, e.name || e.run_id || "");
+  for (const [on, label] of [[e.live, "live"], [e.open, "open"],
+                             [e.baseline, "baseline"]]) {
+    if (!on) continue;
+    const b = document.createElement("span");
+    cls(b, "chip on");
+    text(b, label);
+    c1.append(b);
+  }
+  tr.append(c1);
+  const c2 = document.createElement("td");
+  text(c2, e.started_utc || "");
+  tr.append(c2);
+  const c3 = document.createElement("td");
+  const elf = String(e.elf || "").split("/").pop();
+  text(c3, elf + (e.elf_sha256 ? " " + String(e.elf_sha256).slice(0, 8)
+                               : ""));
+  tr.append(c3);
+  const c4 = document.createElement("td");
+  text(c4, (e.qemu_describe || "?") + (e.qemu_dirty ? " + dirty" : ""));
+  tr.append(c4);
+  const c5 = document.createElement("td");
+  text(c5, e.icount_shift == null ? "?" : String(e.icount_shift));
+  tr.append(c5);
+  const c6 = document.createElement("td");
+  text(c6, e.length_s == null ? "" : e.length_s.toFixed(1) + " s");
+  tr.append(c6);
+  const tags = document.createElement("td");
+  const scn = e.scenario ? (e.scenario.name || "") +
+    (e.scenario.variant ? "/" + e.scenario.variant : "") : null;
+  text(tags, [e.verdict, scn, e.error].filter((x) => x).join(" "));
+  tr.append(tags);
+  const act = document.createElement("td");
+  if (e.error) {
+    text(act, e.error);     // a broken manifest: the error, no actions
+  } else {
+    for (const [verb, label] of [["run.baseline", "baseline"],
+                                 ["run.open", "open"]]) {
+      const b = document.createElement("button");
+      b.dataset.verb = verb;
+      b.dataset.args = JSON.stringify({ name: e.run_id });
+      text(b, label);
+      act.append(b);
+    }
+  }
+  tr.append(act);
+  return tr;
+}
+
+function renderRuns() {
+  const q = $("runs-filter").value.trim().toLowerCase();
+  const rows = [];
+  for (const e of runsCache) if (runsHit(e, q)) rows.push(runsRow(e));
+  $("runs-table").replaceChildren(...rows);
+  $("runs-close-viewer").hidden = !runsCache.some((e) => e.open);
+}
+$("runs-filter").addEventListener("input", renderRuns);
+$("runs-refresh").addEventListener("click", loadRuns);
 
 /* ---- status strip and the per-panel status ---- */
 function fmtS(ns) { return ns == null ? "?" : (ns / 1e9).toFixed(3) + " s"; }
@@ -2607,6 +2714,12 @@ async function main() {
     if (!document.querySelector('[data-tab-panel="idpu"]').hidden)
       paramsRefresh();  // while the IDPU tab is visible (never faster)
   }, 2000);
+  // the runs board, only while its tab is visible (the /status poll
+  // discipline)
+  setInterval(() => {
+    const p = document.querySelector('[data-tab-panel="runs"]');
+    if (p && !p.hidden) loadRuns();
+  }, 5000);
 }
 showTab(tabFromHash());
 main();

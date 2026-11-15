@@ -10,6 +10,9 @@ the host disk (the WSL VHDX does not shrink, D-PLu). A copy whose real
 blocks reach power.sparse_limit_mb is deleted and refused.
 """
 
+import ctypes
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -22,6 +25,108 @@ from . import rundir
 # "..", no hidden name
 NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]{0,63}$")
 COPY_TIMEOUT_S = 120
+
+# -- sparse hashing (S1, run bundles) ---------------------------------------
+# FS_IOC_FIEMAP = _IOWR('f', 43, struct fiemap); Linux-only, like
+# rundir's fallocate
+_IOC_READ = 2
+_IOC_WRITE = 1
+
+
+class _FiemapHeader(ctypes.Structure):
+    _fields_ = [("fm_start", ctypes.c_uint64),
+                ("fm_length", ctypes.c_uint64),
+                ("fm_flags", ctypes.c_uint32),
+                ("fm_mapped_extents", ctypes.c_uint32),
+                ("fm_extent_count", ctypes.c_uint32),
+                ("fm_reserved", ctypes.c_uint32)]
+
+
+class _FiemapExtent(ctypes.Structure):
+    _fields_ = [("fe_logical", ctypes.c_uint64),
+                ("fe_physical", ctypes.c_uint64),
+                ("fe_length", ctypes.c_uint64),
+                ("fe_reserved", ctypes.c_uint64 * 2),
+                ("fe_flags", ctypes.c_uint32),
+                ("fe_reserved2", ctypes.c_uint32 * 3)]
+
+
+FIEMAP_IOCTL = ((_IOC_READ | _IOC_WRITE) << 30) | \
+    (ctypes.sizeof(_FiemapHeader) << 16) | (ord("f") << 8) | 43
+FIEMAP_EXTENT_LAST = 0x0001
+_EXTENTS_PER_CALL = 256
+
+
+def _fiemap_extents(f):
+    """[(logical offset, length)] of the mapped extents; OSError where
+    FIEMAP is not supported."""
+    size = os.fstat(f.fileno()).st_size
+    out = []
+    start = 0
+    while start < size:
+        n = _EXTENTS_PER_CALL
+        buf = (ctypes.c_char * (ctypes.sizeof(_FiemapHeader) +
+                                n * ctypes.sizeof(_FiemapExtent)))()
+        hdr = ctypes.cast(buf, ctypes.POINTER(_FiemapHeader)).contents
+        hdr.fm_start = start
+        hdr.fm_length = size - start
+        hdr.fm_extent_count = n
+        fcntl.ioctl(f.fileno(), FIEMAP_IOCTL, buf, True)
+        base = ctypes.sizeof(_FiemapHeader)
+        esz = ctypes.sizeof(_FiemapExtent)
+        last = False
+        for i in range(hdr.fm_mapped_extents):
+            e = _FiemapExtent.from_buffer(buf, base + i * esz)
+            if e.fe_length:
+                out.append((e.fe_logical, e.fe_length))
+            if e.fe_flags & FIEMAP_EXTENT_LAST:
+                last = True
+        if last or not hdr.fm_mapped_extents or not out:
+            break
+        start = out[-1][0] + out[-1][1]
+    return out
+
+
+def _hash_zeros(h, n):
+    zeros = bytes(1 << 20)
+    while n > 0:
+        c = min(n, len(zeros))
+        h.update(zeros[:c])
+        n -= c
+
+
+def sparse_sha256(path):
+    """The sha256 of a sparse file reading only its mapped extents
+    (zeros for the holes): the flash is 16.5 GB apparent and a
+    materialising walk would fill the disk. Falls back to a dense read
+    where FIEMAP is not available."""
+    with open(path, "rb") as f:
+        try:
+            extents = _fiemap_extents(f)
+        except OSError:
+            extents = None
+        h = hashlib.sha256()
+        if extents is None:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+            return h.hexdigest()
+        size = os.fstat(f.fileno()).st_size
+        pos = 0
+        for off, ln in extents:
+            if off > pos:
+                _hash_zeros(h, off - pos)
+            f.seek(off)
+            left = ln
+            while left > 0:
+                chunk = f.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                h.update(chunk)
+                left -= len(chunk)
+            pos = off + ln
+        if pos < size:
+            _hash_zeros(h, size - pos)
+        return h.hexdigest()
 
 
 class FlashLibError(Exception):
@@ -65,6 +170,11 @@ def save(cfg, run_dir, name, meta):
     rec["created_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                        time.gmtime())
     rec["allocated_kib"] = os.stat(bin_path).st_blocks * 512 // 1024
+    try:
+        rec["sha256"] = sparse_sha256(src)
+    except OSError as e:
+        _unlink(bin_path)
+        raise FlashLibError("hash %s: %s" % (src, e)) from None
     rec["source_run_dir"] = run_dir
     try:
         with open(json_path, "w") as f:

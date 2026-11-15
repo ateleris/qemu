@@ -11,6 +11,7 @@ import re
 import threading
 import time
 
+from . import bundle as bundle_mod
 from . import log as log_mod
 from . import power as power_mod
 from . import qemu as qemu_mod
@@ -31,7 +32,7 @@ DEBUG_PATHS = ("/machine/stixspw", "/machine/stixctrl")
 
 class Controller:
     def __init__(self, cfg, run_dir=None, launcher=None, mono_fn=None,
-                 sleep=time.sleep):
+                 sleep=time.sleep, scenario=None):
         self.cfg = cfg
         self.elf_sha256 = self._elf_sha256()
         self.run_dir = rundir.guard(run_dir or cfg["run_dir"]["path"])
@@ -66,6 +67,8 @@ class Controller:
         self.runner = None
         self.scn_thread = None      # only for scenario.run (interactive)
         self.scn_lock = threading.Lock()
+        self.viewers = bundle_mod.Viewers()   # run.open/run.close (S1)
+        self.bundle = None          # the run-bundle writer (S1)
         self._register()
         from .plat import Platform
         self.trace_filters = []     # fn(name, line) -> True drops it
@@ -91,12 +94,19 @@ class Controller:
             self.sampler.start()
             self.power.hooks.append(self._sampler_power)
         views_mod.ensure_starters(cfg)      # A5: only when missing
-        # elf_sha256 rides next to the config so --view-run can replay
-        # the FSW parameters table from the same ELF (fsw-params T2)
-        self.log.emit("ctl", "log", "controller.start",
-                      {"run_dir": self.run_dir, "fresh_removed":
-                       self.removed, "config": _public(cfg),
-                       "elf_sha256": self.elf_sha256})
+        start_rec = self.log.emit(
+            "ctl", "log", "controller.start",
+            {"run_dir": self.run_dir, "fresh_removed": self.removed,
+             "config": _public(cfg)})
+        # S1: the bundle writer owns manifest.json + decisions.jsonl in
+        # the run dir; its start_seq is this record's (S2 slices the log
+        # from it). Created before anything else can emit a record the
+        # writer would miss.
+        if cfg["bundle"]["enabled"]:
+            self.bundle = bundle_mod.Writer(
+                cfg, self.run_dir, self.log, cfg["mode"],
+                scenario=scenario, start_seq=start_rec.seq)
+            self.log.listeners.append(self.bundle.on_record)
         self._power_changed()
 
     # -- verbs --
@@ -134,6 +144,21 @@ class Controller:
         d.add("view.delete", self._view_delete,
               args={"name": {"type": "string", "required": True}},
               doc="delete a saved timeline view (409 for \"everything\")")
+        d.add("run.baseline", self._run_baseline,
+              args={"name": {"type": "string", "required": True}},
+              doc="mark that run bundle (its run dir) as the comparison "
+                  "baseline; the previous holder's mark moves")
+        d.add("run.baseline.clear", self._run_baseline_clear,
+              doc="remove the baseline mark")
+        d.add("run.open", self._run_open,
+              args={"name": {"type": "string", "required": True},
+                    "port": {"type": "integer", "min": 1024, "max": 65535}},
+              doc="serve a finished run bundle read-only (the --view-run "
+                  "pair) on 127.0.0.1; one slot, 409 while one is open; "
+                  "the answer is {url, port}")
+        d.add("run.close", self._run_close,
+              args={"port": {"type": "integer", "min": 1024, "max": 65535}},
+              doc="close the open run viewer (409 when none)")
         d.add("debug.qmp", self._debug_qmp,
               args={"command": {"type": "string", "required": True,
                                 "enum": list(DEBUG_QMP)},
@@ -195,6 +220,20 @@ class Controller:
     def _view_delete(self, name):
         views_mod.delete(self.cfg, name)
         return {"deleted": name}
+
+    # -- run bundles (S1) --
+    def _run_baseline(self, name):
+        return bundle_mod.baseline_set(self.cfg, name,
+                                       live_dir=self.run_dir)
+
+    def _run_baseline_clear(self):
+        return bundle_mod.baseline_clear(self.cfg, live_dir=self.run_dir)
+
+    def _run_open(self, name, port=None):
+        return self.viewers.open(self, name, port)
+
+    def _run_close(self, port=None):
+        return self.viewers.close(port)
 
     def command(self, verb, args, source="api"):
         res = self.dispatcher.run(verb, args, source=source)
@@ -474,6 +513,10 @@ class Controller:
         if self.sampler is not None:
             self.sampler.stop()
         self.plat.close()
+        if self.bundle is not None:
+            # before log.close(): the post-controller.stop power-off and
+            # plat.close decisions still land in decisions.jsonl
+            self.bundle.close()
         self.log.close()
         if self.lock_fd is not None:
             os.close(self.lock_fd)
