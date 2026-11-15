@@ -639,6 +639,50 @@ default 160).
    deliberately wrong ELUT, so `--negative` — no `align` — shows the
    line at its unaligned bin).
 
+### Single events and DSS sequences (a one-pair burst)
+
+A tape step can also be one DSS-faithful burst (`accepted-diffs.md`
+§58): `{"kind": "single", "for_s": 4, "fpga_det": 22, "pix": 0,
+"adc": 2200, "n": 1000, "wait_us": 20}` — N events on one
+(`fpga_det`, `pix`) pair at one adc (or, instead of the adc, at one
+science `ebin` 0..31), one every `wait_us` µs (default 20). The DSS
+`det(F, P, A) x N` form: the counts flow through the real event sink,
+so the per-tick pix gate, SUMDMASK/SUMCNT/LVAR and the trigger rules
+apply as for a real event. `for_s` must cover the burst — the load
+refuses a tape whose quantized `for_s` is shorter than `n·wait_us`;
+`spec` is refused on a single step; `align: true` is valid with `ebin`
+only; the rate/replay fields (`fpga_det_mask`, `pix_mask`, `cps`,
+`file`, `offset_ms`) are refused, not ignored (one pair, no rate).
+
+1. **Baselines**: the same QEMU flags as the spectrum recipe above
+   (`det-replay-file` + `det-replay-trigger=qmp` for the adc → ebin
+   bases, `det-quiet-cps=0`); with no replay file every base is 0 and
+   the adc bins lower.
+2. **Load and play** in NOMINAL, like the spectrum tape. Where it
+   lands: an adc burst bins through the loaded ELUT exactly like a
+   replay event (a degenerate row falls back linearly above the file's
+   base — with the `1800 + 10·d` baselines `det(22, 0, 2200)` is
+   `ebin` 2 = `floor((2200−2020)·32/2076)`, subcol 19 byte 3 in the
+   SSID 32 flush; with every base 1800 instead it is `ebin` 5); an
+   `ebin` step lands at that science bin
+   whatever the ELUT, and with `align: true` on a honoured row through
+   the ELUT's preimage (a missing preimage drops the mass and counts
+   one `preimage_miss` in `det-align-status`). A burst draws no RNG
+   and adds no sky rate.
+3. **Read `dropped`**: `qom_get $RUN/qmp.sock /machine/stixctrl
+   det-tape-status` now ends `,dropped=N` — the pix-gated share of the
+   play (with the FSW only pix 0, 3, 6, 7, 8 pass in NOMINAL, so a
+   burst on pix 1 lands nothing and `dropped` counts it; ELUT drops
+   are NOT counted — they show as missing mass). It resets when a play
+   starts (and at a loop restart) and sums the whole play; the same
+   number is the `instrument.detector.tape.dropped` leaf. On the
+   platform the Stimulus board's Single-events chip composes the step
+   (one detector, one pixel) and its DSS-sequence chip turns one
+   `det(F, P, A) x N[, wait W us]` line per burst into steps; the
+   progress readout shows `dropped` while a single step plays. The
+   gate is `detector-smoke.sh --single` (and `--single --negative`,
+   the gated pix 1 burst: exactly `single-byte single-chunk` fail).
+
 ### Index spaces (TM detector and pixel indices)
 
 Detector and pixel numbers are renamed several times between the ASIC

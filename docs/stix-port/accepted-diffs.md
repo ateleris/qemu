@@ -6108,6 +6108,13 @@ is unsupported in this build (S3)". The hw-state `det.tape` object
 gains `spec` (the running step's spectrum description, `""` without a
 tape).
 
+**Amended by S3 (§58):** kind `single` is accepted (the refusal text is
+gone; §58's rule table and its per-kind field list replace it — the
+one still-refused shape in `det-tape-props` is `"n": 0`). The
+reported-field list of `det-tape-status` gains a trailing `dropped`
+(the running play's pix-gate drop gauge; `0` without a single step),
+and the hw-state `det.tape` object gains `dropped` the same way.
+
 ## 55. ELUT alignment (baseline: none)
 
 Owner requirement (2026-11-15): "if I wanted to, that you could support
@@ -6398,3 +6405,206 @@ at ebin 12 with 0x5a-0x5b, second highest <= 0x20 (the background's
 ebin-18 line); the unmasked ebin-12/21 bytes stay <= 0x06. Negative,
 the line arrives at ebin 21 (0x5b) and exactly `spectrum-bin` fails.
 The bytes are logged in `ql.spec-*.log`.
+
+**Amended by S3 (§58):** the rule table's "a non-flat spec is valid on
+kind `rate` only" now also names single's no-spec rule — a single step
+refuses `spec` outright (any value, `"flat"` included), before the spec
+parse runs. The `preimage_miss` gauge also counts an aligned `ebin`
+single's misses (one per fed batch, reset at the step start like a
+spectrum step's). The tape's new `dropped` gauge is the pix-gate
+counterpart of the replay's `dropped`: §58's single feed counts the
+pix-gated batches there (ELUT drops stay silent, as here), reset when
+a play starts, reported as `det-tape-status`'s trailing `dropped=N` and
+hw-state `det.tape.dropped`.
+
+## 58. Detector stimulus S3: single events (baseline: none)
+
+Owner requirement (2026-11-15, "All of it, staged", §54): Stage S3
+makes a tape step a DSS-faithful single-event burst — `det(F, P, A) ×
+N, wait W us` — or the same with an explicit science `ebin` instead of
+the adc. Plan: `2026-11-15-single-events-plan.md`, tasks V1-V4; owner
+decisions (1) refuse at load when the quantized `for_s` does not cover
+`n·wait_us`, (2) the DSS-sequence control turns each text line into one
+single step, (3) the LTRG 1.25× rule is qtest-only, the gate logs the
+trigger byte, (4) `dropped` counts pix-gate drops only.
+
+**What:** the events flow through the D-Df event sink
+`stix_det_add_counts`, so the per-tick pix gate, SUMDMASK, SUMCNT, LVAR
+and the 1.25× LTRG/ETRG rules apply exactly as for a real event; an adc
+burst is binned through the loaded ELUT exactly as DSS replay events
+are, and an `ebin` burst with `align` goes through the ELUT's preimage
+(S2 semantics, including the `preimage_miss` drop). Everything runs on
+the 100 ms tick inside `stix_det_tick` (right after the tape tick), so
+the burst is guest-time exact and icount/pace-fast safe.
+
+- **The step shape and the rule table** (one table: the model's
+  `stix_det_single_parse` and the platform's `tapes.py _single` both
+  implement it; every error names the step index): `{"kind": "single",
+  "for_s", "fpga_det", "pix", "adc"|"ebin", "n", "wait_us", "label"?,
+  "align"?}` — `fpga_det` a JSON integer 0..31 (`dss_det = fpga_det`),
+  `pix` 0..11 and `n` 1..1000000 required, `adc` 0..4095 or `ebin` 0..31
+  exactly one (both present or both absent refused), `wait_us`
+  1..10000 optional (default 20, the DSS's), `label` the common rule.
+  `for_s` keeps the common 0.1..86400 rule plus the **coverage rule**
+  (owner decision 1): `n·wait_us ≤ stix_det_tape_step_ticks(for_s)·100000`
+  against the tick-quantized duration, else refused with "for_s %g s
+  (%u ticks) does not cover n·wait_us = %g s" — no silent truncation;
+  the UI composes `for_s` from the schedule instead
+  (`max(0.1, ceil(n·wait_us / 100000) / 10)`). `spec` is refused on a
+  single step ("a single step takes no spec", any value, `"flat"`
+  included) before the S2 parse could see it, and `align` (bool,
+  default the tape's) may be an explicit `true` only with `ebin`
+  ("align applies to ebin singles"). The unknown-field check is
+  per-kind: a single step accepts only `kind, for_s, label, spec,
+  align, fpga_det, pix, adc, ebin, n, wait_us` — the rate/replay
+  fields `fpga_det_mask`, `pix_mask`, `cps`, `file`, `offset_ms` are
+  refused as unknown, not ignored (a single targets one pair; a rate
+  step carrying `n` stays refused). A rejected load leaves the
+  previous tape intact.
+- **No sky rate, no RNG, no double fold:** the step's implicit masks
+  are the one pair (`fpga_det_mask = 1u << fpga_det`,
+  `pix_mask = 1u << pix`) with `cps = 0`, so `stix_det_sky_tick` needs
+  no change and the background still fills the other pairs; a single
+  step draws no RNG (the banks around it are bit-identical with and
+  without the step, `det-single-guard`, the `det-spec-flat-ident`
+  pattern) and stays science-space with `det-adc-mode` on — the batch
+  is added after the fold, never folded twice (`det-single-land`'s
+  mode leg).
+- **The schedule law** (one rule, deterministic): event k (0-based) is
+  due at `k·wait_us` µs after the step's start tick; tick j of the
+  step feeds every due k with `j·100000 ≤ k·wait_us < (j+1)·100000`
+  in ONE `stix_det_add_counts` call, and the cursor `single_next`
+  advances past them (capped at the step's `n`; reset at every step
+  start, next to the S2 `spec_preimage_miss` reset). With `wait_us 20`
+  one tick holds ≤ 5000 events; n 1000 lands whole in the start tick;
+  n 20000 spans ticks 0..3 with batches of 5000; the largest burst
+  (n 1e6, `wait_us` 1) spans 10 ticks. One `stixdet_single` trace line
+  per fed batch carries fpga_det, pix, adc, the resolved ebin (−1 when
+  the gate, the ELUT or a preimage miss dropped it), the batch's n and
+  the vclock; the per-event timing is recoverable from the schedule
+  law. Realized as one sink call per tick batch, not per event
+  (deviation D-d): all events of a step share the pair and the ebin,
+  so the sink's rules are batch-invariant here, and 1e6 calls per step
+  would dominate the tick. Stop/done/loop/step change ends the feed
+  (the cursor belongs to the running step); the running step's kind is
+  re-checked every tick.
+- **The sink semantics (the replay's order):** the pix gate first — a
+  gated-off pix drops the whole batch into `single_dropped` (owner
+  decision 4: gate drops only; the batch is still traced, ebin −1),
+  and the sink's identical check never gates it twice. An `adc` step
+  bins through the loaded ELUT (`stix_det_adc_ebin`): a drop
+  (unassigned 32, or `adc ≤ base` on a degenerate row) is silent, like
+  the replay's — missing mass in the trace, not counted in `dropped`.
+  An `ebin` step with align off is a direct deposit at the science bin
+  (the det-inject semantics), whatever ELUT is loaded; with align on a
+  honoured row the batch goes through the preimage
+  `stix_det_align_adc` — a missing preimage counts one
+  `spec_preimage_miss` per batch (the S2 gauge, reported by
+  `det-align-status`; NOT counted in `dropped`) and the landed ebin is
+  the lookup of that adc (= the step's ebin); a degenerate row makes
+  align a no-op. The ELUT rows are re-classified at a single step's
+  start when it has `adc` or `align` (the spec path's rule), so the
+  feed reads fresh row states from its first tick.
+- **The status fields:** `det-tape-status` gains a trailing
+  `,dropped=N` and the hw-state `det.tape` object a `dropped` leaf —
+  the running play's pix-gate drop gauge, reset when a play starts and
+  at a loop restart (it sums the whole play, so a status read after
+  the burst's step still holds it; plan review M2), `0` whenever no
+  single step ran. `single_next` is per step. The platform leaf is
+  `instrument.detector.tape.dropped` (volatile, so the live readout
+  does not lag).
+- **The pix gate:** as §57 states it — with the FSW only pix 0, 3, 6,
+  7, 8 pass after quarter power-on (R3 < 63), i.e. 0.475 of a burst
+  aimed at a uniform pix choice; FSW configuration, not a model loss
+  (F6 is not "fixed").
+- **The platform** (`tapes.py`, `plat.py`, the UI, self-test): the
+  rule table is mirrored by `tapes._single` (the validator of record;
+  the model stays the authority at load; the vectors are shared with
+  the `det-single-props` qtest in the same order, self-test
+  `tapes_single`); `_tape_status_casts` casts `dropped` (an older
+  model's line without it still parses); `fake_qemu`'s canned line
+  carries `dropped=0`. The UI's two chips are enabled: **Single
+  events** composes the step (the adc/ebin mode select, n, wait_us;
+  a multi-detector target or an "all 12" pix select is refused with a
+  toast — a single targets one pair, the DSS `det()` form), **DSS
+  sequence** parses one `det(F, P, A) x N[, wait W us]` line per step
+  (W optional, default 20; `for_s` composed from the coverage;
+  the line number toasted on a parse error; more than 64 steps
+  refused). The step table shows a single step as
+  `det(22, 0, 2200) x 1000 · 20 us`; the progress readout shows
+  `dropped` while a single step plays.
+- **The qtests** (`det-single-props`, `det-single-land`,
+  `det-single-gated`, `det-single-guard`): the rule table with every
+  rejection leaving the previous tape intact; the schedule (n 1000
+  whole in the start tick — LACC (pix 0, fpga_det 22, ebin 5) = 1000,
+  every neighbour and the bank total exact, LTRG grp 11 = 1250 exactly
+  and no other grp, one trace line; n 20000 in four 5000 batches, LTRG
+  25000, inside one pinned 40-tick QL period); the direct `ebin` on a
+  wrong row and the no-12 row's aligned miss (`preimage_miss=1`,
+  `mode=off`); the chunk leg (EACC (0, 22, 5) = 1000, ETRG grp 11 =
+  1250, the EACC bank zero after the read, and ETRG-only with
+  fpga_det 22 masked out of SUMDMASK); R3 = 63 on pix 1's `asic_ch`
+  drops the batch (bank 0, `dropped=1000` while the step runs, the
+  trace still schedules with ebin −1) with the R3 = 62 control landing
+  its 1000; ClearEnable mid-burst freezes the schedule with the step
+  clock and the resume lands the rest (exactly n in exactly four
+  batches), every CTRL MMIO path still answers under `clock_step`, and
+  the seed identity holds. `det-tape-seed`, `det-adc-off` and the S1/
+  S2/C1 qtests are unchanged; the five literal `det-tape-status` lines
+  end `,dropped=0` and no UART golden moves (nothing new at boot).
+
+**The gate** (`scripts/stix/detector-smoke.sh --single [--negative]`,
+V4): the `--tape` base with no upload shift, so the timeline is the
+default mode's (CONF @215, probe 240 s): @50 CONF, @60 S20 = 0, @62 the
+verification period, @70 NOMINAL (T_nom ∈ [70, 80]), @76 QMP
+`det-tape-load` + `det-tape-play true` of `gate-det-single` (inside
+T_nom ± 10 s, so the burst is inside the first 8 QL periods the exit
+SSID 32 dump sums): background **2 cps** (not `--tape`'s 20 — see
+below), one `single` step `det(22, 0, 2200) × 1000, wait 20 us`
+(`for_s` 4) then `off` 30 s; @100 QMP `qom-get det-tape-status` (the
+burst step has run, the off step is playing: `step=2/2`; `dropped`
+sums the whole play); @215 CONF (T_exit) + the five-product flush.
+QEMU keeps the model's synthetic source with `det-quiet-cps=0` and
+adds `det-replay-file=<run>/dssevs.spec` (the 32 0xE setup words, base
+`1800 + 10·d`, no events) with `det-replay-trigger=qmp` — the replay
+engine stays idle and exists only to give the adc → ebin calibration
+its baselines (without the file every base is 0 and adc 2200 would bin
+to ebin 17); the trace list adds `stixdet_single` and
+`stixdet_tape_step` (`stixdet_chunk` is in the base list). Checks:
+`single-status` (the @100 return holds `state=playing`, `step=2/2`,
+`dropped=0`; negative `dropped=1000`), `single-trace`
+(`stixdet_tape_step 0 kind=single` after the enabling FSM strobe, and
+the `stixdet_single` lines after it sum to n = 1000 with
+fpga_det 22 pix 0 adc 2200 and ebin 2 — negative ebin −1, the sum
+still 1000: the schedule runs even when the gate drops),
+`single-byte` (`ql-check.py --ssid32-inject 19 2 0x37 0x10`: subcol 19
+= `SUBCOL_FROM_FPGA_DET[22]`, ebin 2 = the degenerate-row fallback of
+adc 2200 with base 2020, `floor(180·32/2076)`; the floor 0x37 is S0 of
+n/2, robust to the background, and the exact expected byte 0x3F = S0
+of 1000 is logged; every other sample's ebin-2 byte < 0x10),
+`single-chunk` (the first `stixdet_chunk` line after the last
+`stixdet_single` has `1000 ≤ eacc_events ≤ 1250` — the deposit is
+exact; the +250 headroom holds the 2 cps background's worst nominal
+integration, 32 × 2 cps × 0.475 × 4 s ≈ 120 counts; the background is
+2 cps, not 20, precisely so this window holds — at 20 cps it would be
+~1200 and the negative would not miss it), and, printed but not
+asserted, the target sample's trigger byte against its subcol ± 1
+neighbours with SSID 30's trigger column alongside. Deviations D-a/D-b
+from the outline: LTRG is an AHB SRAM, not a TM field, so the 1.25×
+rule stays qtest-exact (`det-single-land`, 1250) and the gate only
+logs the trigger bytes (D-a); the chunk payload is not TM-visible in
+the gate, so the outline's "the next chunk's EACC cell holds the
+counts" is the trace's `eacc_events` window here, the cell itself
+asserted in `det-single-land`'s chunk leg (D-b). `--single --negative`
+plays the same tape on pix 1 (R3 = 63 there under F6, only pix 0, 3,
+6, 7, 8 pass the model's gate in NOMINAL): the schedule runs, the gate
+drops every event (`dropped=1000`), and nothing reaches ebin 2 or the
+chunk — it passes only when exactly `single-byte single-chunk` fail,
+so the intended evidence is never vacuous. The negative relies on F6:
+if the FSW fixes F6 (writes R3 < 63 for all 12 pix), the negative must
+move to a pix with R3 = 63. `--single` combines with none of `--flare`,
+`--tape`, `--no-rotb`, `--spectrum`; run-dir suffixes `-single` /
+`-singleneg`; `--dry-run --single` prints the QEMU and probe lines.
+
+**Gate record:** pending the first live run — both legs' measured
+byte and `eacc_events` land here.

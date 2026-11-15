@@ -181,8 +181,8 @@
 #     dropped=1000) and holds state=playing, step=2/2;
 #   single-trace: tape step 0 kind=single after the enabling FSM strobe,
 #     and the stixdet_single lines after it sum to n = 1000 with
-#     fpga_det 22 pix 0 adc 2200 and ebin 2 (negative: ebin -1, the sum
-#     still 1000 - the schedule runs even when the gate drops);
+#     fpga_det 22 pix 0 adc 2200 and ebin 2 (negative: pix 1, ebin -1,
+#     the sum still 1000 - the schedule runs even when the gate drops);
 #   single-byte: ql-check.py --ssid32-inject 19 2 0x37 0x10 - subcol 19
 #     = SUBCOL_FROM_FPGA_DET[22], ebin 2 = the degenerate-row fallback
 #     with base 2020 (floor(180 x 32 / 2076)); the floor 0x37 is S0 of
@@ -1308,7 +1308,7 @@ if [ "$SINGLE" -eq 1 ]; then
         head -1 | cut -d: -f1)" || true
     BURST_WANT='stixdet_single single burst: fpga_det 22 pix 0 adc 2200 ebin 2 n '
     [ "$NEGATIVE" -eq 0 ] ||
-        BURST_WANT='stixdet_single single burst: fpga_det 22 pix 0 adc 2200 ebin -1 n '
+        BURST_WANT='stixdet_single single burst: fpga_det 22 pix 1 adc 2200 ebin -1 n '
     SUM_N=""
     if [ -n "$STEP_N" ]; then
         SUM_N="$(tail -n +"$STEP_N" idefx.trace 2>/dev/null |
