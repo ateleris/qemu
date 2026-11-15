@@ -2821,6 +2821,8 @@ static void stix_det_tape_apply_step(StixDetState *d, uint32_t idx)
     d->tape_left_ticks = stix_det_tape_step_ticks(st->for_s);
     /* S2: the preimage_miss gauge belongs to the running step */
     d->spec_preimage_miss = 0;
+    /* S3: so does the single step's schedule cursor */
+    d->single_next = 0;
     trace_stixdet_tape_step(idx, stix_det_tape_kind_name[st->kind],
                             st->label ? st->label : "",
                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -2860,6 +2862,8 @@ static void stix_det_tape_tick(StixDetState *d)
             return;     /* the setter refused these; belt and braces */
         }
         d->tape_state = STIX_DET_TAPE_PLAYING;
+        /* S3: the drop gauge sums the whole play (plan review M2) */
+        d->single_dropped = 0;
         stix_det_tape_apply_step(d, 0);
         return;
     }
@@ -2887,6 +2891,8 @@ static void stix_det_tape_tick(StixDetState *d)
         if (d->tape_step + 1 < d->tape_n_steps) {
             stix_det_tape_apply_step(d, d->tape_step + 1);
         } else if (d->tape_loop) {
+            /* a loop restart is a new play for the drop gauge (M2) */
+            d->single_dropped = 0;
             stix_det_tape_apply_step(d, 0);
         } else {
             d->tape_state = STIX_DET_TAPE_DONE;
@@ -3201,7 +3207,9 @@ static bool stix_det_spec_file_load(const char *path, uint32_t kev_full,
  * or "flat" on any kind (the S1 template), else an object with exactly
  * one key of line_adc (an integer 0..4095), line_kev (a finite number
  * >= 0), flat_kev ([k1, k2], 0 <= k1 < k2) or file (a path, 1..4095
- * bytes, no comma; read here) — only on kind rate. keV values have no K
+ * bytes, no comma; read here) — only on kind rate (a single step is
+ * refused, and its align decided, before this runs: S3 M5). keV values
+ * have no K
  * bound at load (decision Q7). The step's align defaults to the tape's
  * @tape_align; an explicit true is only valid on a keV spec, the tape
  * default is ignored for adc and flat specs. Called last in the step
@@ -3339,11 +3347,122 @@ static bool stix_det_spec_parse(StixDetState *d, QDict *step,
 }
 
 /*
+ * S3: the single fields of one step dict into @st (the single-events
+ * plan's rule table; the platform's tapes.py mirrors it): fpga_det, pix
+ * and n required integers, exactly one of adc/ebin, wait_us optional
+ * (default 20), no spec, align (the step's, else the tape's) an
+ * explicit true only with ebin, and for_s must cover n*wait_us at tick
+ * quantization (owner decision 1). The implicit masks are the one pair
+ * and cps 0: a single step contributes no sky rate (the feed is V2).
+ * Called from the single branch of stix_det_tape_parse_step, before the
+ * common code re-reads for_s.
+ */
+static bool stix_det_single_parse(StixDetState *d, QDict *obj,
+                                  bool tape_align, StixDetTapeStep *st,
+                                  uint32_t idx, Error **errp)
+{
+    uint64_t u64, burst_us;
+    double for_s;
+    bool align, align_set;
+
+    /* the spec is refused here, before the S2 parse could see it (M5) */
+    if (qdict_get(obj, "spec")) {
+        error_setg(errp, "det-tape-load: step %u: a single step takes no "
+                   "spec", idx);
+        return false;
+    }
+    if (!stix_det_tape_uint(obj, "fpga_det", STIX_DET_N_FPGA_DET - 1, &u64,
+                            errp, idx)) {
+        return false;
+    }
+    st->fpga_det = (uint32_t)u64;
+    if (!stix_det_tape_uint(obj, "pix", STIX_DET_N_PIX_ACC - 1, &u64,
+                            errp, idx)) {
+        return false;
+    }
+    st->pix = (uint32_t)u64;
+    if (!!qdict_get(obj, "adc") == !!qdict_get(obj, "ebin")) {
+        error_setg(errp, "det-tape-load: step %u: a single step takes "
+                   "exactly one of 'adc' and 'ebin'", idx);
+        return false;
+    }
+    if (qdict_get(obj, "adc")) {
+        if (!stix_det_tape_uint(obj, "adc", STIX_DET_N_ADC - 1, &u64,
+                                errp, idx)) {
+            return false;
+        }
+        st->adc = (int32_t)u64;
+        st->ebin = -1;
+    } else {
+        if (!stix_det_tape_uint(obj, "ebin", STIX_DET_N_EBIN - 1, &u64,
+                                errp, idx)) {
+            return false;
+        }
+        st->ebin = (int32_t)u64;
+        st->adc = -1;
+    }
+    if (!stix_det_tape_uint(obj, "n", 1000000u, &u64, errp, idx)) {
+        return false;
+    }
+    if (!u64) {
+        error_setg(errp, "det-tape-load: step %u: 'n' is not an integer "
+                   "in 1..1000000", idx);
+        return false;
+    }
+    st->n = (uint32_t)u64;
+    if (qdict_get(obj, "wait_us")) {
+        if (!stix_det_tape_uint(obj, "wait_us", 10000u, &u64, errp, idx)) {
+            return false;
+        }
+        if (!u64) {
+            error_setg(errp, "det-tape-load: step %u: 'wait_us' is not an "
+                       "integer in 1..10000", idx);
+            return false;
+        }
+        st->wait_us = (uint32_t)u64;
+    } else {
+        st->wait_us = 20;           /* the DSS default */
+    }
+    if (!stix_det_tape_num(obj, "for_s", &for_s, errp, idx)) {
+        return false;
+    }
+    if (for_s < 0.1 || for_s > 86400.0) {
+        error_setg(errp, "det-tape-load: step %u: for_s %g s is outside "
+                   "0.1..86400", idx, for_s);
+        return false;
+    }
+    st->for_s = for_s;
+    burst_us = (uint64_t)st->n * st->wait_us;
+    if (burst_us > (uint64_t)stix_det_tape_step_ticks(for_s) * 100000u) {
+        error_setg(errp, "det-tape-load: step %u: for_s %g s (%u ticks) "
+                   "does not cover n·wait_us = %g s", idx, for_s,
+                   stix_det_tape_step_ticks(for_s),
+                   (double)burst_us / 1e6);
+        return false;
+    }
+    align_set = qdict_haskey(obj, "align");
+    if (!stix_det_tape_bool(obj, "align", tape_align, &align, errp, idx)) {
+        return false;
+    }
+    if (align_set && align && st->adc >= 0) {
+        error_setg(errp, "det-tape-load: step %u: align applies to ebin "
+                   "singles", idx);
+        return false;
+    }
+    st->spec.align = align;         /* the effective align, as in S2 */
+    /* no sky rate: the implicit masks are the one pair, cps 0 */
+    st->fpga_det_mask = 1u << st->fpga_det;
+    st->pix_mask = 1u << st->pix;
+    st->cps = 0;
+    return true;
+}
+
+/*
  * One step dict into @st. Every error names the step index @idx; masks
- * are fpga_det/pix indexed and a subcol key is refused by name. Kinds
- * and specs the later stages own (single: S3; non-flat spec: S2) are
- * rejected here with their stage named, so S1 never half-implements
- * them.
+ * are fpga_det/pix indexed and a subcol key is refused by name. A
+ * non-flat spec is S2's (kind rate only); a single step is S3's and
+ * parses wholly in stix_det_single_parse, so S1 never half-implements
+ * either.
  */
 static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
                                      bool tape_align, StixDetTapeStep *st,
@@ -3354,6 +3473,18 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
     uint64_t u64;
     double for_s;
     const QDictEntry *e;
+    static const char *const known[] = {
+        "kind", "for_s", "label", "fpga_det_mask", "pix_mask", "cps",
+        "spec", "file", "offset_ms", "align",
+    };
+    /* single targets one pair: no masks, cps or replay fields (refused
+     * as unknown, not ignored); spec stays listed for its own refusal */
+    static const char *const known_single[] = {
+        "kind", "for_s", "label", "spec", "align",
+        "fpga_det", "pix", "adc", "ebin", "n", "wait_us",
+    };
+    const char *const *keys;
+    size_t n_keys;
 
     memset(st, 0, sizeof(*st));
     if (qdict_haskey(obj, "subcol_mask")) {
@@ -3374,12 +3505,13 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
     } else if (!strcmp(kind, "off")) {
         st->kind = STIX_DET_TAPE_OFF;
     } else if (!strcmp(kind, "single")) {
-        error_setg(errp, "det-tape-load: step %u: kind \"single\" is "
-                   "unsupported in this build (S3)", idx);
-        return false;
+        st->kind = STIX_DET_TAPE_SINGLE;
+        if (!stix_det_single_parse(d, obj, tape_align, st, idx, errp)) {
+            return false;
+        }
     } else {
         error_setg(errp, "det-tape-load: step %u: unknown kind '%s' "
-                   "(rate, replay, off)", idx, kind);
+                   "(rate, replay, off, single)", idx, kind);
         return false;
     }
     if (!stix_det_tape_num(obj, "for_s", &for_s, errp, idx)) {
@@ -3406,7 +3538,9 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
         }
         st->fpga_det_mask = (uint32_t)u64;
     }
-    if (qdict_get(obj, "pix_mask")) {
+    if (st->kind == STIX_DET_TAPE_SINGLE) {
+        /* the single parse stored the implicit one-pair masks */
+    } else if (qdict_get(obj, "pix_mask")) {
         if (!stix_det_tape_uint(obj, "pix_mask", 0xFFFu, &u64, errp, idx)) {
             g_free(label);
             return false;
@@ -3460,29 +3594,33 @@ static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
             }
         }
     }
-    /* no unknown fields past the ones parsed */
+    /* no unknown fields past the ones parsed (per kind: single takes
+     * its fields on top of the common set, a rate step carrying 'n'
+     * stays refused) */
+    keys = st->kind == STIX_DET_TAPE_SINGLE ? known_single : known;
+    n_keys = st->kind == STIX_DET_TAPE_SINGLE ?
+             ARRAY_SIZE(known_single) : ARRAY_SIZE(known);
     for (e = qdict_first(obj); e; e = qdict_next(obj, e)) {
         const char *key = qdict_entry_key(e);
-        static const char *const known[] = {
-            "kind", "for_s", "label", "fpga_det_mask", "pix_mask", "cps",
-            "spec", "file", "offset_ms", "align",
-        };
         size_t k;
 
-        for (k = 0; k < ARRAY_SIZE(known); k++) {
-            if (!strcmp(key, known[k])) {
+        for (k = 0; k < n_keys; k++) {
+            if (!strcmp(key, keys[k])) {
                 break;
             }
         }
-        if (k == ARRAY_SIZE(known)) {
+        if (k == n_keys) {
             g_free(label);
             error_setg(errp, "det-tape-load: step %u: unknown tape step "
                        "field '%s'", idx, key);
             return false;
         }
     }
-    /* S2: the spec last, so no later refusal leaves a loaded spec */
-    if (!stix_det_spec_parse(d, obj, tape_align, st, idx, errp)) {
+    /* S2: the spec last, so no later refusal leaves a loaded spec; a
+     * single step skipped it (its spec was refused and its align
+     * decided in stix_det_single_parse, M5) */
+    if (st->kind != STIX_DET_TAPE_SINGLE &&
+        !stix_det_spec_parse(d, obj, tape_align, st, idx, errp)) {
         g_free(label);
         stix_det_spec_free(&st->spec);
         return false;
@@ -3677,7 +3815,8 @@ static void stix_det_tape_status_get(Object *obj, Visitor *v,
     char *value;
 
     value = g_strdup_printf("state=%s,name=%s,step=%u/%u,label=%s,"
-                            "step_left_ticks=%u,loop=%s,align=%s",
+                            "step_left_ticks=%u,loop=%s,align=%s,"
+                            "dropped=%u",
                             stix_det_tape_state_name[d->tape_state],
                             d->tape_name ? d->tape_name : "",
                             d->tape_n_steps ? d->tape_step + 1 : 0,
@@ -3685,7 +3824,8 @@ static void stix_det_tape_status_get(Object *obj, Visitor *v,
                             st && st->label ? st->label : "",
                             d->tape_left_ticks,
                             d->tape_loop ? "true" : "false",
-                            d->tape_align ? "true" : "false");
+                            d->tape_align ? "true" : "false",
+                            d->single_dropped);
     visit_type_str(v, name, &value, errp);
     g_free(value);
 }
@@ -4589,6 +4729,8 @@ void stix_det_hw_state(StixDetState *d, QDict *det)
     qdict_put_bool(tape, "align", d->tape_align);
     /* S2: the running (or previewed) step's spectrum */
     qdict_put_str(tape, "spec", st ? stix_det_spec_desc(&st->spec) : "");
+    /* S3: the single steps' pix-gate drops of the current play */
+    qdict_put_int(tape, "dropped", d->single_dropped);
     qdict_put(det, "tape", tape);
 
     /* A1: the classification report */

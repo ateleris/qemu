@@ -9467,13 +9467,29 @@ static char *det_tape_play(QTestState *qts, bool play)
     return desc;
 }
 
+/* qom-set det-tape-load; returns the QMP error desc (NULL on success) */
+static char *det_spec_load(QTestState *qts, const char *json)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s,"
+                            " 'property': 'det-tape-load', 'value': %s}}",
+                            SKY_CTRL_PATH, json);
+    QDict *err = qdict_get_qdict(resp, "error");
+    char *desc = err ? g_strdup(qdict_get_try_str(err, "desc")) : NULL;
+
+    qobject_unref(resp);
+    return desc;
+}
+
 /*
  * det-tape-props: the load-time rejections (bad JSON, more than 64
  * steps, past the 64 KiB cap, for_s 0, an unknown kind, pix_mask past
- * 0xFFF, cps past the cap, an S2 spec, the S3 kind, subcol_mask, a
- * masked background, a replay step without a realized table, and a
- * replay step with the nominal trigger), and a rejected load leaves
- * the previous tape intact. det-tape-play is refused with no tape.
+ * 0xFFF, cps past the cap, an S2 spec, a single step with n 0,
+ * subcol_mask, a masked background, a replay step without a realized
+ * table, and a replay step with the nominal trigger), and a rejected
+ * load leaves the previous tape intact. det-tape-play is refused with
+ * no tape.
  * RED on the parent binary: det-tape-load is an unknown property.
  */
 static void test_det_tape_props(void)
@@ -9553,8 +9569,8 @@ static void test_det_tape_props(void)
     json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
                            "[{\"kind\": \"single\", \"for_s\": 0.1, "
                            "\"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
-                           " \"n\": 10}]}");
-    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* S3 kind */
+                           " \"n\": 0}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* S3 n 0 */
     g_free(json);
     json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
                            "[{\"kind\": \"rate\", \"for_s\": 0.1, "
@@ -9626,7 +9642,7 @@ static void test_det_tape_status(void)
 
     g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
                     "state=idle,name=,step=0/0,label=,step_left_ticks=0,"
-                    "loop=false,align=false");
+                    "loop=false,align=false,dropped=0");
     json = g_strdup_printf("{\"api\": 1, \"name\": \"two\", \"steps\": "
                            "[%s, {\"kind\": \"off\", \"for_s\": 0.2, "
                            "\"fpga_det_mask\": 4294967295}]}",
@@ -9634,20 +9650,20 @@ static void test_det_tape_status(void)
     g_assert_true(sky_set_str(qts, "det-tape-load", json));
     g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
                     "state=ready,name=two,step=1/2,label=,"
-                    "step_left_ticks=2,loop=false,align=false");
+                    "step_left_ticks=2,loop=false,align=false,dropped=0");
 
     /* the play applies at the first tick after SetEnable */
     idefx_power_all(qts);
     det_start(qts, 1);                  /* a 2-tick QL period */
     g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
                     "state=ready,name=two,step=1/2,label=,"
-                    "step_left_ticks=2,loop=false,align=false");
+                    "step_left_ticks=2,loop=false,align=false,dropped=0");
     desc = det_tape_play(qts, true);
     g_assert_null(desc);
     det_step_ticks(qts, 1);
     g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
                     "state=playing,name=two,step=1/2,label=,"
-                    "step_left_ticks=2,loop=false,align=false");
+                    "step_left_ticks=2,loop=false,align=false,dropped=0");
     det_step_ticks(qts, 1);
     det_step_ticks(qts, 1);             /* step 1 done: step 2 applies */
     g_assert_cmpstr(det_tape_field(qts, "step"), ==, "2/2");
@@ -9683,13 +9699,167 @@ static void test_det_tape_status(void)
     qtest_system_reset(qts);
     g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
                     "state=ready,name=loop,step=1/2,label=,"
-                    "step_left_ticks=0,loop=true,align=false");
+                    "step_left_ticks=0,loop=true,align=false,dropped=0");
     idefx_power_all(qts);
     det_start(qts, 1);
     desc = det_tape_play(qts, true);
     g_assert_null(desc);
     det_step_ticks(qts, 1);
     g_assert_cmpstr(det_tape_field(qts, "state"), ==, "playing");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* a one-step single tape with the step's @fields (its target, n, ...) */
+static char *det_single_tape1(bool tape_align, const char *fields)
+{
+    return g_strdup_printf("{\"api\": 1, \"name\": \"single\", "
+                           "\"align\": %s, \"steps\": [{\"kind\": "
+                           "\"single\", %s}]}",
+                           tape_align ? "true" : "false", fields);
+}
+
+/*
+ * det-single-props (S3 V1): the single rule table at load. Every
+ * rejected vector is a failed det-tape-load naming the step, and leaves
+ * the previous tape intact (det-tape-status unchanged); every accepted
+ * one loads (state=ready). The vectors are shared with the platform's
+ * tapes_single self-test (V3), same order.
+ * RED on the parent binary: every single shape is refused there.
+ */
+static void test_det_single_props(void)
+{
+    /* each vector: the step's fields after "kind": "single" */
+    static const char *const bad_single[] = {
+        /* rate/replay fields on a single step: refused, not ignored */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"cps\": 5",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"fpga_det_mask\": 1",
+        /* the shape */
+        "\"for_s\": 0.1, \"fpga_det\": 32, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000",                                 /* fpga_det range */
+        "\"for_s\": 0.1, \"pix\": 0, \"adc\": 1000, \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 12, \"adc\": 1000,"
+        " \"n\": 1000",                                 /* pix range */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"adc\": 1000, \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 0",                                    /* n 0 */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000001",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000.0",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"wait_us\": 0",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"wait_us\": 10001",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"wait_us\": 20.0",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 4096,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": -1,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"ebin\": 32,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"ebin\": -1,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"ebin\": 7, \"n\": 1000",                    /* both */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1600.0,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"spec\": \"flat\"",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"spec\": {\"line_adc\": 1600}",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"align\": true",                /* align with adc */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"align\": \"yes\"",
+        /* the coverage rule (the quantized for_s must cover n*wait_us) */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000000, \"wait_us\": 10000",          /* needs 10000 s */
+        "\"for_s\": 1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 60000, \"wait_us\": 20",               /* needs 1.2 s */
+        "\"for_s\": 0.12, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 6000, \"wait_us\": 20",                /* 1 tick, needs 2 */
+    };
+    static const char *const good_single[] = {
+        /* the outline's mono hint (wait_us defaults to 20) */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000",
+        "\"for_s\": 10000, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000000, \"wait_us\": 10000",          /* exact cover */
+        "\"for_s\": 2, \"fpga_det\": 3, \"pix\": 11, \"adc\": 2048,"
+        " \"n\": 100000",                               /* wait_us absent */
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"ebin\": 7,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"ebin\": 31,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 0,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 4095,"
+        " \"n\": 1000",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"ebin\": 7,"
+        " \"n\": 1000, \"align\": true",
+        "\"for_s\": 0.1, \"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+        " \"n\": 1000, \"align\": false",
+    };
+    QTestState *qts = stix_qtest_new();
+    g_autofree char *keeper = NULL, *status0 = NULL;
+    char *desc, *json, *st;
+    size_t i;
+
+    keeper = g_strdup_printf("{\"api\": 1, \"name\": \"keeper\", "
+                             "\"steps\": [%s]}",
+                             det_tape_rate_step("4095", 100, "1"));
+    g_assert_null(det_spec_load(qts, keeper));
+    status0 = sky_get_str(qts, "det-tape-status");
+
+#define DET_SINGLE_REFUSE(json_) do { \
+        desc = det_spec_load(qts, (json_)); \
+        g_assert_nonnull(desc); \
+        g_test_message("refused: %s", desc); \
+        g_assert_nonnull(strstr(desc, "step 0")); \
+        st = sky_get_str(qts, "det-tape-status"); \
+        g_assert_cmpstr(st, ==, status0); \
+        g_free(st); \
+    } while (0)
+
+    /* the rejected vectors */
+    for (i = 0; i < ARRAY_SIZE(bad_single); i++) {
+        json = det_single_tape1(false, bad_single[i]);
+        DET_SINGLE_REFUSE(json);
+        g_free(desc);
+        g_free(json);
+    }
+#undef DET_SINGLE_REFUSE
+
+    /* an explicit align true is only valid with ebin (the tape's align
+     * true is ignored for an adc single) */
+    json = det_single_tape1(true, "\"for_s\": 0.1, \"fpga_det\": 22, "
+                            "\"pix\": 0, \"adc\": 1000, \"n\": 1000");
+    desc = det_spec_load(qts, json);
+    g_assert_null(desc);
+    st = det_tape_field(qts, "align");
+    g_assert_cmpstr(st, ==, "true");
+    g_free(st);
+    g_free(desc);
+    g_free(json);
+
+    /* the accepted vectors */
+    for (i = 0; i < ARRAY_SIZE(good_single); i++) {
+        json = det_single_tape1(false, good_single[i]);
+        desc = det_spec_load(qts, json);
+        g_assert_null(desc);
+        st = det_tape_field(qts, "state");
+        g_assert_cmpstr(st, ==, "ready");
+        g_free(st);
+        g_free(desc);
+        g_free(json);
+    }
 
     qtest_quit(qts);
     stix_qtest_cleanup();
@@ -10521,21 +10691,6 @@ static void test_det_adc_guard(void)
 }
 
 /* ---- S2: spectra (2026-11-15-spectra-plan.md) ---- */
-
-/* qom-set det-tape-load; returns the QMP error desc (NULL on success) */
-static char *det_spec_load(QTestState *qts, const char *json)
-{
-    QDict *resp = qtest_qmp(qts,
-                            "{'execute': 'qom-set',"
-                            " 'arguments': {'path': %s,"
-                            " 'property': 'det-tape-load', 'value': %s}}",
-                            SKY_CTRL_PATH, json);
-    QDict *err = qdict_get_qdict(resp, "error");
-    char *desc = err ? g_strdup(qdict_get_try_str(err, "desc")) : NULL;
-
-    qobject_unref(resp);
-    return desc;
-}
 
 /* a spectrum CSV @name in @dir holding @text (@len bytes, -1 = strlen) */
 static char *det_spec_csv(const char *dir, const char *name,
@@ -11377,9 +11532,10 @@ static void test_det_spec_guard(void)
 
 static void stix_det_tape_register(void)
 {
-    /* S1: the mix tape */
+    /* S1: the mix tape; S3: the single step */
     qtest_add_func("/sparc/stix/det-tape-props", test_det_tape_props);
     qtest_add_func("/sparc/stix/det-tape-status", test_det_tape_status);
+    qtest_add_func("/sparc/stix/det-single-props", test_det_single_props);
     qtest_add_func("/sparc/stix/det-tape-replay", test_det_tape_replay);
     qtest_add_func("/sparc/stix/det-tape-rate", test_det_tape_rate);
     qtest_add_func("/sparc/stix/det-tape-pixmask", test_det_tape_pixmask);

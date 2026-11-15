@@ -112,7 +112,7 @@ typedef enum StixDetTapeKind {
     STIX_DET_TAPE_RATE,
     STIX_DET_TAPE_REPLAY,
     STIX_DET_TAPE_OFF,
-    STIX_DET_TAPE_SINGLE,       /* parsed but rejected in S1 (S3) */
+    STIX_DET_TAPE_SINGLE,       /* S3: a one-pair burst (the feed is V2) */
     STIX_DET_TAPE_KIND__MAX,
 } StixDetTapeKind;
 
@@ -151,9 +151,11 @@ typedef struct StixDetSpec {
 #define STIX_DET_SPEC_MAX_POINTS 4096u
 #define STIX_DET_SPEC_MAX_FILE (256u * 1024u)
 
-/* one tape step (S1): kind rate|replay|off (single is S3), fpga_det/pix
+/* one tape step (S1): kind rate|replay|off|single, fpga_det/pix
  * masks, cps; label is optional. The fpga_det_mask/pix_mask bits are
- * fpga_det/pix indexed (plan T1). S2: spec (zero = FLAT). */
+ * fpga_det/pix indexed (plan T1). S2: spec (zero = FLAT). S3: a single
+ * step holds the one-pair masks, cps 0, and its target and schedule;
+ * its effective align rides spec.align (as in S2). */
 typedef struct StixDetTapeStep {
     uint8_t kind;               /* StixDetTapeKind */
     double for_s;               /* 0.1..86400 s on guest time */
@@ -162,6 +164,12 @@ typedef struct StixDetTapeStep {
     uint32_t cps;               /* counts/s per fpga_det (rate steps) */
     char *label;                /* optional, <= 64 chars */
     StixDetSpec spec;           /* S2: the rate step's spectrum */
+    uint32_t fpga_det;          /* single: the target (dss_det = fpga_det) */
+    uint32_t pix;               /* single: the target pix */
+    uint32_t n;                 /* single: 1..1000000 events */
+    uint32_t wait_us;           /* single: 1..10000, default 20 */
+    int32_t adc;                /* single: -1 when absent */
+    int32_t ebin;               /* single: -1 when absent */
 } StixDetTapeStep;
 
 /* the tape's state word (det-tape-status, hw-state det.tape.state) */
@@ -393,6 +401,14 @@ typedef struct StixDetState {
      * step start and at each build (det-align-status preimage_miss).
      */
     uint32_t spec_preimage_miss;
+    /*
+     * S3: the running single step's schedule cursor (the next event to
+     * feed; reset at every step start) and the pix-gate drop gauge of
+     * the current play (reset at play start and at a loop restart, so
+     * it sums the whole play; det-tape-status dropped).
+     */
+    uint32_t single_next;
+    uint32_t single_dropped;
     /*
      * S2: the running spectrum step's per-pair bin-mass row (built at
      * the step start and at each QL swap; 0 outside the step's masks)
