@@ -27,6 +27,10 @@ VOLATILE = ("idpu.scet.coarse", "idpu.scet.fine", "idpu.watchdog.count",
             "instrument.detector.replay.events",
             "instrument.detector.replay.dropped",
             "instrument.detector.replay.unsupported",
+            # S3 (V3): det.tape.dropped moves on its own while a single
+            # step plays (the pix-gate drop gauge), so the live readout
+            # must not lag on a change record
+            "instrument.detector.tape.dropped",
             "instrument.rotb.count", "instrument.rotb.rd",
             "instrument.rotb.wr")
 
@@ -107,8 +111,9 @@ def leaves_from_hw(ctrl, spw, t_sim):
             # the stimulus plan (T4, C2): the tape playback, the ELUT
             # alignment report and the ADC-sky knob, as the det section
             # carries them. The keys move only at a step boundary or on
-            # a verb, so no VOLATILE entry (step_left_ticks stays in
-            # the model's status string, out of the hw-state)
+            # a verb, so no VOLATILE entry except the S3 dropped gauge
+            # above (step_left_ticks stays in the model's status string,
+            # out of the hw-state)
             for sec, base in (("tape", "instrument.detector.tape."),
                               ("align", "instrument.detector.align."),
                               ("adc", "instrument.detector.adc.")):

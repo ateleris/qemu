@@ -21,6 +21,11 @@ in <tapes_dir>/spectra (filled by hand); a saved tape names one by its
 bare file name, and det.tape.play reads and parses it (a 400 before any
 QMP) and hands the model its absolute path. keV values >= the current K
 (det-cal-kev-full) are a warning, never a refusal (decision Q7).
+
+S3 (single-events plan V3): a single step is one DSS det(F, P, A)
+burst; its rule table (no spec, align true only with ebin, for_s
+covering n*wait_us against the tick-quantized duration) is the model's
+V1 table, mirrored.
 """
 
 import copy
@@ -157,12 +162,52 @@ def _spec(step, kind, where):
                         "flat_kev, a kev,weight file)" % where)
 
 
+def _single(step, where):
+    """S3: the single shape against V1's rule table (the wire ranges
+    were fixed by the outline); VerbError(400) naming the step. spec is
+    refused before _spec runs, align true only with ebin, and for_s
+    must cover n*wait_us against the tick-quantized duration (the
+    model's stix_det_tape_step_ticks rounding, 10 ticks/s)."""
+    if "spec" in step:
+        raise VerbError(400, "%s: a single step takes no spec" % where)
+    for key in ("fpga_det_mask", "pix_mask", "cps", "file", "offset_ms"):
+        if key in step:             # the model refuses them as unknown
+            raise VerbError(400, "%s: a single step takes no %s (it "
+                            "targets one fpga_det/pix pair)" % (where, key))
+    align = step.get("align")
+    if align is not None and not isinstance(align, bool):
+        raise VerbError(400, "%s: align %r is not a boolean" % (where, align))
+    _int_in(step.get("fpga_det"), 0, 31, "fpga_det", where)
+    _int_in(step.get("pix"), 0, 11, "pix", where)
+    _int_in(step.get("n"), 1, 1000000, "n", where)
+    _int_in(step.get("wait_us", 20), 1, 10000, "wait_us", where)
+    adc, ebin = step.get("adc"), step.get("ebin")
+    if adc is not None:
+        if ebin is not None:
+            raise VerbError(400, "%s: single takes adc or ebin, not both"
+                            % where)
+        _int_in(adc, 0, 4095, "adc", where)
+    elif ebin is not None:
+        _int_in(ebin, 0, 31, "ebin", where)
+    else:
+        raise VerbError(400, "%s: single needs adc or ebin" % where)
+    if align is True and adc is not None:
+        raise VerbError(400, "%s: align applies to ebin singles" % where)
+    ticks = int(step["for_s"] * 10.0 + 0.5)     # stix_det_tape_step_ticks
+    need = step["n"] * step.get("wait_us", 20)
+    if need > ticks * 100000:
+        raise VerbError(400, "%s: for_s %g s (%d ticks) does not cover "
+                        "n·wait_us = %g s"
+                        % (where, step["for_s"], ticks, need / 1e6))
+
+
 def _step(step, i):
     """One step of the model's schema (T1); VerbError(400) naming the
-    step index. single steps parse here (the wire interface is fixed);
-    whether the build supports them is the model's call at load. S2:
-    the spec rule table is the model's, mirrored (an align: true on an
-    adc,weight file is caught at resolve, once the CSV is read)."""
+    step index. single steps parse here against V1's rule table (the
+    model's, mirrored; whether the build supports them is its call at
+    load). S2: the spec rule table is the model's, mirrored (an
+    align: true on an adc,weight file is caught at resolve, once the
+    CSV is read); a single step takes no spec."""
     where = "step %d" % i
     if not isinstance(step, dict):
         raise VerbError(400, "%s is not an object" % where)
@@ -176,6 +221,9 @@ def _step(step, i):
     _num_in(step.get("for_s"), MIN_FOR_S, MAX_FOR_S, "for_s", where)
     if step.get("label") is not None:
         _text(step["label"], "%s: label" % where)
+    if kind == "single":                    # S3: V1's table; its spec
+        _single(step, where)                # rule comes before _spec's
+        return
     _spec(step, kind, where)
     if kind in ("rate", "off"):
         _int_in(step.get("fpga_det_mask"), 0, 0xFFFFFFFF,
@@ -187,17 +235,6 @@ def _step(step, i):
         if not isinstance(step.get("file"), str) or not step["file"]:
             raise VerbError(400, "%s: replay needs its file" % where)
         _int_in(step.get("offset_ms", 0), 0, 1 << 31, "offset_ms", where)
-    elif kind == "single":                  # S3's fixed shape
-        _int_in(step.get("fpga_det"), 0, 31, "fpga_det", where)
-        _int_in(step.get("pix"), 0, 11, "pix", where)
-        _int_in(step.get("n"), 1, 1000000, "n", where)
-        _int_in(step.get("wait_us", 20), 1, 10000, "wait_us", where)
-        if step.get("adc") is None and step.get("ebin") is None:
-            raise VerbError(400, "%s: single needs adc or ebin" % where)
-        if step.get("adc") is not None:
-            _int_in(step.get("adc"), 0, 4095, "adc", where)
-        else:
-            _int_in(step.get("ebin"), 0, 31, "ebin", where)
 
 
 def _background(bg):

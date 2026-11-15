@@ -474,11 +474,14 @@ class Platform:
     def _tape_status_casts():
         return {"state": str, "name": str, "label": str,
                 "step_left_ticks": int,
+                # dropped rides since S3 (V3): the pix-gate drop gauge
+                "dropped": int,
                 "loop": lambda v: v == "true",
                 "align": lambda v: v == "true"}
 
     def _tape_status(self):
-        """det-tape-status, with step=K/N split into step and n_steps."""
+        """det-tape-status, with step=K/N split into step and n_steps.
+        An older model's line without dropped still parses (V3)."""
         try:
             line = self._q().qom_get(STIXCTRL, "det-tape-status")
         except QmpError as e:
@@ -486,7 +489,8 @@ class Platform:
         out = split_kv(line)
         casts = self._tape_status_casts()
         try:
-            r = {k: cast(out[k]) for k, cast in casts.items()}
+            r = {k: cast(out[k]) for k, cast in casts.items()
+                 if k != "dropped" or "dropped" in out}
             step, _, n = out["step"].partition("/")
             r["step"] = int(step)
             r["n_steps"] = int(n)

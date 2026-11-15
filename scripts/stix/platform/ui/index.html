@@ -97,6 +97,11 @@ input, select {
 }
 input[type=number] { width: 7em; }
 input.wide { width: 14em; }
+textarea {
+  font: 13px var(--mono); padding: 2px 5px; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+}
+textarea.wide { flex: 1 1 20em; width: 20em; }
 table { border-collapse: collapse; width: 100%; font: 12px var(--mono); }
 th, td { text-align: left; padding: 2px 6px; border-bottom:
          1px solid var(--line); vertical-align: top; }
@@ -480,12 +485,12 @@ section.bluebox { border-color: var(--accent); }
     <button type="button" class="chip" id="stim-kind-spec"
             title="a spectrum: a line or band at ADC or keV, or a CSV">
       Spectrum</button>
-    <button type="button" class="chip" disabled
-            title="single events arrive in stage S3">Single events
-    </button>
-    <button type="button" class="chip" disabled
-            title="the DSS-sequence button is wired in S3">DSS sequence
-    </button>
+    <button type="button" class="chip" id="stim-kind-single"
+            title="single events: one det(F, P, A) pair, N events every W us">
+      Single events</button>
+    <button type="button" class="chip" id="stim-kind-dss"
+            title="a DSS sequence: one det(F, P, A) x N line per burst">
+      DSS sequence</button>
   </div>
   <div class="ctl">
     <span class="lbl">rate</span>
@@ -513,22 +518,47 @@ section.bluebox { border-color: var(--accent); }
     <label class="muted"><input type="checkbox" id="stim-spec-align"
       disabled title="keV specs: bin through the loaded ELUT's preimage">
       align</label>
-    <span class="lbl">duration</span>
+    <span class="lbl" id="stim-dur-lbl">duration</span>
     <input type="number" id="stim-dur" min="0.1" max="86400" step="0.1"
            value="120" data-type="number" title="for_s, seconds">
+    <span class="lbl">single</span>
+    <select id="stim-single-mode" hidden
+            title="a single targets one adc or, instead, one science ebin">
+      <option value="adc">at ADC</option>
+      <option value="ebin">at ebin</option>
+    </select>
+    <input type="number" id="stim-single-adc" min="0" max="4095" value="2200"
+           data-type="int" hidden title="adc 0..4095">
+    <input type="number" id="stim-single-ebin" min="0" max="31" value="7"
+           data-type="int" hidden title="science ebin 0..31">
+    <input type="number" id="stim-single-n" min="1" max="1000000"
+           value="1000" data-type="int" hidden
+           title="events, 1..1000000">
+    <input type="number" id="stim-single-wait" min="1" max="10000"
+           value="20" data-type="int" hidden
+           title="wait_us between events, 1..10000">
     <button type="button" id="stim-send">Send now</button>
     <button type="button" id="stim-add">Add to tape</button>
   </div>
-  <div class="desc">single events, as in the DSS tool:
-    det(22, 0, 1000) × N, wait 20 us</div>
+  <div class="ctl" id="stim-dss-box" hidden>
+    <span class="lbl">sequence</span>
+    <textarea id="stim-dss-text" class="wide" rows="3" spellcheck="false"
+      placeholder="det(22, 0, 1000) x 1000, wait 20 us"
+      title="one det(F, P, A) x N[, wait W us] burst per line"></textarea>
+  </div>
+  <div class="desc">Single events: one det(F, P, A) pair, N events
+    every W us (the DSS det() form). DSS sequence: one burst per line,
+    W optional (default 20 us).</div>
 </section>
 
 <section class="bluebox">
   <h2>Emulator support today vs needed</h2>
   <div class="desc">Today: per-detector and per-pixel rates, spectra (a
     line or flat band at ADC or keV, or a CSV from the spectra dir,
-    binned through the loaded ELUT; keV specs can align), and DSS
-    sequence replay. Still needed: single events (stage S3).</div>
+    binned through the loaded ELUT; keV specs can align), DSS sequence
+    replay, and single events (one det(F, P, A) pair: an adc burst
+    binned through the loaded ELUT, or an ebin direct, with align
+    through the preimage). The stimulus board is complete.</div>
 </section>
 
 <section>
@@ -1906,15 +1936,53 @@ function stimSpecUi() {
   cls($("stim-kind-rate"), v === "flat" ? "chip on" : "chip");
   cls($("stim-kind-spec"), v === "flat" ? "chip" : "chip on");
 }
-$("stim-spec").addEventListener("change", stimSpecUi);
+$("stim-spec").addEventListener("change", stimKindUi);
+/* S3: the kind chips pick what the row composes: the rate/spectrum
+   inputs, a single-event burst (for_s is composed from n·wait_us), or
+   a DSS sequence text. One mode at a time, the chip's "on" class. */
+let stimCompose = "";        // "" (rate or spectrum) | "single" | "dss"
+function stimKindUi() {
+  const single = stimCompose === "single", dss = stimCompose === "dss";
+  const rate = !single && !dss;
+  cls($("stim-kind-rate"),
+      rate && $("stim-spec").value === "flat" ? "chip on" : "chip");
+  cls($("stim-kind-spec"),
+      rate && $("stim-spec").value !== "flat" ? "chip on" : "chip");
+  cls($("stim-kind-single"), single ? "chip on" : "chip");
+  cls($("stim-kind-dss"), dss ? "chip on" : "chip");
+  for (const id of ["stim-spec", "stim-spec-adc", "stim-spec-kev",
+                    "stim-spec-k1", "stim-spec-k2", "stim-spec-file",
+                    "stim-spec-align"])
+    $(id).hidden = !rate;
+  $("stim-dur").hidden = $("stim-dur-lbl").hidden = !rate;
+  $("stim-dss-box").hidden = !dss;
+  $("stim-single-mode").hidden = !single;
+  const adc = $("stim-single-mode").value === "adc";
+  $("stim-single-adc").hidden = !single || !adc;
+  $("stim-single-ebin").hidden = !single || adc;
+  $("stim-single-n").hidden = !single;
+  $("stim-single-wait").hidden = !single;
+  if (rate) stimSpecUi();       // the spec inputs follow the select
+}
 $("stim-kind-rate").addEventListener("click", () => {
+  stimCompose = "";
   $("stim-spec").value = "flat";
-  stimSpecUi();
+  stimKindUi();
 });
 $("stim-kind-spec").addEventListener("click", () => {
+  stimCompose = "";
   if ($("stim-spec").value === "flat") $("stim-spec").value = "line_adc";
-  stimSpecUi();
+  stimKindUi();
 });
+$("stim-kind-single").addEventListener("click", () => {
+  stimCompose = "single";
+  stimKindUi();
+});
+$("stim-kind-dss").addEventListener("click", () => {
+  stimCompose = "dss";
+  stimKindUi();
+});
+$("stim-single-mode").addEventListener("change", stimKindUi);
 /* the step's spec fields ({} for the template), or null when an input
    is out of range (the callers refuse it) */
 function stimSpec() {
@@ -1956,10 +2024,95 @@ function stimStep() {
       fpga_det_mask: stimMask >>> 0, pix_mask: stimPixMask(),
       cps: Number($("stim-cps").value) || 0 }, sp);
 }
+
+/* S3: the single step from the row's inputs — {step} or {error}. A
+   single targets one (fpga_det, pix) pair, the DSS det() form: a
+   multi-detector target or an "all 12"/half pix select is refused.
+   for_s covers the burst: max(0.1, ceil(n·wait_us / 100000) / 10),
+   the model's tick-quantized coverage (M4). */
+function stimSingleStep() {
+  const one = (id, lo, hi) => {
+    const v = Number($(id).value);
+    return Number.isInteger(v) && lo <= v && v <= hi ? v : null;
+  };
+  const n = one("stim-single-n", 1, 1000000);
+  const wait = one("stim-single-wait", 1, 10000);
+  if (n == null || wait == null)
+    return { error: "single: n is 1..1000000, wait_us 1..10000" };
+  const dets = [...Array(32).keys()].filter((i) => stimMask & (1 << i));
+  if (dets.length !== 1)
+    return { error: "single: pick one detector (a single targets one " +
+             "pair, the DSS det() form)" };
+  if ($("stim-pix").value !== "one")
+    return { error: "single: pick one pixel (a single targets one " +
+             "pair, the DSS det() form)" };
+  const pix = one("stim-pix-one", 0, 11);
+  if (pix == null) return { error: "single: pix is 0..11" };
+  const st = { kind: "single", n, wait_us: wait,
+               for_s: Math.max(0.1, Math.ceil(n * wait / 100000) / 10),
+               fpga_det: dets[0], pix };
+  const at = $("stim-single-mode").value;
+  const v = at === "adc" ? one("stim-single-adc", 0, 4095)
+    : one("stim-single-ebin", 0, 31);
+  if (v == null) return { error: "single: adc is 0..4095, ebin 0..31" };
+  st[at] = v;
+  return { step: st };
+}
+
+/* S3: the DSS sequence text — one det(F, P, A) x N[, wait W us] line
+   per single step (W optional, default 20); {steps} or {error} naming
+   the line. */
+function stimDssSteps() {
+  const re = new RegExp("^det\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)"
+                        + "\\s*\\)\\s*[x×]\\s*(\\d+)"
+                        + "(?:\\s*,\\s*wait\\s+(\\d+)\\s*us)?\\s*$", "i");
+  const lines = $("stim-dss-text").value.split("\n");
+  const steps = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const m = re.exec(line);
+    if (!m)
+      return { error: "line " + (i + 1) +
+               ": det(F, P, A) x N[, wait W us]" };
+    const f = Number(m[1]), p = Number(m[2]), a = Number(m[3]);
+    const n = Number(m[4]), w = m[5] == null ? 20 : Number(m[5]);
+    if (f > 31 || p > 11 || a > 4095 || n < 1 || n > 1000000 ||
+        w < 1 || w > 10000)
+      return { error: "line " + (i + 1) + ": F is 0..31, P 0..11, " +
+               "A 0..4095, N 1..1000000, W 1..10000" };
+    steps.push({ kind: "single", fpga_det: f, pix: p, adc: a, n,
+                 wait_us: w,
+                 for_s: Math.max(0.1, Math.ceil(n * w / 100000) / 10) });
+  }
+  if (!steps.length)
+    return { error: "a DSS sequence line: det(F, P, A) x N[, wait W us]" };
+  return { steps };
+}
+
+function stimDssAdd() {
+  const r = stimDssSteps();
+  if (r.error) { toast(r.error, true); return; }
+  if ((tape.steps || []).length + r.steps.length > 64) {
+    toast("a tape holds at most 64 steps", true);
+    return;
+  }
+  tape.steps.push(...r.steps);
+  stimRender();
+}
+
 $("stim-add").addEventListener("click", () => {
   if (!tape) tape = blankTape();
+  if (stimCompose === "dss") { stimDssAdd(); return; }
   if ((tape.steps || []).length >= 64) {
     toast("a tape holds at most 64 steps", true);
+    return;
+  }
+  if (stimCompose === "single") {
+    const r = stimSingleStep();
+    if (r.error) { toast(r.error, true); return; }
+    tape.steps.push(r.step);
+    stimRender();
     return;
   }
   const st = stimStep();
@@ -1969,12 +2122,24 @@ $("stim-add").addEventListener("click", () => {
   stimRender();
 });
 $("stim-send").addEventListener("click", async () => {
+  let steps;
+  if (stimCompose === "dss") {
+    const r = stimDssSteps();
+    if (r.error) { toast(r.error, true); return; }
+    steps = r.steps;
+  } else if (stimCompose === "single") {
+    const r = stimSingleStep();
+    if (r.error) { toast(r.error, true); return; }
+    steps = [r.step];
+  } else {
+    const st = stimStep();
+    if (st == null) { toast("spectrum: an input is out of range", true); return; }
+    if (st.pix_mask == null) { toast("one pixel: 0..11", true); return; }
+    steps = [st];
+  }
   const t = blankTape();
   t.name = "send-now";
-  const st = stimStep();
-  if (st == null) { toast("spectrum: an input is out of range", true); return; }
-  t.steps = [st];
-  if (st.pix_mask == null) { toast("one pixel: 0..11", true); return; }
+  t.steps = steps;
   try {
     await post("det.tape.save", { name: "send-now", tape: t });
     const r = await post("det.tape.play", { name: "send-now",
@@ -2042,8 +2207,10 @@ function stimSettings(s) {
   if (s.kind === "off") return "0 cps";
   if (s.kind === "replay") return (s.file || "") + " @" +
     (s.offset_ms == null ? 0 : s.offset_ms) + " ms";
+  // S3: the single step, the DSS det() form
   return "det(" + s.fpga_det + ", " + s.pix + ", " +
-    (s.adc != null ? s.adc : "ebin " + s.ebin) + ") × " + s.n;
+    (s.adc != null ? s.adc : "ebin " + s.ebin) + ") x " + s.n +
+    " · " + (s.wait_us == null ? 20 : s.wait_us) + " us";
 }
 
 function stimRender() {
@@ -2063,7 +2230,7 @@ function stimRender() {
       cls(d, "stim-step");
       text(d, (i + 1) + " " + (s.label || s.kind));
       d.title = "step " + (i + 1) + ": " + s.kind + ", " + s.for_s +
-        " s, cps " + s.cps;
+        " s" + (s.cps == null ? "" : ", cps " + s.cps);
       d.style.flexGrow = String(Math.max(0.02, s.for_s || 0.1));
       row.append(d);
     });
@@ -2113,7 +2280,9 @@ function stimReadout() {
               step: leafTruth("instrument.detector.tape.step"),
               n: leafTruth("instrument.detector.tape.n_steps"),
               label: leafTruth("instrument.detector.tape.label"),
-              spec: leafTruth("instrument.detector.tape.spec") };
+              spec: leafTruth("instrument.detector.tape.spec"),
+              kind: leafTruth("instrument.detector.tape.kind"),
+              dropped: leafTruth("instrument.detector.tape.dropped") };
   if (t.state == null) text($("stim-now"), "idle");
   else if (t.state === "playing")
     text($("stim-now"), "now playing: tape '" + (t.name || "?") +
@@ -2123,7 +2292,9 @@ function stimReadout() {
          (t.name ? ": " + t.name : ""));
   text($("stim-progress"), t.state == null ? "–" :
        t.step + " / " + t.n +
-       (t.spec && t.state === "playing" ? " · " + t.spec : ""));
+       (t.spec && t.state === "playing" ? " · " + t.spec : "") +
+       (t.state === "playing" && t.kind === "single" &&
+        t.dropped != null ? " · dropped " + t.dropped : ""));
   const chips = $("stim-tape-row").children.length > 1
     ? [...$("stim-tape-row").children[1].children] : [];
   chips.forEach((d, i) =>

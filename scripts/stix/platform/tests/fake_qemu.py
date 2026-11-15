@@ -113,7 +113,7 @@ class Fake:
         # trio stores and reports like the device's store-then-apply
         self.tape = {"state": "idle", "name": "", "step": 0, "n_steps": 0,
                      "label": "", "kind": "", "loop": False, "align": False,
-                     "spec": ""}
+                     "spec": "", "dropped": 0}
         self.tape_json = None
         self.align = {"mode": "off", "rows": 384, "fallback": 0,
                       "honoured": 0, "mismatch_cells": 0,
@@ -191,10 +191,10 @@ class Fake:
     def tape_status(self):
         t = self.tape
         return ("state=%s,name=%s,step=%d/%d,label=%s,step_left_ticks=0,"
-                "loop=%s,align=%s"
+                "loop=%s,align=%s,dropped=%d"
                 % (t["state"], t["name"], t["step"], t["n_steps"],
                    t["label"], "true" if t["loop"] else "false",
-                   "true" if t["align"] else "false"))
+                   "true" if t["align"] else "false", t["dropped"]))
 
     def align_status(self):
         a = self.align
@@ -437,7 +437,8 @@ class Fake:
                                           "label": steps[0].get("label", "")
                                           if steps else "",
                                           "kind": steps[0].get("kind", "")
-                                          if steps else ""})
+                                          if steps else "",
+                                          "dropped": 0})  # the play start
                     elif self.tape["state"] == "playing":
                         self.tape["state"] = "stopped"
                 elif prop == "det-align":

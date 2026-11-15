@@ -2809,10 +2809,9 @@ def t_tapes_crud(env):
             check(e.status == 400 and why in str(e), "%s: %s" % (why, e))
         # the S3 shape parses (the model is the authority at load); the
         # S2 spec rules are t_tapes_spec's
-        tapes_mod.validate(dict(TAPE, steps=[dict(TAPE["steps"][0],
-                                                  kind="single",
-                                                  fpga_det=22, pix=0,
-                                                  adc=1000, n=1000)]))
+        tapes_mod.validate(dict(TAPE, steps=[
+            {"kind": "single", "for_s": 1.0, "fpga_det": 22, "pix": 0,
+             "adc": 1000, "n": 1000}]))
         # names in the path and through the verb, before any file access
         st, _, _ = _http(port, "GET", "/api/v1/tapes/%2e%2e%2fx")
         check(st == 400, "a bad name in the path too")
@@ -3066,6 +3065,128 @@ def t_align_leaves(env):
                 "instrument.detector.source": "synthetic"},
                must={"instrument.detector.align.preimage_miss",
                      "instrument.detector.tape.spec"},
+               must_not={"instrument.detector.source"})
+
+
+# S3 (single-events plan V3): V1's det-single-props vectors, same order;
+# every step rides a full tape through tapes.validate
+SINGLE_STEP = {"kind": "single", "for_s": 1.0, "fpga_det": 22, "pix": 0,
+               "adc": 1000, "n": 1000}
+
+
+def _single_tape(step, **tape):
+    return dict({"api": 1, "name": "single", "steps": [step]}, **tape)
+
+
+def t_tapes_single(env):
+    """S3 V3: V1's vector list through tapes.validate (the validator of
+    record): each rejected vector a 400 naming the step index (the
+    coverage rule's key words included), each accepted vector
+    validates; a single with a file spec is a 400; the tape's align is
+    not the step's."""
+    def without(step, key):
+        return {k: v for k, v in step.items() if k != key}
+
+    for step, why in (
+            (dict(SINGLE_STEP, cps=5), "takes no cps"),
+            (dict(SINGLE_STEP, fpga_det_mask=1), "takes no fpga_det_mask"),
+            (dict(SINGLE_STEP, fpga_det=32), "fpga_det"),
+            (without(SINGLE_STEP, "fpga_det"), "fpga_det"),
+            (dict(SINGLE_STEP, pix=12), "pix"),
+            (without(SINGLE_STEP, "pix"), "pix"),
+            (dict(SINGLE_STEP, n=0), "n"),
+            (dict(SINGLE_STEP, n=1000001), "n"),
+            (without(SINGLE_STEP, "n"), "n"),
+            (dict(SINGLE_STEP, n=1000.0), "n"),
+            (dict(SINGLE_STEP, wait_us=0), "wait_us"),
+            (dict(SINGLE_STEP, wait_us=10001), "wait_us"),
+            (dict(SINGLE_STEP, wait_us=20.0), "wait_us"),
+            (dict(SINGLE_STEP, adc=4096), "adc"),
+            (dict(SINGLE_STEP, adc=-1), "adc"),
+            (without(SINGLE_STEP, "adc"), "adc"),
+            (dict(SINGLE_STEP, adc=1600.0), "adc"),
+            (dict(SINGLE_STEP, spec="flat"), "takes no spec"),
+            (dict(SINGLE_STEP, spec={"line_adc": 1600}),
+             "takes no spec"),
+            (dict(SINGLE_STEP, spec={"file": "s.csv"}), "takes no spec"),
+            (dict(SINGLE_STEP, align=True), "align applies to ebin"),
+            (dict(SINGLE_STEP, align="yes"), "align")):
+        e = raises(VerbError, tapes_mod.validate, _single_tape(step))
+        check(e.status == 400 and "step 0" in str(e) and why in str(e),
+              "refused %r: %s" % (step, e))
+    # the ebin side of the table
+    for step, why in ((dict(without(SINGLE_STEP, "adc"), ebin=32), "ebin"),
+                      (dict(without(SINGLE_STEP, "adc"), ebin=-1), "ebin")):
+        e = raises(VerbError, tapes_mod.validate, _single_tape(step))
+        check(e.status == 400 and "step 0" in str(e) and why in str(e),
+              "refused %r: %s" % (step, e))
+    # adc + ebin both present (m9: the model refuses both)
+    e = raises(VerbError, tapes_mod.validate, _single_tape(
+        dict(SINGLE_STEP, ebin=7)))
+    check(e.status == 400 and "not both" in str(e), "both: %s" % e)
+    # the coverage rule against the quantized duration (owner decision 1,
+    # M4's rounding): 0.1 s is 1 tick, 0.12 s rounds to 1 tick too
+    for step in (dict(SINGLE_STEP, n=1000000, wait_us=10000, for_s=0.1),
+                 dict(SINGLE_STEP, n=60000, wait_us=20, for_s=1),
+                 dict(SINGLE_STEP, n=6000, wait_us=20, for_s=0.12)):
+        e = raises(VerbError, tapes_mod.validate, _single_tape(step))
+        check(e.status == 400 and "step 0" in str(e) and
+              "does not cover" in str(e) and "n·wait_us" in str(e),
+              "coverage %r: %s" % (step, e))
+    # accepted (V1's list): the outline's mono hint, the full-scale
+    # burst, the wait_us default, the ebins, the adc ends, align
+    for step in (dict(SINGLE_STEP, for_s=0.1),
+                 dict(SINGLE_STEP, n=1000000, wait_us=10000, for_s=10000),
+                 dict(SINGLE_STEP, for_s=0.1, n=5000),   # wait_us absent
+                 dict(without(SINGLE_STEP, "adc"), for_s=0.1, ebin=7),
+                 dict(without(SINGLE_STEP, "adc"), for_s=0.1, ebin=31),
+                 dict(SINGLE_STEP, for_s=0.1, adc=0),
+                 dict(SINGLE_STEP, for_s=0.1, adc=4095),
+                 dict(without(SINGLE_STEP, "adc"), for_s=0.1, ebin=7,
+                      align=True),
+                 dict(SINGLE_STEP, for_s=0.1, align=False)):
+        tapes_mod.validate(_single_tape(step))
+    # the tape's align is not the step's: an adc single under an
+    # align: true tape passes (V1 ignores it there)
+    tapes_mod.validate(_single_tape(dict(SINGLE_STEP, for_s=0.1),
+                                    align=True))
+
+
+def t_tapes_status_dropped(env):
+    """S3 V3: det.tape.dropped is a leaf (volatile, no change record),
+    _tape_status casts dropped from a line that carries it and parses
+    an older model's line without it, and the sampler globs need
+    nothing new (instrument.detector.tape.* already matches)."""
+    ctl = env.controller()
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        q = ctl.power.qmp
+        q.execute("x-fake-tape-state", {"state": {"dropped": 1000}})
+        wait_for(lambda: (ctl.state.get("instrument.detector.tape.dropped")
+                          or {}).get("truth") == 1000, what="the leaf")
+        r = ctl.command("det.tape.stop", {})
+        check(r["dropped"] == 1000, "the status casts dropped: %r" % r)
+
+        class _Old:
+            def qom_get(self, path, prop):
+                check(prop == "det-tape-status", "the prop: %s" % prop)
+                return ("state=idle,name=,step=0/0,label=,"
+                        "step_left_ticks=0,loop=false,align=false")
+
+        real = ctl.plat.qmp
+        ctl.plat.qmp = lambda: _Old()
+        try:
+            r = ctl.plat._tape_status()
+        finally:
+            ctl.plat.qmp = real
+        check(r["state"] == "idle" and "dropped" not in r,
+              "an old line parses without dropped: %r" % r)
+    finally:
+        ctl.shutdown()
+    _glob_case({"instrument.detector.tape.dropped": 1000,
+                "instrument.detector.source": "synthetic"},
+               must={"instrument.detector.tape.dropped"},
                must_not={"instrument.detector.source"})
 
 
@@ -3730,7 +3851,12 @@ UI_STIMULUS_IDS = {"det-sub-status", "det-sub-stim", "stim-tapes",
                    # S2 U4: the Spectrum control
                    "stim-kind-spec", "stim-spec", "stim-spec-adc",
                    "stim-spec-kev", "stim-spec-k1", "stim-spec-k2",
-                   "stim-spec-file", "stim-spec-align"}
+                   "stim-spec-file", "stim-spec-align",
+                   # S3 V3: the Single-events and DSS-sequence controls
+                   "stim-kind-single", "stim-kind-dss",
+                   "stim-single-mode", "stim-single-adc",
+                   "stim-single-ebin", "stim-single-n",
+                   "stim-single-wait", "stim-dss-text"}
 
 
 def _csp_hashes(page, tag):
@@ -4032,7 +4158,9 @@ def t_ui_stimulus(env):
     sub-view: the tape select, loop checkbox, play/stop buttons (their
     data-verb), the step table container and the align + ADC-sky
     toggles exist, the new verbs are all served, and the page rules
-    still hold."""
+    still hold. S3 V3: the Single-events and DSS-sequence chips are
+    enabled, the six new ids exist, and stimSettings renders a single
+    step as det(22, 0, 2200) x 1000 · 20 us."""
     ctl = env.controller()
     srv = api_mod.make_server(ctl, "127.0.0.1", 0)
     port = srv.server_address[1]
@@ -4087,6 +4215,45 @@ def t_ui_stimulus(env):
     tag, a = by_id["stim-spec-align"]
     check(tag == "input" and a.get("type") == "checkbox" and
           "disabled" in a, "the align box starts disabled: %r" % (a,))
+    # S3 V3: the two chips are enabled (no disabled, no S3 title); the
+    # single inputs are typed and hidden; the DSS textarea exists
+    for i in ("stim-kind-single", "stim-kind-dss"):
+        tag, a = by_id[i]
+        check(tag == "button" and "disabled" not in a and
+              "S3" not in (a.get("title") or ""),
+              "the %s chip is enabled: %r" % (i, a))
+    check(by_id["stim-single-mode"][0] == "select",
+          "the adc/ebin mode select")
+    for i in ("stim-single-adc", "stim-single-ebin", "stim-single-n",
+              "stim-single-wait"):
+        tag, a = by_id[i]
+        check(tag == "input" and a.get("type") == "number" and
+              "hidden" in a, "%s: a hidden number input %r" % (i, a))
+    check(by_id["stim-dss-text"][0] == "textarea", "the DSS textarea")
+    # stimSettings renders a single step (the source pin, plus the
+    # render itself under node, no browser needed)
+    js = "\n".join(p.scripts)
+    m = re.search(r"function stimSettings\(s\) \{(.*?)\n\}", js, re.S)
+    check(m is not None and '") x " + s.n' in m.group(1) and
+          '" us"' in m.group(1),
+          "stimSettings formats a single as det(F, P, A) x N · W us")
+    node = shutil.which("node") or shutil.which("nodejs")
+    if node:
+        import subprocess
+        src = m.group(0) + \
+            '\nconsole.log(stimSettings({kind: "single", fpga_det: 22, ' \
+            'pix: 0, adc: 2200, n: 1000, wait_us: 20}));'
+        with tempfile.NamedTemporaryFile("w", suffix=".js",
+                                         delete=False) as f:
+            f.write(src)
+        try:
+            r = subprocess.run([node, f.name], capture_output=True,
+                               text=True, timeout=30)
+        finally:
+            os.unlink(f.name)
+        check(r.returncode == 0 and
+              r.stdout.strip() == "det(22, 0, 2200) x 1000 · 20 us",
+              "stimSettings renders: %r %r" % (r.stdout, r.stderr))
 
 
 SETUP_KEYS = {"binary", "elf", "elf_sha256", "icount_shift", "pace",
@@ -6750,6 +6917,9 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("detector tapes: spectrum CSV (S2 U3)", t_tapes_spec_csv),
          ("detector tapes: spectrum play (S2 U3)", t_tapes_spec_play),
          ("detector align/spec leaves (S2 U3)", t_align_leaves),
+         ("detector tapes: single steps (S3 V3)", t_tapes_single),
+         ("detector tapes: dropped leaf + status (S3 V3)",
+          t_tapes_status_dropped),
          ("detector tapes: the numbering table (T3)", t_tapes_numbering),
          ("detector adc verb (C2)", t_adc_verb),
          ("detector adc leaves (C2)", t_adc_leaves),

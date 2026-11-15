@@ -156,7 +156,7 @@ namespaces and where each comes from:
 | `platform.*` | the controller's own state (power, boot, SpW link, time codes, OBT, keep-alive, time sync) |
 | `idpu.scet.*`, `idpu.watchdog.*`, `idpu.spw.*` | the SpW device's hw-state |
 | `instrument.supplies.*`, `instrument.hk_adc.<ch>`, `instrument.hk_prot.*` | the stixctrl hw-state |
-| `instrument.detector.quarter.<q>`, `instrument.detector.{source, flare, quiet_cps, flare_cps, ql_bank}`, `instrument.detector.fsm.*`, `instrument.detector.replay.*`, `instrument.detector.tape.*`, `instrument.detector.align.*`, `instrument.detector.adc.*` | the hw-state's `det` section (`quarter.<q>` since PL-2, the rest PL-11c, tape/align/adc the stimulus plan): the scene (`source` zero \| synthetic \| replay-dss, `flare`, `quiet_cps`/`flare_cps` counts/s per fpga_det), the QL bank in use (`ql_bank`), `fsm.enable`, the replay progress `replay.{state, pos_ns, events, dropped, unsupported, table, count, duration_ns}` (the det-replay-status line's data; `pos_ns` is volatile), the mix tape `tape.{state, name, step, n_steps, label, kind, loop, align, spec}` (1-based `step`, moves only at a step boundary; `spec` the running step's spectrum text, e.g. `line_kev=62 align`, S2), the ELUT-alignment report `align.{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration, preimage_miss}` (`preimage_miss`: the running aligned keV step's dropped (pair, ebin) count, S2), and the ADC-sky knob `adc.{mode, kev_full, base_source, map_rows}` |
+| `instrument.detector.quarter.<q>`, `instrument.detector.{source, flare, quiet_cps, flare_cps, ql_bank}`, `instrument.detector.fsm.*`, `instrument.detector.replay.*`, `instrument.detector.tape.*`, `instrument.detector.align.*`, `instrument.detector.adc.*` | the hw-state's `det` section (`quarter.<q>` since PL-2, the rest PL-11c, tape/align/adc the stimulus plan): the scene (`source` zero \| synthetic \| replay-dss, `flare`, `quiet_cps`/`flare_cps` counts/s per fpga_det), the QL bank in use (`ql_bank`), `fsm.enable`, the replay progress `replay.{state, pos_ns, events, dropped, unsupported, table, count, duration_ns}` (the det-replay-status line's data; `pos_ns` is volatile), the mix tape `tape.{state, name, step, n_steps, label, kind, loop, align, spec, dropped}` (1-based `step`, moves only at a step boundary; `spec` the running step's spectrum text, e.g. `line_kev=62 align`, S2; `dropped` the running play's pix-gate drop count — it moves while a single step plays, so it is volatile, S3), the ELUT-alignment report `align.{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration, preimage_miss}` (`preimage_miss`: the running aligned keV step's dropped (pair, ebin) count, S2), and the ADC-sky knob `adc.{mode, kev_full, base_source, map_rows}` |
 | `instrument.attenuator.*` | the hw-state's `attenuator` section (PL-11b): `truth.{position, position_ppm, sensor_ab, sensor_bc, motor1_driving, motor2_driving, att_c, moves, last_end, last_end_ns}`, `presented.{sensor_ab, sensor_bc, cmdsta, att_c}`, `fsw_accesses`, `faults_active` |
 | `instrument.memory.*` | the hw-state's `edac` section (PL-11b): per-memory `injected`/`corrected`/`detected` counters for `cache`, `sdram` and `rotbuf`, and `poisons` (the armed upsets as one leaf; a change record per arm and per clear). `instrument.memory.bram` maps no leaf: the bram has no EDAC counters and its upsets arm no poison |
 | `instrument.rotb.{count, full, enable, rd, wr, capacity}` | the hw-state's `rotb` section (PL-11c): the ROTB ring's FIFO state — the block count, the full flag, the rotbConfig ENABLE bit, the read/write block indices, and the rotb-blocks capacity. `count`/`rd`/`wr` are volatile (they move while the detector fills the ring) |
@@ -196,7 +196,7 @@ lists exactly these verbs and arguments.
 | `det.align.set` | `enabled` | the ELUT-alignment bench knob (`det-align`, default off) + the parsed `det-align-status` `{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration, preimage_miss}`; the "the ELUT does not match the DSS" signal is a large `mismatch_cells` (the stimulus plan A1) |
 | `det.tape.save` | `name`, `tape` | save a mix tape as `<name>.json` in the tapes dir (next to the views); the model's schema, validated here first (400 with the step index); a tape without its own `name` field takes the file name; a keV value at or past the current K adds `"warnings"` to the answer (not a refusal, S2) |
 | `det.tape.delete` | `name` | delete a saved mix tape (404 unknown) |
-| `det.tape.play` | `name`, `loop` | load a saved tape into the model (`det-tape-load`) and start it on the guest-time tick (`det-tape-play`); `loop` overrides the tape's own; spectrum files are read and parsed first and passed as absolute paths (a bad or missing one is a 400 before any QMP); the answer is the parsed `det-tape-status` (`state`, `name`, `step`, `n_steps`, `label`, `step_left_ticks`, `loop`, `align`) plus `warnings` when a keV value is at or past K; 409 while STIX is off or the model refuses |
+| `det.tape.play` | `name`, `loop` | load a saved tape into the model (`det-tape-load`) and start it on the guest-time tick (`det-tape-play`); `loop` overrides the tape's own; spectrum files are read and parsed first and passed as absolute paths (a bad or missing one is a 400 before any QMP); the answer is the parsed `det-tape-status` (`state`, `name`, `step`, `n_steps`, `label`, `step_left_ticks`, `loop`, `align`, `dropped`) plus `warnings` when a keV value is at or past K; 409 while STIX is off or the model refuses |
 | `det.tape.stop` | | stop the playing tape (`det-tape-play false`); the rates revert to the scene knobs; the answer is the parsed `det-tape-status` |
 | `fault.inject` | `id`, `params`, `trigger`, `seed` | a catalogue fault (`GET /faults`); logged as `fault` with its params and seed |
 | `fault.clear` | `id` | clear an active, reversible fault, or disarm an armed one |
@@ -794,6 +794,33 @@ playback, the scene knobs resume on stop/done).
   `instrument.detector.tape.spec` and
   `instrument.detector.align.preimage_miss` come through the hw-state
   pass-through.
+- **Single events and DSS sequences** (S3,
+  `2026-11-15-single-events-plan.md`): a `single` step is one
+  DSS-faithful burst `det(F, P, A) x N, wait W us` — N events on one
+  (`fpga_det`, `pix`) pair, the DSS `det()` form. The model's V1 rule
+  table, mirrored by the validator: `fpga_det` 0..31 and `pix` 0..11
+  required, `n` 1..1000000 required, `wait_us` 1..10000 optional
+  (default 20), and exactly one of `adc` 0..4095 or `ebin` 0..31
+  (both present or both absent refused). `for_s` must cover the burst
+  against the tick-quantized duration — `n·wait_us` within
+  `stix_det_tape_step_ticks(for_s)` ticks of 100 ms (the model rounds
+  `for_s·10` to nearest) — else a 400. `spec` is refused on single
+  (any value), and `align: true` is valid with `ebin` only (the
+  tape's `align` is not the step's). An adc burst is binned through
+  the loaded ELUT exactly like a replay event (an unassigned adc
+  drops its mass silently); an `ebin` step with `align` goes through
+  the ELUT's preimage (a miss is one `preimage_miss`, not a
+  `dropped`). The pix-gated share of a play is the `dropped` gauge: a
+  trailing `,dropped=N` on `det-tape-status`, the
+  `instrument.detector.tape.dropped` leaf (volatile, reset when a
+  play starts), shown by the board's progress readout while a single
+  step plays. The board's Single-events control composes the step (a
+  multi-detector target or an "all 12" pix select is refused — a
+  single targets one pair); the DSS-sequence control parses one
+  `det(F, P, A) x N[, wait W us]` line per step, `W` optional
+  (default 20), with `for_s = max(0.1, ceil(n·wait_us / 100000) / 10)`
+  (the coverage, raised to 0.1 s), toasting the line number on a parse
+  error and refusing more than 64 steps.
 - **Validation**: `det.tape.save` validates the model's schema before
   any QMP (a bad tape is a 400 naming the step index); the model stays
   the authority at `det-tape-load`. Detector numbers here and in the
@@ -971,11 +998,14 @@ is the ROTB fill as a bar, the `instrument.detector.*` and
 `instrument.rotb.*` leaves as a state table and the burst control;
 Stimulus is the board — target chips (All 32, Q1–Q4, pick on the map;
 the mockup's DG1–DG4 are dropped, decision D2), the pixel select, the
-rate step (Send now / Add to tape), the Spectrum / Single-events /
-DSS-sequence controls rendered disabled (wired in S2/S3), the mix tape
-panel (saved tapes, loop, play/stop, the background and step rows with
-widths proportional to `for_s`, the step table with move up/down/remove)
-and the align + ADC-sky box. The Runs board (S1) lists the run bundles
+rate step (Send now / Add to tape), the Spectrum control (S2) and the
+Single-events and DSS-sequence controls (S3: the adc/ebin, n and
+wait_us burst inputs, the `det(F, P, A) x N` textarea, a single step
+shown as `det(22, 0, 2200) x 1000 · 20 us`; the stimulus board is
+complete), the mix tape panel (saved tapes, loop, play/stop, the
+background and step rows with widths proportional to `for_s`, the step
+table with move up/down/remove) and the align + ADC-sky box. The Runs
+board (S1) lists the run bundles
 from `GET /runs` every 5 s while visible, with a case-insensitive filter
 over name, ELF, QEMU and verdict, the columns bundle (name, live/open
 badges, baseline mark), recorded, FSW ELF (name + the first 8 hex of its
@@ -1058,3 +1088,7 @@ Against a controller with the real ASW (or the self-test's fake QEMU):
    same records (same seqs) and keep streaming.
 8. Stop the controller: the page shows "stream: reconnecting…" and
    recovers when it is back.
+9. Detectors → Stimulus: compose a `det(22, 0, 2200) x 1000` line in
+   the DSS-sequence textarea, Add to tape, save, reload: the step
+   table shows the single step; while it plays the progress readout
+   shows `dropped`.
