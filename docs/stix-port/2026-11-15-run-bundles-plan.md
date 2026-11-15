@@ -10,7 +10,8 @@ opens them, and the record/replay/compare formats are fixed now so S2
 (replay on guest time) and S3 (compare two runs) only add consumers.
 
 **Architecture:** a new `stixplat/bundle.py` owns the manifest, the
-pure input classifier and the pure decisions extractor; the extractor
+input classifier and the decisions extractor (both fed in record
+order with per-run state); the extractor
 runs as a record-log listener appending `decisions.jsonl` next to
 `log.jsonl` in the run dir (the run dir *is* the bundle: no copies).
 API additions (`GET /runs...`, verbs `run.baseline[.clear]`,
@@ -46,6 +47,10 @@ Run dir and retention
   (rundir.py:30): flash.bin, uart.raw, qemu.log, log.jsonl, tm.jsonl —
   a manifest.json or decisions.jsonl would survive, so the bundle
   writer must truncate its own files at start.
+- log.jsonl opens in append mode (log.py:88): a reused interactive
+  dir's log holds the earlier sessions too. The manifest carries the
+  session's `start_seq` (the controller.start record's seq) and S2
+  slices the log from it.
 - Retention sizes are real blocks (retention.py:29-36); the flash is
   sparse (16.5 GB apparent, platform.md "The run dir"); `keep_flash`
   drops a passed run's flash (retention.py:119-128).
@@ -76,12 +81,16 @@ Inputs (all already stamped on guest time in log.jsonl)
   subtype, source, delivered (relay.py:173-198; real GS TCs: source
   "tc", path "tc.gs"; `tc.gs.send`: source "scn", plat.py:418;
   `tc.platform.send`: source "ctl", plat.py:395-397; TC(9,129):
-  source "ctl", path "platform.timesync", timesync.py:201). Real GS
-  TCs arrive on UDP and are logged with `sim_est: true`
-  (relay.py:101-103) — wall-paced, the design's non-replayable case.
+  source "ctl", path "platform.timesync", timesync.py:201 — but that
+  record carries only seq/coarse and a `raw` boolean, no TC bytes).
+  Real GS TCs arrive on UDP (relay.py:149-164) and their tc records
+  carry `sim_est: true` while RUNNING — `emit` stamps the clock's
+  est (log.py:96-105); the `sim_est=True` at relay.py:101-103 is the
+  TM emit. Wall-paced, the design's non-replayable case.
 - Faults: `fault` records with action `inject` (resolved params +
-  seed, faults.py:281-285), `armed` (at_sim trigger, faults.py:238-240,
-  the `inject` follows at fire time), `clear`, `reapply`
+  seed but no trigger, faults.py:281-285), `armed` (the only record
+  carrying the at_sim trigger, faults.py:238-240; the `inject`
+  follows at fire time), `clear`, `reapply`
   (re-applied automatically at power cycles, faults.py:287-299) and
   `error`. Forcings: `force` records action `set`/`clear`
   (force.py:52-66) and `force.reapply` (force.py:75-76).
@@ -93,9 +102,13 @@ Decision sources already decoded in records
 - TM(5,x) events: `tm` records with `data.decoded.type == 5`, EID +
   name (decode.py:53-56); the platform EID table is decode.py:19-26
   (0x0021 mode change, 0x142E keepalive lapse, 0x1429, 0x542B, 0x14A3
-  FDIR). Overrun/skip EIDs: UNVERIFIED (no FSW grep from this
-  sandbox; 0x5440 appears in accepted-diffs §48 for aspect errors) —
-  they become config, default empty.
+  FDIR). Overrun/skip EIDs: none — the FSW event enum (TMData.h:
+  245-364) has no ROTB-overrun/skip EID; an overrun sets flags and
+  silently skips ~60 s of data (RotAccumulator.c:51-64, 104-141) and
+  HK carries only the 3-bit RB level (HKAcquire.c:151-152, status4
+  bits 31..29); the only skip EIDs are the user-request/aspect ones
+  0x543F/0x5440/0x5446 (SciReport path, accepted-diffs §48). S3
+  derives the overrun rows from hk_step/series data instead.
 - HK fields: `tm` records carry `data.hk = {code: value}` when the
   IDB JSON is loaded (relay.py:116-124); RB level NIXD0501 (SID 2)
   and mode NIXD0023 per the timeline plan's pinned rules
@@ -112,8 +125,10 @@ Conventions to reuse
   limit (flashlib.py:116-139); record fields flashlib.py:63-77 (no
   content sha today).
 - API: additive v1 GET routes in api._get (api.py:177-226); verbs are
-  registered in core._register (core.py:99-138) and must be added to
-  platform.md's verbs table (the self-test's "verbs == docs table").
+  registered in core._register (core.py:99-138) **and** listed in
+  verbs.VERBS (the registry the self-test and run mode check), and
+  must be added to platform.md's verbs table (the self-test's
+  "verbs == docs table").
 - `--view-run DIR [--port N]` (default 8081) serves a run dir
   read-only through the same API/page, `view.*` verbs only
   (viewrun.py:62-94, 162-166, 185-209); it takes the run's config
@@ -151,8 +166,11 @@ Conventions to reuse
   TM, UART, argv and flash state are already there; retention and
   `--view-run` keep working unchanged; S2 re-feeds straight from
   log.jsonl. Cost: an interactive session's bundle is overwritten by
-  the next session in the same dir (documented; run mode keeps every
-  session, retention keeps the last N).
+  the next session in the same dir — accepted and documented: the
+  writer truncates its files at start (R2), the manifest's
+  `start_seq` scopes the log slice (R1/R6), platform.md carries the
+  caveat (R5); run mode keeps every session, retention keeps the
+  last N.
 - **B. A separate bundle store** (`<run_root>/bundles/<id>/` with
   copied or hardlinked logs): self-contained exports, but duplicates
   data on a nearly full C: drive and drifts from the run dir.
@@ -180,6 +198,8 @@ Conventions to reuse
 5. The baseline exemption must not break retention's budget: `plan()`
    keeps the baseline run like a running one, and a baseline whose
    dir disappeared is shown as missing, never fatal (test in R3).
+   The baseline's size still counts toward max_total_mb; past it
+   `plan()` warns and keeps the baseline (test in R3).
 
 ---
 
@@ -195,7 +215,8 @@ Conventions to reuse
   `DECISIONS = "decisions.jsonl"`; `BASELINE = ".stixplat-baseline"`.
 - Manifest JSON (written by R2, shape frozen here):
   `{"v": 1, "kind": "run"|"replay", "run_id", "dir", "mode",
-  "scenario": {file,name,variant}|null, "started_utc", "ended_utc",
+  "scenario": {file,name,variant}|null, "started_utc", "start_seq",
+  "ended_utc",
   "open": bool, "t0": ns|null, "final_sim_time": ns, "final_seq": N,
   "length_s": s|null (last sim_time - t0), "fsw": {elf, sha256},
   "qemu": {binary, sha256|null, commit|null, dirty|null, describe|null,
@@ -213,7 +234,8 @@ Conventions to reuse
   `git -C <repo-root> rev-parse HEAD` and `describe --always
   --dirty=.dirty`; repo root = 4 `dirname`s up from bundle.py; any
   failure (no git, foreign binary) -> None, never fatal.
-- `classify(obj) -> input dict | None` (pure, the S2 contract):
+- `classify(obj, state) -> input dict | None` (fed in record order
+  with a per-run `state`; the S2 contract):
   cmd records whose verb is in `REPLAY_VERBS` = {sim.pause,
   sim.resume, log.mark, platform.spw.link, platform.timecode.enable,
   platform.timecode.once, platform.timecode.inject, platform.obt.set,
@@ -223,10 +245,20 @@ Conventions to reuse
   tc records carrying `hex` -> `{"input": "tc", "hex", "replay":
   "guest"|"wall"|"no"}` ("wall" when source == "tc" — a real GS TC,
   why "wall-paced GS TC"; "no" when delivered is false, why "never
-  reached the FSW"); fault records action `inject` -> `{"input":
-  "fault", "id", "params", "seed", "trigger", "replay": "guest"}`,
-  action `clear` -> fault.clear input; actions `armed|reapply|error`
-  -> None (echo / automatic / failure); force records action
+  reached the FSW"); the `platform.timesync` tc record (no hex:
+  seq/coarse + a `raw` boolean, timesync.py:198-201) -> `{"input":
+  "tc", "hex": null, "service": 9, "subtype": 129, "seq", "coarse",
+  "replay": "guest"}` — a manual mid-run sync is a real input (its
+  TM(1,7) ack matches no hex-carrying tc record, so it yields no
+  `ack` decision: documented); fault records: `state` holds the
+  armed faults by id — an `armed` record stores {params, seed,
+  trigger} and maps to None; the matching `inject` (same id) ->
+  `{"input": "fault", "id", "params", "seed", "trigger", "replay":
+  "guest"}` (the trigger survives — an at_sim fault replays as an
+  at_sim fault); an `inject` with no armed twin is an immediate
+  inject, trigger `{"at": "now"}`; action `clear` -> fault.clear
+  input; actions `reapply|error` -> None (automatic / failure);
+  force records action
   `set`/`clear` -> `{"input": "force", "path", "value", "replay":
   "guest"}`, path `force.reapply` -> None. Verbs excluded as
   themselves (their canonical input is another record, or they must
@@ -236,7 +268,9 @@ Conventions to reuse
   platform.flash.* (flash state is by reference), debug.qmp, view.*
   -> `{"input": "verb", "replay": "no", why}` so they count in
   `not_replayable`. `result` records -> None.
-- `decide(obj) -> [decision]` (pure, the S3 contract); a decision is
+- `decide(obj, state) -> [decision]` (a stateful accumulator fed in
+  record order — the ack rule needs the run's input-TC key set in
+  `state`; the S3 contract); a decision is
   `{"v": 1, "seq", "sim_time", "boot_id", "kind", "key", "class",
   "detail"}`; kinds: `event` (tm, decoded.type == 5: key `"0x%04X"`,
   class from `EID_CLASSES = {0x0021: "mode", 0x142E: "keepalive",
@@ -250,9 +284,9 @@ Conventions to reuse
   the series id space — detail {value, previous}). Heartbeats
   (APID 0x5E5) and HK reports without data.hk produce nothing.
 - Config `[bundle]`: `enabled` (bool, true), `hk_codes` (list of
-  str, `["NIXD0501", "NIXD0023"]`), `overrun_eids` (list of int,
-  `[]` — filled when the owner pins the FSW overrun EIDs; S3 reads
-  it). `config._check` validates the types.
+  str, `["NIXD0501", "NIXD0023"]`). `config._check` validates the
+  types. (No `overrun_eids`: the FSW has no overrun EID — S3 derives
+  the overrun rows from hk_step/series data.)
 
 - [ ] Self-test `bundle_decisions`: feed synthetic records to
   `decide`: tm decoded {type: 5, eid: 0x21, params: "02"} -> exactly
@@ -266,7 +300,11 @@ Conventions to reuse
 - [ ] Self-test `bundle_inputs`: cmd sim.pause -> verb/guest;
   cmd scenario.run -> replay "no" with a reason; tc source "tc"
   delivered true -> "wall"; the same with delivered false -> "no";
-  fault action "reapply" -> None; action "inject" with params
+  a `platform.timesync` tc record -> a tc input with hex null and
+  the recorded seq/coarse; fault action "reapply" -> None; an
+  `armed` record then its `inject` -> one fault input carrying
+  params, seed and the at_sim trigger verbatim; an `inject` with no
+  armed twin -> trigger {"at": "now"}; action "inject" with params
   {"delta_s": 4} and seed 99 -> the fault input carries both
   verbatim; force action "set" value 123 -> force input; cmd
   platform.flash.load -> replay "no".
@@ -288,27 +326,35 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
   every start field it can know (config via the same `_public(cfg)`
   dict core.py:95 logs; fsw elf + sha256; qemu binary + binary
   sha256 + git_info; argv null until the power record).
-  `on_record` (the log listener) classifies via `classify`,
-  extracts via `decide`, and appends one json line per decision to
-  decisions.jsonl under its own lock — never emits, never takes
-  state.lock. It also tracks for the close write: the first power
-  record with `argv` (power.py:140), the boot record's `t0`, the
-  last sim_time/seq, the input counts, the platform.flash.load cmd
-  record, and the input-TC (apid, seq) key set for `decide`.
+  `on_record` (the log listener) classifies via `classify(obj,
+  state)`, extracts via `decide(obj, state)`, and appends one json
+  line per decision to decisions.jsonl under its own lock, in seq
+  order: the listener call order can invert adjacent seqs across
+  emitting threads (log.py:114-116 releases `cond` before the
+  calls), so decisions wait in a small per-seq buffer until every
+  lower seq has flushed; whatever is left flushes in seq order at
+  close — never emits, never takes state.lock. It also tracks for
+  the close write: the first power record with `argv` (power.py:140),
+  the boot record's `t0`, the last sim_time/seq, the input counts,
+  the platform.flash.load *result* record (its `result` field
+  carries the library entry with the new sha256, dispatch.py:122-124),
+  and the input-TC (apid, seq) key set for `decide`.
 - [ ] `Writer.close()`: `open: false`, ended_utc, final_sim_time,
   final_seq, length_s, qemu.argv from the power record, and flash
-  provenance — `source: "library"` (name + the entry's record with
-  its sha256) when a platform.flash.load cmd precedes the first
+  provenance — `source: "library"` (name + the entry record with its
+  sha256, taken from the load's result record) when a
+  platform.flash.load cmd precedes the first
   power record; else `"carried"` when flash_existed_at_start; else
   `"fresh"`. `flash.end` = {present, allocated_kib} from os.stat()
   st_blocks — never hashed. outputs counts: log records seen,
   tm.jsonl/uart.raw sizes via os.stat (absent -> null). Rewrite
   manifest.json atomically; idempotent, safe to call twice.
 - [ ] `core.Controller`: create the Writer right after the
-  `controller.start` emit (core.py:93-95) when
-  `cfg["bundle"]["enabled"]`; `shutdown()` closes it after
-  `controller.stop` is emitted and before `log.close()` (the order
-  at core.py:452-473 preserved).
+  `controller.start` emit (core.py:93-95), passing that record's seq
+  as the manifest's `start_seq`, when `cfg["bundle"]["enabled"]`;
+  `shutdown()` closes it immediately before `log.close()`
+  (core.py:473, after plat.close at 472) so the post-controller.stop
+  power-off and plat.close decisions land.
 - [ ] `flashlib.sparse_sha256(path)`: a FIEMAP walk (fcntl.ioctl +
   a ctypes struct — Linux-only like rundir's fallocate), hashing
   mapped extents and zeros for holes; `save()` adds `sha256` to the
@@ -321,16 +367,21 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
   controller with `timeline.sample_s = 0.5` and
   `[gs] emulation = "on"`; power on, boot, one
   `fault.inject {"id": "timecode.missing"}`, one `tc.gs.send
-  {service: 237, subtype: 18, data: "00013c00000000"}` (its tc
-  record's param is index 312, value 0), power off, shutdown.
-  Assert manifest.json: v == 1, run_id == basename,
-  fsw.sha256 == hashlib.sha256(b"").hexdigest()
+  {service: 237, subtype: 18, data: "01383c00000000"}` (its tc
+  record's param is {index: 312, sub: 60, value: 0},
+  relay.py:250-260), then — the fake QEMU never sends TM — a
+  synthetic tm record via `log.ingest` whose decoded.tc matches that
+  tc record's (apid, seq), power off, shutdown.
+  Assert manifest.json: v == 1, run_id == basename + "-" + the
+  compact started_utc (the Env dir's name is not a stamp — R1's
+  rule), fsw.sha256 == hashlib.sha256(b"").hexdigest()
   (e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855),
   qemu.argv[0] endswith qemu-new, inputs.counts.fault == 1,
-  inputs.counts.tc == 1, decisions.counts has an `ack` key, flash
-  .start.source == "fresh", open == false. Then a second controller
-  in the SAME run dir: a new started_utc, the old decisions gone
-  (truncated), and `retention.read_marker` still None.
+  inputs.counts.tc == 1, decisions.counts.ack == 1,
+  flash.start.source == "fresh", open == false. Then a second
+  controller in the SAME run dir: a new started_utc and start_seq,
+  the old decisions gone (truncated), and
+  `retention.read_marker` still None.
 - [ ] Self-test `bundle_writer_rotation`: `log.max_log_mb` tiny so
   the log rotates mid-run; the manifest still carries the full
   config (controller.start rotated away) and decisions.jsonl has
@@ -338,7 +389,9 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
 - [ ] Self-test `bundle_writer_concurrent`: 4 threads emit 500
   cmd/tm/fault records through one RecordLog with the writer
   attached; afterwards every decisions.jsonl line json.loads alone
-  (no interleaved writes) and their seqs are strictly increasing.
+  (no interleaved writes) and their seqs are strictly increasing
+  (the Writer's per-seq buffer orders what the listener rule leaves
+  unordered).
 - [ ] Self-test `bundle_flashlib_sha`: a 64 MiB sparse file with two
   4 KiB blocks 32 MiB apart -> sparse_sha256(f) == the dense
   hashlib.sha256, and it returns in < 2 s (the timing guard is the
@@ -351,7 +404,7 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
 
 **Files:** `bundle.py` (`listing`, `detail`, `baseline_*`,
 `Viewers`); modify `api.py` (3 GET routes), `core.py` (4 verbs),
-`selftest.py`.
+`verbs.py` (VERBS), `selftest.py`.
 
 - [ ] `listing(cfg, live_dir=None)`: scan the live dir (when it has
   a manifest) plus `<retention.run_root>/runs/*/manifest.json`;
@@ -372,7 +425,9 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
   marker (`{"name", "set_utc"}`) into the target run dir and removes
   the previous holder's; unknown run_id -> 404. `retention.plan`
   treats a dir holding BASELINE like a running run (never doomed;
-  one clause next to retention.py:79-90).
+  one clause next to retention.py:79-90). Its size still counts
+  toward max_total_mb: past the budget `plan()` logs a warning
+  naming the baseline dir — counted and warned, never deleted.
 - [ ] `Viewers`: at most one open read-only viewer;
   `open(ctl, run_id, port=None)` builds `viewrun_mod.ViewRun(dir)`
   and `api_mod.make_server(vr, "127.0.0.1", port)` — the exact
@@ -384,7 +439,10 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
   The handler passes `bundle_mod.listing(ctl.cfg, getattr(ctl,
   "run_dir", None))`, so a --view-run server lists other bundles too
   (no viewrun.py change needed).
-- [ ] Verbs (core._register; the platform.md table in R5):
+- [ ] Verbs (core._register **and** `verbs.VERBS`, verbs.py:6-16 —
+  the self-test asserts `set(dispatcher.verbs) == VERBS`
+  (selftest.py:2013-2015) and run mode validates scenarios against
+  it (runmode.py:130); the platform.md table is R5):
   `run.baseline {name}` (string, required), `run.baseline.clear {}`,
   `run.open {name, port?}` (1024..65535, default a free port),
   `run.close {port?}` — all 403 in a --view-run server by the
@@ -398,7 +456,8 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
 - [ ] Self-test `bundle_baseline`: set -> /runs shows baseline: true
   on that row only and the marker file exists in that dir; clear ->
   gone; `retention.plan` with fake sizes keeps the baseline dir past
-  max_total_mb; set on an unknown id -> 404.
+  max_total_mb with a warning that names it; set on an unknown id ->
+  404.
 - [ ] Self-test `bundle_run_open`: run.open on a finished dir -> 200
   with a URL; GET <url>/api/v1/status says mode "view" and view_run
   == the dir; a second run.open -> 409; run.close -> the port no
@@ -408,6 +467,10 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
 ### Task R4: the Runs board tab
 
 **Files:** `ui/index.html`, `stixplat/selftest.py`.
+
+(The mockup's "Bundle this run" / "Import…" buttons, Runs.dc.html:
+48-49, are not in S1: the run dir is the bundle and there is no
+import format.)
 
 - [ ] Tab button `data-tab="runs"` between State and Setup
   (index.html:160-171: ...State, **Runs**, Setup) and a
@@ -463,8 +526,10 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
 **Files:** create `stixplat/replay.py`; modify `stixplat.py` (the
 flag), `selftest.py`, platform.md.
 
-- Input: `bundle.inputs(run_dir)` — the recorded log.jsonl passed
-  through `classify`, ordered by seq, each `{seq, sim_time, boot_id,
+- Input: `bundle.inputs(run_dir)` — log.jsonl from the manifest's
+  `start_seq` on (a reused interactive dir's log.jsonl also holds
+  earlier sessions, log.py:88) passed through `classify`, ordered by
+  seq, each `{seq, sim_time, boot_id,
   input, verb|hex|id+params+trigger+seed|path+value, replay, why}`;
   plus the origin manifest (ELF/QEMU defaults, config).
 - Re-feed rule per kind (fixed now): verb inputs are re-dispatched
@@ -475,9 +540,13 @@ flag), `selftest.py`, platform.md.
   re-sent as the recorded `hex` through `Relay.gs_tc` (the link-down
   policy re-applies; the recorded bytes keep the TC seq, so TM(1,x)
   ack matching reproduces). fault inputs re-run `fault.inject` with
-  the recorded resolved params + seed + trigger (armed echoes are
-  already excluded by classify; reapply is never re-fed — the power
-  cycle re-applies by itself). force inputs re-run
+  the recorded resolved params + seed + trigger (an at_sim trigger
+  re-arms and fires via `clock.at()`; an immediate trigger injects
+  now; the armed echo is consumed by classify and never re-fed;
+  reapply is never re-fed — the power cycle re-applies by itself).
+  A tc input with hex null (the manual TC(9,129)) re-runs
+  `platform.timesync.send {coarse: <recorded>}`; its ack produces no
+  decision in either run. force inputs re-run
   `force.set`/`force.clear`. Power verbs are re-dispatched; the
   off-time stays wall-paced by design (D-PLr), and the replay's own
   bench clock accumulates off-times the same way.
@@ -503,8 +572,9 @@ flag), `selftest.py`, platform.md.
 `selftest.py`, platform.md.
 
 - `compare(baseline_dir, other_dir, tol=None)`: load both
-  decisions.jsonl (derive with `decide` from log.jsonl when missing —
-  pre-S1 runs still comparable); align at the first common decision
+  decisions.jsonl (derive with `decide` from log.jsonl when missing
+  — one accumulator fed in record order; pre-S1 runs still
+  comparable); align at the first common decision
   (one-sided leading rows are skipped); pass 1 — decisions: the same
   (kind, key) sequence, times within tol (default 1.0 s for
   event/mode/ack; 1.0 s and an exact value match for hk_step); pass
@@ -516,8 +586,13 @@ flag), `selftest.py`, platform.md.
   the Runs board's Compare panel reads it, and the Timeline overlay
   draws the second run's series dashed with the first divergence as
   a marker.
-- Mode rows compare the recorded `detail.params` hex in v1 (open
-  question 5).
+- Mode rows compare the recorded `detail.params` hex in v1
+  (decided: the 0x0021 param layout stays undecoded until needed).
+  The mockup's "First overrun (HK level 7)" and "Overruns in the
+  run" rows derive from the hk_step NIXD0501 steps and the
+  instrument.rotb.*/as.dropped series — there is no overrun EID;
+  "Processed drain" is a series row (pass 2). The Compare panel
+  renders Check | Baseline | Replay | Result (Runs.dc.html:116).
 - [ ] Self-test: two synthetic bundles differing only in one event's
   time beyond tol -> verdict "differs" and first_divergence names
   that row; identical bundles -> "same".
@@ -534,34 +609,79 @@ of fixing the formats now.
 
 - accepted-diffs.md, continuing after §50: §51 "Run bundles:
   retention keeps the baseline run" (controller-side policy, no
-  upstream analogue; risk: the baseline can hold the budget past
-  max_total_mb, documented); §52 "flashlib records gain sha256"
-  (additive field; sparse-aware FIEMAP hashing; readers ignore
-  unknown fields); §53 if run.open ships, "the controller may serve
-  one read-only viewer of another run dir in-process" (127.0.0.1
-  bind, one slot, --view-run's 403 rules unchanged).
+  upstream analogue; the baseline's size is counted and a
+  past-budget `plan()` warns but keeps it); §52 "flashlib records
+  gain sha256" (additive field; sparse-aware FIEMAP hashing; readers
+  ignore unknown fields); §53 "the controller may serve one
+  read-only viewer of another run dir in-process" (run.open;
+  127.0.0.1 bind, one slot, --view-run's 403 rules unchanged).
 - platform.md: the verbs table rows (run.baseline,
   run.baseline.clear, run.open, run.close), the "Run bundles"
   section, the /runs endpoints, the retention paragraph.
 
-## Open questions for the owner (do not block)
+## Open questions — answered 2026-11-15
 
-1. Overrun/skip EIDs for the compare rows ("First overrun",
-   "Overruns in the run"): UNVERIFIED from here (no FSW grep in this
-   sandbox). Proposed answer: `[bundle] overrun_eids` config, default
-   empty; you name the EIDs (the GS EID list or the FSW `EID_` table)
-   and S3 grows the rows.
-2. An interactive bundle is overwritten by the next session in the
-   same run dir (the dir is the bundle). Proposed answer: accept and
-   document; keeping one = copy the dir or use run mode; an Export
-   button can come with S3.
-3. "Open in --view-run" from the board: proposed answer = the
-   in-process viewer (run.open: one slot, a free 127.0.0.1 port,
-   --view-run's rules); the alternative — showing the command line
-   only — needs no new verb but no click either.
-4. Retention keeps the baseline run even past `max_total_mb`.
-   Proposed answer: yes (§51); silently deleting the comparison
-   reference is worse.
-5. Mode-change compare values: compare the EID 0x0021 `params` hex
-   (v1) or decode the new mode now (needs the event's FSW param
-   layout, UNVERIFIED). Proposed answer: hex in v1, decode later.
+1. Overrun/skip EIDs: none exist (see Key facts) — the EID promise
+   is dropped; S3 derives the overrun rows from hk_step/series data.
+   `[bundle] overrun_eids` is gone.
+2. Interactive overwrite: accepted (Approach A stands). The rule is
+   documented: the writer truncates its files at start, the
+   manifest's `start_seq` scopes the log slice, platform.md carries
+   the caveat. A new run_id per controller start was rejected: it
+   would need a per-session run dir (a copy or a redirect of
+   `run_dir.path`) for no gain; run mode already keeps every
+   session.
+3. run.open: the in-process viewer ships as specified (R3's
+   `Viewers` is exactly the --view-run pair, viewrun.py:185-200).
+4. Retention keeps the baseline past `max_total_mb`, but its size
+   is counted and a past-budget `plan()` warns naming the dir.
+5. Mode-change compare: `detail.params` hex in v1.
+
+## Plan review (2026-11-15)
+
+Applied against the code at c0f5083a5d; every cited claim
+re-verified by reading before editing. No finding was rejected.
+
+- B1 (fixed): `classify` is now fed in record order with per-run
+  state and pairs `armed` -> `inject` by id, so the fault input
+  carries the at_sim trigger (the `inject` record itself has none,
+  faults.py:281-285 vs 238-240). `bundle_inputs` covers the armed/
+  inject pair and the immediate inject; R6 re-feeds the trigger.
+- B2 (fixed): R3 now also edits `verbs.py` (VERBS) and cites the two
+  checks that fail without it (selftest.py:2013-2015,
+  runmode.py:130).
+- SH3 (fixed): the `platform.timesync` tc record (no hex,
+  timesync.py:198-201) is classified as an input (hex null,
+  seq/coarse); S2 re-runs `platform.timesync.send {coarse}`; the
+  manual sync's unmatched TM(1,7) ack (no `ack` decision) is
+  documented as a loss.
+- SH4 (fixed): the lifecycle test feeds a synthetic TM(1,x) via
+  `log.ingest` (the fake QEMU never sends TM) and asserts
+  `decisions.counts.ack == 1` instead of a vacuous key check; the
+  run_id assertion now follows R1's rule for a non-stamp Env dir.
+- SH5 (fixed): the TC(237,18) example hex is now
+  "01383c00000000" = {index 312, sub 60, value 0} (relay.py:250-260;
+  the design's "param 312", timeline-design.md:241).
+- SH6 (fixed): the Writer buffers decisions per seq and flushes in
+  order (log.py:114-116 releases `cond` before the listener calls),
+  so the concurrent test keeps its strict-ordering assertion without
+  extending the listener contract.
+- SH7 (fixed): the overrun/skip EID claim replaced with the verified
+  FSW facts (TMData.h:245-364, RotAccumulator.c, HKAcquire.c:151-152);
+  `overrun_eids` config dropped; S3 derives the rows from hk_step/
+  series data (owner Q1).
+- N8 (fixed): sim_est citation corrected — log.py:96-105 stamps the
+  clock's est; relay.py:101-103 is the TM emit.
+- N9 (fixed): classify/decide described as stateful accumulators fed
+  in record order (also R7's re-derive).
+- N10 (fixed): the library entry comes from the load's result record
+  (dispatch.py:122-124); Writer.close sits immediately before
+  log.close() (core.py:473, after plat.close).
+- Also, for Q2's soundness: the manifest gains `start_seq` and
+  `bundle.inputs` slices log.jsonl from it (log.jsonl opens in
+  append mode, log.py:88, so a reused interactive dir holds earlier
+  sessions); mockup details inlined where cheap (compare-panel
+  columns, out-of-scope buttons).
+
+Nothing left open for the owner; the reviewer still owns all
+builds/tests/commits.
