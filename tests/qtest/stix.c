@@ -9524,6 +9524,15 @@ static void test_det_tape_props(void)
                            "[{\"kind\": \"kite\", \"for_s\": 0.1}]}");
     g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* kind */
     g_free(json);
+    /* tape-level bools: a present non-bool is refused, not defaulted */
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"loop\": \"yes\", "
+                           "\"steps\": []}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* loop */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"align\": 1, "
+                           "\"steps\": []}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* align */
+    g_free(json);
     json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
                            "[{\"kind\": \"rate\", \"for_s\": 0.1, "
                            "\"fpga_det_mask\": 1, \"cps\": 1, "
@@ -10593,6 +10602,7 @@ static void test_det_spec_props(void)
         "adc,weight\n+5,1\n",
         "adc,weight\n1600,-1\n",
         "adc,weight\n1600,0\n2000,0\n",
+        "adc,weight\n1600,1e308\n2000,1e308\n",
         "adc,weight\n4096,1\n",
         "adc,weight\n1600,1\n\n2000,1\n",
     };

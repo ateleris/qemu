@@ -1909,8 +1909,11 @@ static void stix_det_spec_pair(StixDetState *d, const StixDetSpec *sp,
         double lo = base + (STIX_DET_N_ADC - base) * sp->v0 / d->adc_kev_full;
         double hi = base + (STIX_DET_N_ADC - base) * sp->v1 / d->adc_kev_full;
         uint32_t a, a_end = (uint32_t)MIN(ceil(hi), (double)STIX_DET_N_ADC);
+        /* any finite keV loads (Q7): a band past the top is all overflow */
+        uint32_t a0 = lo < (double)STIX_DET_N_ADC ? (uint32_t)floor(lo) :
+                                                    STIX_DET_N_ADC;
 
-        for (a = (uint32_t)floor(lo); a < a_end; a++) {
+        for (a = a0; a < a_end; a++) {
             double w = MIN(a + 1.0, hi) - MAX((double)a, lo);
 
             if (w > 0) {
@@ -3168,6 +3171,11 @@ static bool stix_det_spec_file_load(const char *path, uint32_t kev_full,
     if (!(sum > 0)) {
         error_setg(errp, "det-tape-load: step %u: spectrum file '%s': the "
                    "weights sum to 0", idx, path);
+        return false;
+    }
+    if (!isfinite(sum)) {
+        error_setg(errp, "det-tape-load: step %u: spectrum file '%s': the "
+                   "weights sum is not finite", idx, path);
         return false;
     }
     /* repeated values are summed: sort, then merge equal neighbours */

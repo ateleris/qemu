@@ -200,12 +200,12 @@ ALIGN_ADC=2050          # the replay events' adc (ebin 3 both ways)
 ALIGN_EVENTS=6200       # > 1650: neither leg's NOMINAL exhausts them
 # the expected det-align-status lines (A1's format; the calibration is
 # dss-linear because the gate's own .dssevs realizes the 0xE baselines)
-STATUS_FRESH="mode=on,rows=384,fallback=384,honoured=0,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear"
-STATUS_ALIGNED="mode=on,rows=384,fallback=0,honoured=384,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear"
+STATUS_FRESH="mode=on,rows=384,fallback=384,honoured=0,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear,preimage_miss=0"
+STATUS_ALIGNED="mode=on,rows=384,fallback=0,honoured=384,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear,preimage_miss=0"
 # the ADC legs set det-adc-mode, not det-align: the same aligned rows
 # with mode=off (a mode=on match there would never fire, and the
 # negative's "not aligned" verdict would pass vacuously)
-STATUS_ADC_ALIGNED="mode=off,rows=384,fallback=0,honoured=384,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear"
+STATUS_ADC_ALIGNED="mode=off,rows=384,fallback=0,honoured=384,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear,preimage_miss=0"
 
 qom_set() {  # path property json-value (detector-smoke's form)
     printf '{"execute": "qom-set", "arguments": %s' \

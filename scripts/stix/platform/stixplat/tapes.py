@@ -332,8 +332,11 @@ def parse_spectrum_csv(text, kev_full, where):
     if not rows:
         raise VerbError(400, "%s: no data rows (1..%d)"
                         % (where, MAX_SPEC_ROWS))
-    if not sum(pts.values()) > 0:
+    total = sum(pts.values())
+    if not total > 0:
         raise VerbError(400, "%s: the weights sum to 0" % where)
+    if not math.isfinite(total):
+        raise VerbError(400, "%s: the weights sum is not finite" % where)
     return unit, sorted(pts.items())
 
 

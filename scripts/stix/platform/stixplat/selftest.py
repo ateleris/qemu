@@ -2880,6 +2880,7 @@ SPEC_BAD_CSV = [
     "adc,weight\n1600,nan\n",
     "adc,weight\n1600,inf\n",
     "adc,weight\n1600,1e999\n",
+    "adc,weight\n1600,1e308\n2000,1e308\n",
     "adc,weight\n0x10,1\n",
     "adc,weight\n+5,1\n",
     "adc,weight\n1600,-1\n",
