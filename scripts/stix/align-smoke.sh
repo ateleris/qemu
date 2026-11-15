@@ -202,6 +202,10 @@ ALIGN_EVENTS=6200       # > 1650: neither leg's NOMINAL exhausts them
 # dss-linear because the gate's own .dssevs realizes the 0xE baselines)
 STATUS_FRESH="mode=on,rows=384,fallback=384,honoured=0,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear"
 STATUS_ALIGNED="mode=on,rows=384,fallback=0,honoured=384,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear"
+# the ADC legs set det-adc-mode, not det-align: the same aligned rows
+# with mode=off (a mode=on match there would never fire, and the
+# negative's "not aligned" verdict would pass vacuously)
+STATUS_ADC_ALIGNED="mode=off,rows=384,fallback=0,honoured=384,mismatch_cells=0,unassigned_cells=0,calibration=dss-linear"
 
 qom_set() {  # path property json-value (detector-smoke's form)
     printf '{"execute": "qom-set", "arguments": %s' \
@@ -660,16 +664,16 @@ if len(prods) != 1:
 tgt = [s for s in prods[0]["samples"] if s["subcol"] == 0]
 if len(tgt) != 1:
     raise SystemExit("no subcol 0 sample")
-byte = tgt[0]["ebin"][18]
-lo, hi = q.s0_decode(byte)
-print("%d %d" % (lo, hi))
+lo, hi = q.s0_decode(tgt[0]["ebin"][18])
+lo19, hi19 = q.s0_decode(tgt[0]["ebin"][19])
+print("%d %d %d %d" % (lo, hi, lo19, hi19))
 EOF
 )"
     REF_RC=$?
     set -e
     REF_LO=""
     REF_HI=""
-    [ "$REF_RC" -ne 0 ] || read -r REF_LO REF_HI <<< "$REF_OUT"
+    [ "$REF_RC" -ne 0 ] || read -r REF_LO REF_HI REF19_LO REF19_HI <<< "$REF_OUT"
     C_MIN=""
     if [ -n "$REF_LO" ] && [ "$REF_LO" -ge 256 ]; then
         # the leg-3 count lies in [REF_LO, REF_HI); its 5-sigma band is
@@ -692,6 +696,24 @@ spec.loader.exec_module(q)
 hi = int(sys.argv[3])
 print(q.s0_compress(int(hi + 5 * int(sys.argv[2]) ** 0.5)))
 ' "$QLCHECK" "$REF_LO" "$REF_HI")"
+    fi
+    # leg 4's ebin-24 window: under the base-0 row ebin 24 is adc
+    # [3072, 3200), the preimage of all of ebin 18 [3092, 3164) and the
+    # lower 36/71 of ebin 19 [3164, 3235) (the template's 10 % Ba-133
+    # line); the 20-adc ebin-17 sliver is flat floor, inside 5 sigma
+    C4_MIN=""
+    C4_MAX=""
+    if [ -n "$C_MIN" ]; then
+        read -r C4_MIN C4_MAX <<< "$(python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ql_check", sys.argv[1])
+q = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(q)
+lo = int(sys.argv[2]) + int(sys.argv[4]) * 36 // 71
+hi = int(sys.argv[3]) + -(-int(sys.argv[5]) * 36 // 71)
+print(q.s0_compress(max(0, int(lo - 5 * lo ** 0.5))),
+      q.s0_compress(int(hi + 5 * lo ** 0.5)))
+' "$QLCHECK" "$REF_LO" "$REF_HI" "$REF19_LO" "$REF19_HI")"
     fi
     CT3="$(chunk_total qemu-stdout.adc3.log)"
     # leg 4's ceiling at ebin 18: the line has left, at most 1/8 of the
@@ -748,7 +770,7 @@ print(q.s0_compress(int(sys.argv[2]) // 8))
             "$C_GONE" > byte19.adc4.log 2>&1
         B19=$?
         python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 24 \
-            "$C_MIN" "$C_MAX" > byte25.adc4.log 2>&1
+            "$C4_MIN" "$C4_MAX" > byte25.adc4.log 2>&1
         B25=$?
         set -e
         grep -hE '^QL-CHECK' byte19.adc4.log byte25.adc4.log || true
@@ -763,7 +785,8 @@ print(q.s0_compress(int(sys.argv[2]) // 8))
     if [ "$ADC4_OK" -eq 1 ]; then
         echo "CHECK adc-mismatch: ok (mismatch_cells=$MISMATCH," \
             "calibration=dss-linear, the line left byte 19 (<= 1/8 of" \
-            "the reference), arrived at byte 25 = ebin 24 within 5 sigma," \
+            "the reference), arrived at byte 25 = ebin 24 within 5 sigma" \
+            "of its preimage (ebin 18 + 36/71 of ebin 19)," \
             "the chunk total flows)"
     else
         echo "CHECK adc-mismatch: FAIL ($ADC4_WHY)"
@@ -791,12 +814,12 @@ print(q.s0_compress(int(sys.argv[2]) // 8))
             ALIGNED_OK=0
             ALIGNED_WHY="no leg-3 reference to compare against"
         elif [ "$NEGATIVE" -eq 0 ]; then
-            printf '%s' "$RET" | grep -qF "$STATUS_ALIGNED" || {
+            printf '%s' "$RET" | grep -qF "$STATUS_ADC_ALIGNED" || {
                 ALIGNED_OK=0
                 ALIGNED_WHY="the status is not the aligned line"
             }
         else
-            printf '%s' "$RET" | grep -qF "$STATUS_ALIGNED" && {
+            printf '%s' "$RET" | grep -qF "$STATUS_ADC_ALIGNED" && {
                 ALIGNED_OK=0
                 ALIGNED_WHY="the negative aligned the status"
             }
@@ -826,7 +849,7 @@ print(q.s0_compress(int(sys.argv[2]) // 8))
                 # mode on and no upload the rows are degenerate, so the
                 # fold keeps the mass at its own bin (byte 19 high)
                 # while the status still reports fallback=384
-                if printf '%s' "$RET" | grep -qF "$STATUS_ALIGNED"; then
+                if printf '%s' "$RET" | grep -qF "$STATUS_ADC_ALIGNED"; then
                     ALIGNED_OK=0
                     ALIGNED_WHY="the negative aligned the status"
                 fi

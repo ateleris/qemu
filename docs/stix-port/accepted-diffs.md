@@ -6239,8 +6239,11 @@ and golden unchanged; the mode adds no RNG draws and no folds when off
   `calibration=dss-linear`, byte 19 at most 1/8 of the reference (the
   line left; the 128-adc base-0 bin keeps ~1.8 bins of the template's
   flat floor, so it is not empty) while the counts ARRIVE at `ebin` 24
-  (byte 25) within 5σ of the leg-3 reference (a mass-losing fold must
-  fail). "Byte N" is the SSID 32 sample byte (byte 0 the detector
+  (byte 25) within 5σ of its leg-3 preimage — all of `ebin` 18 plus
+  the lower 36/71 of `ebin` 19 (the template's 10 % line; the base-0
+  bin [3072, 3200) reaches into 3164..3235) — a mass-losing fold must
+  fail. The ADC legs set `det-adc-mode`, not `det-align`, so the
+  aligned status they expect reads `mode=off`. "Byte N" is the SSID 32 sample byte (byte 0 the detector
   byte), so byte 19 = `ebin` 18; `ql-check --ssid32-byte` takes the
   0-based ebin; leg 5 (`adc-aligned`) runs the §52 derive/upload chain —
   `mismatch_cells = 0`, byte 19 back at the reference — twice, with
