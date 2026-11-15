@@ -729,5 +729,55 @@ needed, unlike R2/R3). Nothing in S1's formats changes; the S3 task
    is already silent, relay.py:86-89); (b) strip them (a replay never
    feeds a GS — but then a GS-side comparison needs a hand-edited
    config).
+6. **A missing IDB on the replay host** (`timeline.idb_json` /
+   `idb_sqlite` from the recorded config; `idb.load` returns None,
+   idb.py:148-171, so no `data.hk` and no `hk_step` decision).
+   (a) Refuse at pre-flight (exit 2, naming the path) unless
+   `--no-idb` is given, which records `idb: "absent"` in the replay
+   manifest so S3 knows the hk_step rows are not comparable
+   (recommended — never a silent loss); (b) warn only (a
+   `replay.skipped`-grade log record) and run.
 
+## Plan review (2026-11-15, GLM, findings folded in — these override the text above)
+
+- R1 (minor): citation drift — "seq starts 0" is `log.py:79/:107`; the
+  retention marker check is `retention.py:126` (doom at `:94/:103`).
+- R2 (major): the replay's own manifest counts come from `classify` on
+  the replay's own log (`bundle.py:397-399, 409-417`). The re-feed's
+  `fault.inject`, `platform.timesync.send`, `force.*` and
+  `platform.flash.load` go through `ctl.command` and appear there as
+  excluded verb inputs, and the re-fed null-hex TC(9,129) is a new tc
+  record. `replay_run` asserts key-scoped counts instead:
+  `counts.tc == 2` for that fixture, `counts.verb["platform.power.on"]
+  == 1`, and the expected excluded-verb entries listed explicitly; P2's
+  "the wall/undelivered/excluded inputs are absent" is reworded to "the
+  origin's skipped inputs are not re-fed (their `replay.skipped`
+  records are the evidence)". Optionally (implementer's call, say
+  which): tag re-feed commands `source: "replay"` so the classifier can
+  report them separately — only if the Writer already keys on source.
+- R3 (major): the IDB is a by-reference input; P2's pre-flight checks it
+  next to the tape/flash files (owner question 6; the tasks implement
+  6a: refuse unless `--no-idb`, manifest `idb: "absent"`).
+- R4 (minor): `det.tape.play`'s pre-flight also resolves each step's
+  `spec.file` CSV (`tapes.resolve`, plat.py:527-532); a missing
+  spectrum is an exit-2 refusal, not a `replay.failed`.
+- R5 (minor): `views_dir` and `tapes_dir` are forced to the replay's
+  local run root like `retention.run_root`, so `ensure_starters`
+  (core.py:96) never writes the origin's dirs. The tape pre-flight
+  reads the ORIGIN's tapes dir (the recorded path) and copies the
+  played tapes (and their spectra) into the replay's tapes dir, so the
+  replay is self-contained and the origin's dirs stay read-only.
+- R6 (minor): a free API port is probed (`free_udp_port`-style TCP
+  probe); `ports.api = 0` is refused by `config._check`
+  (config.py:177-179).
+- R7 (minor): `replay_run`'s ack parity ingests the matching TM(1,7)
+  into the origin before its power-off (the t_bundle_writer_lifecycle
+  pattern, selftest.py:6333-6348), then compares the keys.
+- R8 (note): the loader's phase tracker reads only power/sim.pause
+  records; a QMP STOP (power.py:336-339) or HALT (power.py:355) leaves
+  no input, and placement stays correct because deadlines are
+  RUNNING-only.
+- R9 (note): "same decisions" stays scoped as P4 says: hk_step values
+  depend on the sky RNG when a tape plays, so the live check plays no
+  tape. ±2 s stays UNVERIFIED until the first live run.
 
