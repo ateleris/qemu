@@ -22,7 +22,9 @@
  * row classification and its report. C1: the ADC-faithful sky
  * (det-adc-mode): the cached per-row bin-mass map and the draw fold.
  * S2: tape step spectra (line/flat at adc or keV, CSV files), binned
- * through the loaded ELUT by a per-spec bin-mass row.
+ * through the loaded ELUT by a per-spec bin-mass row. S3: tape step
+ * kind single — a one-pair event burst fed per tick through the D-Df
+ * event sink (the pix-gated share in the tape's dropped gauge).
  *
  * FSW references are to STIX-FSW 600a7a72, the ASW tree (BSW =
  * BSW_ASW/src/BSW/...; utils.c, utils.h = ASW/src/utils.*; Detectors.c
@@ -130,6 +132,8 @@ static void stix_det_nom_latch(StixDetState *d);
 /* S1 mix tape (defined after the scene properties it shares) */
 static void stix_det_tape_tick(StixDetState *d);
 static void stix_det_tape_stop(StixDetState *d, const char *why);
+/* S3: the single step's per-tick feed (defined after the tape tick) */
+static void stix_det_single_tick(StixDetState *d);
 /* S1 per-pair rate: the tape step's cps or the background's */
 static uint32_t stix_det_tape_pair_cps(const StixDetState *d,
                                        uint32_t fpga_det, uint32_t pix);
@@ -285,8 +289,11 @@ static void stix_det_tick(void *opaque)
      * running step advances, so the sky tick below reads this tick's
      * per-pair rates from the tape state. The step clock only advances
      * here, i.e. only while FSM Enable = 1 (D3: SAFE freezes playback).
+     * S3: the single feed follows it, so the step's start tick feeds
+     * its first window.
      */
     stix_det_tape_tick(d);
+    stix_det_single_tick(d);
     stix_det_sky_tick(d);
     stix_det_replay_tick(d);
     stix_det_inject_apply(d);
@@ -2831,6 +2838,13 @@ static void stix_det_tape_apply_step(StixDetState *d, uint32_t idx)
         stix_det_replay_classify(d);
         stix_det_spec_build(d);
     }
+    if (st->kind == STIX_DET_TAPE_SINGLE &&
+        (st->adc >= 0 || st->spec.align)) {
+        /* S3: fresh row states for the burst's adc/align lookups (the
+         * spec path's rule; the feed reads them in this and the next
+         * ticks) */
+        stix_det_replay_classify(d);
+    }
     if (st->kind != STIX_DET_TAPE_REPLAY) {
         return;
     }
@@ -2899,6 +2913,81 @@ static void stix_det_tape_tick(StixDetState *d)
             d->tape_left_ticks = 0;
         }
     }
+}
+
+/*
+ * One tick of a playing single step (S3): feed the events due in this
+ * tick's 100 ms window. Event k (0-based) of the step is due k*wait_us
+ * us after the step's start tick, so tick j of the step (j = the
+ * step's tick count minus tape_left_ticks; j 0 is the start tick)
+ * feeds every k with j*100000 <= k*wait_us < (j+1)*100000, in ONE
+ * stix_det_add_counts call — all events of a step share the pair and
+ * the ebin, and the sink applies the pix gate, SUMDMASK/SUMCNT/LVAR
+ * and the nominal/extra-trigger rules to the whole batch. The
+ * resolution is the replay's order: the pix gate first (the sink drops
+ * gated deposits without telling the caller, so the gate is evaluated
+ * here to count them in single_dropped; a batch past this gate passes
+ * the sink's identical check — the counts are never gated twice), then
+ * an adc step's ELUT lookup (a drop is silent, like the replay's), an
+ * ebin step direct, or through the align preimage on a honoured row (a
+ * miss counts one in spec_preimage_miss, not in dropped; a degenerate
+ * row makes align a no-op). One trace line per fed batch; the sum of n
+ * over the step is the step's n whatever dropped. Stop/done/loop/step
+ * change ends the feed: the cursor belongs to the running step (the
+ * apply_step resets cover it) and the kind is re-checked every tick.
+ */
+static void stix_det_single_tick(StixDetState *d)
+{
+    const StixDetTapeStep *st = &d->tape_steps[d->tape_step];
+    uint64_t lo_us, lo, hi, start;
+    uint32_t batch;
+    int ebin = -1;
+
+    if (d->tape_state != STIX_DET_TAPE_PLAYING || !d->tape_n_steps ||
+        st->kind != STIX_DET_TAPE_SINGLE) {
+        return;
+    }
+    lo_us = (uint64_t)(stix_det_tape_step_ticks(st->for_s) -
+                       d->tape_left_ticks) * 100000u;
+    lo = (lo_us + st->wait_us - 1) / st->wait_us;
+    hi = (lo_us + 100000u + st->wait_us - 1) / st->wait_us;
+    start = MAX(d->single_next, lo);
+    hi = MIN(hi, st->n);
+    if (hi <= start) {
+        return;                         /* nothing due in this window */
+    }
+    batch = (uint32_t)(hi - start);     /* <= the step's n <= 1e6 */
+    d->single_next = (uint32_t)hi;
+    if (!((stix_det_pix_gate(d, st->fpga_det) >> st->pix) & 1)) {
+        d->single_dropped += batch;     /* owner decision 4: gate only */
+        trace_stixdet_single(st->fpga_det, st->pix, st->adc, -1, batch,
+                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        return;
+    }
+    if (st->adc >= 0) {
+        /* an adc burst bins through the loaded ELUT exactly as a
+         * replay event; a drop (unassigned 32, adc <= base) is silent */
+        ebin = stix_det_adc_ebin(d, st->fpga_det, st->pix, st->adc);
+    } else if (!st->spec.align ||
+               d->replay_row_fallback[st->fpga_det][st->pix]) {
+        ebin = st->ebin;    /* direct deposit (align off or a no-op) */
+    } else {
+        /* align on a honoured row: the ebin's preimage adc */
+        int adc = stix_det_align_adc(d, st->fpga_det, st->pix, st->ebin);
+
+        if (adc < 0) {
+            d->spec_preimage_miss++;    /* one per batch, as in S2 */
+        } else {
+            /* the landed ebin is the lookup of the preimage (= the
+             * step's ebin) */
+            ebin = stix_det_adc_ebin(d, st->fpga_det, st->pix, adc);
+        }
+    }
+    if (ebin >= 0) {
+        stix_det_add_counts(d, st->fpga_det, st->pix, ebin, batch);
+    }
+    trace_stixdet_single(st->fpga_det, st->pix, st->adc, ebin, batch,
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /* ---- det-tape-load: the JSON parser ---- */

@@ -11406,6 +11406,140 @@ static void test_det_spec_flat_ident(void)
 }
 
 /*
+ * det-single-guard (S3 V2; the det-tape-guard pattern with the burst):
+ * single steps changing under clock_step, every CTRL MMIO path still
+ * answers; a ClearEnable mid-burst freezes the schedule with the step
+ * clock (step_left_ticks holds, no stixdet_single lines while frozen,
+ * the remaining events land after the resume, and the bank still holds
+ * exactly n in exactly the four batches); and the det-spec-flat-ident
+ * seed pattern: the banks around a single step are bit-identical to
+ * the same tape with a cps-0 rate step on the single's pair (a single
+ * step draws no RNG), the step's own bank differs by exactly the
+ * deposit (base 0 fresh flash: adc 2200 bins at ebin 17), and the same
+ * tape twice is bit-identical (the det-tape-seed precedent).
+ * RED on the V1 binary: nothing lands, the trace stays empty.
+ */
+static void test_det_single_guard(void)
+{
+    /* a. MMIO under clock_step with the steps changing */
+    {
+        QTestState *qts = rotb_qtest_new(128);
+        g_autofree char *json = NULL;
+        uint32_t i;
+
+        rotb_cfg(qts, true, false);
+        ctrl_write(qts, CTRL_FSMCMD, FSMCMD_QLIRQEN);
+        det_start_nom(qts, 9, 0, 9, 0xFFFFFFFFu);
+        json = g_strdup_printf(
+            "{\"api\": 1, \"name\": \"singleguard\", \"loop\": true, "
+            "\"steps\": [{\"kind\": \"single\", \"for_s\": 0.1, "
+            "\"fpga_det\": 22, \"pix\": 0, \"adc\": 2200, \"n\": 10000,"
+            " \"wait_us\": 1}, {\"kind\": \"single\", \"for_s\": 0.1, "
+            "\"fpga_det\": 2, \"pix\": 1, \"ebin\": 7, \"n\": 5000, "
+            "\"wait_us\": 2}]}");
+        g_assert_null(det_spec_load(qts, json));
+        g_assert_null(det_tape_play(qts, true));
+        qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+
+        for (i = 0; i < 20; i++) {    /* 20 step changes, 2 chunks */
+            det_step_ticks(qts, 1);
+        }
+        g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS);
+        g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, FSMCMD_QLIRQEN);
+        g_assert_cmphex(ctrl_read(qts, CTRL_FSMINTTIME), ==, 9u << 16);
+        g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+        g_assert_true(det_irq_pending(qts));
+        g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                        CHUNK_DESC_DETECTOR);
+        rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+        g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS - 1);
+        g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                        CHUNK_DESC_DETECTOR | 1u);
+
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+    }
+
+    /* b. ClearEnable mid-burst: the schedule freezes with the clock */
+    {
+        g_autofree gchar *log = NULL, *extra = NULL;
+        g_autofree gchar *text1 = NULL, *text2 = NULL;
+        g_autofree char *json = NULL, *left1 = NULL, *left2 = NULL;
+        SkyBank *b = g_new0(SkyBank, 1);
+        QTestState *qts;
+        int fd;
+
+        fd = g_file_open_tmp("stix-det-single-XXXXXX", &log, NULL);
+        g_assert(fd >= 0);
+        close(fd);
+        extra = g_strdup_printf("-trace stixdet_single -D %s", log);
+        qts = stix_qtest_new_extra(extra);
+        g_assert_true(sky_set_u32(qts, "det-quiet-cps", 0));
+        idefx_power_all(qts);
+        sky_start(qts, 9, 0xFFF);
+        det_step_ticks(qts, 10);            /* the first swap */
+        json = det_single_tape1(false, "\"for_s\": 0.5, \"fpga_det\": 22,"
+                                " \"pix\": 0, \"adc\": 2200, \"n\": 20000,"
+                                " \"wait_us\": 20");
+        g_assert_null(det_spec_load(qts, json));
+        g_assert_null(det_tape_play(qts, true));
+        det_step_ticks(qts, 2);             /* two burst ticks land */
+        det_cmd_or(qts, FSMCMD_CLEARENABLE);
+        left1 = det_tape_field(qts, "step_left_ticks");
+        det_step_ticks(qts, 10);            /* the paused second */
+        left2 = det_tape_field(qts, "step_left_ticks");
+        g_assert_cmpstr(left1, ==, left2);
+        text1 = det7_read_log(log);
+        g_assert_cmpint(det7_count_str(text1, "stixdet_single"), ==, 2);
+        det_cmd_or(qts, FSMCMD_SETENABLE);  /* resume */
+        det_step_ticks(qts, 10);            /* the rest of the burst */
+        sky_read_bank(qts, 1, b);
+        g_assert_cmpuint(b->lacc[0][22][17], ==, 20000);
+        g_assert_cmpuint(sky_total(b), ==, 20000);
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+        text2 = det7_read_log(log);
+        g_assert_cmpint(det7_count_str(text2, "stixdet_single"), ==, 4);
+        g_assert_cmpint(det7_count_str(text2, "n 5000 at"), ==, 4);
+        g_free(b);
+        unlink(log);
+    }
+
+    /* c. the seed check: no RNG draws, the banks around the step */
+    {
+        g_autofree char *rate = det_tape_rate_step("4095", 12000, "1");
+        g_autofree char *with_t = g_strdup_printf(
+            "{\"api\": 1, \"name\": \"with\", \"background\": {\"cps\": "
+            "100}, \"steps\": [%s, {\"kind\": \"single\", \"for_s\": 1,"
+            " \"fpga_det\": 22, \"pix\": 0, \"adc\": 2200, \"n\": 1000},"
+            " %s]}", rate, rate);
+        g_autofree char *without_t = g_strdup_printf(
+            "{\"api\": 1, \"name\": \"without\", \"background\": "
+            "{\"cps\": 100}, \"steps\": [%s, {\"kind\": \"rate\", "
+            "\"for_s\": 1, \"fpga_det_mask\": 4194304, \"pix_mask\": 1,"
+            " \"cps\": 0}, %s]}", rate, rate);
+        SkyBank *a = g_new0(SkyBank, 3);
+        SkyBank *a2 = g_new0(SkyBank, 3);
+        SkyBank *c = g_new0(SkyBank, 3);
+
+        det_spec_ident_run(with_t, a);
+        det_spec_ident_run(with_t, a2);
+        det_spec_ident_run(without_t, c);
+        g_assert_cmpuint(sky_total(&a[0]), >, 0);
+        g_assert_cmpint(memcmp(a, a2, 3 * sizeof(*a)), ==, 0);
+        g_assert_cmpint(memcmp(&a[0], &c[0], sizeof(*a)), ==, 0);
+        g_assert_cmpint(memcmp(&a[2], &c[2], sizeof(*a)), ==, 0);
+        g_assert_cmpint(memcmp(&a[1], &c[1], sizeof(*a)), !=, 0);
+        g_assert_cmpuint(a[1].lacc[0][22][17], ==,
+                         c[1].lacc[0][22][17] + 1000);
+        g_assert_cmpuint(sky_total(&a[1]), ==, sky_total(&c[1]) + 1000);
+        g_free(a);
+        g_free(a2);
+        g_free(c);
+    }
+}
+
+/*
  * det-spec-rebuild (U2, ELUT pickup at the step start and the QL swap):
  * line_adc 1600 on fpga_det 0 (adc/128: ebin 12) for 4 s; 5 ticks into
  * the step's second period the test rewrites fpga_det 0's 12 rows to
@@ -11530,12 +11664,329 @@ static void test_det_spec_guard(void)
     stix_qtest_cleanup();
 }
 
+/*
+ * det-single-land (S3 V2): the schedule and the sink. Each leg plays a
+ * one-step single tape over the det_spec_qtest fixture (the replay
+ * table's baselines are 1800 for every dss_det, so det(22, 0, 2200)
+ * bins at ebin 5 on the degenerate rows; fpga_det 0 is the wrong
+ * adc/128 row, 1 degenerate, 2 the no-12 row) and reads the bank the
+ * step's swap closed — one leg per step of the plan's tape, so the
+ * bank assertions stay exact:
+ *   1. n 1000 wait 20: the whole burst lands in the start tick — LACC
+ *      (pix 0, fpga_det 22, ebin 5) = 1000, every neighbour and the
+ *      bank total 0/1000, LTRG grp 11 = (5*1000+2)/4 = 1250 exactly and
+ *      no other grp, and the trace holds exactly one stixdet_single
+ *      line (one batch, the start tick's window);
+ *   2. n 20000 wait 20: four trace lines of 5000 (the tick window
+ *      holds <= 5000 events) summing to n, 20000 in the bank, LTRG grp
+ *      11 = 25000; the 40-tick QL period (det_start(qts, 39), the
+ *      det-inject-chunk pattern) holds all four burst ticks;
+ *   3. ebin 7 direct on the honoured wrong row: the deposit lands at
+ *      the science bin whatever the ELUT (det-inject semantics);
+ *   4. ebin 12 + align on the no-12 row: no adc maps to ebin 12 —
+ *      nothing lands, preimage_miss=1, mode=off, and the trace carries
+ *      ebin -1 with the step's n;
+ *   5. the chunk (the det-inject-chunk pattern): EACC (0, 22, 5) = 1000
+ *      and ETRG grp 11 = 1250, the EACC bank zero after the read; with
+ *      fpga_det 22 masked out of SUMDMASK the deposit is ETRG-only;
+ *   6. the tape's adc_mode on: the deposit stays science-space (added
+ *      after the fold; no double fold).
+ * RED on the V1 binary: the tapes load and play, nothing lands.
+ */
+static void test_det_single_land(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL;
+    SkyBank *b = g_new0(SkyBank, 1);
+    QTestState *qts;
+    char *json;
+    uint32_t grp;
+
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+
+    /* leg 1: n 1000 lands whole in the start tick */
+    {
+        g_autofree gchar *log = NULL, *extra = NULL, *text = NULL;
+        int fd;
+
+        fd = g_file_open_tmp("stix-det-single-XXXXXX", &log, NULL);
+        g_assert(fd >= 0);
+        close(fd);
+        extra = g_strdup_printf("-trace stixdet_single -D %s", log);
+        qts = det_spec_qtest(path, extra);
+        json = det_single_tape1(false, "\"for_s\": 0.2, \"fpga_det\": 22,"
+                                " \"pix\": 0, \"adc\": 2200, \"n\": 1000");
+        g_assert_null(det_spec_load(qts, json));
+        g_free(json);
+        g_assert_null(det_tape_play(qts, true));
+        det_step_ticks(qts, 10);            /* the step's swap */
+        sky_read_bank(qts, 1, b);
+        /* the raw offset and the decoded cell, then the neighbours */
+        g_assert_cmphex(inject_lacc_cell(qts, 1, 0, 22, 5), ==, 1000);
+        g_assert_cmpuint(b->lacc[0][22][5], ==, 1000);
+        g_assert_cmpuint(b->lacc[0][21][5], ==, 0);
+        g_assert_cmpuint(b->lacc[0][23][5], ==, 0);
+        g_assert_cmpuint(b->lacc[1][22][5], ==, 0);
+        g_assert_cmpuint(b->lacc[0][22][4], ==, 0);
+        g_assert_cmpuint(b->lacc[0][22][6], ==, 0);
+        g_assert_cmpuint(sky_total(b), ==, 1000);
+        g_assert_cmpuint(b->ltrg_grp[11], ==, (5 * 1000 + 2) / 4);
+        for (grp = 0; grp < SKY_N_GRP; grp++) {
+            if (grp != 11) {
+                g_assert_cmpuint(b->ltrg_grp[grp], ==, 0);
+            }
+        }
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+        text = det7_read_log(log);
+        g_assert_cmpint(det7_count_str(text, "stixdet_single"), ==, 1);
+        g_assert_nonnull(strstr(text, "fpga_det 22 pix 0 adc 2200 "
+                                "ebin 5 n 1000 at"));
+        unlink(log);
+    }
+
+    /* leg 2: n 20000 spans four ticks, 5000 per tick; the 40-tick QL
+     * period holds all four burst ticks */
+    {
+        g_autofree gchar *log = NULL, *extra = NULL, *text = NULL;
+        int fd;
+
+        fd = g_file_open_tmp("stix-det-single-XXXXXX", &log, NULL);
+        g_assert(fd >= 0);
+        close(fd);
+        extra = g_strdup_printf("-trace stixdet_single -D %s", log);
+        qts = det_spec_qtest(path, extra);
+        det_start(qts, 39);
+        json = det_single_tape1(false, "\"for_s\": 0.5, \"fpga_det\": 22,"
+                                " \"pix\": 0, \"adc\": 2200, \"n\": 20000,"
+                                " \"wait_us\": 20");
+        g_assert_null(det_spec_load(qts, json));
+        g_free(json);
+        g_assert_null(det_tape_play(qts, true));
+        det_step_ticks(qts, 40);            /* the step's swap */
+        sky_read_bank(qts, 1, b);
+        g_assert_cmpuint(b->lacc[0][22][5], ==, 20000);
+        g_assert_cmpuint(sky_total(b), ==, 20000);
+        g_assert_cmpuint(b->ltrg_grp[11], ==, (5 * 20000 + 2) / 4);
+        for (grp = 0; grp < SKY_N_GRP; grp++) {
+            if (grp != 11) {
+                g_assert_cmpuint(b->ltrg_grp[grp], ==, 0);
+            }
+        }
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+        text = det7_read_log(log);
+        g_assert_cmpint(det7_count_str(text, "stixdet_single"), ==, 4);
+        g_assert_cmpint(det7_count_str(text, "ebin 5 n 5000 at"), ==, 4);
+        unlink(log);
+    }
+
+    /* leg 3: ebin 7 direct on the honoured wrong row (fpga_det 2) */
+    qts = det_spec_qtest(path, NULL);
+    json = det_single_tape1(false, "\"for_s\": 0.2, \"fpga_det\": 2, "
+                            "\"pix\": 0, \"ebin\": 7, \"n\": 1000");
+    g_assert_null(det_spec_load(qts, json));
+    g_free(json);
+    g_assert_null(det_tape_play(qts, true));
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[0][2][7], ==, 1000);
+    g_assert_cmpuint(sky_total(b), ==, 1000);
+    g_assert_cmpuint(b->ltrg_grp[1], ==, (5 * 1000 + 2) / 4);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* leg 4: ebin 12 + align on the no-12 row: no adc maps to 12 */
+    {
+        g_autofree gchar *log = NULL, *extra = NULL, *text = NULL;
+        g_autofree char *line = NULL;
+        int fd;
+
+        fd = g_file_open_tmp("stix-det-single-XXXXXX", &log, NULL);
+        g_assert(fd >= 0);
+        close(fd);
+        extra = g_strdup_printf("-trace stixdet_single -D %s", log);
+        qts = det_spec_qtest(path, extra);
+        json = det_single_tape1(false, "\"for_s\": 0.2, \"fpga_det\": 2,"
+                                " \"pix\": 0, \"ebin\": 12, \"n\": 1000,"
+                                " \"align\": true");
+        g_assert_null(det_spec_load(qts, json));
+        g_free(json);
+        g_assert_null(det_tape_play(qts, true));
+        det_step_ticks(qts, 10);
+        sky_read_bank(qts, 1, b);
+        g_assert_cmpuint(sky_total(b), ==, 0);
+        line = sky_get_str(qts, "det-align-status");
+        g_assert_true(g_str_has_prefix(line, "mode=off,"));
+        g_assert_true(g_str_has_suffix(line, "preimage_miss=1"));
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+        text = det7_read_log(log);
+        g_assert_cmpint(det7_count_str(text, "stixdet_single"), ==, 1);
+        g_assert_nonnull(strstr(text, "fpga_det 2 pix 0 adc -1 "
+                                "ebin -1 n 1000 at"));
+        unlink(log);
+    }
+
+    /* leg 5: the chunk; then fpga_det 22 out of SUMDMASK: ETRG-only */
+    {
+        g_autofree gchar *extra = NULL;
+        NomChunk *c = g_new0(NomChunk, 1);
+        uint64_t trg;
+
+        extra = g_strdup_printf("-global grlib-stixctrl.rotb-blocks=128 "
+                                "-global grlib-stixctrl.det-replay-file="
+                                "%s", path);
+        qts = stix_qtest_new_extra(extra);
+        g_assert_true(sky_set_u32(qts, "det-quiet-cps", 0));
+        idefx_power_all(qts);
+        rotb_cfg(qts, true, false);
+        sky_start_nom(qts, 39, 0xFFF, 9, 49, 0xFFFFFFFFu);
+        json = det_single_tape1(false, "\"for_s\": 0.2, \"fpga_det\": 22,"
+                                " \"pix\": 0, \"adc\": 2200, \"n\": 1000");
+        g_assert_null(det_spec_load(qts, json));
+        g_free(json);
+        g_assert_null(det_tape_play(qts, true));
+        det_step_ticks(qts, 50);            /* one nominal integration */
+        g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+        nom_read_chunk(qts, c);
+        g_assert_cmpuint(c->eacc[0][22][5], ==, 1000);
+        g_assert_cmpuint(nom_fpga_det_sum(c, 22), ==, 1000);
+        g_assert_cmpuint(c->etrg_grp[11], ==, (5 * 1000 + 2) / 4);
+        for (grp = 0; grp < SKY_N_GRP; grp++) {
+            if (grp != 11) {
+                g_assert_cmpuint(c->etrg_grp[grp], ==, 0);
+            }
+        }
+        /* read and clear: the bank is zero after the swap */
+        det_expect(qts, DET_EACC(0), DET_EACC_SIZE, 0);
+        det_expect(qts, DET_ETRG(0), DET_ETRG_SIZE, 0);
+
+        ctrl_write(qts, CTRL_FSMSUMDMASK, ~(1u << 22));
+        g_assert_null(det_tape_play(qts, true));    /* restart at step 0 */
+        det_step_ticks(qts, 50);
+        g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+        nom_read_chunk(qts, c);
+        g_assert_cmpuint(c->eacc[0][22][5], ==, 0);
+        g_assert_cmpuint(nom_fpga_det_sum(c, 22), ==, 0);
+        trg = c->etrg_grp[11];
+        g_test_message("ETRG grp 11 from the masked burst: %" PRIu64, trg);
+        g_assert_cmpuint(trg, >, 900);
+        g_assert_cmpuint(trg, <, 1600);
+        for (grp = 0; grp < SKY_N_GRP; grp++) {
+            if (grp != 11) {
+                g_assert_cmpuint(c->etrg_grp[grp], ==, 0);
+            }
+        }
+        g_free(c);
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+    }
+
+    /* leg 6: the tape's adc_mode on — no double fold */
+    qts = det_spec_qtest(path, NULL);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"single\", "
+                           "\"align\": false, \"adc_mode\": true, "
+                           "\"steps\": [{\"kind\": \"single\", "
+                           "\"for_s\": 0.2, \"fpga_det\": 22, "
+                           "\"pix\": 0, \"adc\": 2200, \"n\": 1000}]}");
+    g_assert_null(det_spec_load(qts, json));
+    g_free(json);
+    g_assert_null(det_tape_play(qts, true));
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[0][22][5], ==, 1000);
+    g_assert_cmpuint(sky_total(b), ==, 1000);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    g_free(b);
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-single-gated (S3 V2; the det-inject-gated pattern on a burst):
+ * the R3 threshold of pix 1's asic_ch (15, utils_pixelId2channelId[1])
+ * on fpga_det 22's grp 11 written to 63 drops the whole batch at the
+ * model's pix gate: the bank stays exactly 0, det-tape-status read
+ * while the step runs ends dropped=1000, and the trace still holds the
+ * batch line with ebin -1 (the schedule ran; the gate dropped the
+ * mass). The R3 = 62 control lands its 1000 at ebin 5 (paired arrival,
+ * lesson 3).
+ * RED on the V1 binary: dropped stays 0 and the trace is empty.
+ */
+static void test_det_single_gated(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL;
+    SkyBank *b = g_new0(SkyBank, 1);
+    uint32_t th;
+
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+
+    for (th = 62; th <= 63; th++) {
+        g_autofree gchar *log = NULL, *extra = NULL, *text = NULL;
+        g_autofree char *json = NULL;
+        char *v;
+        uint8_t r3[24];
+        QTestState *qts;
+        int fd;
+
+        fd = g_file_open_tmp("stix-det-single-XXXXXX", &log, NULL);
+        g_assert(fd >= 0);
+        close(fd);
+        extra = g_strdup_printf("-trace stixdet_single -D %s", log);
+        qts = det_spec_qtest(path, extra);
+        sky_r3_wire(r3, 15, th);            /* asic_ch 15 = pix 1 */
+        idefx_write_reg(qts, 11, 0, 3, r3, sizeof(r3));
+        json = det_single_tape1(false, "\"for_s\": 0.2, \"fpga_det\": 22,"
+                                " \"pix\": 1, \"adc\": 2200, \"n\": 1000");
+        g_assert_null(det_spec_load(qts, json));
+        g_assert_null(det_tape_play(qts, true));
+        det_step_ticks(qts, 1);             /* the burst's start tick */
+        v = det_tape_field(qts, "state");
+        g_assert_cmpstr(v, ==, "playing");
+        g_free(v);
+        v = det_tape_field(qts, "dropped");
+        g_assert_cmpstr(v, ==, th == 63 ? "1000" : "0");
+        g_free(v);
+        det_step_ticks(qts, 10);            /* the step's swap */
+        sky_read_bank(qts, 1, b);
+        if (th == 63) {
+            g_assert_cmpuint(sky_total(b), ==, 0);
+        } else {
+            g_assert_cmpuint(b->lacc[1][22][5], ==, 1000);
+            g_assert_cmpuint(sky_total(b), ==, 1000);
+        }
+        qtest_quit(qts);
+        stix_qtest_cleanup();
+        text = det7_read_log(log);
+        g_assert_cmpint(det7_count_str(text, "stixdet_single"), ==, 1);
+        g_assert_nonnull(strstr(text, th == 63 ?
+                               "pix 1 adc 2200 ebin -1 n 1000 at" :
+                               "pix 1 adc 2200 ebin 5 n 1000 at"));
+        unlink(log);
+    }
+
+    g_free(b);
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
 static void stix_det_tape_register(void)
 {
     /* S1: the mix tape; S3: the single step */
     qtest_add_func("/sparc/stix/det-tape-props", test_det_tape_props);
     qtest_add_func("/sparc/stix/det-tape-status", test_det_tape_status);
     qtest_add_func("/sparc/stix/det-single-props", test_det_single_props);
+    qtest_add_func("/sparc/stix/det-single-land", test_det_single_land);
+    qtest_add_func("/sparc/stix/det-single-gated", test_det_single_gated);
+    qtest_add_func("/sparc/stix/det-single-guard", test_det_single_guard);
     qtest_add_func("/sparc/stix/det-tape-replay", test_det_tape_replay);
     qtest_add_func("/sparc/stix/det-tape-rate", test_det_tape_rate);
     qtest_add_func("/sparc/stix/det-tape-pixmask", test_det_tape_pixmask);
