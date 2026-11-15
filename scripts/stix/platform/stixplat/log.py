@@ -88,6 +88,9 @@ class RecordLog:
         # seqs restart at 1 per session while the file appends, so a
         # session (run bundle S2) is the file from this offset on
         self.start_offset = 0
+        # rotations since this session opened: the session's first bytes
+        # are then in log.jsonl.<rotations>.gz (lost past max_files)
+        self.rotations = 0
         if path is not None:
             self.start_offset = (os.path.getsize(path)
                                  if os.path.exists(path) else 0)
@@ -187,6 +190,7 @@ class RecordLog:
                 shutil.copyfileobj(src, dst)
         os.unlink(self.path)
         self.fh = open(self.path, "a", encoding="utf-8")
+        self.rotations += 1
 
     def since(self, seq, kinds=None, topics=None):
         """The records after @seq still in the ring (filtered)."""

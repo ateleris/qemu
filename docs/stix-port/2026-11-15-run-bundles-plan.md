@@ -358,8 +358,9 @@ record), `runmode.py` (verdict into the manifest), `selftest.py`.
 - [ ] `flashlib.sparse_sha256(path)`: a FIEMAP walk (fcntl.ioctl +
   a ctypes struct — Linux-only like rundir's fallocate), hashing
   mapped extents and zeros for holes; `save()` adds `sha256` to the
-  record (additive; readers ignore unknown fields). Cost is bounded
-  by the sparse limit (real blocks <= power.sparse_limit_mb = 1 GiB).
+  record (additive; readers ignore unknown fields). I/O is bounded
+  by the sparse limit (real blocks <= power.sparse_limit_mb = 1 GiB);
+  CPU is not (holes hash as zeros: the full image, ~10 s per save).
 - [ ] `runmode._batch` calls `bundle.set_verdict(run_dir, verdict)`
   after `retention.finish_run` (runmode.py:200) so a finished
   run-mode manifest carries `"verdict"`.

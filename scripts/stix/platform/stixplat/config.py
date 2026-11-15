@@ -231,6 +231,8 @@ def _check(cfg):
                           "or 0.5..60")
     if not all(isinstance(x, str) for x in cfg["timeline"]["sample_paths"]):
         raise ConfigError("timeline.sample_paths is a list of globs")
+    if not isinstance(cfg["bundle"]["enabled"], bool):
+        raise ConfigError("bundle.enabled is true or false")
     if not all(isinstance(x, str) for x in cfg["bundle"]["hk_codes"]):
         raise ConfigError("bundle.hk_codes is a list of strings")
 

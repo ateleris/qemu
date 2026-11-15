@@ -541,7 +541,7 @@ derived files the controller writes in it — nothing is copied, and
 
 - `manifest.json` — rewritten atomically at controller start and close.
   `{"v": 1, "kind": "run", "run_id", "dir", "mode", "scenario", 
-  "started_utc", "start_seq", "start_offset", "ended_utc", "open", "t0",
+  "started_utc", "start_seq", "start_offset", "log_rotations", "ended_utc", "open", "t0",
   "final_sim_time", "final_seq", "length_s", "verdict" (run mode),
   "fsw": {elf, sha256}, "qemu": {binary, sha256, commit, dirty,
   describe, argv}, "config": {…the launch config…}, "flash": {start:
@@ -558,6 +558,11 @@ derived files the controller writes in it — nothing is copied, and
   slice for a replay: log.jsonl opens in append mode, so a reused
   interactive dir holds earlier sessions too, and seqs restart at 1 in
   every session (`start_seq` alone cannot tell sessions apart).
+  `log_rotations` counts the rotations since the session opened: the
+  slice starts at `start_offset` in `log.jsonl.<log_rotations>.gz`
+  (`log.jsonl` itself when 0) and runs on through every newer part to
+  `log.jsonl`; past `[log] max_files - 1` rotations its start is gone.
+  `outputs.log_bytes` is the current `log.jsonl` only.
 - `decisions.jsonl` — one decision per line, appended live by a
   record-log listener: `{"v": 1, "seq", "sim_time", "boot_id", "kind",
   "key", "class", "detail"}`. Kinds: `event` (a TM(5,x), key `0x%04X`,
@@ -777,7 +782,8 @@ With run bundles (S1) the run dir also holds `manifest.json` and
 `decisions.jsonl` (see Run bundles above). `run_dir.fresh = true`
 removes only the controller's named files, so the bundle writer
 truncates its own files at every start; `log.jsonl` opens in append
-mode and the manifest's `start_seq` scopes the session's slice.
+mode and the manifest's `start_offset` (with `log_rotations`) scopes
+the session's slice.
 
 The controller refuses the gates' run dirs (`/tmp/stix-*-run` and the
 persistent master `~/dev/stix-state/uprev-run`, i.e.

@@ -57,10 +57,9 @@ FIEMAP_EXTENT_LAST = 0x0001
 _EXTENTS_PER_CALL = 256
 
 
-def _fiemap_extents(f):
-    """[(logical offset, length)] of the mapped extents; OSError where
-    FIEMAP is not supported."""
-    size = os.fstat(f.fileno()).st_size
+def _fiemap_extents(f, size):
+    """[(logical offset, length)] of the mapped extents below @size (the
+    caller's one stat); OSError where FIEMAP is not supported."""
     out = []
     start = 0
     while start < size:
@@ -102,7 +101,8 @@ def sparse_sha256(path):
     where FIEMAP is not available."""
     with open(path, "rb") as f:
         try:
-            extents = _fiemap_extents(f)
+            size = os.fstat(f.fileno()).st_size    # once, for both
+            extents = _fiemap_extents(f, size)
         except OSError:
             extents = None
         h = hashlib.sha256()
@@ -110,7 +110,6 @@ def sparse_sha256(path):
             for chunk in iter(lambda: f.read(1 << 20), b""):
                 h.update(chunk)
             return h.hexdigest()
-        size = os.fstat(f.fileno()).st_size
         pos = 0
         for off, ln in extents:
             if off > pos:

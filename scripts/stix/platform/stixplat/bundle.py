@@ -58,6 +58,10 @@ _EXCLUDED_VERB_WHY = {
     "platform.flash.save": "flash state is by reference",
     "debug.qmp": "a dev tool, never re-run",
     "view.save": "views are not run inputs",
+    "run.open": "controller management, not a run input",
+    "run.close": "controller management, not a run input",
+    "run.baseline": "controller management, not a run input",
+    "run.baseline.clear": "controller management, not a run input",
     "view.delete": "views are not run inputs",
 }
 
@@ -441,8 +445,11 @@ class Writer:
             "dir": self.run_dir, "mode": self.mode,
             "scenario": self.scenario, "started_utc": self.started_utc,
             "start_seq": self._start_seq,
-            # seqs restart per session; S2 slices log.jsonl from here
+            # seqs restart per session; S2 slices the log from here:
+            # log.jsonl.<log_rotations>.gz (or log.jsonl when 0) from
+            # start_offset, then every newer part, then log.jsonl
             "start_offset": getattr(self.log, "start_offset", 0),
+            "log_rotations": getattr(self.log, "rotations", 0),
             "ended_utc": None if open_ else log_mod.wall_now(),
             "open": open_, "t0": self._t0,
             "final_sim_time": None if open_ else self._last_sim,

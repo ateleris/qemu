@@ -97,7 +97,10 @@ class Controller:
         start_rec = self.log.emit(
             "ctl", "log", "controller.start",
             {"run_dir": self.run_dir, "fresh_removed": self.removed,
-             "config": _public(cfg)})
+             "config": _public(cfg),
+             # elf_sha256 rides next to the config so --view-run can
+             # replay the FSW parameters table from the same ELF
+             "elf_sha256": self.elf_sha256})
         # S1: the bundle writer owns manifest.json + decisions.jsonl in
         # the run dir; its start_seq is this record's (S2 slices the log
         # from it). Created before anything else can emit a record the

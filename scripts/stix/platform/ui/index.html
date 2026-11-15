@@ -773,12 +773,18 @@ document.addEventListener("click", async (ev) => {
     if (verb === "platform.flash.save" || verb === "platform.flash.load")
       loadFlash();  // the library table shows the new state
     if (verb.startsWith("param.")) paramsRefresh();  // ditto the params
-    if (verb === "run.open" && res.result && res.result.url)
+    if (verb === "run.open" && res.result && res.result.url) {
       window.open(res.result.url, "_blank", "noopener");
+      runsViewerOpen = true;
+      renderRuns();
+    }
+    if (verb === "run.close") { runsViewerOpen = false; renderRuns(); }
     if (verb === "run.baseline" || verb === "run.baseline.clear")
       loadRuns();   // the baseline mark moved
   } catch (e) {
     toast(String(e.message || e), true);
+    // a 409 close means no viewer is open (closed elsewhere)
+    if (verb === "run.close") { runsViewerOpen = false; renderRuns(); }
   } finally {
     btn.disabled = !!btn.dataset.off;
     refresh();
@@ -1024,12 +1030,15 @@ function runsRow(e) {
   return tr;
 }
 
+let runsViewerOpen = false;
 function renderRuns() {
   const q = $("runs-filter").value.trim().toLowerCase();
   const rows = [];
   for (const e of runsCache) if (runsHit(e, q)) rows.push(runsRow(e));
   $("runs-table").replaceChildren(...rows);
-  $("runs-close-viewer").hidden = !runsCache.some((e) => e.open);
+  // the viewer this page opened (run.open/run.close), not a manifest's
+  // open flag (the live run's manifest is always open)
+  $("runs-close-viewer").hidden = !runsViewerOpen;
 }
 $("runs-filter").addEventListener("input", renderRuns);
 $("runs-refresh").addEventListener("click", loadRuns);

@@ -83,7 +83,10 @@ def run_one(cfg, sc, variant, run_dir, term=None):
             {"run_dir": {"path": run_dir, "fresh": True}}]
     rcfg = config_mod.merged(cfg, *over)
     try:
-        ctl = core.Controller(rcfg, run_dir=run_dir)
+        # the bundle's scenario record (manifest + Runs board)
+        ctl = core.Controller(rcfg, run_dir=run_dir, scenario={
+            "name": sc["name"],
+            "variant": variant if sc.get("variants_declared") else None})
     except Exception as e:
         return _failed(sc, variant, True, "controller: %s: %s"
                        % (type(e).__name__, e))

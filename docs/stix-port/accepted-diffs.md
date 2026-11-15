@@ -5929,8 +5929,9 @@ digest of the saved flash, computed with a new sparse-aware
 Linux-only like rundir's fallocate — hashing only mapped extents and
 zeros for the holes, with a dense fallback where FIEMAP is missing).
 The hash runs only at an explicit save (power off/paused), never at
-controller start or close, and its cost is bounded by the sparse limit
-(real blocks <= power.sparse_limit_mb).
+controller start or close. Its I/O is bounded by the sparse limit
+(real blocks <= power.sparse_limit_mb); its CPU is not: the holes are
+hashed as zeros, so a save hashes the whole 16.5 GB image (~10 s).
 
 **Why:** S2 replay and S3 compare pin the flash start state by
 reference (bundle manifests carry the library entry's name and
