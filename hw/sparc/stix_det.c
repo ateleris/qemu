@@ -1120,6 +1120,11 @@ static void stix_det_sky_clear_expo(StixDetState *d)
     memset(d->expo, 0, sizeof(d->expo));
     /* the injected counts belong to the period, like the exposure */
     memset(d->inj_ql, 0, sizeof(d->inj_ql));
+    /* S2: the spectrum exposure too (only written when the flag is) */
+    if (d->spec_expo_any) {
+        memset(d->spec_expo, 0, sizeof(d->spec_expo));
+        d->spec_expo_any = false;
+    }
 }
 
 /*
@@ -1212,6 +1217,13 @@ static double stix_det_ebin_share_masked(StixDetState *d, uint32_t profile,
  * C1: with the ADC mode on the SUMEMASK/VAREMASK shares are the
  * map-folded ones (per pair, from the cached bin-mass map); the
  * exposure and the totals stay ebin-space.
+ *
+ * S2: a pair inside a running spectrum step's masks takes its counts
+ * c = tick counts x pix share into the destination-ebin exposure
+ * spec_expo (and nom_spec_expo in SUMDMASK, else ETRG only) through
+ * the step's bin-mass row; its SUMCNT/LVAR shares are the row's masked
+ * sums (already ELUT-binned: no C1 fold); nothing goes to expo or
+ * nom_expo for it. Pairs outside the masks keep the background path.
  */
 static void stix_det_sky_tick(StixDetState *d)
 {
@@ -1228,6 +1240,8 @@ static void stix_det_sky_tick(StixDetState *d)
     uint32_t var_ebin_mask = d->reg->fsmQlVarEMask;
     double sum_share, var_share, sum_lambda = 0, var_lambda = 0;
     bool folded = stix_det_adc_mode_on(d) && d->adc_map_valid;
+    bool spec = stix_det_spec_active(d);
+    const StixDetTapeStep *st = &d->tape_steps[d->tape_step];
     uint32_t fpga_det, pix;
     uint64_t n;
 
@@ -1250,6 +1264,43 @@ static void stix_det_sky_tick(StixDetState *d)
                 continue;
             }
             tick_counts = pair_cps * (STIX_DET_TICK_NS / 1e9);
+            if (spec && ((st->fpga_det_mask >> fpga_det) & 1) &&
+                ((st->pix_mask >> pix) & 1)) {
+                const double *row = d->spec_row[fpga_det][pix];
+                bool in_sum = (sumd_fpga_det >> fpga_det) & 1;
+                bool in_var = ((vard_fpga_det >> fpga_det) & 1) &&
+                              ((varp_pix >> pix) & 1);
+                double row_all = 0, row_sum = 0, row_var = 0;
+                uint32_t t;
+
+                c = tick_counts * d->pix_share[pix];
+                for (t = 0; t < STIX_DET_N_EBIN; t++) {
+                    double m = c * row[t];
+
+                    if (m == 0.0) {
+                        continue;
+                    }
+                    d->spec_expo[fpga_det][pix][t] += m;
+                    d->spec_expo_any = true;
+                    if (in_sum) {
+                        d->nom_spec_expo[fpga_det][pix][t] += m;
+                        d->nom_spec_expo_any = true;
+                    }
+                    row_all += row[t];
+                    row_sum += ((sum_ebin_mask >> t) & 1) ? row[t] : 0;
+                    row_var += ((var_ebin_mask >> t) & 1) ? row[t] : 0;
+                }
+                if (in_sum) {
+                    sum_lambda += c * row_sum;
+                } else {
+                    d->nom_trg_extra_grp[stix_det_grp_of(fpga_det)] +=
+                        c * row_all;
+                }
+                if (in_var) {
+                    var_lambda += c * row_var;
+                }
+                continue;
+            }
             d->expo[fpga_det][pix][profile] += tick_counts;
             c = tick_counts * d->pix_share[pix];
             pair_sum_share = folded ?
@@ -1610,8 +1661,10 @@ static double stix_det_kev_gain(const StixDetState *d, uint32_t fpga_det)
 static int stix_det_kev_adc(const StixDetState *d, uint32_t fpga_det,
                             double kev)
 {
-    double adc = stix_det_cal_base(d, fpga_det) +
-                 floor(stix_det_kev_gain(d, fpga_det) * kev + 0.5);
+    uint32_t base = stix_det_cal_base(d, fpga_det);
+    /* gain * kev as (4096 - base) * kev / K: exact for integer keV */
+    double adc = base + floor((STIX_DET_N_ADC - base) * kev /
+                              d->adc_kev_full + 0.5);
 
     return adc > STIX_DET_N_ADC - 1 ? -1 : (int)adc;
 }
@@ -1853,7 +1906,8 @@ static void stix_det_spec_pair(StixDetState *d, const StixDetSpec *sp,
         /* adc a weighted by the overlap of [a, a+1) with the band */
         double base = stix_det_cal_base(d, fpga_det);
         double gain = stix_det_kev_gain(d, fpga_det);
-        double lo = base + gain * sp->v0, hi = base + gain * sp->v1;
+        double lo = base + (STIX_DET_N_ADC - base) * sp->v0 / d->adc_kev_full;
+        double hi = base + (STIX_DET_N_ADC - base) * sp->v1 / d->adc_kev_full;
         uint32_t a, a_end = (uint32_t)MIN(ceil(hi), (double)STIX_DET_N_ADC);
 
         for (a = (uint32_t)floor(lo); a < a_end; a++) {
@@ -2253,12 +2307,21 @@ static void stix_det_adc_split_counts(const double (*map)[STIX_DET_N_EBIN],
  * added after the draw, at their own ebin, science-space. The Poisson
  * loop order and the RNG stream are unchanged; with the mode off the
  * writes are bit-identical to the plain path.
+ *
+ * S2: with @spec_any each cell also draws Poisson(@spec cell), the
+ * destination-ebin spectrum exposure, after the sky's draw and fold
+ * and before the deposits (counted for LTRG/ETRG as the sky). Without
+ * spectrum exposure the loop is unchanged (and a zero lambda draws no
+ * RNG anyway).
  */
 static uint64_t stix_det_draw_acc(StixDetState *d,
                                   double (*expo_set)[STIX_DET_N_PIX_ACC]
                                                     [STIX_DET_N_PROFILE],
                                   uint32_t (*inj)[STIX_DET_N_PIX_ACC]
                                                  [STIX_DET_N_EBIN],
+                                  const double (*spec)[STIX_DET_N_PIX_ACC]
+                                                      [STIX_DET_N_EBIN],
+                                  bool spec_any,
                                   uint8_t *acc,
                                   uint64_t grp_events[STIX_DET_N_GRP])
 {
@@ -2295,6 +2358,14 @@ static uint64_t stix_det_draw_acc(StixDetState *d,
                     }
                 } else {
                     cell[ebin] += n_sky;
+                }
+                /* S2: the spectrum, ELUT-binned at build: never folded */
+                if (spec_any) {
+                    uint64_t n_spec =
+                        stix_det_poisson(d, spec[fpga_det][pix][ebin]);
+
+                    cell[ebin] += n_spec;
+                    pair_total += n_spec;
                 }
                 /* the deposits stay science-space: added after the draw */
                 cell[ebin] += n_inj;
@@ -2333,8 +2404,10 @@ static void stix_det_sky_materialize(StixDetState *d, uint32_t ql_bank)
     uint64_t lacc_events;
     uint32_t grp;
 
-    lacc_events = stix_det_draw_acc(d, d->expo, d->inj_ql, lacc,
-                                    grp_events);
+    lacc_events = stix_det_draw_acc(d, d->expo, d->inj_ql,
+                                    (const double (*)[STIX_DET_N_PIX_ACC]
+                                     [STIX_DET_N_EBIN])d->spec_expo,
+                                    d->spec_expo_any, lacc, grp_events);
     memory_region_set_dirty(d->sram, stix_det_lacc_off[ql_bank],
                             STIXCTRL_LACC0_SIZE);
     /* the rewrite cures any armed upset in the bank (D-Uc) */
@@ -2409,6 +2482,10 @@ static void stix_det_nom_clear_expo(StixDetState *d)
     memset(d->nom_trg_extra_grp, 0, sizeof(d->nom_trg_extra_grp));
     /* the injected counts belong to the integration, like the exposure */
     memset(d->inj_nom, 0, sizeof(d->inj_nom));
+    if (d->nom_spec_expo_any) {
+        memset(d->nom_spec_expo, 0, sizeof(d->nom_spec_expo));
+        d->nom_spec_expo_any = false;
+    }
 }
 
 /* the parameters are latched at the start of each integration */
@@ -2447,8 +2524,10 @@ static uint64_t stix_det_nom_materialize(StixDetState *d, uint32_t nom_bank)
     uint64_t eacc_events;
     uint32_t grp;
 
-    eacc_events = stix_det_draw_acc(d, d->nom_expo, d->inj_nom, eacc,
-                                    grp_events);
+    eacc_events = stix_det_draw_acc(d, d->nom_expo, d->inj_nom,
+                                    (const double (*)[STIX_DET_N_PIX_ACC]
+                                     [STIX_DET_N_EBIN])d->nom_spec_expo,
+                                    d->nom_spec_expo_any, eacc, grp_events);
     memory_region_set_dirty(d->sram, stix_det_eacc_off[nom_bank],
                             STIXCTRL_EACC0_SIZE);
     /* the rewrite cures any armed upset in the bank (D-Uc) */

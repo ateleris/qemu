@@ -10836,6 +10836,92 @@ static char *det_spec_align_field(QTestState *qts, const char *key)
     return g_strndup(p, end ? (size_t)(end - p) : strlen(p));
 }
 
+/* one fpga_det's count at @ebin, summed over pix */
+static uint64_t det_spec_cell(const SkyBank *b, uint32_t fpga_det,
+                              uint32_t ebin)
+{
+    uint64_t sum = 0;
+    uint32_t pix;
+
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        sum += b->lacc[pix][fpga_det][ebin];
+    }
+    return sum;
+}
+
+/*
+ * one fpga_det's 32 ebins (summed over pix) against @lam: a positive
+ * lambda is a +-5 sigma Poisson bound, 0 is exactly 0
+ */
+static void det_spec_assert_row(const char *what, const SkyBank *b,
+                                uint32_t fpga_det, const double *lam)
+{
+    uint32_t ebin;
+
+    for (ebin = 0; ebin < SKY_N_EBIN; ebin++) {
+        uint64_t got = det_spec_cell(b, fpga_det, ebin);
+
+        if (lam[ebin] > 0) {
+            g_autofree char *m = g_strdup_printf("%s fpga_det %u ebin %u",
+                                                 what, fpga_det, ebin);
+
+            sky_assert_poisson(m, got, lam[ebin], 5);
+        } else if (got) {
+            g_test_message("%s fpga_det %u ebin %u: %" PRIu64
+                           ", expected exactly 0", what, fpga_det, ebin,
+                           got);
+            g_assert_cmpuint(got, ==, 0);
+        }
+    }
+}
+
+/*
+ * det-spec-line's expected banks: step @i (0-based), fpga_det @f; false
+ * when not asserted. 12000 counts per fpga_det per step.
+ */
+static bool det_spec_line_lam(uint32_t i, uint32_t f, double *lam)
+{
+    uint32_t e;
+
+    memset(lam, 0, 32 * sizeof(*lam));
+    switch (i) {
+    case 0:                     /* line_adc 1600 */
+        if (f == 0) {
+            lam[12] = 12000;    /* 1600 / 128 */
+        } else if (f == 2) {
+            lam[13] = 12000;    /* the no-12 row */
+        }                       /* f 1: 1600 <= base 1800, dropped */
+        break;
+    case 1:                     /* line_kev 62: adc 2690 */
+        lam[f == 1 ? 12 : 21] = 12000;
+        break;
+    case 2:                     /* line_kev 62 align: preimage 1600 */
+        if (f != 2) {
+            lam[12] = 12000;    /* f 2: no preimage of 12, dropped */
+        }
+        break;
+    case 3:                     /* flat_kev [40, 60) align */
+        for (e = 8; e <= 11; e++) {
+            lam[e] = 3000;
+        }
+        if (f == 1) {           /* degenerate: align off, adc 2374-2660 */
+            lam[8] = lam[9] = lam[10] = 12000.0 * 72 / 287;
+            lam[11] = 12000.0 * 71 / 287;
+        }
+        break;
+    case 6:                     /* flat_kev [150, 170) align: [160, 170)
+                                 * is past K, dropped */
+        if (f == 1) {
+            return false;
+        }
+        lam[30] = lam[31] = 3000;
+        break;
+    default:                    /* 4, 5 (keV >= K) and 7 (off): all 0 */
+        break;
+    }
+    return true;
+}
+
 /*
  * det-spec-line (U2): one tape of eight 1 s steps on fpga_det 0-2 (the
  * three row states of det_spec_qtest), background cps 0, played on the
@@ -10844,7 +10930,18 @@ static char *det_spec_align_field(QTestState *qts, const char *key)
  * 12 pix of the no-12 fpga_det 2) and 0 during the others (reset at
  * every step start; an ADC overflow is not a miss); det-align-status
  * starts mode=off (det-align is not set); the trace holds each build's
- * desc.
+ * desc. Each bank (the one the step's swap closed, summed over pix):
+ *   step 1 line_adc 1600: f0 ebin 12, f1 dropped (<= base), f2 ebin 13;
+ *   step 2 line_kev 62 (adc 2690): f0/f2 ebin 21, f1 (fallback) 12;
+ *   step 3 the same aligned: f0/f1 ebin 12, f2 nothing (no preimage);
+ *   step 4 flat_kev [40, 60) aligned: ebins 8-11 (f1, degenerate:
+ *     align a no-op, 72/72/72/71 of the 287 adc);
+ *   steps 5/6 line_kev 170 >= K: nothing (ADC overflow, never ebin 31);
+ *   step 7 flat_kev [150, 170) aligned: ebins 30/31, half the counts;
+ *   step 8 off: all 0.
+ * A second run of step 1 with the tape's adc_mode on: no double fold.
+ * The "exactly 0" cells pair with the arrival cells of the same bank.
+ * RED on the U2a binary (rows built, nothing reaches the banks).
  */
 static void test_det_spec_line(void)
 {
@@ -10865,9 +10962,11 @@ static void test_det_spec_line(void)
     g_autofree gchar *dir = NULL, *path = NULL, *log = NULL;
     g_autofree gchar *extra = NULL, *text = NULL;
     GString *steps = g_string_new(NULL);
+    SkyBank *b = g_new0(SkyBank, 1);
     QTestState *qts;
+    double lam[32];
     char *json, *v;
-    uint32_t i;
+    uint32_t i, fpga_det;
     int fd;
 
     det_adc_file_baselines(&f, 1800);
@@ -10896,6 +10995,17 @@ static void test_det_spec_line(void)
         g_autofree char *line = NULL;
 
         det_step_ticks(qts, 10);        /* the step's period closes */
+        sky_read_bank(qts, (i + 1) % 4, b);
+        for (fpga_det = 0; fpga_det < 3; fpga_det++) {
+            g_autofree char *what = g_strdup_printf("step %u", i + 1);
+
+            if (det_spec_line_lam(i, fpga_det, lam)) {
+                det_spec_assert_row(what, b, fpga_det, lam);
+            }
+        }
+        if (i == 4 || i == 5 || i == 7) {
+            g_assert_cmpuint(sky_total(b), ==, 0);
+        }
         v = det_tape_field(qts, "step");
         g_assert_cmpstr(v, ==, step);
         g_free(v);
@@ -10921,11 +11031,338 @@ static void test_det_spec_line(void)
     /* the off step builds nothing */
     g_assert_cmpint(det7_count_str(text, "step 7:"), ==, 0);
 
+    /*
+     * step 1 again with the tape's adc_mode on: no double fold (through
+     * the C1 map the base-1800 ebin-12 range [2661, 2733) would move to
+     * ebin 20/21 on the adc/128 row)
+     */
+    qts = det_spec_qtest(path, NULL);
+    v = det_spec_step(fields[0]);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"adcmode\", "
+                           "\"adc_mode\": true, \"background\": {\"cps\": "
+                           "0}, \"steps\": [%s]}", v);
+    g_free(v);
+    g_assert_null(det_spec_load(qts, json));
+    g_free(json);
+    g_assert_null(det_tape_play(qts, true));
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    sky_assert_poisson("adc_mode: fpga_det 0 ebin 12", det_spec_cell(b, 0, 12),
+                       12000, 5);
+    g_assert_cmpuint(det_spec_cell(b, 0, 20), ==, 0);
+    g_assert_cmpuint(det_spec_cell(b, 0, 21), ==, 0);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    g_free(b);
     g_string_free(steps, true);
     unlink(log);
     g_unlink(path);
     g_rmdir(dir);
     g_free(f.w);
+}
+
+/*
+ * det-spec-file (U2): spectrum CSVs on fpga_det 0 (the adc/128 row) in
+ * one tape of four 1 s steps; the files are unlinked after the load,
+ * before the play (the parsed copy plays):
+ *   a. adc,weight 1600,3 / 2200,1: ebin 12 ~ 9000, ebin 17 ~ 3000;
+ *   b. CRLF kev,weight 62,1 / 121,1, step align: ebins 12 / 24 ~ 6000;
+ *   c. adc,weight 1600,1 / 1600,1 / 2200,2 (repeats summed): 12 / 17;
+ *   d. det-cal-kev-full set to 100 after the load (K is read at the
+ *      build, Q7), kev,weight 62,1 / 121,1 unaligned on the degenerate
+ *      fpga_det 1: adc 1800 + floor(22.96 * 62 + 0.5) = 3224, ebin 19
+ *      ~ 6000; 121 keV (adc 4578) dropped.
+ * The trace holds "file=<basename> unit=adc rows=2" for a and rows=3
+ * for c (data lines, not unique points).
+ * RED on the U2a binary.
+ */
+static void test_det_spec_file(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL, *log = NULL;
+    g_autofree gchar *extra = NULL, *text = NULL, *json = NULL;
+    g_autofree gchar *cdir = g_dir_make_tmp("stix-det-spec-XXXXXX", NULL);
+    g_autofree char *pa = NULL, *pb = NULL, *pc = NULL, *pd = NULL;
+    g_autofree char *sa = NULL, *sb = NULL, *sc = NULL, *sd = NULL;
+    SkyBank *b = g_new0(SkyBank, 1);
+    QTestState *qts;
+    double lam[32];
+    int fd;
+
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+    fd = g_file_open_tmp("stix-det-spec-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixdet_spectrum -D %s", log);
+    qts = det_spec_qtest(path, extra);
+
+    pa = det_spec_csv(cdir, "a.csv", "adc,weight\n1600,3\n2200,1\n", -1);
+    pb = det_spec_csv(cdir, "b.csv", "kev,weight\r\n62,1\r\n121,1\r\n", -1);
+    pc = det_spec_csv(cdir, "c.csv",
+                      "adc,weight\n1600,1\n1600,1\n2200,2\n", -1);
+    pd = det_spec_csv(cdir, "d.csv", "kev,weight\n62,1\n121,1\n", -1);
+    sa = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", pa);
+    sb = g_strdup_printf("\"spec\": {\"file\": \"%s\"}, \"align\": true",
+                         pb);
+    sc = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", pc);
+    sd = g_strdup_printf("\"spec\": {\"file\": \"%s\"}", pd);
+    {
+        g_autofree char *ja = det_spec_step(sa), *jb = det_spec_step(sb);
+        g_autofree char *jc = det_spec_step(sc), *jd = det_spec_step(sd);
+
+        json = g_strdup_printf("{\"api\": 1, \"name\": \"file\", "
+                               "\"background\": {\"cps\": 0}, \"steps\": "
+                               "[%s, %s, %s, %s]}", ja, jb, jc, jd);
+    }
+    g_assert_null(det_spec_load(qts, json));
+    g_unlink(pa);
+    g_unlink(pb);
+    g_unlink(pc);
+    g_unlink(pd);
+    g_rmdir(cdir);
+    g_assert_null(det_tape_play(qts, true));
+
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    memset(lam, 0, sizeof(lam));
+    lam[12] = 9000;
+    lam[17] = 3000;
+    det_spec_assert_row("a", b, 0, lam);
+
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 2, b);
+    memset(lam, 0, sizeof(lam));
+    lam[12] = 6000;
+    lam[24] = 6000;
+    det_spec_assert_row("b", b, 0, lam);
+
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 3, b);
+    memset(lam, 0, sizeof(lam));
+    lam[12] = 6000;
+    lam[17] = 6000;
+    det_spec_assert_row("c", b, 0, lam);
+
+    /* K changes now, before step d's first tick builds its row */
+    g_assert_true(sky_set_u32(qts, "det-cal-kev-full", 100));
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 0, b);
+    memset(lam, 0, sizeof(lam));
+    lam[19] = 6000;
+    det_spec_assert_row("d", b, 1, lam);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    text = det7_read_log(log);
+    g_assert_cmpint(det7_count_str(text, "file=a.csv unit=adc rows=2 at"),
+                    >=, 1);
+    g_assert_cmpint(det7_count_str(text,
+                                   "file=b.csv unit=kev rows=2 align at"),
+                    >=, 1);
+    g_assert_cmpint(det7_count_str(text, "file=c.csv unit=adc rows=3 at"),
+                    >=, 1);
+    g_free(b);
+    unlink(log);
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/* one seeded run of three 1 s periods under @tape: banks 1-3 */
+static void det_spec_ident_run(const char *tape, SkyBank *banks)
+{
+    QTestState *qts = stix_qtest_new_extra(
+        "-global grlib-stixctrl.det-seed=7");
+    uint32_t i;
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 0));
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 10);            /* the first swap */
+    g_assert_null(det_spec_load(qts, tape));
+    g_assert_null(det_tape_play(qts, true));
+    det_step_ticks(qts, 30);
+    for (i = 0; i < 3; i++) {
+        sky_read_bank(qts, i + 1, &banks[i]);
+    }
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-spec-flat-ident (U2, default-off is bit-identical): the same
+ * seed, three 1 s periods: A a rate step without spec, B the same with
+ * "spec": "flat" — banks 1-3 bit-identical; C A's step for periods 1-2
+ * then a line_adc 1600 step — banks 1 and 2 bit-identical to A (the
+ * extra draws start only in the first bank with spectrum exposure),
+ * bank 3 differs.
+ * RED on the U2a binary (C's bank 3 has no spectrum, the step's
+ * template mass gone: it still differs from A, but its spectrum cells
+ * are 0 — the arrival check below).
+ */
+static void test_det_spec_flat_ident(void)
+{
+    static const char tape_a[] =
+        "{\"api\": 1, \"name\": \"a\", \"background\": {\"cps\": 100}, "
+        "\"steps\": [{\"kind\": \"rate\", \"for_s\": 3, \"fpga_det_mask\": "
+        "7, \"cps\": 12000}]}";
+    static const char tape_b[] =
+        "{\"api\": 1, \"name\": \"b\", \"background\": {\"cps\": 100}, "
+        "\"steps\": [{\"kind\": \"rate\", \"for_s\": 3, \"fpga_det_mask\": "
+        "7, \"cps\": 12000, \"spec\": \"flat\"}]}";
+    static const char tape_c[] =
+        "{\"api\": 1, \"name\": \"c\", \"background\": {\"cps\": 100}, "
+        "\"steps\": [{\"kind\": \"rate\", \"for_s\": 2, \"fpga_det_mask\": "
+        "7, \"cps\": 12000}, {\"kind\": \"rate\", \"for_s\": 1, "
+        "\"fpga_det_mask\": 7, \"cps\": 12000, \"spec\": {\"line_adc\": "
+        "1600}}]}";
+    SkyBank *a = g_new0(SkyBank, 3);
+    SkyBank *b = g_new0(SkyBank, 3);
+    SkyBank *c = g_new0(SkyBank, 3);
+
+    det_spec_ident_run(tape_a, a);
+    det_spec_ident_run(tape_b, b);
+    det_spec_ident_run(tape_c, c);
+    g_assert_cmpuint(sky_total(&a[0]), >, 0);
+    g_assert_cmpint(memcmp(a, b, 3 * sizeof(*a)), ==, 0);
+    g_assert_cmpint(memcmp(&a[0], &c[0], sizeof(*a)), ==, 0);
+    g_assert_cmpint(memcmp(&a[1], &c[1], sizeof(*a)), ==, 0);
+    g_assert_cmpint(memcmp(&a[2], &c[2], sizeof(*a)), !=, 0);
+    /* C's bank 3: the line arrived (a fresh flash: every row degenerate,
+     * the base-0 fallback bins 1600 at ebin 12) */
+    sky_assert_poisson("C bank 3: fpga_det 0 ebin 12", det_spec_cell(&c[2], 0,
+                                                                   12),
+                       12000, 5);
+    g_free(a);
+    g_free(b);
+    g_free(c);
+}
+
+/*
+ * det-spec-rebuild (U2, ELUT pickup at the step start and the QL swap):
+ * line_adc 1600 on fpga_det 0 (adc/128: ebin 12) for 4 s; 5 ticks into
+ * the step's second period the test rewrites fpga_det 0's 12 rows to
+ * min(adc/128 + 1, 31). The bank closed by the first swap after the
+ * rewrite still holds ebin 12 (the row is the ELUT read at the step
+ * start/swap: the replay's bank-1 precedent, decision Q5), ebin 13
+ * exactly 0; the next bank ebin 13, ebin 12 exactly 0. A ClearEnable
+ * 5 ticks into the fourth period freezes step_left_ticks and accrues
+ * no spectrum exposure: the bank after the resume is one period's
+ * worth.
+ * RED on the U2a binary.
+ */
+static void test_det_spec_rebuild(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL, *json = NULL;
+    g_autofree char *left1 = NULL, *left2 = NULL;
+    g_autofree uint8_t *row = g_malloc(4096);
+    SkyBank *b = g_new0(SkyBank, 1);
+    QTestState *qts;
+    uint32_t pix, adc;
+
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+    qts = det_spec_qtest(path, NULL);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"rebuild\", "
+                           "\"background\": {\"cps\": 0}, \"steps\": [{"
+                           "\"kind\": \"rate\", \"for_s\": 4, "
+                           "\"fpga_det_mask\": 1, \"cps\": 12000, "
+                           "\"spec\": {\"line_adc\": 1600}}]}");
+    g_assert_null(det_spec_load(qts, json));
+    g_assert_null(det_tape_play(qts, true));
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    sky_assert_poisson("before: ebin 12", det_spec_cell(b, 0, 12), 12000, 5);
+
+    det_step_ticks(qts, 5);
+    for (adc = 0; adc < 4096; adc++) {
+        row[adc] = MIN(adc / 128 + 1, 31);
+    }
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        qtest_memwrite(qts, DET7_ELUT_ADDR(pix, 0), row, 4096);
+    }
+    det_step_ticks(qts, 5);
+    sky_read_bank(qts, 2, b);
+    sky_assert_poisson("closed bank: ebin 12", det_spec_cell(b, 0, 12),
+                       12000, 5);
+    g_assert_cmpuint(det_spec_cell(b, 0, 13), ==, 0);
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 3, b);
+    sky_assert_poisson("next bank: ebin 13", det_spec_cell(b, 0, 13),
+                       12000, 5);
+    g_assert_cmpuint(det_spec_cell(b, 0, 12), ==, 0);
+
+    /* ClearEnable mid-step: frozen, nothing accrues while paused */
+    det_step_ticks(qts, 5);
+    det_cmd_or(qts, FSMCMD_CLEARENABLE);
+    left1 = det_tape_field(qts, "step_left_ticks");
+    det_step_ticks(qts, 10);
+    left2 = det_tape_field(qts, "step_left_ticks");
+    g_assert_cmpstr(left1, ==, left2);
+    det_cmd_or(qts, FSMCMD_SETENABLE);
+    det_step_ticks(qts, 5);
+    sky_read_bank(qts, 0, b);
+    sky_assert_poisson("after the pause: ebin 13", det_spec_cell(b, 0, 13),
+                       12000, 5);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-spec-guard (U2, D-Dj; the det-tape-guard pattern): a line_adc and
+ * a file spectrum step changing under clock_step (a row build at every
+ * step start and swap), every CTRL MMIO path still answers.
+ */
+static void test_det_spec_guard(void)
+{
+    QTestState *qts = rotb_qtest_new(128);
+    g_autofree gchar *cdir = g_dir_make_tmp("stix-det-spec-XXXXXX", NULL);
+    g_autofree char *csv = NULL, *json = NULL;
+    uint32_t i;
+
+    csv = det_spec_csv(cdir, "g.csv", "adc,weight\n1600,1\n2200,1\n", -1);
+    rotb_cfg(qts, true, false);
+    ctrl_write(qts, CTRL_FSMCMD, FSMCMD_QLIRQEN);
+    det_start_nom(qts, 9, 0, 9, 0xFFFFFFFFu);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"specguard\", "
+                           "\"loop\": true, \"steps\": [{\"kind\": "
+                           "\"rate\", \"for_s\": 0.1, \"fpga_det_mask\": "
+                           "4294967295, \"cps\": 2000, \"spec\": "
+                           "{\"line_adc\": 1600}}, {\"kind\": \"rate\", "
+                           "\"for_s\": 0.1, \"fpga_det_mask\": 4294967295,"
+                           " \"cps\": 2000, \"spec\": {\"file\": \"%s\"}}]}",
+                           csv);
+    g_assert_null(det_spec_load(qts, json));
+    g_unlink(csv);
+    g_rmdir(cdir);
+    g_assert_null(det_tape_play(qts, true));
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+
+    for (i = 0; i < 20; i++) {    /* 2 chunks: 3 x 49 > 128 */
+        det_step_ticks(qts, 1);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, FSMCMD_QLIRQEN);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMINTTIME), ==, 9u << 16);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+    g_assert_true(det_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR);
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS - 1);
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR | 1u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
 }
 
 static void stix_det_tape_register(void)
@@ -10951,6 +11388,11 @@ static void stix_det_tape_register(void)
     /* S2: spectra */
     qtest_add_func("/sparc/stix/det-spec-props", test_det_spec_props);
     qtest_add_func("/sparc/stix/det-spec-line", test_det_spec_line);
+    qtest_add_func("/sparc/stix/det-spec-file", test_det_spec_file);
+    qtest_add_func("/sparc/stix/det-spec-flat-ident",
+                   test_det_spec_flat_ident);
+    qtest_add_func("/sparc/stix/det-spec-rebuild", test_det_spec_rebuild);
+    qtest_add_func("/sparc/stix/det-spec-guard", test_det_spec_guard);
 }
 
 
