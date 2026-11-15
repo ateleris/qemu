@@ -359,7 +359,8 @@ qemu_args() {  # tag dssevs [ctrl-global...]
 # One boot: the probe first (it retries until QEMU binds the port), then
 # QEMU; the probe's verdict, with the reason, as in elut-smoke.
 boot() {  # tag seconds probe-args...
-    local tag="$1" secs="$2" rc alive qrc why log="probe.$tag.log"
+    local tag="$1" secs="$2" rc alive qrc why log
+    log="probe.$tag.log"
     shift 2
     rm -f "uart.$tag.raw" "uart.$tag.txt" "qemu-stdout.$tag.log" "$log"
     stix_disk_guard
