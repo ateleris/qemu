@@ -91,9 +91,9 @@ not asserted.
 
 --ssid32-subcols SUBCOLS is the --tape SSID 32 rule (T6): in the last
 SSID 32 dump, every sample whose detector byte (subcol) is in the
-comma-separated masked list holds >= 0x30 at byte 4 (ebin 3, a
-flat-share ebin of the quiet template, 0.10/11: 2000 cps x 32 s ~=
-580 counts), every other sample stays < 0x10 there (the 20 cps
+comma-separated masked list holds >= 0x20 at byte 4 (ebin 3, a
+flat-share ebin of the quiet template, 0.10/11; measured ~240..300
+counts live, S0 0x2e..0x31), every other sample stays < 0x10 there (the 20 cps
 background floor, ~= 6 counts - the ql-inject bound, not zero). A dump
 with several products (align-smoke's two NOMINAL windows) reads the
 last.
@@ -679,12 +679,15 @@ def check_tape_flush(products, seconds, out=None):
 # byte 4 of an SSID 32 sample = ebin 3 (the sample is subcol, then
 # ebin 0..31, trigger, offset): a flat-share ebin of the quiet template,
 # 0.10/11. The tape's rate step covers the first 8 QL periods SSID 32
-# sums, so a masked subcol holds 2000 cps x 32 s x 0.10/11 ~= 580 counts
-# (S0 >= 0x30) and an unmasked one the 20 cps background floor
+# sums, so a masked subcol would hold 2000 cps x 32 s x 0.10/11 ~= 580
+# counts; the live gate measures ~240..300 (S0 0x2e..0x31: the FSW's
+# product carries ~0.43 of the naive estimate, not chased), so the
+# floor is S0 >= 0x20 (64 counts, ~10 sigma over the background) and an
+# unmasked one the 20 cps background floor
 # ~= 6 counts (>= 0, < 0x10 - the ql-inject bound, not zero: the
 # background fills all 32).
 TAPE_EBIN = 3
-TAPE_MIN_MASKED = 0x30
+TAPE_MIN_MASKED = 0x20
 TAPE_MAX_UNMASKED = 0x10
 
 
@@ -1062,23 +1065,23 @@ def self_test_tape(zero_lines, secs, n4, n8):
 
     prods = decode_lines(flush(spectra_at(0x30, 0x05)))
     assert check_ssid32_subcols(prods, {0, 5}) == []
-    prods = decode_lines(flush(spectra_at(0x2F, 0x05)))
+    prods = decode_lines(flush(spectra_at(0x1F, 0x05)))
     f = check_ssid32_subcols(prods, {0, 5})
     assert len(f) == 2 and all("masked subcol" in x for x in f), f
     prods = decode_lines(flush(spectra_at(0x30, 0x10)))
     f = check_ssid32_subcols(prods, {0, 5})
     assert len(f) == 30 and all("unmasked subcol" in x for x in f), f
     # a failing first product, a passing second: the last one wins
-    two = flush(spectra_at(0x2F, 0x05))[:3]
+    two = flush(spectra_at(0x1F, 0x05))[:3]
     two += [build_packet(ssid32_body(spectra_at(0x31, 0x05)),
                          seg=SEG_STANDALONE, seq=3).hex()]
     prods = decode_lines(two)
     assert check_ssid32_subcols(prods, {0, 5}) == []
     two = flush(spectra_at(0x31, 0x05))[:3]
-    two += [build_packet(ssid32_body(spectra_at(0x2E, 0x05)),
+    two += [build_packet(ssid32_body(spectra_at(0x1E, 0x05)),
                          seg=SEG_STANDALONE, seq=3).hex()]
     f = check_ssid32_subcols(decode_lines(two), {0, 5})
-    assert len(f) == 2 and "0x2e" in f[0], f   # the second product
+    assert len(f) == 2 and "0x1e" in f[0], f   # the second product
 
     # SSID 32 byte check: print, bounds, missing subcol
     prods = decode_lines(flush(spectra))

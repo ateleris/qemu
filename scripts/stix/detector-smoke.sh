@@ -98,7 +98,7 @@
 # (SUBCOL_FROM_FPGA_DET[f] for the masked f) --tape-lc ON OFF OFF_END
 # as ONE verdict: in the one SSID 32 dump every masked subcol holds
 # byte 4 (ebin 3, a flat-share ebin of the quiet template, 0.10/11)
-# >= 0x30 (2000 cps x 32 s ~= 580 counts) and every unmasked subcol
+# >= 0x20 (measured ~240..300 counts, S0 0x2e..0x31) and every unmasked subcol
 # stays at the background floor, byte 4 < 0x10 (20 cps x 32 s ~= 6
 # counts, the ql-inject bound - not zero: the background fills all 32);
 # the rate step's SSID 30 band-0 median is >= 8 compressed steps above
