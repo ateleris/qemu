@@ -974,11 +974,15 @@ if [ "$NEGATIVE" -eq 0 ]; then
     echo "$ELUT_RECORD"
 fi
 
-# split the boot's log and the QL dump at the second replay start /
-# SSID 32 product: leg 1 before, leg 2 after
-awk '/replay state=start \(nominal\)/ { n++ }
-     { if (n < 2) print > "align.leg1.log"; else print > "align.leg2.log" }' \
+# split the boot's log at the CONFIGURATION window between the two
+# NOMINAL periods (the replay starts once per boot, so not at a replay
+# start): the first stixdet_align line after a > 30 s guest gap opens
+# leg 2; the QL dump splits by SSID 32 product
+awk '/^stixdet_align / { v = $0; sub(/.*vclock_ns=/, "", v); v = v / 1e9
+                         if (p != "" && v - p > 30) leg2 = 1; p = v }
+     { if (leg2) print > "align.leg2.log"; else print > "align.leg1.log" }' \
     qemu-stdout.align.log
+: >> align.leg2.log             # present (maybe empty) for the checks
 ssid32_products ql.dump.align.hex align
 
 FAILED=()
@@ -1023,12 +1027,13 @@ if ! grep -q "stixdet_align" align.leg2.log; then
     LEG2_OK=0
     LEG2_WHY="${LEG2_WHY:+$LEG2_WHY; }no stixdet_align line in leg 2"
 fi
-CHUNK_N="$(grep -o 'eacc_events=[0-9]*' align.leg2.log | head -1 |
+# the second leg-2 chunk: the first also carries the EACC the bank
+# accumulated between leg 1's last chunk and the CONFIGURATION pause
+CHUNK_N="$(grep -o 'eacc_events=[0-9]*' align.leg2.log | sed -n 2p |
     cut -d= -f2)" || true
 if [ -z "$CHUNK_N" ] || [ "$CHUNK_N" -lt 150 ] || [ "$CHUNK_N" -gt 250 ]; then
     LEG2_OK=0
-    LEG2_WHY="${LEG2_WHY:+$LEG2_WHY; }the leg-2 chunk EACC total" \
-        "${CHUNK_N:-is missing}, want 150..250 (1 event per tick)"
+    LEG2_WHY="${LEG2_WHY:+$LEG2_WHY; }the leg-2 chunk EACC total ${CHUNK_N:-is missing}, want 150..250 (1 event per tick)"
 fi
 if [ "$NEGATIVE" -eq 0 ]; then
     if [ -s align.ssid32.2.hex ]; then
@@ -1040,8 +1045,7 @@ if [ "$NEGATIVE" -eq 0 ]; then
         grep -E '^QL-CHECK' ql.leg2.log || true
         if [ "$QL2" -ne 0 ]; then
             LEG2_OK=0
-            LEG2_WHY="${LEG2_WHY:+$LEG2_WHY; }ql-check rc=$QL2 (see" \
-                "ql.leg2.log)"
+            LEG2_WHY="${LEG2_WHY:+$LEG2_WHY; }ql-check rc=$QL2 (see ql.leg2.log)"
         fi
     else
         LEG2_OK=0
