@@ -3122,7 +3122,7 @@ decisions D-Db, D-Df, D-Dd, D-Dj; "Index spaces").
   **This is a deliberate deviation** (plan Doc vs code 20): a gate that
   compares QL against real hardware with an empty flash must not use the
   synthetic sky. Except the tape's `align` option for science-space
-  steps (§51/§52) and the `det-adc-mode` sky of §53.
+  steps (§54/§55) and the `det-adc-mode` sky of §56.
 
 **The scene properties (D-Db), on `/machine/stixctrl`:**
 - runtime class properties with setters (they also work before realize,
@@ -3582,7 +3582,7 @@ has the index-space table, the recipe and the template flash.
   edges, so ebin 0 covers `adc` 0..e[0]−1 and ebin 31 covers
   e[30]..4095; nothing is unassigned. The ops value of the lowest
   boundary is unknown here. Amended additively by the derived CSV's
-  `--b0` (A2/D6, §52): a non-zero *integral* offset column becomes
+  `--b0` (A2/D6, §55): a non-zero *integral* offset column becomes
   B[0] — sub-baseline adc is then unassigned, dropped like the DSS —
   while the flight files' fractional scale offset stays ignored, and
   `check-dump --skip-sensitivity` (A2/D7) skips the D-Eg sensitivity
@@ -4013,7 +4013,7 @@ never the user's file; all RED on the D-6 binary, where
   `state=idle`.
 
 **Deviations from the plan's D-7 section:**
-- since the alignment track (§52) the classification also runs under
+- since the alignment track (§55) the classification also runs under
   `det-align` and `det-adc-mode` (not only `det-source=replay-dss`) and
   emits one summary trace per classification, `stixdet_align(rows,
   fallback, honoured, mismatch_cells, vclock_ns)` — the E-4 vacuity
@@ -4090,7 +4090,7 @@ missing or surprising behaviour is not mistaken for a bug (plan D-8,
   dark detectors; the live `--replay` gate run that would confirm
   nothing else reacts is still pending (no `--replay` gate yet, §37).
 - **Sub-baseline adc bins to `ebin` 0 unless the derived CSV's `--b0`**
-  (§52, A2/D6): the derived ELUT under `B0 = 0` bins `adc <= base` to
+  (§55, A2/D6): the derived ELUT under `B0 = 0` bins `adc <= base` to
   `ebin` 0 where the D-7 fallback (and the DSS) drops it — outside the
   LC bands and the QLDetPerf mask, so benign; with `--b0` the offset
   column makes it unassigned instead.
@@ -5980,7 +5980,7 @@ D-PLj request filter, loopback bind and 403 rules as `--view-run`;
 nothing is written into the viewed run dir (self-tested). The one
 slot keeps the process's footprint bounded.
 
-## 51. Detector stimulus: per-pair rates and the mix tape (baseline: one uniform rate, no tape)
+## 54. Detector stimulus: per-pair rates and the mix tape (baseline: one uniform rate, no tape)
 
 Owner requirement (2026-11-15): "All of it, staged" — Stage S1 =
 per-detector and per-pixel rates + the mix tape (JSON steps on guest
@@ -6001,7 +6001,7 @@ owns the tape files, verbs and markers (`stixplat/tapes.py`, verbs
   "align": <bool, default false>, "adc_mode": <bool, optional>,
   "loop": <bool, default false>, "background": <rate layer>,
   "steps": [...]}` — the tape-level `align` converts science-space
-  steps through the loaded ELUT once S2/S3 land (§52). Step kinds
+  steps through the loaded ELUT once S2/S3 land (§55). Step kinds
   `rate` | `replay` | `off`; `single` and `spec` values other than
   `"flat"` parse (the wire shape is fixed) but are refused at load with
   "unsupported in this build (S2/S3)". A step is `{"kind", "for_s":
@@ -6099,7 +6099,7 @@ while FSM Enable = 1), saves and plays the tape via
 `instrument.detector.tape.step` = 2 within 70 s, stops and awaits
 `state=stopped`, and expects the `stim` record in the log.
 
-## 52. ELUT alignment (baseline: none)
+## 55. ELUT alignment (baseline: none)
 
 Owner requirement (2026-11-15): "if I wanted to, that you could support
 alignment between the ELUT in the flight software and also the detector
@@ -6144,7 +6144,7 @@ Three pieces:
     today's.
 - **(c) The classification report** (A1): the ELUT row classification
   (until now only while `det-source=replay-dss`) also runs whenever
-  `det-align` is on or `det-adc-mode` is on (§53), at the SetEnable
+  `det-align` is on or `det-adc-mode` is on (§56), at the SetEnable
   edge and each QL swap, and emits one summary trace
   `stixdet_align(rows, fallback, honoured, mismatch_cells, vclock_ns)`
   per classification — the E-4 vacuity gap closed: the classification
@@ -6183,7 +6183,7 @@ trace's EACC total (the replay counts reach EACC through `add_counts`'
 is not reachable from a host gate (the ROTB ring is host RAM behind an
 IO window), so the cell-level proof stays with the qtests.
 
-## 53. ADC-faithful sky mode (baseline: off)
+## 56. ADC-faithful sky mode (baseline: off)
 
 Decision D1 (owner, 2026-11-15): the synthetic sky and the ROTB chunk
 (EACC) path can draw ADC values through a per-pixel simulation
@@ -6226,7 +6226,7 @@ and golden unchanged; the mode adds no RNG draws and no folds when off
   nominal EACC chunk. Totals per (`fpga_det`, `pix`) are unchanged by
   the mode except where the row itself drops (a honoured row's
   32-valued cells; a degenerate row's `adc <= base`, a 1/len₀ sliver of
-  `ebin` 0 — benign per §52's note). Deposits (`det-inject`), replay
+  `ebin` 0 — benign per §55's note). Deposits (`det-inject`), replay
   events and S3 `single` steps are science-space and stay out of the
   fold (the fold splits only the Poisson part; `draw_acc` adds `inj`
   after the draw).
@@ -6245,7 +6245,7 @@ and golden unchanged; the mode adds no RNG draws and no folds when off
   fail. The ADC legs set `det-adc-mode`, not `det-align`, so the
   aligned status they expect reads `mode=off`. "Byte N" is the SSID 32 sample byte (byte 0 the detector
   byte), so byte 19 = `ebin` 18; `ql-check --ssid32-byte` takes the
-  0-based ebin; leg 5 (`adc-aligned`) runs the §52 derive/upload chain —
+  0-based ebin; leg 5 (`adc-aligned`) runs the §55 derive/upload chain —
   `mismatch_cells = 0`, byte 19 back at the reference — twice, with
   byte-identical SSID 32 ebin bytes (the fold's guest-time
   determinism). `--negative` skips leg 5's upload and must fail

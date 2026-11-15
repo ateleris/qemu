@@ -568,7 +568,7 @@ Notes:
 
 When the counts land in the wrong science bins because the FSW's ELUT
 does not match the detector simulation (the owner's rotating-fill
-symptom), the alignment track (`accepted-diffs.md` §52) tells you where
+symptom), the alignment track (`accepted-diffs.md` §55) tells you where
 and fixes it:
 
 1. **Turn the report on**: `qom_set $RUN/qmp.sock /machine/stixctrl
@@ -592,8 +592,8 @@ and fixes it:
    `elut-derive.py derive --dssevs <file> --out derived.csv`, then the
    ELUT chain above; `mismatch_cells` drops to 0 and the quick-look
    spectra keep their bins. The gate is `scripts/stix/align-smoke.sh`
-   (`accepted-diffs.md` §52); the ADC-faithful variant that reproduces
-   the miscount with the synthetic sky is its `--adc` mode (§53, and
+   (`accepted-diffs.md` §55); the ADC-faithful variant that reproduces
+   the miscount with the synthetic sky is its `--adc` mode (§56, and
    "The ADC-faithful sky recipe" in the ELUT section).
 
 ### Index spaces (TM detector and pixel indices)
@@ -857,7 +857,7 @@ The FSW accepts both TCs only in CONFIGURATION or MAINTENANCE.
 ### Deriving the CSV from the simulator (alignment)
 
 When the FSW's ELUT should match the detector simulation instead of the
-flight table (the alignment track, `accepted-diffs.md` §52), derive the
+flight table (the alignment track, `accepted-diffs.md` §55), derive the
 CSV from the sim's per-detector baseline law and upload it through the
 chain above:
 
@@ -953,7 +953,7 @@ a template or a GS run dir holding one is.
 ### The ADC-faithful sky recipe (alignment end to end)
 
 `det-adc-mode` (a scene knob on `/machine/stixctrl`, default off,
-`accepted-diffs.md` §53) makes the synthetic sky draw through the
+`accepted-diffs.md` §56) makes the synthetic sky draw through the
 loaded FPGA ELUT exactly like replay events, so a misaligned ELUT
 miscounts the sky as on hardware:
 

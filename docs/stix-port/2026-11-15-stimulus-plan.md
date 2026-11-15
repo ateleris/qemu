@@ -1090,19 +1090,23 @@ new at boot; `det-adc-mode` defaults off).
 
 ## Accepted-diffs / docs updates
 
-- New **§51 "Detector stimulus: per-pair rates and the mix tape"**
+(As built: §54–56. The track wrote them as §51–53; the run-bundles
+track merged first with its own §51–53, so the rebase renumbered
+these.)
+
+- New **§54 "Detector stimulus: per-pair rates and the mix tape"**
   (baseline: one uniform rate, no tape): the tape schema (incl. the
   `adc_mode` field), tick rules, step/background precedence, the
   replay-step constraint (`det-replay-file` is realize-time),
   markers, gate record.
-- New **§52 "ELUT alignment (baseline: none)"**: the three pieces
+- New **§55 "ELUT alignment (baseline: none)"**: the three pieces
   ((a)/(b)/(c)), the derived-CSV round-trip theorem and its B0
   nuance (resolved additively by D6's `--b0`), the classification
   exposure, `align-smoke` gate record, and the statement that the
   ebin-space sky still bypasses the ELUT (amends §34's "No ELUT"
   bullet with "except the tape's `align` option for science-space
-  steps and the `det-adc-mode` sky of §53").
-- New **§53 "ADC-faithful sky mode (baseline: off)"** (decision D1):
+  steps and the `det-adc-mode` sky of §56").
+- New **§56 "ADC-faithful sky mode (baseline: off)"** (decision D1):
   the calibration law (base/gain per dss_det/pix, `K`), the cached
   per-row bin-mass map and its cost (one full 384 × 4096 pass per
   classification point — per QL swap/edge — while the mode is on;
@@ -1143,7 +1147,7 @@ recorded here as decided, with reasons; D5 follows from D1.
   0xE0000000), so a misaligned ELUT miscounts exactly as on hardware;
   the alignment report (c) shows where and `elut-derive` +
   `elut-upload` (b) fixes it. Default off, so §34 and every existing
-  gate/golden stay unchanged. Tasks C1–C3; deviation section §53.
+  gate/golden stay unchanged. Tasks C1–C3; deviation section §56.
 - **D2 — DG1–DG4: dropped from the board (owner).** No DG buttons and
   no DG → fpga_det mapping question: the FSW has no DG concept and
   the mockup's group table is not in it. The chips do not render
@@ -1259,7 +1263,7 @@ file-format blockers are resolved (D4/D5) and its spectra fold
 per-spec maps, not per-event draws; A1's classification also runs
 under `det-adc-mode`; A2 gains `--b0` (D6) and `check-dump
 --skip-sensitivity` (D7); review focus gained items 6–8; merge order
-and the accepted-diffs names (§53 new) updated; the open-questions
+and the accepted-diffs names (§56 new) updated; the open-questions
 section became the decisions record. No first-pass finding was
 reverted.
 
@@ -1288,7 +1292,7 @@ Dispositions:
   is one full 384 × 4096 walk per classification point (per QL
   swap/edge) while the mode is on — changes are undetectable — and
   the walk is always 4096 bytes/row (the classify early-exits);
-  ~ms host per swap, zero when off. Approach 4(ii) and the §53
+  ~ms host per swap, zero when off. Approach 4(ii) and the §56
   sketch aligned.
 - SF3 (totals invariant overbroad) — **fixed**: qualified — unchanged
   except where the row itself drops (32-valued cells; the degenerate
