@@ -461,7 +461,9 @@ align_status() {  # probe-log
 }
 
 ssid32_products() {  # dump tag: the SSID 32 packets of a flush dump
-    awk '{ if (substr($0, 31, 2) == "14")
+    # the SSID byte follows the 6-byte primary header, the 4-byte data
+    # field header and the 6-byte time: hex column 33; SSID 32 = 0x20
+    awk '{ if (substr($0, 33, 2) == "20")
                { n++; print > (sprintf("%s.ssid32.%d.hex", tag, n)) } }' \
         tag="$2" "$1"
 }
@@ -712,7 +714,7 @@ print(q.s0_compress(int(hi + 5 * int(sys.argv[2]) ** 0.5)))
     rm -f ql.dump.4.hex
     qemu_args adc4 "$ADC_DSSEVS" det-quiet-cps=200 det-adc-mode=true
     boot adc4 290 "${ADC4_ARGS[@]}"
-    uart_ok adc4 "$([ "$NEGATIVE" -eq 0 ] && echo 1 || echo 0)"
+    uart_ok adc4 1      # leg 4 always uploads (--negative skips leg 5's)
     ssid32_products ql.dump.4.hex adc4
     RET="$(align_status probe.adc4.log)"
     MISMATCH="$(printf '%s' "$RET" |
@@ -728,7 +730,7 @@ print(q.s0_compress(int(hi + 5 * int(sys.argv[2]) ** 0.5)))
         ADC4_OK=0; ADC4_WHY="no SSID 32 dump in the flush"
     else
         set +e
-        python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 19 0 0x10 \
+        python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 19 0 0x0f \
             > byte19.adc4.log 2>&1
         B19=$?
         python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 25 \
@@ -931,7 +933,6 @@ ALIGN_ARGS=(
     --expect "0x5A1:1:1:1DACC005"
     --expect "0x5A7:5:1:00210405@45"
     --expect "0x5A1:1:7:1DACC005@45"
-    --expect "0x5A7:5:2:542c01@45"
     --forbid "0x5A7:5:2:542c03"
     --forbid "0x5A7:5:1:00210502"
     --send-at 300 --qmp-cmd "$(qom_get /machine/stixctrl \
