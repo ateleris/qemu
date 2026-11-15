@@ -853,3 +853,12 @@ step).
   ignores the second); `spec` on single is refused before `_spec`;
   `det.tape.dropped` goes into `state.py`'s VOLATILE set so the live
   readout does not lag.
+
+## Owner decisions (2026-11-15)
+
+All four open questions answered with the recommended option: (1)
+refuse at load when the quantized `for_s` does not cover
+`n·wait_us`; (2) the DSS-sequence control turns each
+`det(F, P, A) x N[, wait W us]` line into one single step; (3) the
+LTRG 1.25× rule is asserted in the qtest only, the gate logs the
+SSID 30 trigger byte; (4) `dropped` counts pix-gate drops only.
