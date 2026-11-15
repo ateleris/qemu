@@ -10766,6 +10766,168 @@ static void test_det_spec_props(void)
     stix_qtest_cleanup();
 }
 
+/* the "no-12" row: adc / 128 with every 12 replaced by 13 */
+static void det_spec_no12_row(uint8_t *row)
+{
+    uint32_t adc;
+
+    det_adc_wrong_row(row);
+    for (adc = 0; adc < 4096; adc++) {
+        if (row[adc] == 12) {
+            row[adc] = 13;
+        }
+    }
+}
+
+/*
+ * The S2 bank fixture: a replay table with baseline 1800 for every
+ * dss_det (K 160: gain 14.35), det-quiet-cps 0, all 12 pix open
+ * (idefx_power_all: model-internal, not the FSW's pix set), QlIntTime
+ * 9 (1 s periods), started, the first swap done (bank 1 active), and
+ * three ELUT row states on all 12 pix: fpga_det 0 the wrong row
+ * adc/128, fpga_det 1 untouched (degenerate: the D-7 fallback),
+ * fpga_det 2 the no-12 row. @extra adds QEMU arguments (a trace).
+ */
+static QTestState *det_spec_qtest(const char *replay_file, const char *extra)
+{
+    g_autofree gchar *args = g_strdup_printf(
+        "-global grlib-stixctrl.det-replay-file=%s "
+        "-global grlib-stixctrl.det-seed=7 %s", replay_file,
+        extra ? extra : "");
+    g_autofree uint8_t *wrong = g_malloc(4096), *no12 = g_malloc(4096);
+    QTestState *qts = stix_qtest_new_extra(args);
+    uint32_t pix;
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 0));
+    det_adc_wrong_row(wrong);
+    det_spec_no12_row(no12);
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        qtest_memwrite(qts, DET7_ELUT_ADDR(pix, 0), wrong, 4096);
+        qtest_memwrite(qts, DET7_ELUT_ADDR(pix, 2), no12, 4096);
+    }
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 10);            /* the first swap */
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    return qts;
+}
+
+/* a 1 s, 12000 cps rate step on fpga_det 0-2 with the given fields */
+static char *det_spec_step(const char *fields)
+{
+    return g_strdup_printf("{\"kind\": \"rate\", \"for_s\": 1, "
+                           "\"fpga_det_mask\": 7, \"cps\": 12000, %s}",
+                           fields);
+}
+
+/* the det-align-status field @key (NULL when absent) */
+static char *det_spec_align_field(QTestState *qts, const char *key)
+{
+    g_autofree char *line = sky_get_str(qts, "det-align-status");
+    g_autofree char *pat = g_strdup_printf("%s=", key);
+    const char *p = line ? strstr(line, pat) : NULL;
+    const char *end;
+
+    if (!p) {
+        return NULL;
+    }
+    p += strlen(pat);
+    end = strchr(p, ',');
+    return g_strndup(p, end ? (size_t)(end - p) : strlen(p));
+}
+
+/*
+ * det-spec-line (U2): one tape of eight 1 s steps on fpga_det 0-2 (the
+ * three row states of det_spec_qtest), background cps 0, played on the
+ * tick after a swap, so each step owns one whole period. The
+ * preimage_miss gauge reads 12 during the aligned line_kev step (the
+ * 12 pix of the no-12 fpga_det 2) and 0 during the others (reset at
+ * every step start; an ADC overflow is not a miss); det-align-status
+ * starts mode=off (det-align is not set); the trace holds each build's
+ * desc.
+ */
+static void test_det_spec_line(void)
+{
+    static const char *const fields[] = {
+        "\"spec\": {\"line_adc\": 1600}",
+        "\"spec\": {\"line_kev\": 62}",
+        "\"spec\": {\"line_kev\": 62}, \"align\": true",
+        "\"spec\": {\"flat_kev\": [40, 60]}, \"align\": true",
+        "\"spec\": {\"line_kev\": 170}",
+        "\"spec\": {\"line_kev\": 170}, \"align\": true",
+        "\"spec\": {\"flat_kev\": [150, 170]}, \"align\": true",
+    };
+    /* the preimage_miss each step's build leaves (step 8 = off) */
+    static const char *const miss[] = {
+        "0", "0", "12", "0", "0", "0", "0", "0",
+    };
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL, *log = NULL;
+    g_autofree gchar *extra = NULL, *text = NULL;
+    GString *steps = g_string_new(NULL);
+    QTestState *qts;
+    char *json, *v;
+    uint32_t i;
+    int fd;
+
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+    fd = g_file_open_tmp("stix-det-spec-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixdet_spectrum -D %s", log);
+    qts = det_spec_qtest(path, extra);
+
+    for (i = 0; i < ARRAY_SIZE(fields); i++) {
+        json = det_spec_step(fields[i]);
+        g_string_append_printf(steps, "%s, ", json);
+        g_free(json);
+    }
+    g_string_append(steps, "{\"kind\": \"off\", \"for_s\": 1, "
+                           "\"fpga_det_mask\": 4294967295}");
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"line\", \"background\":"
+                           " {\"cps\": 0}, \"steps\": [%s]}", steps->str);
+    g_assert_null(det_spec_load(qts, json));
+    g_free(json);
+    g_assert_null(det_tape_play(qts, true));
+
+    for (i = 0; i < 8; i++) {
+        g_autofree char *step = g_strdup_printf("%u/8", i + 1);
+        g_autofree char *line = NULL;
+
+        det_step_ticks(qts, 10);        /* the step's period closes */
+        v = det_tape_field(qts, "step");
+        g_assert_cmpstr(v, ==, step);
+        g_free(v);
+        v = det_spec_align_field(qts, "preimage_miss");
+        g_test_message("step %u: preimage_miss=%s", i + 1, v);
+        g_assert_cmpstr(v, ==, miss[i]);
+        g_free(v);
+        line = sky_get_str(qts, "det-align-status");
+        g_assert_true(g_str_has_prefix(line, "mode=off,"));
+    }
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    text = det7_read_log(log);
+    g_assert_cmpint(det7_count_str(text, "step 0: line_adc=1600 at"), >=,
+                    1);
+    g_assert_cmpint(det7_count_str(text, "step 1: line_kev=62 at"), >=, 1);
+    g_assert_cmpint(det7_count_str(text, "step 2: line_kev=62 align at"),
+                    >=, 1);
+    g_assert_cmpint(det7_count_str(text,
+                                   "step 3: flat_kev=40..60 align at"),
+                    >=, 1);
+    /* the off step builds nothing */
+    g_assert_cmpint(det7_count_str(text, "step 7:"), ==, 0);
+
+    g_string_free(steps, true);
+    unlink(log);
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
 static void stix_det_tape_register(void)
 {
     /* S1: the mix tape */
@@ -10788,6 +10950,7 @@ static void stix_det_tape_register(void)
     qtest_add_func("/sparc/stix/det-adc-guard", test_det_adc_guard);
     /* S2: spectra */
     qtest_add_func("/sparc/stix/det-spec-props", test_det_spec_props);
+    qtest_add_func("/sparc/stix/det-spec-line", test_det_spec_line);
 }
 
 

@@ -21,6 +21,8 @@
  * layer, per-pair rates on the 100 ms tick). A1: det-align, the ELUT
  * row classification and its report. C1: the ADC-faithful sky
  * (det-adc-mode): the cached per-row bin-mass map and the draw fold.
+ * S2: tape step spectra (line/flat at adc or keV, CSV files), binned
+ * through the loaded ELUT by a per-spec bin-mass row.
  *
  * FSW references are to STIX-FSW 600a7a72, the ASW tree (BSW =
  * BSW_ASW/src/BSW/...; utils.c, utils.h = ASW/src/utils.*; Detectors.c
@@ -131,8 +133,11 @@ static void stix_det_tape_stop(StixDetState *d, const char *why);
 /* S1 per-pair rate: the tape step's cps or the background's */
 static uint32_t stix_det_tape_pair_cps(const StixDetState *d,
                                        uint32_t fpga_det, uint32_t pix);
-/* S2: the tape step spectrum (parsed with the tape) */
+/* S2: the tape step spectrum (parsed with the tape) and its row */
 static void stix_det_spec_free(StixDetSpec *sp);
+static bool stix_det_spec_active(const StixDetState *d);
+static void stix_det_spec_build(StixDetState *d);
+static const char *stix_det_spec_desc(const StixDetSpec *sp);
 /* A1: the ELUT row classification gate (the pass itself is
  * stix_det_replay_classify, extended with the summary and the C1 map) */
 static bool stix_det_classify_wanted(const StixDetState *d);
@@ -238,6 +243,10 @@ static void stix_det_ql_swap(StixDetState *d)
      */
     if (stix_det_classify_wanted(d)) {
         stix_det_replay_classify(d);
+    }
+    /* S2: the spectrum row for the next period's ticks (approach 2) */
+    if (stix_det_spec_active(d)) {
+        stix_det_spec_build(d);
     }
     stix_det_sky_materialize(d, done);
 
@@ -1533,7 +1542,7 @@ static uint32_t stix_det_replay_fallback_ebin(StixDetState *d,
 static bool stix_det_classify_wanted(const StixDetState *d)
 {
     return d->align || d->source == STIX_DET_SOURCE_REPLAY_DSS ||
-           stix_det_adc_mode_on(d);
+           stix_det_adc_mode_on(d) || stix_det_spec_active(d);
 }
 
 /*
@@ -1562,6 +1571,61 @@ static uint32_t stix_det_cal_ebin(uint32_t base, uint32_t adc)
     int64_t ebin = diff * (int64_t)STIX_DET_N_EBIN / w;
 
     return (uint32_t)MAX(0, MIN(ebin, (int64_t)STIX_DET_N_EBIN - 1));
+}
+
+/*
+ * The ebin the loaded ELUT gives one (fpga_det, pix, adc) — the one
+ * lookup of the replay tick and the S2 spectrum build: a honoured row's
+ * val (32 = unassigned -> -1, the FPGA drops it); a degenerate row's
+ * D-7 linear fallback (adc at or below the baseline -> -1). The row
+ * state is the last classification's (replay_row_fallback).
+ */
+static int stix_det_adc_ebin(StixDetState *d, uint32_t fpga_det,
+                             uint32_t pix, uint32_t adc)
+{
+    uint32_t ebin;
+
+    if (d->replay_row_fallback[fpga_det][pix]) {
+        if (adc <= d->replay_base_dss_det[fpga_det]) {
+            return -1;
+        }
+        return stix_det_replay_fallback_ebin(d, fpga_det, adc);
+    }
+    ebin = stix_det_replay_elut_ebin(d, fpga_det, pix, adc);
+    return ebin < STIX_DET_N_EBIN ? (int)ebin : -1;
+}
+
+/* the D5 gain of one fpga_det: (4096 - base) / K, adc per keV */
+static double stix_det_kev_gain(const StixDetState *d, uint32_t fpga_det)
+{
+    return (double)(STIX_DET_N_ADC - stix_det_cal_base(d, fpga_det)) /
+           d->adc_kev_full;
+}
+
+/*
+ * D5: the adc of @kev on one fpga_det, base + floor(gain * kev + 0.5)
+ * (half up; never rint's half-even); -1 when it is past 4095 (an ADC
+ * overflow: the caller drops the mass). K is read now, at the build.
+ */
+static int stix_det_kev_adc(const StixDetState *d, uint32_t fpga_det,
+                            double kev)
+{
+    double adc = stix_det_cal_base(d, fpga_det) +
+                 floor(stix_det_kev_gain(d, fpga_det) * kev + 0.5);
+
+    return adc > STIX_DET_N_ADC - 1 ? -1 : (int)adc;
+}
+
+/*
+ * D5: the science ebin of @kev, floor(32 * kev / K); -1 when kev >= K
+ * (an ADC overflow, decision Q7: dropped, never clamped to ebin 31)
+ */
+static int stix_det_kev_ebin(const StixDetState *d, double kev)
+{
+    if (kev >= d->adc_kev_full) {
+        return -1;
+    }
+    return (int)floor(STIX_DET_N_EBIN * kev / d->adc_kev_full);
 }
 
 /*
@@ -1680,6 +1744,203 @@ int stix_det_align_adc(StixDetState *d, uint32_t fpga_det, uint32_t pix,
         run_len = 0;
     }
     return best_len ? (int)best_mid : -1;
+}
+
+/*
+ * ---- S2: the per-spec bin-mass row ----
+ *
+ * spec_row[fpga_det][pix][ebin] is the fraction of the running step's
+ * counts the loaded ELUT puts in each ebin (destination space; the
+ * row's drops — unassigned, at or below the baseline, ADC overflow,
+ * a preimage miss — are missing mass). Built from the SRAM ram pointer
+ * inside the tick only (step start, QL swap), under the tick's
+ * mem_reentrancy_guard; never from QMP.
+ */
+
+/* a playing tape whose running step has a non-flat spec */
+static bool stix_det_spec_active(const StixDetState *d)
+{
+    return d->tape_state == STIX_DET_TAPE_PLAYING && d->tape_n_steps &&
+           d->tape_steps[d->tape_step].kind == STIX_DET_TAPE_RATE &&
+           d->tape_steps[d->tape_step].spec.kind != STIX_DET_SPEC_FLAT;
+}
+
+/* one adc point of weight @w into the row (a dropped adc is lost mass) */
+static void stix_det_spec_put_adc(StixDetState *d, uint32_t fpga_det,
+                                  uint32_t pix, int adc, double w,
+                                  double *row)
+{
+    int ebin = adc < 0 ? -1 : stix_det_adc_ebin(d, fpga_det, pix, adc);
+
+    if (ebin >= 0) {
+        row[ebin] += w;
+    }
+}
+
+/*
+ * One pair's row, unnormalized (the caller divides by the spec's total
+ * weight). Align (keV specs on a honoured row): the keV mass goes to
+ * ebins by the D5 law, then each ebin with mass lands at the ELUT bin
+ * of its preimage adc (stix_det_align_adc, = that ebin); no preimage is
+ * a miss (dropped, counted per (pair, ebin)). On a degenerate row align
+ * is a no-op (the fallback is the calibration grid).
+ */
+static void stix_det_spec_pair(StixDetState *d, const StixDetSpec *sp,
+                               uint32_t fpga_det, uint32_t pix, double *row)
+{
+    bool kev = sp->kind == STIX_DET_SPEC_LINE_KEV ||
+               sp->kind == STIX_DET_SPEC_FLAT_KEV ||
+               sp->kind == STIX_DET_SPEC_FILE_KEV;
+    uint32_t i;
+
+    if (kev && sp->align && !d->replay_row_fallback[fpga_det][pix]) {
+        double kmass[STIX_DET_N_EBIN] = { 0 };
+        double k_bin = (double)d->adc_kev_full / STIX_DET_N_EBIN;
+        uint32_t e;
+        int eb;
+
+        switch (sp->kind) {
+        case STIX_DET_SPEC_LINE_KEV:
+            eb = stix_det_kev_ebin(d, sp->v0);
+            if (eb >= 0) {
+                kmass[eb] += 1.0;
+            }
+            break;
+        case STIX_DET_SPEC_FLAT_KEV:
+            for (e = 0; e < STIX_DET_N_EBIN; e++) {
+                double lo = MAX(sp->v0, e * k_bin);
+                double hi = MIN(sp->v1, (e + 1) * k_bin);
+
+                if (hi > lo) {
+                    kmass[e] += hi - lo;
+                }
+            }
+            break;
+        default:        /* a kev,weight file */
+            for (i = 0; i < sp->n_pts; i++) {
+                eb = stix_det_kev_ebin(d, sp->pts[i].value);
+                if (eb >= 0) {
+                    kmass[eb] += sp->pts[i].weight;
+                }
+            }
+            break;
+        }
+        for (e = 0; e < STIX_DET_N_EBIN; e++) {
+            int adc;
+
+            if (kmass[e] <= 0) {
+                continue;
+            }
+            adc = stix_det_align_adc(d, fpga_det, pix, e);
+            if (adc < 0) {
+                d->spec_preimage_miss++;
+                continue;
+            }
+            stix_det_spec_put_adc(d, fpga_det, pix, adc, kmass[e], row);
+        }
+        return;
+    }
+    switch (sp->kind) {
+    case STIX_DET_SPEC_LINE_ADC:
+        stix_det_spec_put_adc(d, fpga_det, pix, (int)sp->v0, 1.0, row);
+        break;
+    case STIX_DET_SPEC_LINE_KEV:
+        stix_det_spec_put_adc(d, fpga_det, pix,
+                              stix_det_kev_adc(d, fpga_det, sp->v0), 1.0,
+                              row);
+        break;
+    case STIX_DET_SPEC_FLAT_KEV: {
+        /* adc a weighted by the overlap of [a, a+1) with the band */
+        double base = stix_det_cal_base(d, fpga_det);
+        double gain = stix_det_kev_gain(d, fpga_det);
+        double lo = base + gain * sp->v0, hi = base + gain * sp->v1;
+        uint32_t a, a_end = (uint32_t)MIN(ceil(hi), (double)STIX_DET_N_ADC);
+
+        for (a = (uint32_t)floor(lo); a < a_end; a++) {
+            double w = MIN(a + 1.0, hi) - MAX((double)a, lo);
+
+            if (w > 0) {
+                stix_det_spec_put_adc(d, fpga_det, pix, a, w / gain, row);
+            }
+        }
+        break;
+    }
+    case STIX_DET_SPEC_FILE_ADC:
+        for (i = 0; i < sp->n_pts; i++) {
+            stix_det_spec_put_adc(d, fpga_det, pix, (int)sp->pts[i].value,
+                                  sp->pts[i].weight, row);
+        }
+        break;
+    case STIX_DET_SPEC_FILE_KEV:
+        for (i = 0; i < sp->n_pts; i++) {
+            stix_det_spec_put_adc(d, fpga_det, pix,
+                                  stix_det_kev_adc(d, fpga_det,
+                                                   sp->pts[i].value),
+                                  sp->pts[i].weight, row);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+/* the spec's total weight: what the row is normalized by */
+static double stix_det_spec_total(const StixDetSpec *sp)
+{
+    double total = 0;
+    uint32_t i;
+
+    switch (sp->kind) {
+    case STIX_DET_SPEC_FLAT_KEV:
+        return sp->v1 - sp->v0;     /* keV (the adc path divides by gain) */
+    case STIX_DET_SPEC_FILE_ADC:
+    case STIX_DET_SPEC_FILE_KEV:
+        for (i = 0; i < sp->n_pts; i++) {
+            total += sp->pts[i].weight;
+        }
+        return total;
+    default:
+        return 1.0;
+    }
+}
+
+/*
+ * Build spec_row for the running spectrum step: one pass over the
+ * pairs of its fpga_det/pix masks (0 outside them). Called at the
+ * step start (after a classification) and at each QL swap while the
+ * step runs (after the classification, before materialize: the
+ * rebuild acts on the next period's ticks, so the bank closed by the
+ * first swap after an ELUT rewrite still shows the old binning — the
+ * replay's bank-1 precedent). Resets the preimage_miss gauge first, and
+ * traces stixdet_spectrum.
+ */
+static void stix_det_spec_build(StixDetState *d)
+{
+    const StixDetTapeStep *st = &d->tape_steps[d->tape_step];
+    const StixDetSpec *sp = &st->spec;
+    double total = stix_det_spec_total(sp);
+    uint32_t fpga_det, pix, ebin;
+
+    memset(d->spec_row, 0, sizeof(d->spec_row));
+    d->spec_preimage_miss = 0;
+    for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
+        if (!((st->fpga_det_mask >> fpga_det) & 1)) {
+            continue;
+        }
+        for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+            double *row = d->spec_row[fpga_det][pix];
+
+            if (!((st->pix_mask >> pix) & 1)) {
+                continue;
+            }
+            stix_det_spec_pair(d, sp, fpga_det, pix, row);
+            for (ebin = 0; ebin < STIX_DET_N_EBIN; ebin++) {
+                row[ebin] /= total;
+            }
+        }
+    }
+    trace_stixdet_spectrum(d->tape_step, stix_det_spec_desc(sp),
+                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 /*
@@ -1897,7 +2158,7 @@ static void stix_det_replay_tick(StixDetState *d)
     while (d->replay_cursor < d->replay_n_ev &&
            d->replay_ev[d->replay_cursor].t_tick <= d->replay_time_tick) {
         const StixDetReplayEvent *e = &d->replay_ev[d->replay_cursor];
-        uint32_t ebin;
+        int ebin;
 
         d->replay_cursor++;
         d->replay_events_done++;
@@ -1906,17 +2167,9 @@ static void stix_det_replay_tick(StixDetState *d)
             d->replay_dropped++;
             continue;
         }
-        if (d->replay_row_fallback[e->fpga_det][e->pix]) {
-            if (e->adc <= d->replay_base_dss_det[e->fpga_det]) {
-                continue;       /* at or below the baseline: no bin */
-            }
-            ebin = stix_det_replay_fallback_ebin(d, e->fpga_det, e->adc);
-        } else {
-            ebin = stix_det_replay_elut_ebin(d, e->fpga_det, e->pix,
-                                             e->adc);
-            if (ebin >= STIX_DET_N_EBIN) {
-                continue;       /* 32 = unassigned: the FPGA drops it */
-            }
+        ebin = stix_det_adc_ebin(d, e->fpga_det, e->pix, e->adc);
+        if (ebin < 0) {
+            continue;   /* unassigned, or at or below the baseline */
         }
         stix_det_add_counts(d, e->fpga_det, e->pix, ebin, 1);
     }
@@ -2484,9 +2737,16 @@ static void stix_det_tape_apply_step(StixDetState *d, uint32_t idx)
 
     d->tape_step = idx;
     d->tape_left_ticks = stix_det_tape_step_ticks(st->for_s);
+    /* S2: the preimage_miss gauge belongs to the running step */
+    d->spec_preimage_miss = 0;
     trace_stixdet_tape_step(idx, stix_det_tape_kind_name[st->kind],
                             st->label ? st->label : "",
                             qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (stix_det_spec_active(d)) {
+        /* fresh row states, then the row (in the tick, under its guard) */
+        stix_det_replay_classify(d);
+        stix_det_spec_build(d);
+    }
     if (st->kind != STIX_DET_TAPE_REPLAY) {
         return;
     }

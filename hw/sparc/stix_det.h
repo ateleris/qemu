@@ -393,6 +393,22 @@ typedef struct StixDetState {
      * step start and at each build (det-align-status preimage_miss).
      */
     uint32_t spec_preimage_miss;
+    /*
+     * S2: the running spectrum step's per-pair bin-mass row (built at
+     * the step start and at each QL swap; 0 outside the step's masks)
+     * and the destination-ebin exposure it feeds, per QL period
+     * (spec_expo) and per nominal integration (nom_spec_expo, SUMDMASK
+     * fpga_det only). The *_any flags say a bank holds spectrum
+     * exposure (the draw's extra Poisson pass runs only then).
+     */
+    double spec_row[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
+                   [STIX_DET_N_EBIN];
+    double spec_expo[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
+                    [STIX_DET_N_EBIN];
+    double nom_spec_expo[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
+                        [STIX_DET_N_EBIN];
+    bool spec_expo_any;
+    bool nom_spec_expo_any;
 } StixDetState;
 
 bool stix_det_realize(StixDetState *d, STIXCTRL *owner, stixCtrlRegs_s *reg,
