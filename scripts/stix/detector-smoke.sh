@@ -395,18 +395,16 @@ fi
 # T6: the gate's mix tape, loaded and played at @75 (two QMP groups;
 # see the header). The negative plays only the off step, so the flush
 # is the D-3 zero one and only the tape check fails.
-TAPE_STEPS_RATE="$(printf '%s' \
-    '{"kind": "rate", "for_s": 60, "cps": 2000, "label": "flare Q1+Q3",'
-    ' "fpga_det_mask": 16711935}')"
-TAPE_STEPS_OFF="$(printf '%s' \
-    '{"kind": "off", "for_s": 30, "label": "off",'
-    ' "fpga_det_mask": 4294967295}')"
+# (TAPE is the --tape flag; the JSON is TAPE_JSON)
+TAPE_STEPS_RATE='{"kind": "rate", "for_s": 60, "cps": 2000, "label":'
+TAPE_STEPS_RATE+=' "flare Q1+Q3", "fpga_det_mask": 16711935}'
+TAPE_STEPS_OFF='{"kind": "off", "for_s": 30, "label": "off",'
+TAPE_STEPS_OFF+=' "fpga_det_mask": 4294967295}'
 TAPE_STEPS="$TAPE_STEPS_RATE, $TAPE_STEPS_OFF"
 [ "$NEGATIVE" -eq 0 ] || TAPE_STEPS="$TAPE_STEPS_OFF"
-TAPE="$(printf '%s' \
-    '{"api": 1, "name": "gate-det-tape", "loop": false,'
-    ' "background": {"cps": 20}, "steps": ['"$TAPE_STEPS"']}')"
-TAPE_ESC="$(printf '%s' "$TAPE" | sed 's/"/\\"/g')"
+TAPE_JSON='{"api": 1, "name": "gate-det-tape", "loop": false,'
+TAPE_JSON+=' "background": {"cps": 20}, "steps": ['"$TAPE_STEPS"']}'
+TAPE_ESC="$(printf '%s' "$TAPE_JSON" | sed 's/"/\\"/g')"
 TAPE_ARGS=()
 if [ "$TAPE" -eq 1 ]; then
     TAPE_ARGS=(
