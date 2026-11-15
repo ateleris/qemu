@@ -164,13 +164,21 @@ unchanged (every new field defaults off/absent; nothing new at boot);
   negative-only `spectrum-arrival` (it arrived at the predicted
   unaligned ebin) pass. Every qtest "exactly 0" assertion is paired
   with an arrival assertion elsewhere.
-- **Lesson 4 (the quiet template).** The spectrum gate and the spectrum
-  qtests silence the template: `det-quiet-cps=0` and tape background
-  `cps 0`; unmasked subcols are then asserted exactly zero.
+- **Lesson 4 (the quiet template).** The spectrum qtests silence the
+  template (`det-quiet-cps=0`, tape background `cps 0`), so their
+  "exactly 0" cells are exact. The gate keeps `det-quiet-cps=0` but
+  plays a 20 cps background (as the `--tape` gate): `--expect-tape-flush`
+  needs SSID 31 (BG detector `fpga_det` 10, LTRG grp 4 = `fpga_det`
+  8/9) and SSID 33 (energy mask ebin 17-30, 0x7FFE0000) non-zero, which
+  ebin-12/21 lines on Q1/Q3 alone never light. The background is
+  accounted explicitly: its floor at ebin 12 or 21 is
+  0.475 × 20 cps × ≤ 32 s × 0.15/19 ≈ 2.4 counts per subcol sample
+  (lines at ebin 18/27 ≈ 140/60), against ≈ 11 000 in a masked line.
 - **Lesson 5 (pixels, relative thresholds).** With the FSW only pix 0,
   3, 6, 7, 8 count (0.475 of the configured cps). Gate checks are per
   `subcol` sample sums and relative (the peak ebin ≥ 8 compressed steps
-  above every other ebin of the same sample; unmasked exactly zero),
+  above every other ebin of the same sample; unmasked samples below the
+  background floor at the checked ebins),
   never absolute from cps × time, and never assume 12 pixels; step
   `pix_mask` stays 0xFFF in the gate. qtests run with all 12 pix open
   (`idefx_power_all`) and say so; their ±5σ Poisson bounds are
@@ -190,7 +198,7 @@ unchanged (every new field defaults off/absent; nothing new at boot);
    row"). (iii) Accumulate in source (adc) space and fold at the draw
    with a row rebuilt before `materialize` (C1-like pickup): needs a
    per-step exposure flush whenever a step changes mid-period;
-   rejected for complexity (open question 5).
+   rejected for complexity (decision Q5).
 2. **ELUT pickup.** With (ii) the row is the ELUT as read at the step
    start and at each QL swap; a mid-period TC(237,8) rewrite reaches
    the bank after the next swap — the bank closed by the first swap
@@ -203,7 +211,7 @@ unchanged (every new field defaults off/absent; nothing new at boot);
    flash (degenerate rows → fallback = calibration), `align` is a
    no-op, so an `align`-off negative cannot fail. The gate therefore
    uploads C3's deliberately wrong base-0 ELUT while the calibration
-   baselines are `1800 + 10·d` (open question 2).
+   baselines are `1800 + 10·d` (decision Q2; deviation D-b).
 
 ## Review focus (five input classes, each pinned to a test)
 
@@ -278,8 +286,15 @@ unchanged (every new field defaults off/absent; nothing new at boot);
                                       Error **errp);
   static void stix_det_spec_free(StixDetSpec *sp);
   ```
-  called from `stix_det_tape_parse_step` in place of today's refusal;
-  `stix_det_spec_free` from `stix_det_tape_clear` and from the load
+  called from `stix_det_tape_parse_step` in place of today's refusal,
+  as its LAST parse (after the unknown-field check, `:2775`), so no
+  later refusal can leave a loaded spec behind; `stix_det_tape_parse_step`
+  also frees `st->spec` on every one of its own error returns (belt and
+  braces) and gains the tape-level default:
+  `static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
+  bool tape_align, StixDetTapeStep *st, uint32_t idx, Error **errp)`
+  (the tape's `align` is parsed first, `:2853`, and passed in).
+  `stix_det_spec_free` runs from `stix_det_tape_clear` and from the load
   setter's error unwind (which today frees only labels, `:2909-2911`).
 - `known[]` gains `"align"`. The `single` refusal text becomes
   "kind \"single\" is unsupported in this build (S3)".
@@ -290,26 +305,36 @@ unchanged (every new field defaults off/absent; nothing new at boot);
   |---|---|
   | `spec` | absent or `"flat"` (any kind, as S1), or an object with exactly one key of `line_adc`, `line_kev`, `flat_kev`, `file`; a non-flat spec only on kind `rate` |
   | `line_adc` | JSON integer 0..4095 (`1600.0` refused, as `qnum_get_try_int`) |
-  | `line_kev` | JSON number, `0 <= v < K` (K = `det-cal-kev-full` at load) |
-  | `flat_kev` | array of exactly two numbers, `0 <= k1 < k2 <= K` |
-  | `file` | string 1..4095 bytes; read at load (below) |
+  | `line_kev` | JSON number, finite, `v >= 0` (no K bound at load, decision Q7) |
+  | `flat_kev` | array of exactly two finite numbers, `0 <= k1 < k2` (no K bound at load) |
+  | `file` | string 1..4095 bytes, no comma (the `desc`/status text must stay one comma-free field); read at load (below) |
   | step `align` | optional bool, default = the tape's `align`; an explicit `true` only on `line_kev`, `flat_kev` or a `kev,weight` file ("align applies to keV specs"); the tape-level default is ignored for adc and flat specs |
   | CSV size | ≤ 256 KiB (`STIX_DET_SPEC_MAX_FILE`), checked before reading |
   | CSV header | the first line exactly `adc,weight` or `kev,weight` |
   | CSV rows | 1..4096 lines `value,weight`; no spaces; an optional `\r` before `\n`; the final newline optional; no blank or comment lines |
   | numbers | `[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?`, finite (no sign, no `inf`/`nan`, no `0x`, no `_`) |
   | adc value | `[0-9]+`, 0..4095 |
-  | keV value | a number, `< K` |
+  | keV value | a number (no K bound at load) |
   | weights | numbers ≥ 0, sum > 0; repeated values are summed |
 
   The file is read once at load into `pts`; a later change or deletion
   of the file does not affect the loaded tape. Relative paths resolve
   against QEMU's working directory (the platform always passes absolute
   paths, U3).
-- `desc` (the trace and hw-state text, no comma): `flat`,
-  `line_adc=1600`, `line_kev=62`, `line_kev=62 align`,
-  `flat_kev=40..60 align`, `file=<basename> unit=adc rows=2` (keV
-  printed with `%g`; `align` appended when effective).
+- **keV and K (decision Q7).** K (`det-cal-kev-full`) is settable at
+  any time (`stix_det.c:3076-3095`), so it is read when the step's row
+  is built, not at load. Mass at keV ≥ K is dropped as an ADC overflow
+  on both paths (unaligned: `stix_det_kev_adc` past 4095; aligned: no
+  ebin — never clamped to ebin 31), like the other drops of the row
+  (unassigned 32, at or below the baseline): it is not counted in
+  `preimage_miss`, it shows as missing mass. The platform warns at save
+  when a keV value is ≥ the current K (advice, not a refusal).
+- `desc` (the trace and hw-state text, no comma — the file path is
+  comma-free by the rule above): `flat`, `line_adc=1600`, `line_kev=62`,
+  `line_kev=62 align`, `flat_kev=40..60 align`,
+  `file=<basename> unit=adc rows=2` (keV printed with `%g`; `align`
+  appended when effective; `rows` = the file's data lines, before
+  repeated values are summed).
 - `det-align-status` gains a trailing `,preimage_miss=N` (the outline's
   fixed field; defined in U2; 0 until a build counts). hw-state
   `det.align` gains `preimage_miss`; `det.tape` gains `spec` (the
@@ -327,20 +352,22 @@ Steps:
   - spec: `{"line": 1}`; `{"line_adc": 1600, "line_kev": 62}`; `{}`;
     `"line"`; `[1]`; a `line_adc` spec on an `off` step;
   - `line_adc`: 4096, −1, 1600.0, `"1600"`;
-  - `line_kev`: −1, 160 (= K), `"62"`; after `det-cal-kev-full=100`,
-    120;
-  - `flat_kev`: `[60, 40]`, `[40]`, `[40, 161]`, `[-1, 5]`;
+  - `line_kev`: −1, `"62"`;
+  - `flat_kev`: `[60, 40]`, `[40]`, `[-1, 5]`;
   - `align`: `"yes"`; `true` with `line_adc`; `true` with an
-    `adc,weight` file; `true` with `"flat"`;
+    `adc,weight` file (model only: `tapes.validate` cannot see the
+    unit — U3 tests it at resolve); `true` with `"flat"`;
   - file: `""`; a missing path (the error names it); a 262145-byte
     file; header `energy,weight`; a first line `1600,1`; header only
     (0 rows); 4097 rows; `1600,1,2`; `1600, 1`; `1600,nan`;
     `1600,inf`; `1600,1e999`; `0x10,1`; `+5,1`; `1600,-1`; all
-    weights 0; `4096,1` (adc file); `160,1` (kev file, K 160); a blank
-    line between rows.
+    weights 0; `4096,1` (adc file); a blank line between rows; a path
+    holding a comma.
   Accepted (each loads, `state=ready`): `"flat"`; `{"line_adc": 0}`;
   `{"line_adc": 4095}`; `{"line_kev": 0}`; `{"line_kev": 159.9}`;
-  `{"flat_kev": [0, 160]}`; a CRLF `kev,weight` file; a file without a
+  `{"line_kev": 170}` and `{"flat_kev": [40, 161]}` (keV ≥ K loads,
+  Q7; U2 pins the drop); `{"flat_kev": [0, 160]}`; a `kev,weight` file
+  with `160,1` (K 160); a CRLF `kev,weight` file; a file without a
   final newline; a step `align: true` on `line_kev` with tape `align`
   false; tape `align: true` with a `line_adc` step (ignored there).
 - [ ] Update `det-tape-props`: its "S2 spec" case
@@ -362,7 +389,15 @@ Steps:
 **Verification:** `scripts/stix/qt.sh all` — all ok; `det-spec-props`
 RED on the parent binary.
 
-## Task U2: the per-spec row, the sky path, the draw (model)
+## Task U2 (U2a + U2b): the per-spec row, the sky path, the draw (model)
+
+U2a = the shared adc → ebin helper (the replay-tick refactor), the keV
+helpers, `stix_det_spec_build`, the classification hook and the
+`preimage_miss` gauge; its own commit, pinned by the unchanged
+`det-replay-*` tests plus the `det-align-status` read of
+`det-spec-line` step 3 (status only; the banks come with U2b). U2b =
+the sky tick, the draw, the expo clears and the qtests below; RED on
+the U2a binary.
 
 **Files:** modify `hw/sparc/stix_det.c`, `hw/sparc/stix_det.h`,
 `tests/qtest/stix.c`.
@@ -382,8 +417,9 @@ RED on the parent binary.
    * -1 when the result is past 4095 (an ADC overflow: dropped) */
   static int stix_det_kev_adc(const StixDetState *d, uint32_t fpga_det,
                               double kev);
-  /* D5: floor(32 * kev / K), clamped to 0..31 */
-  static uint32_t stix_det_kev_ebin(const StixDetState *d, double kev);
+  /* D5: floor(32 * kev / K); -1 when kev >= K (ADC overflow:
+   * dropped, decision Q7 — never clamped to ebin 31) */
+  static int stix_det_kev_ebin(const StixDetState *d, double kev);
   static bool stix_det_spec_active(const StixDetState *d);
   static void stix_det_spec_build(StixDetState *d);
   ```
@@ -411,11 +447,14 @@ RED on the parent binary.
     preimage miss: that mass is dropped and `spec_preimage_miss`
     counts one per (pair, ebin). On a degenerate row align is a no-op
     (the fallback is the calibration grid): the align-off path runs.
-  - `spec_preimage_miss` is a gauge: reset at each build, so
-    `det-align-status` reports the running step's last build (0 for
-    a step without an aligned spec).
-  - Built at the step start (`stix_det_tape_apply_step`: classify
-    first, then build) and at the start of `stix_det_ql_swap` while a
+  - `spec_preimage_miss` is a gauge: reset at EVERY step start (any
+    kind, so a flat or off step after an aligned one reads 0) and at
+    each build, so `det-align-status` reports the running step's last
+    build.
+  - Built at the start of a spectrum step only (`stix_det_tape_apply_step`:
+    for a non-flat spec classify first, then build; other steps neither
+    classify nor build, so they emit no `stixdet_align` and do not
+    rebuild the C1 map mid-period) and at the start of `stix_det_ql_swap` while a
     spectrum step runs (after the classification, before
     `materialize`; the rebuild affects the next period's ticks only —
     approach 2). Each build traces `stixdet_spectrum(step, desc,
@@ -438,7 +477,11 @@ RED on the parent binary.
   `n_spec = stix_det_poisson(d, spec[fpga_det][pix][ebin])`,
   `cell[ebin] += n_spec`, counted in `pair_total` (LTRG 1.25× as for
   the sky). The expo-clear helpers clear the spectrum exposure and its
-  flag. With `spec_any` false the loop is unchanged.
+  flag. With `spec_any` false the loop is unchanged. Note:
+  `stix_det_poisson(d, 0)` consumes no RNG (`stix_det.c:1081`), so the
+  `*_any` flags are a fast path (no 12 288 extra calls per bank), not
+  what makes the default path bit-identical — a zero lambda already
+  is.
 
 Steps (all qtests: QlIntTime 9 → 1 s periods, `det-quiet-cps=0`,
 tape background `cps 0`, `idefx_power_all` (all 12 pix open), play on
@@ -459,12 +502,20 @@ to all 12 pix: `fpga_det` 0 the wrong row `adc/128`
   | 1 | `line_adc 1600` | ebin 12 ≈ 12000, rest 0 | total 0 (1600 ≤ base) | ebin 13 ≈ 12000 |
   | 2 | `line_kev 62` | ebin 21 ≈ 12000 (adc 2690) | ebin 12 ≈ 12000 | ebin 21 ≈ 12000 |
   | 3 | `line_kev 62`, step `align: true` | ebin 12 ≈ 12000 (preimage 1600) | ebin 12 ≈ 12000 | total 0 (miss) |
-  | 4 | `flat_kev [40, 60]`, `align: true` | ebins 8..11 each ≈ 3000, rest 0 | ebins 8..11 each ≈ 3000 | ebins 8..11 each ≈ 3000 |
-  | 5 | `off` | all 0 | all 0 | all 0 |
+  | 4 | `flat_kev [40, 60]`, `align: true` | ebins 8..11 each ≈ 3000, rest 0 | ebins 8, 9, 10 ≈ 3010.5 each, ebin 11 ≈ 2968.6 (align no-op: adc spans 2374-2445 / 2446-2517 / 2518-2589 / 2590-2660 = 72/72/72/71 of 287) | ebins 8..11 each ≈ 3000 |
+  | 5 | `line_kev 170` (≥ K 160), align off | total 0 (adc past 4095) | total 0 | total 0 |
+  | 6 | `line_kev 170`, `align: true` | total 0 (no ebin, not clamped to 31) | total 0 | total 0 |
+  | 7 | `flat_kev [150, 170]`, `align: true` | ebins 30, 31 each ≈ 3000 (the half below K), rest 0 | — (not asserted) | ebins 30, 31 each ≈ 3000 |
+  | 8 | `off` | all 0 | all 0 | all 0 |
+
+  Steps 5-6 load although keV ≥ K (Q7) and drop the mass on both paths;
+  `preimage_miss` reads 0 during them (an overflow is not a miss).
+  Step 7 = half the 12000 kept: [150, 160) over ebins 30 and 31 by the
+  D5 law (`32·150/160 = 30`), [160, 170) dropped.
 
   `det-align-status` read during step 3 ends `preimage_miss=12` (12
-  pix of `fpga_det` 2) and starts `mode=off`; during step 2 and step 4
-  `preimage_miss=0`. A `-trace stixdet_spectrum -D` log holds
+  pix of `fpga_det` 2) and starts `mode=off`; during step 2, step 4
+  and the `off` step 8 (reset at every step start) `preimage_miss=0`. A `-trace stixdet_spectrum -D` log holds
   `line_adc=1600`, `line_kev=62` (without ` align`), `line_kev=62
   align` and `flat_kev=40..60 align` (`det7_count_str` ≥ 1 each). A
   second run of step 1 alone with the tape's `"adc_mode": true`:
@@ -478,7 +529,12 @@ to all 12 pix: `fpga_det` 0 the wrong row `adc/128`
   `kev,weight` / `62,1` / `121,1` with step `align: true` → ebins 12
   and 24 each ≈ 6000; (c) `adc,weight` / `1600,1` / `1600,1` /
   `2200,2` (repeats summed) → ebins 12 and 17 each ≈ 6000. The trace
-  holds `file=<basename> unit=adc rows=2`.
+  holds `file=<basename> unit=adc rows=2` for (a) and `rows=3` for (c)
+  (data lines, not unique points); (d) after load, `det-cal-kev-full`
+  set to 100, a `kev,weight` / `62,1` / `121,1` file unaligned on the
+  degenerate `fpga_det` 1 → 62 keV at adc `1800 + floor(22.96·62 +
+  0.5) = 3224`, ebin 19 ≈ 6000; the 121 keV half (adc 4578) dropped
+  (K is read at build, Q7).
 - [ ] qtest `det-spec-flat-ident`: same seed, three runs of three 1 s
   periods: A a rate step with no `spec`, B the same with
   `"spec": "flat"` → banks 1-3 bit-identical (A = B); C = A's step
@@ -502,8 +558,8 @@ to all 12 pix: `fpga_det` 0 the wrong row `adc/128`
   `det-adc-off`, `det-adc-wrong`, `det-replay-elut` unchanged.
 - [ ] Commit.
 
-**Verification:** `scripts/stix/qt.sh all`; each new test RED on the
-U1 binary (spectrum steps load but put nothing anywhere); `git grep -c
+**Verification:** `scripts/stix/qt.sh all`; each U2b test RED on the
+U2a binary (rows are built but nothing reaches the banks); `git grep -c
 stixdet_spectrum hw/sparc/trace-events` = 1.
 
 ## Task U3: the platform — validator of record, spectra dir, play, leaves
@@ -526,8 +582,11 @@ stixdet_spectrum hw/sparc/trace-events` = 1.
   ```
   `_step` implements U1's rule table exactly (same messages' key words:
   "align applies to keV specs", "is not an integer", the step index).
-  At save, keV bounds use `KEV_FULL_MAX` (the model's K is not known
-  offline); `resolve` re-checks with the live K.
+  keV values are refused only when negative or non-finite (Q7); at
+  save and at play, a keV ≥ the current K (the leaf, 160 when absent)
+  adds a warning, never a refusal. `resolve` refuses an explicit step
+  `align: true` on an `adc,weight` file (the unit is known only once
+  the CSV is read).
 - Platform file rule (a stricter subset of the model's): a saved
   tape's `spec.file` is a bare name `<NAME_RE>.csv` in
   `spectra_dir(cfg)` (no `/`, checked before any file access). The
@@ -546,10 +605,13 @@ stixdet_spectrum hw/sparc/trace-events` = 1.
 
 Steps:
 
-- [ ] Self-test `tapes_spec`: U1's vector list (the JSON ones) through
+- [ ] Self-test `tapes_spec`: U1's vector list (the JSON ones, except
+  "align true with an `adc,weight` file", which needs the CSV) through
   `tapes.validate` — each rejected vector a 400 naming the step index,
-  each accepted vector validates; replace the "S2/S3 shapes parse" case
-  (`selftest.py:2810-2815`) with these.
+  each accepted vector validates; `line_kev 170` saves with a warning
+  in the verb result (`"warnings": ["step 0: line_kev 170 >= K 160 ..."]`,
+  additive) and no 400; a `file` with a comma → 400; replace the
+  "S2/S3 shapes parse" case (`selftest.py:2810-2815`) with these.
 - [ ] Self-test `tapes_spec_csv`: U1's file vectors through
   `parse_spectrum_csv` (same order, same verdicts), plus the accepted
   CRLF / no-final-newline / repeated-value files; `1e999` and `nan`
@@ -557,8 +619,10 @@ Steps:
 - [ ] Self-test `tapes_spec_play` (fake-QMP verb pattern): a tape
   referencing `s.csv` → the `det-tape-load` JSON carries
   `<spectra_dir>/s.csv` absolute; a missing `s.csv` → 400 and no QMP
-  call; `line_kev 150` with the leaf K = 100 → 400 before QMP;
-  `file: "../x.csv"` → 400 at save.
+  call; `line_kev 150` with the leaf K = 100 → played, with a warning;
+  `align: true` on a step whose `s.csv` is `adc,weight` → 400 before
+  QMP (the vector moved here from `tapes_spec`); `file: "../x.csv"` →
+  400 at save.
 - [ ] Self-test `align_leaves`: a fake hw-state with
   `det.align.preimage_miss` 3 and `det.tape.spec "line_adc=1600"` →
   both leaves; `det.align.set` returns `preimage_miss` 3; the
@@ -614,17 +678,23 @@ Steps:
     same sample. Prints each listed sample's 32 bytes, its argmax and
     top two bytes. `def check_ssid32_peak(products, want, margin=8,
     out=None)`.
-  - `--ssid32-line SUBCOLS [MARGIN]`: every listed sample has one
-    dominant ebin (its top byte ≥ MARGIN steps above its second), every
-    other sample is all-zero over ebins 0..31. Prints the same.
-    `def check_ssid32_line(products, masked, margin=8, out=None)`.
+  - `--ssid32-line SUBCOLS EBINS [MARGIN]`: every listed sample has one
+    dominant ebin (its top byte ≥ MARGIN steps above its second); every
+    other sample's bytes at EBINS (comma list) stay below 0x10 (the
+    background floor, the `--ssid32-subcols` bound) and are not its
+    argmax. Prints the same.
+    `def check_ssid32_line(products, masked, ebins, margin=8, out=None)`.
 - `detector-smoke.sh --spectrum [--negative]` (combines with neither
   `--flare`, `--tape` nor `--no-rotb`; run-dir suffix `-spec` /
   `-specneg`; verdict tag `DETECTOR-SMOKE (spectrum)` /
   `DETECTOR-SMOKE (spectrum negative)`). Copies from `align-smoke.sh`
   (with a "keep in step with align-smoke.sh" comment, no refactor of
   align-smoke): `write_adc_dssevs` (32 0xE words, base `1800 + 10·d`,
-  no events), the BASE0 JSON, `encode_args`, and the applied-UART rule
+  no events), the BASE0 JSON, `encode_args`, `qom_get` (detector-smoke
+  has only `qom_set`), the `align_status` probe-log grep
+  (`align-smoke.sh:462-466`, the last `det-align-status` return; it
+  needs `--qmp-cmd` returns logged, as align-smoke's probe args do),
+  and the applied-UART rule
   as a new check `uart-elut` (exactly 4 "problem erasing LUT type=3,"
   lines, none of align-smoke's forbidden LUT lines).
 
@@ -634,8 +704,9 @@ Steps:
   pattern): peak at ebin 12 with every other byte 0 → pass; peak 0x40
   with a neighbour 0x39 → fail (margin); peak at 21 asked at 12 →
   fail naming argmax 21; an all-zero listed sample → fail;
-  `--ssid32-line` with one unmasked sample holding a non-zero byte →
-  fail; a listed sample with two equal top bytes → fail.
+  `--ssid32-line` with one unmasked sample holding 0x12 at a checked
+  ebin → fail, the same sample with 0x30 at ebin 18 (its background
+  line) → pass; a listed sample with two equal top bytes → fail.
 - [ ] The `--spectrum` timeline (seconds from the TMTC connect; the
   default mode's times after @62 shift by 85 s):
   - QEMU: `-global grlib-stixctrl.det-replay-file=<run>/dssevs.spec`,
@@ -650,34 +721,41 @@ Steps:
     @64.. the upload, @155 NOMINAL (T_nom, its TM(5,1) within 10 s).
   - @160 QMP `det-tape-load` + `det-tape-play true`, the tape
     `{"api": 1, "name": "gate-det-spectrum", "align": false,
-    "background": {"cps": 0}, "steps": [`
+    "background": {"cps": 20}, "steps": [`
     `{"kind": "rate", "label": "kev Q1", "for_s": 12, "cps": 2000,
     "fpga_det_mask": 255, "spec": {"line_kev": 62}, "align": true},`
     `{"kind": "rate", "label": "adc Q3", "for_s": 12, "cps": 2000,
     "fpga_det_mask": 16711680, "spec": {"line_adc": 1600}},`
     `{"kind": "off", "for_s": 30, "fpga_det_mask": 4294967295}]}`;
     `--negative` drops step 0's `"align": true` (tape `align` false:
-    the override is what the positive exercises).
-  - @180 `qom-get det-align-status` (during step 1).
+    the override is what the positive exercises). The 20 cps background
+    fills every pair outside the running step's masks (the `off` step
+    silences it): it lights SSID 31 and 33 for the flush check, and a
+    masked subcol carries it only during the other step (≤ 12 s,
+    ≈ 1 count at ebin 12/21, ≈ 50 at ebin 18) — far below its line.
+  - @166 `qom-get det-align-status` (during step 0, the aligned keV
+    step: its `preimage_miss` is the one that means something — the
+    gauge resets at every step start) and @180 again (during step 1).
   - @300 CONF (T_exit) + the five-product flush within 15 s; hold to
     the default duration + 85 s.
 - [ ] Checks (each echoes what it decided on):
   - base: probe, UART (incl. `uart-elut`), `trace-verif`, `uart-chunk`,
     and the flush with `--expect-tape-flush (T_exit − T_nom)` in both
     legs; the D-5 chunk checks are skipped as in the tape modes.
-  - `spectrum-status`: the @180 return starts `mode=off` (lesson 2:
-    `det-align` is not set) and contains `fallback=0,honoured=384`,
-    `calibration=dss-linear` and `preimage_miss=0` (the base-0 row
-    has every ebin).
+  - `spectrum-status`: the @166 return (step 0) ends `preimage_miss=0`
+    (the base-0 row has every ebin; in the negative step 0 is unaligned,
+    so 0 too); the @180 return starts `mode=off` (lesson 2: `det-align`
+    is not set) and contains `fallback=0,honoured=384` and
+    `calibration=dss-linear`. Both returns are echoed.
   - `spectrum-trace`: `stixdet_spectrum` lines for `step 0: line_kev=62
     align` (negative: `step 0: line_kev=62` and no `align` on step 0)
     and `step 1: line_adc=1600`, both after the enabling
     `stixdet_fsm_strobe` in trace order.
   - `spectrum-line`: `--ssid32-line
-    0,1,5,6,4,10,11,12,30,31,25,26,21,27,19,20 8` (the 16 masked
+    0,1,5,6,4,10,11,12,30,31,25,26,21,27,19,20 12,21 8` (the 16 masked
     subcols = `SUBCOL_FROM_FPGA_DET[f]` for `f` 0-7, 16-23 have a line;
-    the other 16 are exactly zero — the template and background are
-    silenced, lesson 4).
+    the other 16 hold only the 20 cps background, below 0x10 at ebins
+    12 and 21 — ≈ 2.4 counts, lesson 4).
   - `spectrum-bin`: `--ssid32-peak
     0:12,1:12,5:12,6:12,4:12,10:12,11:12,12:12 8` — Q1's aligned keV
     line at ebin 12 (`floor(32·62/160) = 12`; preimage 1600 in the
@@ -689,35 +767,36 @@ Steps:
     0:21,1:21,5:21,6:21,4:21,10:21,11:21,12:21 8` — unaligned, `adc =
     b + floor((4096 − b)·62/160 + 0.5)` for `b = 1800 + 10·f`: 2690,
     2696, 2702, 2708, 2714, 2720, 2726, 2733 for `f` 0..7, all
-    `floor(adc/128) = 21`.
+    `floor(adc/128) = 21`. Masked subcols only: the unmasked samples
+    carry the background and are never arrival evidence.
   - Verdicts: positive PASS when nothing fails; `--negative` PASS only
     when the failed set is exactly `spectrum-bin` (so `spectrum-line`,
     `spectrum-adc`, `spectrum-status`, `spectrum-trace` and
     `spectrum-arrival` passed), with the line `DETECTOR-SMOKE (spectrum
     negative): PASS (failed exactly as planned: the unaligned keV line
     arrived at ebin 21, not 12; everything else passed)`.
-- [ ] Known first-run risks (investigate, do not re-run, lesson 6):
-  `--expect-tape-flush` wants a non-zero byte in SSID 30/31/32/33 —
-  with only ebins 12 and 21 lit, SSID 33 (the FSW's variance energy
-  mask) or SSID 31 could be zero by design; the gate logs
-  `ql.check.log` and the reviewer decides from the FSW's masks.
+- [ ] First-run record (lesson 6): the masked peak bytes and the
+  unmasked ebin-12/21 bytes are logged; the margin-8 rule assumes the
+  line/background ratio in a masked sample (≈ 11 000 vs ≈ 50 at ebin
+  18, > 200×) is at least the `--flare` contrast's 100×; a failure is
+  investigated from `ql.check.log`, not re-run.
 - [ ] `--dry-run --spectrum` prints the QEMU and probe lines (the 96
   upload sends and the shifted times visible); the reviewer runs both
   legs.
 - [ ] Commit.
 
-**gates2 legs** (`gates2.sh` is outside the repo; UNVERIFIED form —
-copy the existing `detector-smoke --tape` / `--tape --negative`
-entries and change only the leg name, the flags and the expected
-line):
+**gates2 legs** (`gates2.sh` is outside the repo; the form of its
+`dettape` entry, `gates2.sh:132-135`: leg, group, expected seconds,
+slot leg, env, cmd; the verdict is the script's exit code):
 
 ```
-add_leg det-spectrum     "scripts/stix/detector-smoke.sh build/qemu-system-sparc --spectrum"            "DETECTOR-SMOKE (spectrum): PASS"
-add_leg det-spectrum-neg "scripts/stix/detector-smoke.sh build/qemu-system-sparc --spectrum --negative" "DETECTOR-SMOKE (spectrum negative): PASS"
+add_leg detspec     det      330 1 'STIX_DETECTOR_RUN_DIR=/tmp/stix-$TAG-detspec' \
+    'scripts/stix/detector-smoke.sh build/qemu-system-sparc --spectrum'
+add_leg detspecneg  det      330 1 'STIX_DETECTOR_RUN_DIR=/tmp/stix-$TAG-detspecneg' \
+    'scripts/stix/detector-smoke.sh build/qemu-system-sparc --spectrum --negative'
 ```
 
-Each leg ≈ 5.5 min (the default 240 s + 85 s of upload), one slot,
-`STIX_PORT_BASE=auto` as the other legs; same group as `det-tape`.
+330 s = the 240 s default run + the 85 s upload shift + margin.
 
 **Verification:** `python3 scripts/stix/ql-check.py --self-test` → PASS;
 `STIX_PORT_BASE=auto scripts/stix/detector-smoke.sh
@@ -736,7 +815,9 @@ U3 did not cover it).
   format (D4) and its limits; the keV law (D5) with the half-up
   rounding and the ADC-overflow drop; the per-spec row (approach 1)
   and its pickup points — step start and QL swap, the closed bank
-  keeps the old binning (the replay's bank-1 precedent, unlike §56);
+  keeps the old binning (the replay's bank-1 precedent; decision Q5,
+  stated against §56, whose C1 map is rebuilt before `materialize` so
+  that bank already folds with the new ELUT); the deviations D-a/D-b;
   cost; spectrum counts are ELUT-binned once and never pass §56's
   fold; the RNG stream changes only for banks with spectrum exposure;
   `align` (step overrides tape, keV specs only, degenerate rows
@@ -761,52 +842,45 @@ U3 did not cover it).
 
 ## Merge order and gates
 
-U1 → U2 → (U3, U4 parallel; U4 needs U3's listing field) → U5 → U6.
+U1 → U2a → U2b → (U3, U4 parallel; U4 needs U3's listing field) → U5 → U6.
 Each model task: new qtests RED on its parent, the suite green after;
 U3/U4: self-test PASS; U5: both legs PASS plus a re-run of the
 existing `align-smoke.sh` (A3 + `--adc`) and `detector-smoke.sh
 --tape` legs (their status substrings and tape schema must still
 hold). UART goldens unchanged (nothing new at boot).
 
-## Open questions for the owner
+## Deviations from the S2 outline (deliberate)
 
-1. **Where the S2 gate lives.** (a) `detector-smoke.sh --spectrum` with
-   align-smoke's upload helpers copied (≈30 lines; the D-3 base checks
-   come for free; the outline's choice); (b) the same, but the helpers
-   moved to `scripts/stix/lib/elut-legs.sh` and sourced by both (one
-   copy, but touches a validated gate); (c) `align-smoke.sh
-   --spectrum` (all machinery there, but none of detector-smoke's
-   product checks). **Recommendation: (a)** now; (b) as a later
-   clean-up if a third gate needs the chain.
-2. **The gate's ELUT.** The outline says "on the A3-derived flash",
-   but on a derived (aligned) ELUT `align` changes nothing, so the
-   align-off negative could not fail. (a) Upload C3's base-0 wrong
-   ELUT while the calibration is `1800 + 10·d` (this plan); (b) the
-   derived ELUT with no negative (weaker: `align` unproven end to
-   end); (c) a real flight ELUT CSV (not in the repo; D-Ed).
-   **Recommendation: (a).**
-3. **What a preimage miss does with the mass.** (a) Drop it and count
-   `preimage_miss` (this plan: the intended bin is unreachable, and the
-   loss is visible); (b) fall back to the unaligned calibration adc
-   (counts appear, in the wrong bin); (c) use the nearest ebin that has
-   a preimage. **Recommendation: (a)** — (b)/(c) hide exactly the
-   misalignment the option exists to expose.
-4. **Spectrum files on the platform.** (a) Bare names in
-   `<tapes_dir>/spectra/`, dropped there by hand, listed in `GET
-   /api/v1/tapes` and resolved to absolute paths at play (this plan);
-   (b) also an upload verb from the UI (new verb, file-size handling);
-   (c) points inline in the tape JSON (no file; the 64 KiB tape cap
-   bounds it, but D4 fixed the file form). **Recommendation: (a)**,
-   (b) later if wanted.
-5. **ELUT pickup inside a running step.** (a) The row is read at the
-   step start and each QL swap; the bank closed by the first swap
-   after a rewrite keeps the old binning (replay precedent; simple,
-   bounded cost); (b) C1-like: accumulate in adc space and fold at the
-   draw so that bank already uses the new ELUT (needs a per-step
-   exposure flush at mid-period step changes). **Recommendation:
-   (a)**; TC(237,8) during a spectrum step is not a planned use.
-6. **The `"flat"` name.** S1 fixed `"flat"` = the quiet template
-   (lines at 18/19/27), which reads oddly next to `flat_kev`. (a) Keep
-   the wire name and label it "template (flat)" in the UI (this plan);
-   (b) add an alias `"template"` (additive) and keep `"flat"`.
-   **Recommendation: (a)**; (b) only if users trip over it.
+- **D-a.** The negative fails exactly `spectrum-bin` (the aligned keV
+  leg). A line at an ADC value cannot be failed by turning `align`
+  off (align does not apply to adc specs), so the outline's
+  line-at-adc check is `spectrum-adc` here and stays green in the
+  negative.
+- **D-b.** The gate uploads C3's base-0 wrong ELUT instead of the
+  outline's "A3-derived flash": on a derived (aligned) ELUT `align` is
+  a no-op, so the negative would be vacuous.
+
+## Owner decisions (2026-11-15)
+
+- **Q1 — gate home:** `detector-smoke.sh --spectrum`, with
+  align-smoke's upload helpers copied (no refactor of align-smoke)
+  (orchestrator's call).
+- **Q2 — the gate's ELUT:** C3's base-0 wrong ELUT, calibration
+  `1800 + 10·d` (orchestrator's call; deviation D-b).
+- **Q3 — preimage miss:** the mass is dropped and counted in
+  `preimage_miss`.
+- **Q4 — spectrum files:** a `spectra/` dir under `tapes_dir`, filled
+  by hand, listed in `GET /api/v1/tapes`, resolved to absolute paths at
+  play; no upload verb.
+- **Q5 — ELUT pickup:** an ELUT rewrite takes effect at the next QL
+  swap, as the replay; §57 records the difference from §56's C1 map,
+  which is rebuilt before `materialize` so the closed bank already
+  uses the new ELUT.
+- **Q6 — the `"flat"` name:** kept on the wire; the UI labels it
+  "template (flat)".
+- **Q7 — keV and K:** the load refuses only a negative or non-finite
+  keV; K is read when the step's row is built; mass at keV ≥ K is
+  dropped as ADC overflow on both the aligned and the unaligned path
+  (no clamp to ebin 31), like the row's other drops; the platform
+  warns at save (and play) when a keV is ≥ the current K, without
+  refusing.
