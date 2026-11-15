@@ -977,7 +977,8 @@ skeleton), `scripts/stix/ql-check.py` (the SSID 32 check gains an
   the drawn ebin-18 adc range, 3092–3163 for base 1800, lands in
   ebin 24 under the base-0 row); `det-align-status` has
   `mismatch_cells ≥ 1` and `calibration=dss-linear`; SSID 32 byte 19
-  < 0x10 while the total still flows (the counts are in the wrong
+  ≤ 1/8 of the leg-3 reference (as built: the 128-adc base-0 bin
+  keeps the flat floor, so not < 0x10) while the total still flows (the counts are in the wrong
   bins — the AX miscount, end to end); the counts arrive at ebin 24:
   SSID 32 byte 25 (ebin 24) within 5σ of the leg-3 byte-19 reference
   (the whole line moved, not lost — a mass-losing fold must fail)
@@ -989,7 +990,9 @@ skeleton), `scripts/stix/ql-check.py` (the SSID 32 check gains an
   the leg-3 reference; the chunk's EACC cell back at ebin 18. Run
   twice: the two SSID 32 dumps byte-identical (guest-time
   determinism of the fold). `--negative`: skip the upload → leg 5
-  fails exactly `adc-aligned` (byte 19 stays low); SKIP 77 without
+  fails exactly `adc-aligned` (as built: the status stays unaligned;
+  byte 19 stays AT the reference — the degenerate rows keep the mass
+  at its own bin); SKIP 77 without
   the ELF.
 - [ ] Host-only parts (`--dry-run`, `--check-guard`, the
   derive/encode pipeline with the base-0 CSV) run without QEMU in

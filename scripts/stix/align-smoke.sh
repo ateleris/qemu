@@ -59,7 +59,8 @@
 #          the drawn ebin-18 adc range, 3092..3164 for base 1800, lands
 #          in ebin 24 under the base-0 row); NOMINAL @135, CONF @235.
 #          det-align-status has mismatch_cells >= 1 and
-#          calibration=dss-linear; SSID 32 byte 19 < 0x10 while byte 25
+#          calibration=dss-linear; SSID 32 byte 19 <= 1/8 of the
+#          reference (the wider base-0 bin keeps the flat floor) while byte 25
 #          (ebin 24) stays within 5 sigma of the leg-3 reference (the
 #          whole line moved, not lost - a mass-losing fold must fail);
 #          the chunk's EACC total still flows.
@@ -693,6 +694,17 @@ print(q.s0_compress(int(hi + 5 * int(sys.argv[2]) ** 0.5)))
 ' "$QLCHECK" "$REF_LO" "$REF_HI")"
     fi
     CT3="$(chunk_total qemu-stdout.adc3.log)"
+    # leg 4's ceiling at ebin 18: the line has left, at most 1/8 of the
+    # reference (the base-0 bin is 128 adc wide, so the flat floor of
+    # ~1.8 template bins stays there; the line alone is >= REF_LO)
+    C_GONE=""
+    [ -z "$REF_LO" ] || C_GONE="$(python3 -c '
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("ql_check", sys.argv[1])
+q = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(q)
+print(q.s0_compress(int(sys.argv[2]) // 8))
+' "$QLCHECK" "$REF_LO")"
     if [ -z "$C_MIN" ]; then
         echo "CHECK adc-reference: FAIL (no SSID 32 dump, or the subcol 0" \
             "ebin 18 reference below the floor: ${REF_LO:-none})"
@@ -730,10 +742,12 @@ print(q.s0_compress(int(hi + 5 * int(sys.argv[2]) ** 0.5)))
         ADC4_OK=0; ADC4_WHY="no SSID 32 dump in the flush"
     else
         set +e
-        python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 19 0 0x0f \
-            > byte19.adc4.log 2>&1
+        # --ssid32-byte takes the 0-based ebin: ebin 18 is sample
+        # byte 19 (byte 0 is the detector byte), ebin 24 byte 25
+        python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 18 0 \
+            "$C_GONE" > byte19.adc4.log 2>&1
         B19=$?
-        python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 25 \
+        python3 "$QLCHECK" adc4.ssid32.1.hex --ssid32-byte 0 24 \
             "$C_MIN" "$C_MAX" > byte25.adc4.log 2>&1
         B25=$?
         set -e
@@ -748,8 +762,9 @@ print(q.s0_compress(int(hi + 5 * int(sys.argv[2]) ** 0.5)))
     fi
     if [ "$ADC4_OK" -eq 1 ]; then
         echo "CHECK adc-mismatch: ok (mismatch_cells=$MISMATCH," \
-            "calibration=dss-linear, byte 19 empty, the line arrived at" \
-            "ebin 24 within 5 sigma, the chunk total flows)"
+            "calibration=dss-linear, the line left byte 19 (<= 1/8 of" \
+            "the reference), arrived at byte 25 = ebin 24 within 5 sigma," \
+            "the chunk total flows)"
     else
         echo "CHECK adc-mismatch: FAIL ($ADC4_WHY)"
         add_fail adc-mismatch
@@ -792,7 +807,7 @@ print(q.s0_compress(int(hi + 5 * int(sys.argv[2]) ** 0.5)))
         else
             set +e
             python3 "$QLCHECK" "adc5$run.ssid32.1.hex" \
-                --ssid32-byte 0 19 "$C_MIN" "$C_MAX" \
+                --ssid32-byte 0 18 "$C_MIN" "$C_MAX" \
                 > "byte19.adc5$run.log" 2>&1
             B19=$?
             set -e

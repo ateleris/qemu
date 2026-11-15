@@ -6236,9 +6236,13 @@ and golden unchanged; the mode adds no RNG draws and no folds when off
   deliberately wrong ELUT (derived from base 0 — shifted: the drawn
   ebin-18 adc range, 3092..3163 for base 1800, lands in `ebin` 24 under
   the base-0 row) and asserts `mismatch_cells >= 1`,
-  `calibration=dss-linear`, byte 19 empty while the counts ARRIVE at
-  `ebin` 24 within 5σ of the leg-3 reference (a mass-losing fold must
-  fail); leg 5 (`adc-aligned`) runs the §52 derive/upload chain —
+  `calibration=dss-linear`, byte 19 at most 1/8 of the reference (the
+  line left; the 128-adc base-0 bin keeps ~1.8 bins of the template's
+  flat floor, so it is not empty) while the counts ARRIVE at `ebin` 24
+  (byte 25) within 5σ of the leg-3 reference (a mass-losing fold must
+  fail). "Byte N" is the SSID 32 sample byte (byte 0 the detector
+  byte), so byte 19 = `ebin` 18; `ql-check --ssid32-byte` takes the
+  0-based ebin; leg 5 (`adc-aligned`) runs the §52 derive/upload chain —
   `mismatch_cells = 0`, byte 19 back at the reference — twice, with
   byte-identical SSID 32 ebin bytes (the fold's guest-time
   determinism). `--negative` skips leg 5's upload and must fail
