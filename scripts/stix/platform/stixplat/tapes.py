@@ -13,10 +13,21 @@ the display name the model reports (spaces allowed there, 1..64).
 Masks are fpga_det/pix indexed; subcol-keyed steps are refused. The
 background layer is unmasked by definition — it fills all 384
 (fpga_det, pix) pairs outside the active step's masks.
+
+S2 (spectra plan U3): a rate step's spec is "flat" (the quiet template)
+or exactly one of line_adc / line_kev / flat_kev / file, the model's
+rule table mirrored here as the validator of record. Spectrum CSVs live
+in <tapes_dir>/spectra (filled by hand); a saved tape names one by its
+bare file name, and det.tape.play reads and parses it (a 400 before any
+QMP) and hands the model its absolute path. keV values >= the current K
+(det-cal-kev-full) are a warning, never a refusal (decision Q7).
 """
 
+import copy
 import json
+import math
 import os
+import re
 
 from .dispatch import VerbError
 from .views import NAME_RE
@@ -28,6 +39,16 @@ KINDS = ("rate", "replay", "off", "single")
 MAX_CPS = 1000000
 MAX_FOR_S = 86400.0
 MIN_FOR_S = 0.1
+
+# S2: the spectrum spec (the model's stix_det_spec_parse rule table)
+SPEC_KEYS = ("line_adc", "line_kev", "flat_kev", "file")
+MAX_SPEC_ROWS = 4096
+MAX_SPEC_FILE = 256 * 1024
+KEV_FULL_MAX = 4096          # det-cal-kev-full's range cap
+KEV_FULL_DEFAULT = 160       # the model's default K
+MAX_SPEC_PATH = 4095
+_CSV_NUM = re.compile(r"[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?")
+_CSV_INT = re.compile(r"[0-9]+")
 
 # utils.c:113-119 (utils_subcolIdFromFpgaId): fpga_det -> subcol, the
 # TM's numbering — the same FSW-sourced table elut-upload.py carries
@@ -44,6 +65,22 @@ SUBCOL_FROM_FPGA_DET = [
 def tapes_dir(cfg):
     return cfg["timeline"]["tapes_dir"] or \
         os.path.join(cfg["retention"]["run_root"], "tapes")
+
+
+def spectra_dir(cfg):
+    """S2: the spectrum CSVs, next to the tapes (filled by hand)."""
+    return os.path.join(tapes_dir(cfg), "spectra")
+
+
+def check_spectrum_name(name, where="spectrum"):
+    """The platform's file rule (a stricter subset of the model's any
+    path): a bare <NAME_RE>.csv in spectra_dir, no '/', checked before
+    any file access."""
+    if not isinstance(name, str) or "/" in name or \
+            not name.endswith(".csv") or not NAME_RE.match(name[:-4]):
+        raise VerbError(400, "%s: file %r is not a bare <name>.csv in the "
+                        "spectra dir (1..64 of A-Za-z0-9._- not starting "
+                        "with '.', then .csv)" % (where, name))
 
 
 def check_name(name):
@@ -67,11 +104,65 @@ def _num_in(v, lo, hi, what, where):
                         % (where, what, v, lo, hi))
 
 
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _spec(step, kind, where):
+    """S2: the step's spec and align against the model's rule table;
+    VerbError(400) naming the step."""
+    spec = step.get("spec", "flat")
+    align = step.get("align")
+    if align is not None and not isinstance(align, bool):
+        raise VerbError(400, "%s: align %r is not a boolean" % (where, align))
+    if spec == "flat":
+        if align is True:
+            raise VerbError(400, "%s: align applies to keV specs (line_kev, "
+                            "flat_kev, a kev,weight file)" % where)
+        return
+    if not isinstance(spec, dict) or len(spec) != 1:
+        raise VerbError(400, "%s: spec %r must be \"flat\" or an object "
+                        "with exactly one key of %s"
+                        % (where, spec, ", ".join(SPEC_KEYS)))
+    if kind != "rate":
+        raise VerbError(400, "%s: a non-flat spec is only valid on kind "
+                        "rate" % where)
+    (key, v), = spec.items()
+    if key == "line_adc":
+        if isinstance(v, bool) or not isinstance(v, int) or \
+                not 0 <= v <= 4095:
+            raise VerbError(400, "%s: line_adc %r is not an integer in "
+                            "0..4095" % (where, v))
+    elif key == "line_kev":
+        if not _is_num(v) or not math.isfinite(v) or v < 0:
+            raise VerbError(400, "%s: line_kev %r is not a finite number "
+                            ">= 0 (keV)" % (where, v))
+    elif key == "flat_kev":
+        if not isinstance(v, list) or len(v) != 2 or \
+                not all(_is_num(k) and math.isfinite(k) for k in v) or \
+                not 0 <= v[0] < v[1]:
+            raise VerbError(400, "%s: flat_kev %r is not [k1, k2] with "
+                            "0 <= k1 < k2 (keV)" % (where, v))
+    elif key == "file":
+        if not isinstance(v, str) or not 1 <= len(v.encode()) <= \
+                MAX_SPEC_PATH or "," in v:
+            raise VerbError(400, "%s: file %r is not a path of 1..%d bytes "
+                            "without a comma" % (where, v, MAX_SPEC_PATH))
+        check_spectrum_name(v, where)
+    else:
+        raise VerbError(400, "%s: spec key %r is not one of %s"
+                        % (where, key, ", ".join(SPEC_KEYS)))
+    if align is True and key == "line_adc":
+        raise VerbError(400, "%s: align applies to keV specs (line_kev, "
+                        "flat_kev, a kev,weight file)" % where)
+
+
 def _step(step, i):
     """One step of the model's schema (T1); VerbError(400) naming the
-    step index. single steps and the S2 spec shapes parse here (the
-    wire interface is fixed); whether the build supports them is the
-    model's call at load."""
+    step index. single steps parse here (the wire interface is fixed);
+    whether the build supports them is the model's call at load. S2:
+    the spec rule table is the model's, mirrored (an align: true on an
+    adc,weight file is caught at resolve, once the CSV is read)."""
     where = "step %d" % i
     if not isinstance(step, dict):
         raise VerbError(400, "%s is not an object" % where)
@@ -85,22 +176,13 @@ def _step(step, i):
     _num_in(step.get("for_s"), MIN_FOR_S, MAX_FOR_S, "for_s", where)
     if step.get("label") is not None:
         _text(step["label"], "%s: label" % where)
-    align = step.get("align")
-    if align is not None and not isinstance(align, bool):
-        raise VerbError(400, "%s: align %r is not a boolean" % (where, align))
+    _spec(step, kind, where)
     if kind in ("rate", "off"):
         _int_in(step.get("fpga_det_mask"), 0, 0xFFFFFFFF,
                 "fpga_det_mask", where)
         _int_in(step.get("pix_mask", 0xFFF), 0, 0xFFF, "pix_mask", where)
     if kind == "rate":
         _int_in(step.get("cps"), 0, MAX_CPS, "cps", where)
-        spec = step.get("spec", "flat")
-        if isinstance(spec, str):
-            if spec != "flat":
-                raise VerbError(400, "%s: spec %r" % (where, spec))
-        elif not isinstance(spec, dict):
-            raise VerbError(400, "%s: spec %r is not \"flat\" or an object"
-                            % (where, spec))
     elif kind == "replay":
         if not isinstance(step.get("file"), str) or not step["file"]:
             raise VerbError(400, "%s: replay needs its file" % where)
@@ -169,7 +251,8 @@ def validate(tape):
 
 
 def listing(cfg):
-    """GET /api/v1/tapes: the saved tape names and the dir."""
+    """GET /api/v1/tapes: the saved tape names and the dir; S2 adds
+    "spectra", the .csv files of the spectra dir (additive)."""
     d = tapes_dir(cfg)
     names = []
     try:
@@ -179,7 +262,148 @@ def listing(cfg):
                 names.append(name)
     except OSError:
         pass
-    return {"tapes": sorted(names), "dir": d}
+    spectra = []
+    try:
+        for fn in os.listdir(spectra_dir(cfg)):
+            if fn.endswith(".csv") and NAME_RE.match(fn[:-4]):
+                spectra.append(fn)
+    except OSError:
+        pass
+    return {"tapes": sorted(names), "dir": d, "spectra": sorted(spectra)}
+
+
+# -- S2: spectrum CSVs, keV warnings, resolve at play --------------------------
+
+def parse_spectrum_csv(text, kev_full, where):
+    """A spectrum CSV (D4), the model's stix_det_spec_file_load grammar
+    exactly: <= 256 KiB; the first line exactly "adc,weight" or
+    "kev,weight"; then 1..4096 lines "value,weight", no spaces, an
+    optional \\r before \\n, the final newline optional, no blank lines;
+    numbers [0-9]+(.[0-9]+)?([eE][-+]?[0-9]+)? and finite (no sign, no
+    inf/nan — although Python's float() takes them); adc values
+    integers 0..4095; weights >= 0 with a sum > 0; repeated values are
+    summed. kev_full is not a bound (decision Q7: K is read at the
+    model's row build). Returns (unit, [(value, weight)]) sorted by
+    value; VerbError(400) naming @where and the line."""
+    del kev_full                         # Q7: no K bound at load
+    if len(text.encode("utf-8", "surrogateescape")) > MAX_SPEC_FILE:
+        raise VerbError(400, "%s: the file is past the %d KiB cap"
+                        % (where, MAX_SPEC_FILE // 1024))
+    segs = text.split("\n")
+    if len(segs) > 1 and segs[-1] == "":
+        segs.pop()                       # the final newline
+        terminated = len(segs)
+    else:
+        terminated = len(segs) - 1       # the last line has no newline
+    unit = None
+    pts = {}
+    rows = 0
+    for n, line in enumerate(segs):
+        if n < terminated and line.endswith("\r"):
+            line = line[:-1]
+        lineno = n + 1
+        if n == 0:
+            if line not in ("adc,weight", "kev,weight"):
+                raise VerbError(400, "%s line 1: the header must be "
+                                "exactly \"adc,weight\" or \"kev,weight\""
+                                % where)
+            unit = line[:3]
+            continue
+        if rows == MAX_SPEC_ROWS:
+            raise VerbError(400, "%s line %d: more than %d data rows"
+                            % (where, lineno, MAX_SPEC_ROWS))
+        val, sep, wt = line.partition(",")
+        num = _CSV_NUM if unit == "kev" else _CSV_INT
+        ok = bool(sep) and num.fullmatch(val) and _CSV_NUM.fullmatch(wt)
+        if ok:
+            v, w = float(val), float(wt)
+            ok = math.isfinite(v) and math.isfinite(w) and \
+                (unit == "kev" or v <= 4095)
+        if not ok:
+            raise VerbError(400, "%s line %d: not \"%s,weight\" (%s, weight "
+                            "a number >= 0; no spaces, no blank lines)"
+                            % (where, lineno, unit, "keV a number"
+                               if unit == "kev" else
+                               "adc an integer 0..4095"))
+        if unit == "adc":
+            v = int(val)
+        pts[v] = pts.get(v, 0.0) + w
+        rows += 1
+    if not rows:
+        raise VerbError(400, "%s: no data rows (1..%d)"
+                        % (where, MAX_SPEC_ROWS))
+    if not sum(pts.values()) > 0:
+        raise VerbError(400, "%s: the weights sum to 0" % where)
+    return unit, sorted(pts.items())
+
+
+def kev_warnings(tape, kev_full):
+    """Q7: the line_kev / flat_kev values at or past the current K (the
+    mass there is dropped as an ADC overflow) — advice, never a
+    refusal. Files are checked at resolve, once read."""
+    out = []
+    for i, step in enumerate(tape.get("steps") or []):
+        spec = step.get("spec") if isinstance(step, dict) else None
+        if not isinstance(spec, dict):
+            continue
+        if "line_kev" in spec and _is_num(spec["line_kev"]) and \
+                spec["line_kev"] >= kev_full:
+            out.append("step %d: line_kev %g >= K %d keV: the line is "
+                       "dropped (ADC overflow)" % (i, spec["line_kev"],
+                                                  kev_full))
+        fk = spec.get("flat_kev")
+        if isinstance(fk, list) and len(fk) == 2 and _is_num(fk[1]) and \
+                fk[1] > kev_full:
+            out.append("step %d: flat_kev %g..%g reaches past K %d keV: "
+                       "the part >= K is dropped (ADC overflow)"
+                       % (i, fk[0], fk[1], kev_full))
+    return out
+
+
+def resolve(cfg, tape, kev_full, warnings=None):
+    """det.tape.play: a copy of the (validated) tape whose spectrum
+    files are read and parsed here (a bad or missing file is a 400
+    before any QMP) and named by their absolute path; an explicit
+    align: true on an adc,weight file is refused now that the unit is
+    known; keV >= K points add to @warnings. The saved file is never
+    rewritten."""
+    out = copy.deepcopy(tape)
+    d = spectra_dir(cfg)
+    for i, step in enumerate(out.get("steps") or []):
+        spec = step.get("spec")
+        if not isinstance(spec, dict) or "file" not in spec:
+            continue
+        where = "step %d: spectrum %s" % (i, spec["file"])
+        check_spectrum_name(spec["file"], "step %d" % i)
+        path = os.path.abspath(os.path.join(d, spec["file"]))
+        if "," in path:
+            raise VerbError(400, "%s: the path %s holds a comma (the "
+                            "model refuses it)" % (where, path))
+        try:
+            if os.stat(path).st_size > MAX_SPEC_FILE:
+                raise VerbError(400, "%s: the file is past the %d KiB cap"
+                                % (where, MAX_SPEC_FILE // 1024))
+            with open(path, "rb") as f:
+                raw = f.read(MAX_SPEC_FILE + 1)
+        except OSError as e:
+            raise VerbError(400, "%s: %s" % (where, e))
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            raise VerbError(400, "%s: not ASCII text" % where)
+        unit, pts = parse_spectrum_csv(text, kev_full, where)
+        if step.get("align") is True and unit == "adc":
+            raise VerbError(400, "step %d: align applies to keV specs "
+                            "(line_kev, flat_kev, a kev,weight file): %s "
+                            "is adc,weight" % (i, spec["file"]))
+        if unit == "kev" and warnings is not None:
+            over = [v for v, _ in pts if v >= kev_full]
+            if over:
+                warnings.append("step %d: %s has %d keV value(s) >= K %d "
+                                "keV: dropped (ADC overflow)"
+                                % (i, spec["file"], len(over), kev_full))
+        step["spec"] = {"file": path}
+    return out
 
 
 def read(cfg, name):

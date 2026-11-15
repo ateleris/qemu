@@ -15,8 +15,8 @@ on the EDAC (they move the hw-state's poisons and counters), the
 det-rotb-burst pair (the FF plan's burst), the det tape/align/adc QOM
 pairs (the stimulus plan T3/C2), memsave (the fsw-params RAM snapshot:
 zeros into the asked file, in the cwd), and the test-only
-x-fake-guest-reset and x-fake-tape-state, which behave per -no-reboot /
--action like QEMU.
+x-fake-guest-reset, x-fake-tape-state, x-fake-align-state and
+x-fake-adc-state, which behave per -no-reboot / -action like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
 `noqmp` accepts the QMP connection and never answers; `badstate`
 serves a hw-state without its keys.
@@ -112,11 +112,13 @@ class Fake:
         # the hw-state carries them at their defaults; the tape QOM
         # trio stores and reports like the device's store-then-apply
         self.tape = {"state": "idle", "name": "", "step": 0, "n_steps": 0,
-                     "label": "", "kind": "", "loop": False, "align": False}
+                     "label": "", "kind": "", "loop": False, "align": False,
+                     "spec": ""}
         self.tape_json = None
         self.align = {"mode": "off", "rows": 384, "fallback": 0,
                       "honoured": 0, "mismatch_cells": 0,
-                      "unassigned_cells": 0, "calibration": "none"}
+                      "unassigned_cells": 0, "calibration": "none",
+                      "preimage_miss": 0}
         self.adc = {"mode": False, "kev_full": 160, "base_source": "zero",
                     "map_rows": 0}
         # the EDAC state the hw-state section shows (stix_edac.c:
@@ -197,10 +199,11 @@ class Fake:
     def align_status(self):
         a = self.align
         return ("mode=%s,rows=%d,fallback=%d,honoured=%d,"
-                "mismatch_cells=%d,unassigned_cells=%d,calibration=%s"
+                "mismatch_cells=%d,unassigned_cells=%d,calibration=%s,"
+                "preimage_miss=%d"
                 % (a["mode"], a["rows"], a["fallback"], a["honoured"],
                    a["mismatch_cells"], a["unassigned_cells"],
-                   a["calibration"]))
+                   a["calibration"], a["preimage_miss"]))
 
     def adc_status(self):
         a = self.adc
@@ -464,6 +467,21 @@ class Fake:
             if not isinstance(st, dict):
                 raise KeyError("x-fake-tape-state needs {state: {...}}")
             self.tape.update(st)
+            return {}
+        if ex == "x-fake-adc-state":
+            # S2 (tapes_spec_play): the det.adc section (kev_full = K)
+            st = a.get("state")
+            if not isinstance(st, dict):
+                raise KeyError("x-fake-adc-state needs {state: {...}}")
+            self.adc.update(st)
+            return {}
+        if ex == "x-fake-align-state":
+            # S2 (align_leaves): move the det.align section (the
+            # preimage_miss gauge the model's spectrum build sets)
+            st = a.get("state")
+            if not isinstance(st, dict):
+                raise KeyError("x-fake-align-state needs {state: {...}}")
+            self.align.update(st)
             return {}
         if ex == "x-fake-guest-reset":
             threading.Timer(0.05, self.guest_reset).start()

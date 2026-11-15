@@ -2807,10 +2807,9 @@ def t_tapes_crud(env):
                            "at most 64")):
             e = raises(VerbError, tapes_mod.validate, tape)
             check(e.status == 400 and why in str(e), "%s: %s" % (why, e))
-        # the S2/S3 shapes parse (the model is the authority at load)
+        # the S3 shape parses (the model is the authority at load); the
+        # S2 spec rules are t_tapes_spec's
         tapes_mod.validate(dict(TAPE, steps=[dict(TAPE["steps"][0],
-                                                  spec={"line_adc": 1000}),
-                                             dict(TAPE["steps"][0],
                                                   kind="single",
                                                   fpga_det=22, pix=0,
                                                   adc=1000, n=1000)]))
@@ -2833,6 +2832,240 @@ def t_tapes_crud(env):
         srv.shutdown()
         srv.server_close()
         ctl.shutdown()
+
+
+# S2 (spectra plan U3): U1's det-spec-props vectors, same order
+SPEC_STEP = {"kind": "rate", "for_s": 0.1, "fpga_det_mask": 1, "cps": 1}
+SPEC_BAD_JSON = [
+    {"spec": {"line": 1}},
+    {"spec": {"line_adc": 1600, "line_kev": 62}},
+    {"spec": {}},
+    {"spec": "line"},
+    {"spec": [1]},
+    {"spec": {"line_adc": 4096}},
+    {"spec": {"line_adc": -1}},
+    {"spec": {"line_adc": 1600.0}},
+    {"spec": {"line_adc": "1600"}},
+    {"spec": {"line_kev": -1}},
+    {"spec": {"line_kev": "62"}},
+    {"spec": {"flat_kev": [60, 40]}},
+    {"spec": {"flat_kev": [40]}},
+    {"spec": {"flat_kev": [-1, 5]}},
+    {"spec": {"line_kev": 62}, "align": "yes"},
+    {"spec": {"line_adc": 1600}, "align": True},
+    {"spec": "flat", "align": True},
+    {"spec": {"file": ""}},
+]
+SPEC_GOOD_JSON = [
+    {"spec": "flat"},
+    {"spec": {"line_adc": 0}},
+    {"spec": {"line_adc": 4095}},
+    {"spec": {"line_kev": 0}},
+    {"spec": {"line_kev": 159.9}},
+    {"spec": {"line_kev": 170}},
+    {"spec": {"flat_kev": [40, 161]}},
+    {"spec": {"flat_kev": [0, 160]}},
+    {"spec": {"line_kev": 62}, "align": True},
+]
+# the file content vectors (det-spec-props' bad_csv, plus the size and
+# row-count cases first)
+SPEC_BAD_CSV = [
+    "adc,weight\n" + "1" * (262145 - 11),
+    "adc,weight\n" + "1,1\n" * 4097,
+    "energy,weight\n1600,1\n",
+    "1600,1\n",
+    "adc,weight\n",
+    "adc,weight\n1600,1,2\n",
+    "adc,weight\n1600, 1\n",
+    "adc,weight\n1600,nan\n",
+    "adc,weight\n1600,inf\n",
+    "adc,weight\n1600,1e999\n",
+    "adc,weight\n0x10,1\n",
+    "adc,weight\n+5,1\n",
+    "adc,weight\n1600,-1\n",
+    "adc,weight\n1600,0\n2000,0\n",
+    "adc,weight\n4096,1\n",
+    "adc,weight\n1600,1\n\n2000,1\n",
+]
+
+
+def _spec_tape(fields, align=False, kind="rate"):
+    step = dict(SPEC_STEP, kind=kind)
+    step.update(fields)
+    return {"api": 1, "name": "spec", "align": align, "steps": [step]}
+
+
+def t_tapes_spec(env):
+    """S2 U3: U1's JSON vectors through tapes.validate (the validator
+    of record): each refusal a 400 naming the step index, each accepted
+    vector validates; a line_kev >= K saves with a warning in the verb
+    result and no 400; a file with a comma (or a path) is a 400."""
+    for fields in SPEC_BAD_JSON:
+        e = raises(VerbError, tapes_mod.validate, _spec_tape(fields))
+        check(e.status == 400 and "step 0" in str(e),
+              "refused %r: %s" % (fields, e))
+    e = raises(VerbError, tapes_mod.validate,
+               _spec_tape({"spec": {"line_adc": 1600}}, kind="off"))
+    check(e.status == 400 and "only valid on kind rate" in str(e),
+          "a line_adc spec on an off step: %s" % e)
+    e = raises(VerbError, tapes_mod.validate,
+               _spec_tape({"spec": {"line_adc": 1600}, "align": True}))
+    check("align applies to keV specs" in str(e), "the key words: %s" % e)
+    e = raises(VerbError, tapes_mod.validate,
+               _spec_tape({"spec": {"line_adc": 1600.0}}))
+    check("is not an integer" in str(e), "the key words: %s" % e)
+    for fields in SPEC_GOOD_JSON:
+        tapes_mod.validate(_spec_tape(fields))
+    tapes_mod.validate(_spec_tape({"spec": {"line_adc": 1600}}, align=True))
+    tapes_mod.validate(_spec_tape({"spec": {"file": "s.csv"}}))
+    for bad in ("a,b.csv", "../x.csv", "/abs/s.csv", "s.txt", ".s.csv"):
+        e = raises(VerbError, tapes_mod.validate,
+                   _spec_tape({"spec": {"file": bad}}))
+        check(e.status == 400 and "step 0" in str(e),
+              "file %r: %s" % (bad, e))
+    # keV >= K: a warning at save, no refusal (K = the leaf, 160 absent)
+    d = os.path.join(env.tmp, "tapes-spec-root")
+    ctl = env.controller(retention={"run_root": d})
+    try:
+        r = ctl.command("det.tape.save", {"name": "hot", "tape":
+                        _spec_tape({"spec": {"line_kev": 170}})})
+        w = r.get("warnings") or []
+        check(len(w) == 1 and w[0].startswith("step 0: line_kev 170 >= K "
+                                              "160"), "the warning: %r" % w)
+        check(os.path.isfile(os.path.join(tapes_mod.tapes_dir(ctl.cfg),
+                                          "hot.json")), "saved anyway")
+        r = ctl.command("det.tape.save", {"name": "cool", "tape":
+                        _spec_tape({"spec": {"line_kev": 62}})})
+        check("warnings" not in r, "no warning below K: %r" % r)
+        st = tapes_mod.listing(ctl.cfg)
+        check(st["spectra"] == [], "no spectra yet: %r" % st)
+    finally:
+        ctl.shutdown()
+
+
+def t_tapes_spec_csv(env):
+    """S2 U3: U1's file vectors through parse_spectrum_csv, the same
+    verdicts as the model's reader; the CRLF / no-final-newline /
+    repeated-value files parse; 1e999 and nan are refused although
+    Python's float() takes them."""
+    for text in SPEC_BAD_CSV:
+        e = raises(VerbError, tapes_mod.parse_spectrum_csv, text, 160,
+                   "s.csv")
+        check(e.status == 400 and "s.csv" in str(e),
+              "refused %r: %s" % (text[:40], e))
+    e = raises(VerbError, tapes_mod.parse_spectrum_csv,
+               "adc,weight\n" + "1,1\n" * 4097, 160, "s.csv")
+    check("line 4098" in str(e), "the row cap names the line: %s" % e)
+    check(float("1e999") == float("inf") and float("nan") != 0,
+          "Python's float takes them (the grammar must refuse)")
+    unit, pts = tapes_mod.parse_spectrum_csv("kev,weight\n160,1\n", 160,
+                                             "k")
+    check(unit == "kev" and pts == [(160.0, 1.0)],
+          "keV >= K parses (Q7): %r" % pts)
+    unit, pts = tapes_mod.parse_spectrum_csv(
+        "kev,weight\r\n62,1\r\n121,1\r\n", 160, "crlf")
+    check(unit == "kev" and pts == [(62.0, 1.0), (121.0, 1.0)],
+          "CRLF: %r" % pts)
+    unit, pts = tapes_mod.parse_spectrum_csv("adc,weight\n1600,1", 160,
+                                             "nonl")
+    check(unit == "adc" and pts == [(1600, 1.0)], "no final newline")
+    unit, pts = tapes_mod.parse_spectrum_csv(
+        "adc,weight\n1600,1\n1600,1\n2200,2\n", 160, "rep")
+    check(pts == [(1600, 2.0), (2200, 2.0)], "repeats summed: %r" % pts)
+    e = raises(VerbError, tapes_mod.parse_spectrum_csv,
+               "adc,weight\n1600,1\r", 160, "cr")
+    check(e.status == 400, "a lone \\r without \\n is not a line end")
+
+
+def t_tapes_spec_play(env):
+    """S2 U3 (the fake-QMP verb pattern): det.tape.play reads and parses
+    the referenced spectra/s.csv and hands det-tape-load its absolute
+    path; a missing s.csv is a 400 and no QMP; line_kev 150 with the
+    leaf K = 100 plays, with a warning; align true on an adc,weight
+    s.csv is a 400 before QMP; file "../x.csv" is a 400 at save; the
+    listing shows the spectra."""
+    d = os.path.join(env.tmp, "tapes-spec-play-root")
+    ctl = env.controller(retention={"run_root": d})
+    try:
+        cmd = ctl.command
+        sdir = tapes_mod.spectra_dir(ctl.cfg)
+        os.makedirs(sdir, exist_ok=True)
+        csv = os.path.join(sdir, "s.csv")
+        cmd("det.tape.save", {"name": "f", "tape":
+            _spec_tape({"spec": {"file": "s.csv"}})})
+        cmd("det.tape.save", {"name": "fa", "tape":
+            _spec_tape({"spec": {"file": "s.csv"}, "align": True})})
+        cmd("det.tape.save", {"name": "k", "tape":
+            _spec_tape({"spec": {"line_kev": 150}})})
+        e = raises(VerbError, cmd, "det.tape.save", {"name": "up", "tape":
+                   _spec_tape({"spec": {"file": "../x.csv"}})})
+        check(e.status == 400, "../x.csv at save: %s" % e)
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        q = ctl.power.qmp
+        n0 = len(q.execute("x-fake-set-log"))
+        e = raises(VerbError, cmd, "det.tape.play", {"name": "f"})
+        check(e.status == 400 and "s.csv" in str(e),
+              "a missing s.csv: %s" % e)
+        check(len(q.execute("x-fake-set-log")) == n0, "no QMP for it")
+        with open(csv, "w") as f:
+            f.write("adc,weight\n1600,3\n2200,1\n")
+        check(tapes_mod.listing(ctl.cfg)["spectra"] == ["s.csv"],
+              "the listing's spectra")
+        e = raises(VerbError, cmd, "det.tape.play", {"name": "fa"})
+        check(e.status == 400 and "align applies to keV specs" in str(e),
+              "align on adc,weight: %s" % e)
+        check(len(q.execute("x-fake-set-log")) == n0, "no QMP for it")
+        cmd("det.tape.play", {"name": "f"})
+        sets = q.execute("x-fake-set-log")
+        loaded = json.loads(sets[-2][2])
+        check(sets[-2][1] == "det-tape-load" and
+              loaded["steps"][0]["spec"] == {"file": os.path.abspath(csv)},
+              "the absolute path rode det-tape-load: %r" % loaded)
+        with open(os.path.join(tapes_mod.tapes_dir(ctl.cfg), "f.json")) as f:
+            check(json.load(f)["steps"][0]["spec"] == {"file": "s.csv"},
+                  "the saved file is never rewritten")
+        q.execute("x-fake-adc-state", {"state": {"kev_full": 100}})
+        wait_for(lambda: (ctl.state.get("instrument.detector.adc.kev_full")
+                          or {}).get("truth") == 100, what="K = 100")
+        r = cmd("det.tape.play", {"name": "k"})
+        w = r.get("warnings") or []
+        check(r["state"] == "playing" and len(w) == 1 and
+              w[0].startswith("step 0: line_kev 150 >= K 100"),
+              "played with a warning: %r" % r)
+    finally:
+        ctl.shutdown()
+
+
+def t_align_leaves(env):
+    """S2 U3: the hw-state's det.align.preimage_miss and det.tape.spec
+    become leaves through state.py's pass-through (no code); the
+    det.align.set verb returns preimage_miss; the sampler globs need
+    nothing new."""
+    ctl = env.controller()
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        q = ctl.power.qmp
+        q.execute("x-fake-align-state", {"state": {"preimage_miss": 3}})
+        q.execute("x-fake-tape-state", {"state": {"spec": "line_adc=1600"}})
+        wait_for(lambda: (ctl.state.get(
+            "instrument.detector.align.preimage_miss") or {}).get("truth")
+            == 3, what="the preimage_miss leaf")
+        wait_for(lambda: (ctl.state.get("instrument.detector.tape.spec")
+                          or {}).get("truth") == "line_adc=1600",
+                 what="the tape spec leaf")
+        r = ctl.command("det.align.set", {"enabled": True})
+        check(r["preimage_miss"] == 3 and r["mode"] == "on",
+              "det.align.set: %r" % r)
+    finally:
+        ctl.shutdown()
+    _glob_case({"instrument.detector.align.preimage_miss": 3,
+                "instrument.detector.tape.spec": "line_adc=1600",
+                "instrument.detector.source": "synthetic"},
+               must={"instrument.detector.align.preimage_miss",
+                     "instrument.detector.tape.spec"},
+               must_not={"instrument.detector.source"})
 
 
 def t_tapes_play_stop(env):
@@ -6485,6 +6718,10 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("detector burst verb (FF)", t_det_burst),
          ("detector tapes: files + schema (T3)", t_tapes_crud),
          ("detector tapes: play/stop verbs (T3)", t_tapes_play_stop),
+         ("detector tapes: spec rules (S2 U3)", t_tapes_spec),
+         ("detector tapes: spectrum CSV (S2 U3)", t_tapes_spec_csv),
+         ("detector tapes: spectrum play (S2 U3)", t_tapes_spec_play),
+         ("detector align/spec leaves (S2 U3)", t_align_leaves),
          ("detector tapes: the numbering table (T3)", t_tapes_numbering),
          ("detector adc verb (C2)", t_adc_verb),
          ("detector adc leaves (C2)", t_adc_leaves),

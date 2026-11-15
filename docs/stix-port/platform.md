@@ -156,7 +156,7 @@ namespaces and where each comes from:
 | `platform.*` | the controller's own state (power, boot, SpW link, time codes, OBT, keep-alive, time sync) |
 | `idpu.scet.*`, `idpu.watchdog.*`, `idpu.spw.*` | the SpW device's hw-state |
 | `instrument.supplies.*`, `instrument.hk_adc.<ch>`, `instrument.hk_prot.*` | the stixctrl hw-state |
-| `instrument.detector.quarter.<q>`, `instrument.detector.{source, flare, quiet_cps, flare_cps, ql_bank}`, `instrument.detector.fsm.*`, `instrument.detector.replay.*`, `instrument.detector.tape.*`, `instrument.detector.align.*`, `instrument.detector.adc.*` | the hw-state's `det` section (`quarter.<q>` since PL-2, the rest PL-11c, tape/align/adc the stimulus plan): the scene (`source` zero \| synthetic \| replay-dss, `flare`, `quiet_cps`/`flare_cps` counts/s per fpga_det), the QL bank in use (`ql_bank`), `fsm.enable`, the replay progress `replay.{state, pos_ns, events, dropped, unsupported, table, count, duration_ns}` (the det-replay-status line's data; `pos_ns` is volatile), the mix tape `tape.{state, name, step, n_steps, label, kind, loop, align}` (1-based `step`, moves only at a step boundary), the ELUT-alignment report `align.{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration}`, and the ADC-sky knob `adc.{mode, kev_full, base_source, map_rows}` |
+| `instrument.detector.quarter.<q>`, `instrument.detector.{source, flare, quiet_cps, flare_cps, ql_bank}`, `instrument.detector.fsm.*`, `instrument.detector.replay.*`, `instrument.detector.tape.*`, `instrument.detector.align.*`, `instrument.detector.adc.*` | the hw-state's `det` section (`quarter.<q>` since PL-2, the rest PL-11c, tape/align/adc the stimulus plan): the scene (`source` zero \| synthetic \| replay-dss, `flare`, `quiet_cps`/`flare_cps` counts/s per fpga_det), the QL bank in use (`ql_bank`), `fsm.enable`, the replay progress `replay.{state, pos_ns, events, dropped, unsupported, table, count, duration_ns}` (the det-replay-status line's data; `pos_ns` is volatile), the mix tape `tape.{state, name, step, n_steps, label, kind, loop, align, spec}` (1-based `step`, moves only at a step boundary; `spec` the running step's spectrum text, e.g. `line_kev=62 align`, S2), the ELUT-alignment report `align.{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration, preimage_miss}` (`preimage_miss`: the running aligned keV step's dropped (pair, ebin) count, S2), and the ADC-sky knob `adc.{mode, kev_full, base_source, map_rows}` |
 | `instrument.attenuator.*` | the hw-state's `attenuator` section (PL-11b): `truth.{position, position_ppm, sensor_ab, sensor_bc, motor1_driving, motor2_driving, att_c, moves, last_end, last_end_ns}`, `presented.{sensor_ab, sensor_bc, cmdsta, att_c}`, `fsw_accesses`, `faults_active` |
 | `instrument.memory.*` | the hw-state's `edac` section (PL-11b): per-memory `injected`/`corrected`/`detected` counters for `cache`, `sdram` and `rotbuf`, and `poisons` (the armed upsets as one leaf; a change record per arm and per clear). `instrument.memory.bram` maps no leaf: the bram has no EDAC counters and its upsets arm no poison |
 | `instrument.rotb.{count, full, enable, rd, wr, capacity}` | the hw-state's `rotb` section (PL-11c): the ROTB ring's FIFO state — the block count, the full flag, the rotbConfig ENABLE bit, the read/write block indices, and the rotb-blocks capacity. `count`/`rd`/`wr` are volatile (they move while the detector fills the ring) |
@@ -193,10 +193,10 @@ lists exactly these verbs and arguments.
 | `force.clear` | `path` | clear a forcing |
 | `det.rotb.burst` | `frames` | append that many copies of the last live detector frame into the ROTB ring now; the answer is the parsed burst status `{requested, appended, stop, rotb_count}`; 409 while STIX is off or the device refuses (no live chunk since reset, 0 or over the ring's chunk count) |
 | `det.adc.set` | `enabled` | the ADC-faithful sky knob (`det-adc-mode` on `/machine/stixctrl`, default off) + the parsed `det-adc-status` `{mode, kev_full, base_source, map_rows}`; while on, the synthetic sky folds through the loaded FPGA ELUT (the stimulus plan C1/C2) |
-| `det.align.set` | `enabled` | the ELUT-alignment bench knob (`det-align`, default off) + the parsed `det-align-status` `{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration}`; the "the ELUT does not match the DSS" signal is a large `mismatch_cells` (the stimulus plan A1) |
-| `det.tape.save` | `name`, `tape` | save a mix tape as `<name>.json` in the tapes dir (next to the views); the model's schema, validated here first (400 with the step index); a tape without its own `name` field takes the file name |
+| `det.align.set` | `enabled` | the ELUT-alignment bench knob (`det-align`, default off) + the parsed `det-align-status` `{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration, preimage_miss}`; the "the ELUT does not match the DSS" signal is a large `mismatch_cells` (the stimulus plan A1) |
+| `det.tape.save` | `name`, `tape` | save a mix tape as `<name>.json` in the tapes dir (next to the views); the model's schema, validated here first (400 with the step index); a tape without its own `name` field takes the file name; a keV value at or past the current K adds `"warnings"` to the answer (not a refusal, S2) |
 | `det.tape.delete` | `name` | delete a saved mix tape (404 unknown) |
-| `det.tape.play` | `name`, `loop` | load a saved tape into the model (`det-tape-load`) and start it on the guest-time tick (`det-tape-play`); `loop` overrides the tape's own; the answer is the parsed `det-tape-status` (`state`, `name`, `step`, `n_steps`, `label`, `step_left_ticks`, `loop`, `align`); 409 while STIX is off or the model refuses |
+| `det.tape.play` | `name`, `loop` | load a saved tape into the model (`det-tape-load`) and start it on the guest-time tick (`det-tape-play`); `loop` overrides the tape's own; spectrum files are read and parsed first and passed as absolute paths (a bad or missing one is a 400 before any QMP); the answer is the parsed `det-tape-status` (`state`, `name`, `step`, `n_steps`, `label`, `step_left_ticks`, `loop`, `align`) plus `warnings` when a keV value is at or past K; 409 while STIX is off or the model refuses |
 | `det.tape.stop` | | stop the playing tape (`det-tape-play false`); the rates revert to the scene knobs; the answer is the parsed `det-tape-status` |
 | `fault.inject` | `id`, `params`, `trigger`, `seed` | a catalogue fault (`GET /faults`); logged as `fault` with its params and seed |
 | `fault.clear` | `id` | clear an active, reversible fault, or disarm an armed one |
@@ -774,6 +774,26 @@ playback, the scene knobs resume on stop/done).
   and `pix`-indexed (Q1–Q4 are `fpga_det` 0-7/8-15/16-23/24-31, so
   Q1+Q3 is `0x00FF00FF`); the background layer is unmasked — it fills
   every (fpga_det, pix) pair a step does not.
+- **Spectra** (S2, `2026-11-15-spectra-plan.md`): a rate step's `spec`
+  is `"flat"` (the quiet template, the default) or exactly one of
+  `{"line_adc": 0..4095}`, `{"line_kev": keV}`, `{"flat_kev": [k1,
+  k2]}` (0 <= k1 < k2) or `{"file": "<name>.csv"}`; a step's `align`
+  (default: the tape's) applies to keV specs only. Spectrum CSVs live
+  in `<tapes_dir>/spectra/`, filled by hand (no upload verb), and are
+  listed as `"spectra"` in `GET /api/v1/tapes` (additive). A saved
+  tape names one by its bare file name (`<name>.csv`, the tape-name
+  rule plus `.csv`, no `/` — stricter than the model, which takes any
+  path); `det.tape.play` reads and parses it (header `adc,weight` or
+  `kev,weight`, 1..4096 rows, <= 256 KiB; the model's grammar,
+  mirrored by `tapes.parse_spectrum_csv`) and passes the absolute path
+  to `det-tape-load`; the saved tape is never rewritten. `align: true`
+  on an `adc,weight` file is refused at play (the unit is known only
+  then). keV values at or past K (`instrument.detector.adc.kev_full`,
+  160 when absent) are dropped by the model as an ADC overflow; the
+  platform warns at save and play, it does not refuse. The leaves
+  `instrument.detector.tape.spec` and
+  `instrument.detector.align.preimage_miss` come through the hw-state
+  pass-through.
 - **Validation**: `det.tape.save` validates the model's schema before
   any QMP (a bad tape is a 400 naming the step index); the model stays
   the authority at `det-tape-load`. Detector numbers here and in the

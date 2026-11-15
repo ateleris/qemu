@@ -494,10 +494,23 @@ class Platform:
         except (KeyError, ValueError):
             raise VerbError(500, "det-tape-status %r" % line)
 
+    def _kev_full(self):
+        """S2: the current K, the leaf instrument.detector.adc.kev_full
+        (the model's default 160 when absent)."""
+        lf = self.ctl.state.get("instrument.detector.adc.kev_full")
+        v = lf.get("truth") if isinstance(lf, dict) else None
+        if isinstance(v, bool) or not isinstance(v, int) or \
+                not 1 <= v <= tapes_mod.KEV_FULL_MAX:
+            return tapes_mod.KEV_FULL_DEFAULT
+        return v
+
     def v_tape_save(self, name, tape):
         """Save the tape as <name>.json in the tapes dir (the model's
-        schema, validated client-side first)."""
-        return tapes_mod.save(self.cfg, name, tape)
+        schema, validated client-side first). S2: keV values >= the
+        current K come back as "warnings" (additive; not a refusal)."""
+        r = tapes_mod.save(self.cfg, name, tape)
+        warnings = tapes_mod.kev_warnings(r, self._kev_full())
+        return dict(r, warnings=warnings) if warnings else r
 
     def v_tape_delete(self, name):
         tapes_mod.delete(self.cfg, name)
@@ -508,6 +521,11 @@ class Platform:
         argument overrides the tape's own, as in the schema). The read
         and the validation come before any QMP."""
         tape = tapes_mod.read(self.cfg, name)       # 400/404 first
+        # S2: the spectrum files read and parsed, absolute paths (400
+        # before any QMP); keV >= K is a warning
+        kev_full = self._kev_full()
+        warnings = tapes_mod.kev_warnings(tape, kev_full)
+        tape = tapes_mod.resolve(self.cfg, tape, kev_full, warnings)
         if loop is not None:
             tape = dict(tape)
             tape["loop"] = loop
@@ -515,6 +533,8 @@ class Platform:
         self._qom_set("det-tape-play", True, STIXCTRL)
         r = self._tape_status()
         self._stim_emit(r, self._tape_step_kind(tape, r["step"]))
+        if warnings:
+            r["warnings"] = warnings
         return r
 
     def v_tape_stop(self):
@@ -537,7 +557,7 @@ class Platform:
         return self._det_status("det-align-status", {
             "mode": str, "rows": int, "fallback": int, "honoured": int,
             "mismatch_cells": int, "unassigned_cells": int,
-            "calibration": str})
+            "calibration": str, "preimage_miss": int})
 
     def v_adc_set(self, enabled):
         """C2's verb: the det-adc-mode bench knob + the parsed status."""
