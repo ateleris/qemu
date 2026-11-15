@@ -3121,7 +3121,8 @@ decisions D-Db, D-Df, D-Dd, D-Dj; "Index spaces").
   "The ELUT"), so real hardware would put every count in `ebin` 31.
   **This is a deliberate deviation** (plan Doc vs code 20): a gate that
   compares QL against real hardware with an empty flash must not use the
-  synthetic sky.
+  synthetic sky. Except the tape's `align` option for science-space
+  steps (§51/§52) and the `det-adc-mode` sky of §53.
 
 **The scene properties (D-Db), on `/machine/stixctrl`:**
 - runtime class properties with setters (they also work before realize,
@@ -5979,6 +5980,125 @@ D-PLj request filter, loopback bind and 403 rules as `--view-run`;
 nothing is written into the viewed run dir (self-tested). The one
 slot keeps the process's footprint bounded.
 
+## 51. Detector stimulus: per-pair rates and the mix tape (baseline: one uniform rate, no tape)
+
+Owner requirement (2026-11-15): "All of it, staged" — Stage S1 =
+per-detector and per-pixel rates + the mix tape (JSON steps on guest
+time, a background layer under the steps, each step start a Timeline
+marker, tapes saved next to the saved views); the Spectra and
+single-events controls of the mockup board are wired in S2/S3. Plan:
+`2026-11-15-stimulus-plan.md`, tasks T1-T6, decisions D2 (DG1-DG4
+dropped) and D3 (SAFE freezes playback).
+
+**What:** the tape engine lives in `stix_det.c` on the existing 100 ms
+tick (D-Dj store-then-apply, under the tick's `mem_reentrancy_guard`),
+so steps are guest-time exact and icount/pace-fast safe; the platform
+owns the tape files, verbs and markers (`stixplat/tapes.py`, verbs
+`det.tape.*`, the `stim` record kind).
+
+- **The schema** (`det-tape-load`, a write-only string of JSON on
+  `/machine/stixctrl`; ≤ 64 steps, ≤ 64 KiB): `{"api": 1, "name": ...,
+  "align": <bool, default false>, "adc_mode": <bool, optional>,
+  "loop": <bool, default false>, "background": <rate layer>,
+  "steps": [...]}` — the tape-level `align` converts science-space
+  steps through the loaded ELUT once S2/S3 land (§52). Step kinds
+  `rate` | `replay` | `off`; `single` and `spec` values other than
+  `"flat"` parse (the wire shape is fixed) but are refused at load with
+  "unsupported in this build (S2/S3)". A step is `{"kind", "for_s":
+  <0.1..86400>, "label": <optional>, "fpga_det_mask": <u32, required
+  for rate/off>, "pix_mask": <0..0xFFF, default 0xFFF>, "cps":
+  <integer 0..1 000 000, rate>}`; a replay step carries `"file"` and
+  `"offset_ms"` (below). Every error names the step index; masks are
+  `fpga_det`/`pix` indexed and a `subcol_mask` key is refused by name
+  (`dss_det = fpga_det`). The background is a rate layer with an
+  integer `cps` and no `for_s` and no masks — unmasked by definition,
+  it fills all 384 (`fpga_det`, `pix`) pairs outside the active step's
+  masks. Name and labels hold no comma and no control character (the
+  `det-tape-status` line must stay one line); the platform's tape file
+  name is additionally 1..64 of A-Za-z0-9._- without a leading dot (the
+  views' rule). A rejected load leaves the previous tape intact; a load
+  while playing stops first. `det-tape-status` (read-only) reports
+  state, name, step K/N, label, step_left_ticks, loop, align.
+  `loop=true` restarts at step 0 after the last step; otherwise the
+  tape ends `done` and — like a stop — the rates revert to the scene
+  knobs at the next tick; a device reset stops playback and keeps the
+  tape (state `ready`).
+- **Tick rules (D-Dj):** the step clock advances one tick per tick only
+  while the tick runs, i.e. only while FSM Enable = 1 — SAFE/paused
+  freezes playback (D3), and a ClearEnable mid-step freezes the
+  countdown (`step_left_ticks` holds). A play/stop stores a request and
+  applies at the next tick (a play starts step 0 there, traced
+  `stixdet_tape_step`); the sky tick reads this tick's per-pair rates
+  from the tape state.
+- **Step/background precedence:** while a tape plays, a pair's rate is
+  the active step's `cps` inside the step's masks, else the
+  background's; an `off` step contributes 0 on its masks, so an all-32
+  `off` step silences the background too. The rate still flows through
+  the exposure + template and the per-tick pix gate (a gated-off pix
+  produces nothing, like a real event); the scene's `det-flare` and the
+  two `*-cps` knobs are ignored while playing. Rate steps need
+  `det-source=synthetic` (the play setter refuses otherwise, naming the
+  source).
+- **Replay steps** start/stop the D-7 engine at the step's start/end
+  and switch `det-source` to/from `replay-dss` for the step's duration.
+  `det-replay-file` is realize-time, so a replay step is refused at
+  load unless a table was scanned at realize and
+  `det-replay-trigger=qmp` (the default nominal trigger starts the
+  replay at the SetEnable edge regardless of the tape); the step's
+  `file` must equal the realized `det-replay-file` and its `offset_ms`
+  must equal `det-replay-offset-ms`.
+- **Two recorded deviations.** (a) During a replay step the source is
+  `replay-dss`, and the synthetic sky draws only while
+  `det-source=synthetic` — so the tape's rates, the background
+  included, produce nothing for the whole step (the step's counts come
+  from the replay alone). (b) A tape without an `adc_mode` field
+  snapshots the `det-adc-mode` knob at load time and holds it for the
+  whole playback (the field's default is the knob's value at load); a
+  mid-play knob change applies only at the next load or stop/done.
+- **Platform markers (T4):** the hw-state `det.tape` object (state,
+  name, step 1-based, n_steps, label, kind, loop, align) feeds the
+  `instrument.detector.tape.*` leaves; every step change (and the
+  play/stop verbs) logs one `stim` record — Timeline marker kind
+  `stim`, hover label `tape '<name>' step <k>/<N>: <label>`; tape
+  files live in `[timeline] tapes_dir` (default
+  `<retention.run_root>/tapes`, next to the saved views).
+
+**Why:** the §34 scene knobs are one uniform rate per `fpga_det` behind
+a flare bool — no per-detector or per-pixel targeting, no schedule. A
+controller-side scheduler was rejected (plan approach 1): at
+`pace = fast` one 20 Hz poll is ~1 s of guest time, so 0.1 s steps are
+impossible there and playback would not be icount-deterministic. On the
+model tick the step timing is tick-quantized guest time inside the same
+deterministic stream the qtests pin, and the FSW-visible end (SSID 30
+and 32) gets a stimulus the gates can assert against.
+
+**The gate** (`scripts/stix/detector-smoke.sh --tape`, T6): synthetic
+base with `det-quiet-cps=0` (the play setter refuses `zero`, so the
+only sky is the tape's); background 20 cps on all 32, steps rate
+Q1+Q3 (`fpga_det` 0-7, 16-23) 2000 cps for 60 s, then `off` (all 32)
+30 s; the play lands inside the T_nom ± 10 s window, so the rate step
+covers the 8 QL periods SSID 32 sums. One `tape` verdict in
+`ql-check.py` (`--ssid32-subcols
+0,1,5,6,4,10,11,12,30,31,25,26,21,27,19,20` =
+`SUBCOL_FROM_FPGA_DET[f]` for the masked `f`): in the one SSID 32 dump
+every masked subcol holds byte 4 (`ebin` 3, a flat-share ebin of the
+quiet template) ≥ 0x20 — measured 0x2e..0x31 live (≈ 240..300 counts)
+— and every unmasked subcol stays at the background floor, byte 4
+< 0x10 (20 cps × 32 s ≈ 6 counts; not zero — the background fills all
+32); the rate step's SSID 30 band-0 median is ≥ 8 compressed steps
+above the `off` step's and the off-window samples are exactly 0 (off
+beats the background end to end through the FSW) — that SSID 30 rule
+lives inside `tape`, so `--tape --negative` (only the `off` step
+played; its base flush is the D-3 zero one) fails exactly `tape`. The
+D-5 chunk checks are skipped in the tape modes (the ROTB path stays
+witnessed by uart-chunk). The platform scenario `gate-det-tape.json`
+(run mode) enters NOMINAL first, via CONFIGURATION and S20 = 0 (a
+direct SAFE -> NOMINAL is refused; the tick, and so the tape, only runs
+while FSM Enable = 1), saves and plays the tape via
+`det.tape.save`/`det.tape.play`, awaits
+`instrument.detector.tape.step` = 2 within 70 s, stops and awaits
+`state=stopped`, and expects the `stim` record in the log.
+
 ## 52. ELUT alignment (baseline: none)
 
 Owner requirement (2026-11-15): "if I wanted to, that you could support
@@ -6114,7 +6234,7 @@ and golden unchanged; the mode adds no RNG draws and no folds when off
   captures the mode-off quiet sky at `subcol` 0 byte 19 (`ebin` 18, the
   quiet template's 45 % line); leg 4 (`adc-mismatch`) uploads a
   deliberately wrong ELUT (derived from base 0 — shifted: the drawn
-  ebin-18 adc range, 3092-3164 for base 1800, lands in `ebin` 24 under
+  ebin-18 adc range, 3092..3163 for base 1800, lands in `ebin` 24 under
   the base-0 row) and asserts `mismatch_cells >= 1`,
   `calibration=dss-linear`, byte 19 empty while the counts ARRIVE at
   `ebin` 24 within 5σ of the leg-3 reference (a mass-losing fold must
