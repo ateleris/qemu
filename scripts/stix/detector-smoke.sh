@@ -149,6 +149,63 @@
 # adc b + floor((4096 - b) 62/160 + 0.5) = 2690..2733, ebin 21
 # (spectrum-arrival, negative only), so exactly spectrum-bin fails.
 # --spectrum combines with none of --flare, --tape, --no-rotb.
+# --single (single-events plan V4) plays a DSS-faithful mono burst: one
+# single step det(22, 0, 2200) x 1000, wait 20 us (1000 x 20 us = 20 ms,
+# one 100 ms tick), then off 30 s, on a 2 cps background. The base is
+# the --tape one and no ELUT is uploaded, so nothing shifts: QEMU keeps
+# the model's default synthetic det-source with det-quiet-cps=0 and adds
+# -global grlib-stixctrl.det-replay-file=<run>/dssevs.spec (the 32 0xE
+# setup words, base 1800 + 10 d, no events; with det-replay-trigger=qmp
+# the replay engine stays idle and exists only to give the adc -> ebin
+# calibration baselines: without the file every base is 0 and adc 2200
+# would bin to ebin 17, not the gate's ebin 2), and traces stixdet_single,
+# stixdet_tape_step and stixdet_chunk too. The timeline is the default
+# mode's (CONF @215, probe 240 s): @50 CONF, @60 S20 = 0, @62 the
+# verification period, @70 NOMINAL (T_nom in [70, 80]), @76 QMP
+# det-tape-load + det-tape-play true of gate-det-single (inside the
+# T_nom +- 10 s window, so the burst is inside the first 8 QL periods
+# the exit SSID 32 dump sums), @100 QMP qom-get det-tape-status (the 4 s
+# burst step has run, the 30 s off step is playing: step=2/2; dropped
+# sums the whole play), @215 CONF (T_exit) + the five-product flush. The
+# 2 cps background exists for the flush evidence only (--expect-tape-
+# flush needs SSID 31 and 33 non-zero, which a one-pair burst never
+# lights; the BG pair fpga_det 8/9 still sees ~8 counts in the 4 s
+# step). It is per fpga_det (32 x 2 cps x 0.475 pix share x 4 s ~ 120
+# counts in all), small next to the 1000 so single-chunk's window can
+# hold and the negative (~120) misses it; at 20 cps it would be ~1200.
+# Its ebin-2 share on any sample is < 1 count.
+# Checks: the base ones (probe, UART, trace-verif, uart-chunk, the flush
+# with --expect-tape-flush (T_exit - T_nom); the D-5 chunk checks
+# skipped as in the tape modes), then
+#   single-status: the @100 return ends dropped=0 (negative:
+#     dropped=1000) and holds state=playing, step=2/2;
+#   single-trace: tape step 0 kind=single after the enabling FSM strobe,
+#     and the stixdet_single lines after it sum to n = 1000 with
+#     fpga_det 22 pix 0 adc 2200 and ebin 2 (negative: ebin -1, the sum
+#     still 1000 - the schedule runs even when the gate drops);
+#   single-byte: ql-check.py --ssid32-inject 19 2 0x37 0x10 - subcol 19
+#     = SUBCOL_FROM_FPGA_DET[22], ebin 2 = the degenerate-row fallback
+#     with base 2020 (floor(180 x 32 / 2076)); the floor 0x37 is S0 of
+#     n/2 (robust to the background; the exact expected byte 0x3F = S0
+#     of 1000 is logged), every other sample's ebin-2 byte < 0x10;
+#   single-chunk: the first stixdet_chunk line after the last
+#     stixdet_single has 1000 <= eacc_events <= 1250 (the deposit is
+#     exact; the +250 headroom holds the 2 cps background, ~120 counts
+#     over the 4 s step (+ 3 sigma); bound and measured value logged) - the TM-visible stand-in for the outline's EACC
+#     cell (deviation D-b, asserted cell-exactly in det-single-land);
+#   for the record only (printed, not asserted): the target sample's
+#     trigger byte against its subcol +- 1 neighbours - LTRG is an AHB
+#     SRAM, not a TM field (deviation D-a; the 1.25x rule is asserted
+#     in det-single-land). SSID 30's samples are per 4 s period, so the
+#     per-subcol trigger byte logged is the SSID 32 sample's (LTRG of
+#     that subcol's grp), with the SSID 30 trigger column alongside.
+# --single --negative plays the same tape with pix 1 (R3 = 63 there
+# under F6: only pix 0, 3, 6, 7, 8 pass the model's gate in NOMINAL):
+# the schedule runs (the trace still sums 1000), the gate drops every
+# event (dropped=1000) and nothing reaches ebin 2 or the chunk. It
+# passes only when exactly single-byte and single-chunk fail.
+# --single combines with none of --flare, --tape, --no-rotb,
+# --spectrum (run-dir suffixes -single / -singleneg).
 # ROTB science chunks (D-5), in every mode: QEMU also traces
 # stixdet_scene, stixdet_nominal_swap, stixdet_chunk, stixdet_chunk_drop
 # and stixctrl_rotb_cmd into the same trace file, and
@@ -211,6 +268,8 @@
 # this mode must find the trace file present and empty: no IDeF-X
 # command words at all (a missing trace FAILS the negative). Every
 # other check must pass.
+# (The --flare, --tape, --spectrum and --single modes keep det-idefx on,
+# so even their negatives take the positive trace branch.)
 #
 # In legacy mode (STIX_PORT_BASE unset) this script, like tc-smoke.sh,
 # does NOT take the /tmp/stix-qtest-21000 flock itself; the caller must
@@ -220,11 +279,13 @@
 #
 # Usage: detector-smoke.sh <qemu-binary> [--flare] [--negative]
 #                           [--no-rotb] [--tape] [--spectrum]
-#                           [--dry-run] [--check-guard]
+#                           [--single] [--dry-run] [--check-guard]
 #   (--flare carries the D-6 det-inject deposit at @85; see above)
 #   --no-rotb combines with neither --flare nor --negative.
 #   --tape combines with neither --flare nor --no-rotb.
 #   --spectrum combines with none of --flare, --tape, --no-rotb.
+#   --single combines with none of --flare, --tape, --no-rotb,
+#   --spectrum.
 #   STIX_ASW_ELF            as in tc-smoke.sh
 #   STIX_DETECTOR_RUN_DIR   run dir (default /tmp/stix-detector-run).
 #                           Canonicalised, then anything at or above
@@ -232,8 +293,8 @@
 #                           (or /) is refused, as in nominal-smoke.sh.
 #                           Each mode adds its suffix (-neg, -flare,
 #                           -flareneg, -norotb, -tape, -tapeneg,
-#                           -spec, -specneg; none for the positive),
-#                           then slot
+#                           -spec, -specneg, -single, -singleneg;
+#                           none for the positive), then slot
 #                           mode -s<k>. A run that did not PASS leaves
 #                           .unfinished; the next run moves that dir aside
 #                           to <dir>.fail-<date>-<pid>, never reusing it.
@@ -255,13 +316,14 @@
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: detector-smoke.sh <qemu-binary> \
-[--flare] [--negative] [--no-rotb] [--tape] [--spectrum] [--dry-run] \
-[--check-guard]}"
+[--flare] [--negative] [--no-rotb] [--tape] [--spectrum] [--single] \
+[--dry-run] [--check-guard]}"
 NEGATIVE=0
 FLARE=0
 NO_ROTB=0
 TAPE=0
 SPECTRUM=0
+SINGLE=0
 DRY_RUN=0
 CHECK_GUARD=0
 for a in "${@:2}"; do
@@ -282,6 +344,9 @@ for a in "${@:2}"; do
             [ "$SPECTRUM" -eq 0 ] || {
                 echo "--spectrum given twice"; exit 2; }
             SPECTRUM=1 ;;
+        --single)
+            [ "$SINGLE" -eq 0 ] || { echo "--single given twice"; exit 2; }
+            SINGLE=1 ;;
         --dry-run)
             [ "$DRY_RUN" -eq 0 ] || { echo "--dry-run given twice"; exit 2; }
             DRY_RUN=1 ;;
@@ -305,6 +370,12 @@ fi
 if [ "$SPECTRUM" -eq 1 ] && { [ "$FLARE" -eq 1 ] || [ "$TAPE" -eq 1 ] ||
         [ "$NO_ROTB" -eq 1 ]; }; then
     echo "--spectrum combines with none of --flare, --tape, --no-rotb"
+    exit 2
+fi
+if [ "$SINGLE" -eq 1 ] && { [ "$FLARE" -eq 1 ] || [ "$TAPE" -eq 1 ] ||
+        [ "$NO_ROTB" -eq 1 ] || [ "$SPECTRUM" -eq 1 ]; }; then
+    echo "--single combines with none of --flare, --tape, --no-rotb," \
+        "--spectrum"
     exit 2
 fi
 
@@ -375,6 +446,8 @@ MODE_SFX=""
 [ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-tapeneg"
 [ "$SPECTRUM" -eq 1 ] && MODE_SFX="-spec"
 [ "$SPECTRUM" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-specneg"
+[ "$SINGLE" -eq 1 ] && MODE_SFX="-single"
+[ "$SINGLE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-singleneg"
 RUN_DIR="$(stix_slot_dir "$RUN_DIR$MODE_SFX")"
 guard_shared
 QMP_SOCK="$RUN_DIR/qmp.sock"
@@ -518,6 +591,10 @@ encode_args() {  # csv t0 -> probe args in ELUT_ARGS, record in ELUT_RECORD
 align_status() {  # probe-log
     grep -F '"property": "det-align-status' "$1" || true
 }
+# the probe log's det-tape-status return (the @100 read; V4)
+tape_status() {  # probe-log
+    grep -F '"property": "det-tape-status' "$1" || true
+}
 # the base-0 JSON of the wrong-but-honoured CSV (align-smoke's C3 one)
 BASE0="{"
 for d in $(seq 0 31); do
@@ -568,6 +645,33 @@ if [ "$SPECTRUM" -eq 1 ]; then
     )
 fi
 
+# --single (single-events plan V4): the burst tape, loaded and played at
+# @76, the status read at @100 (three QMP groups; see the header). The
+# negative plays the same tape on pix 1 (R3 = 63 there under F6): the
+# schedule runs, the gate drops every event, nothing lands.
+SINGLE_PIX=0
+[ "$NEGATIVE" -eq 0 ] || SINGLE_PIX=1
+SINGLE_STEPS='{"kind": "single", "label": "mono", "for_s": 4,'
+SINGLE_STEPS+=" \"fpga_det\": 22, \"pix\": $SINGLE_PIX, \"adc\": 2200,"
+SINGLE_STEPS+=' "n": 1000, "wait_us": 20},'
+SINGLE_STEPS+='{"kind": "off", "for_s": 30, "fpga_det_mask": 4294967295}'
+SINGLE_JSON='{"api": 1, "name": "gate-det-single",'
+SINGLE_JSON+=' "background": {"cps": 2}, "steps": ['"$SINGLE_STEPS"']}'
+SINGLE_ESC="$(printf '%s' "$SINGLE_JSON" | sed 's/"/\\"/g')"
+SINGLE_ARGS=()
+if [ "$SINGLE" -eq 1 ]; then
+    SINGLE_ARGS=(
+        --qmp "$QMP_SOCK"
+        --send-at 76
+        --qmp-cmd "$(qom_set /machine/stixctrl det-tape-load \
+            "\"$SINGLE_ESC\"")"
+        --send-at 76
+        --qmp-cmd "$(qom_set /machine/stixctrl det-tape-play true)"
+        --send-at 100
+        --qmp-cmd "$(qom_get /machine/stixctrl det-tape-status)"
+    )
+fi
+
 # TM(5,x) on 0x5A7, the subtype from the EID's severity nibble (1 ->
 # TM(5,1), 5 -> TM(5,2), 9 -> TM(5,3)); TM(21,6) QL on 0x5DC, matched
 # on the SSID (the first application byte).
@@ -607,6 +711,7 @@ PROBE_ARGS=(
     ${FLARE_ARGS[@]+"${FLARE_ARGS[@]}"}
     ${TAPE_ARGS[@]+"${TAPE_ARGS[@]}"}
     ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"}
+    ${SINGLE_ARGS[@]+"${SINGLE_ARGS[@]}"}
     --send-at "$AT_CONF2" --send-hex "$TC_CONF2"
     --expect "0x5A1:1:1:1DACC005"
     --expect "0x5A7:5:1:00210504@10"
@@ -635,6 +740,13 @@ if [ "$FLARE" -eq 0 ]; then
     # quiet rate 0: the only sky is the tape's
     if [ "$TAPE" -eq 1 ]; then
         QEMU_ARGS+=(-global grlib-stixctrl.det-quiet-cps=0)
+    elif [ "$SINGLE" -eq 1 ]; then
+        # the single tape's sky only; the .dssevs realizes the 0xE
+        # baselines for the adc -> ebin lookup, the replay engine stays
+        # idle (trigger qmp, never triggered)
+        QEMU_ARGS+=(-global grlib-stixctrl.det-quiet-cps=0
+                    -global "grlib-stixctrl.det-replay-file=$SPEC_DSSEVS"
+                    -global grlib-stixctrl.det-replay-trigger=qmp)
     elif [ "$SPECTRUM" -eq 1 ]; then
         # the spectrum tape's sky only; the .dssevs realizes the 0xE
         # baselines, the replay engine stays idle (trigger qmp, never
@@ -646,10 +758,10 @@ if [ "$FLARE" -eq 0 ]; then
         QEMU_ARGS+=(-global grlib-stixctrl.det-source=zero)
     fi
     if [ "$NEGATIVE" -eq 1 ] && [ "$TAPE" -eq 0 ] &&
-            [ "$SPECTRUM" -eq 0 ]; then
-        # the plain negative's CmdReady-0 run; --tape --negative keeps
-        # det-idefx on (like --flare --negative) so it fails exactly
-        # the tape check
+            [ "$SPECTRUM" -eq 0 ] && [ "$SINGLE" -eq 0 ]; then
+        # the plain negative's CmdReady-0 run; --tape/--spectrum/
+        # --single --negative keep det-idefx on (like --flare
+        # --negative) so they fail exactly their own check
         QEMU_ARGS+=(-global grlib-stixctrl.det-idefx=off)
     fi
     if [ "$NO_ROTB" -eq 1 ]; then
@@ -662,6 +774,7 @@ MODE="positive"
 [ "$NO_ROTB" -eq 1 ] && MODE="no-rotb"
 [ "$TAPE" -eq 1 ] && MODE="tape $MODE"
 [ "$SPECTRUM" -eq 1 ] && MODE="spectrum $MODE"
+[ "$SINGLE" -eq 1 ] && MODE="single $MODE"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY RUN — the commands detector-smoke would run ($MODE):"
@@ -671,6 +784,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
         echo "# the tape: $SPEC_JSON"
         rm -rf "$SPEC_TMP"
     fi
+    [ "$SINGLE" -eq 0 ] || echo "# the tape: $SINGLE_JSON"
     printf '(cd %s && timeout %s %s ' "$RUN_DIR" "$((PROBE_SECS + 30))" \
         "$QEMU_BIN"
     printf '%q ' "${QEMU_ARGS[@]}"
@@ -713,10 +827,17 @@ rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       ql.contrast.log ql.inject.log ql.tape.log trace.check.log \
       chunk.check.log chunk-flare.check.log qmp.sock \
       dssevs.spec wrong-base0.csv derive.spec.log ql.spec-line.log \
-      ql.spec-bin.log ql.spec-adc.log ql.spec-arrival.log
+      ql.spec-bin.log ql.spec-adc.log ql.spec-arrival.log \
+      ql.single-byte.log ql.single-trig.log
 truncate -s 17716740096 flash.bin
-if [ "$SPECTRUM" -eq 1 ]; then
+if [ "$SPECTRUM" -eq 1 ] || [ "$SINGLE" -eq 1 ]; then
+    # the 32 0xE setup words with the 1800 + 10 d baselines; the replay
+    # engine stays idle (trigger qmp) and the file only gives the
+    # adc -> ebin calibration its baselines (V4: without it every base
+    # is 0 and adc 2200 bins to ebin 17)
     write_adc_dssevs "$SPEC_DSSEVS"
+fi
+if [ "$SPECTRUM" -eq 1 ]; then
     mv -- "$SPEC_TMP/wrong-base0.csv" wrong-base0.csv
     mv -- "$SPEC_TMP/derive.log" derive.spec.log
     rm -rf "$SPEC_TMP"
@@ -733,6 +854,10 @@ printf '%s\n' stixdet_idefx_cmd stixdet_fsm_strobe stixdet_scene \
 [ "$SPECTRUM" -eq 0 ] ||
     printf '%s\n' stixdet_spectrum stixdet_tape_step stixdet_align \
         >> idefx.events
+# --single: the burst feed and the step starts (stixdet_chunk is in the
+# base list above)
+[ "$SINGLE" -eq 0 ] ||
+    printf '%s\n' stixdet_single stixdet_tape_step >> idefx.events
 
 PROBE_PID=""
 QEMU_PID=""
@@ -901,8 +1026,11 @@ QL_FLUSH_ARG=--expect-zero-flush
 if [ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 0 ]; then
     QL_FLUSH_ARG=--expect-tape-flush
 fi
-# --spectrum: the tape's sky in both legs
+# --spectrum and --single: the tape's sky in both legs (the 20 cps
+# background keeps SSID 31 and 33 non-zero; a one-pair burst never
+# lights them, lesson 4)
 [ "$SPECTRUM" -eq 0 ] || QL_FLUSH_ARG=--expect-tape-flush
+[ "$SINGLE" -eq 0 ] || QL_FLUSH_ARG=--expect-tape-flush
 if [ -z "$NOM_SECONDS" ]; then
     echo "CHECK ql: FAIL (no NOMINAL window: 0021 04 05 or 0021 05 04" \
         "not seen)"
@@ -1145,6 +1273,143 @@ if [ "$SPECTRUM" -eq 1 ]; then
     fi
 fi
 
+# 2f. --single (single-events plan V4): the @100 status return, the
+# traces, the SSID 32 byte and the chunk total. Every check echoes what
+# it decides on: the status line, the trace lines, ql-check's deposit
+# line and the chunk line.
+if [ "$SINGLE" -eq 1 ]; then
+    # single-status: the one @100 return, echoed in full
+    mapfile -t TST < <(tape_status detector.probe.log |
+        sed -n 's/.* -> return "\([^"]*\)".*/\1/p')
+    TS0="${TST[0]:-}"
+    echo "single: det-tape-status @100: '${TS0}'"
+    TS_DROP=0
+    [ "$NEGATIVE" -eq 0 ] || TS_DROP=1000
+    if [ "${#TST[@]}" -ne 1 ]; then
+        echo "CHECK single-status: FAIL (${#TST[@]} det-tape-status" \
+            "returns in the probe log, want 1)"
+        FAILED+=(single-status)
+    elif [[ "$TS0" == state=playing,* ]] && [[ "$TS0" == *,step=2/2,* ]] &&
+            [[ "$TS0" == *",dropped=$TS_DROP" ]]; then
+        echo "CHECK single-status: ok (state=playing, step=2/2," \
+            "dropped=$TS_DROP)"
+    else
+        echo "CHECK single-status: FAIL (want state=playing, step=2/2," \
+            "dropped=$TS_DROP)"
+        FAILED+=(single-status)
+    fi
+
+    # single-trace: the step line and the burst lines after the enabling
+    # strobe (trace order, never a time); the burst lines sum to n
+    STROBE_N="$(grep -n 'stixdet_fsm_strobe .* enable=1 ' idefx.trace \
+        2>/dev/null | head -1 | cut -d: -f1)" || true
+    STEP_WANT='stixdet_tape_step tape step 0 kind=single'
+    STEP_N="$(grep -n -F -- "$STEP_WANT" idefx.trace 2>/dev/null |
+        head -1 | cut -d: -f1)" || true
+    BURST_WANT='stixdet_single single burst: fpga_det 22 pix 0 adc 2200 ebin 2 n '
+    [ "$NEGATIVE" -eq 0 ] ||
+        BURST_WANT='stixdet_single single burst: fpga_det 22 pix 0 adc 2200 ebin -1 n '
+    SUM_N=""
+    if [ -n "$STEP_N" ]; then
+        SUM_N="$(tail -n +"$STEP_N" idefx.trace 2>/dev/null |
+            grep -F -- "$BURST_WANT" |
+            sed -n 's/.* n \([0-9][0-9]*\) at vclock.*/\1/p' |
+            awk '{ s += $1 } END { printf "%u", s }')" || true
+    fi
+    grep -m4 -F -- "$BURST_WANT" idefx.trace 2>/dev/null || true
+    if [ -n "$STROBE_N" ] && [ -n "$STEP_N" ] &&
+            [ "$STEP_N" -gt "$STROBE_N" ] && [ "$SUM_N" = "1000" ]; then
+        echo "CHECK single-trace: ok (step 0 kind=single at line" \
+            "$STEP_N, after the enabling strobe at line $STROBE_N; the" \
+            "burst lines after it sum to n = $SUM_N, fpga_det 22 pix 0" \
+            "adc 2200, ebin as played)"
+    else
+        echo "CHECK single-trace: FAIL (enabling strobe line" \
+            "'${STROBE_N}', step 0 line '${STEP_N}', the burst sum" \
+            "'${SUM_N}', want 1000)"
+        FAILED+=(single-trace)
+    fi
+
+    # single-byte: the deposit byte at subcol 19, ebin 2 (byte 3). The
+    # floor 0x37 is S0 of n/2; the exact expected byte is 0x3F = S0 of
+    # 1000, in ql-check's deposit line below. The quiet bound 0x10: the
+    # 2 cps background adds < 1 count at ebin 2 (lesson 4).
+    if [ ! -s ql.dump.hex ]; then
+        echo "CHECK single-byte: FAIL (no 0x5DC packet dumped)"
+        FAILED+=(single-byte)
+        add_why single-byte "no 0x5DC packet dumped"
+    else
+        set +e
+        python3 "$QLCHECK" ql.dump.hex --ssid32-inject 19 2 0x37 0x10 \
+            > ql.single-byte.log 2>&1
+        QLSB_RC=$?
+        set -e
+        grep -E '^QL-CHECK' ql.single-byte.log || true
+        if [ "$QLSB_RC" -eq 0 ]; then
+            echo "CHECK single-byte: ok (subcol 19 =" \
+                "SUBCOL_FROM_FPGA_DET[22] holds >= 0x37 = S0 of n/2 at" \
+                "ebin 2, the degenerate-row fallback of adc 2200 with" \
+                "base 2020; exact expected 0x3F = S0 of 1000, measured" \
+                "byte in the QL-CHECK line above)"
+        else
+            echo "CHECK single-byte: FAIL ($(ql_why ql.single-byte.log);" \
+                "ql-check rc=$QLSB_RC; see ql.single-byte.log)"
+            FAILED+=(single-byte)
+            add_why single-byte "$(ql_why ql.single-byte.log)"
+        fi
+    fi
+
+    # single-chunk: the first stixdet_chunk after the last
+    # stixdet_single carries that integration's eacc_events (the chunk's
+    # own total, not cumulative): the 1000 exact + the 2 cps
+    # background over the 4 s step (32 x 2 x 0.475 x 4 ~ 120, the +250
+    # headroom; deviation D-b, the EACC cell itself is det-single-land's)
+    LAST_SINGLE_N="$(grep -n 'stixdet_single ' idefx.trace 2>/dev/null |
+        tail -1 | cut -d: -f1)" || true
+    CHUNK_LINE=""
+    EACC=""
+    if [ -n "$LAST_SINGLE_N" ]; then
+        CHUNK_LINE="$(tail -n +"$LAST_SINGLE_N" idefx.trace 2>/dev/null |
+            grep -m1 -F 'stixdet_chunk ')" || true
+        EACC="$(printf '%s\n' "$CHUNK_LINE" |
+            sed -n 's/.* eacc_events=\([0-9][0-9]*\) rotb_count.*/\1/p')" ||
+            true
+    fi
+    [ -z "$CHUNK_LINE" ] || echo "single: $CHUNK_LINE"
+    if [ -n "$EACC" ] && [ "$EACC" -ge 1000 ] && [ "$EACC" -le 1250 ]; then
+        echo "CHECK single-chunk: ok (eacc_events=$EACC in [1000, 1250]:" \
+            "the 1000 exact + the background's worst nominal integration" \
+            "~250)"
+    else
+        echo "CHECK single-chunk: FAIL (eacc_events='${EACC}', want in" \
+            "[1000, 1250]; the first stixdet_chunk after the last" \
+            "stixdet_single: '${CHUNK_LINE}')"
+        FAILED+=(single-chunk)
+        add_why single-chunk "eacc_events '${EACC}' outside [1000, 1250]"
+    fi
+
+    # for the record only, not asserted (deviation D-a: LTRG is an AHB
+    # SRAM, not a TM field; the 1.25x rule is asserted in
+    # det-single-land). SSID 30's samples are per 4 s period - no subcol
+    # dimension - so the target subcol's trigger byte is the SSID 32
+    # sample's (LTRG of that subcol's grp): subcol 19 and its +-1
+    # neighbours, with SSID 30's trigger column alongside.
+    if [ -s ql.dump.hex ]; then
+        set +e
+        python3 "$QLCHECK" ql.dump.hex --samples > ql.single-trig.log 2>&1
+        set -e
+        echo "single: SSID 32 trigger bytes of subcol 19 and its +-1" \
+            "neighbours 18/20 (LTRG of the subcol's grp; the record):"
+        grep -E '^  sample [0-9]+: subcol (18|19|20) ' ql.single-trig.log |
+            sed -n 's/^\(  sample [0-9]*: subcol [0-9]*\).* trigger \(..\).*/\1 trigger \2/p' ||
+            true
+        SSID30_TRIGS="$(sed -n 's/^  sample [0-9]*: lc_band.* trigger \(..\) rcr .*/\1/p' \
+            ql.single-trig.log | paste -sd' ' -)" || true
+        echo "single: SSID 30 trigger bytes per 4 s period (the record):" \
+            "$SSID30_TRIGS"
+    fi
+fi
+
 # 3. the UART, NULs stripped
 tr -d '\000' < uart.detector.raw > uart.detector.txt
 UART_BASE_OK=1
@@ -1244,7 +1509,7 @@ fi
 # negatives take the positive branch here.
 IDEFX_NEG=0
 [ "$NEGATIVE" -eq 1 ] && [ "$FLARE" -eq 0 ] && [ "$TAPE" -eq 0 ] && \
-    [ "$SPECTRUM" -eq 0 ] && IDEFX_NEG=1
+    [ "$SPECTRUM" -eq 0 ] && [ "$SINGLE" -eq 0 ] && IDEFX_NEG=1
 # Neither branch compares a time with another clock: the runs are
 # placed in NOMINAL by the FSM strobes' order in the same trace.
 TRACE_ARGS=(idefx.trace)
@@ -1278,10 +1543,16 @@ fi
 # integrations have no scene flare window for chunk-trace-check (its
 # 200-tick quiet rule is the flare mode's); the ROTB path stays
 # witnessed by uart-chunk.
-if [ "$TAPE" -eq 1 ] || [ "$SPECTRUM" -eq 1 ]; then
-    echo "CHECK chunk: skipped (--tape/--spectrum: the rate step's 1 s" \
-        "integrations are not the D-5 quiet cadence; chunk-trace-check" \
-        "has no tape window)"
+if [ "$TAPE" -eq 1 ] || [ "$SPECTRUM" -eq 1 ] || [ "$SINGLE" -eq 1 ]; then
+    if [ "$SINGLE" -eq 1 ]; then
+        echo "CHECK chunk: skipped (--single: skipped as in the tape" \
+            "modes; the chunk path stays witnessed by uart-chunk and" \
+            "single-chunk)"
+    else
+        echo "CHECK chunk: skipped (--tape/--spectrum: the rate step's 1 s" \
+            "integrations are not the D-5 quiet cadence; chunk-trace-check" \
+            "has no tape window)"
+    fi
 else
     CHUNK_ARGS=(idefx.trace)
     if [ "$NO_ROTB" -eq 1 ]; then
@@ -1383,6 +1654,26 @@ if [ "$SPECTRUM" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
         "'${GOT}', want 'spectrum-bin'$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
+if [ "$SINGLE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
+    # PASS only when exactly single-byte and single-chunk fail as
+    # planned: pix 1 is gated (R3 = 63 there under F6), so the burst
+    # reached neither the SSID 32 byte nor the chunk; the schedule ran
+    # (single-trace sums 1000), the status counted 1000 dropped, and
+    # the status, trace, flush, probe, UART and trace-verif checks
+    # passed
+    if [ "$GOT" = "single-byte single-chunk" ]; then
+        echo "DETECTOR-SMOKE (single negative): PASS (failed exactly as" \
+            "planned: the gated pix 1 burst reached neither the SSID 32" \
+            "byte nor the chunk total; the status counted 1000" \
+            "dropped)${STIX_SLOT_TAG}"
+        pass_cleanup
+        exit 0
+    fi
+    echo "DETECTOR-SMOKE (single negative): FAIL (failed checks:" \
+        "'${GOT}', want 'single-byte single-chunk'$WHY_QL)" \
+        "${STIX_SLOT_TAG}"
+    exit 1
+fi
 if [ "$NO_ROTB" -eq 1 ]; then
     # PASS only when exactly the two chunk checks fail as planned
     if [ "$GOT" = "uart-chunk chunk" ]; then
@@ -1423,6 +1714,7 @@ TAG="DETECTOR-SMOKE"
 [ "$FLARE" -eq 1 ] && TAG="DETECTOR-SMOKE ($MODE)"
 [ "$TAPE" -eq 1 ] && TAG="DETECTOR-SMOKE (tape)"
 [ "$SPECTRUM" -eq 1 ] && TAG="DETECTOR-SMOKE (spectrum)"
+[ "$SINGLE" -eq 1 ] && TAG="DETECTOR-SMOKE (single)"
 if [ -n "$GOT" ]; then
     echo "$TAG: FAIL (failed checks: $GOT$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
