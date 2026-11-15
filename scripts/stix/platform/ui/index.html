@@ -114,6 +114,7 @@ tbody th { position: static; }   /* group headers scroll, thead sticks */
 .k-err { color: var(--bad); }
 .k-fault, .k-force { color: var(--warn); }
 .k-power, .k-state { color: var(--ok); }
+.k-stim { color: var(--accent); font-weight: 600; }
 .muted { color: var(--muted); }
 .diff { color: var(--warn); font-weight: 600; }
 #toast { min-height: 1.4em; font: 12px var(--mono); }
@@ -150,6 +151,13 @@ tr.p-group th { background: #f8fafc; font-weight: 600; }
 tr.p-diff td { background: #fff7ed; }
 tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
 .k-param { color: var(--warn); }
+section.bluebox { border-color: var(--accent); }
+.stim-tape { display: flex; width: 100%; gap: 2px; }
+.stim-tape div { border: 1px solid var(--line); border-radius: 4px;
+  padding: 2px 6px; font: 11px var(--mono); overflow: hidden;
+  white-space: nowrap; text-overflow: ellipsis; min-width: 2em; }
+.stim-bg { background: var(--chip); }
+.stim-step.active { border-color: var(--accent); color: var(--accent); }
 </style>
 </head>
 <body>
@@ -391,6 +399,18 @@ tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="detectors" hidden>
+<section class="wide">
+  <h2>Detectors
+    <span class="ctl">
+      <button type="button" id="det-sub-status" class="chip on">Status
+      </button>
+      <button type="button" id="det-sub-stim" class="chip">Stimulus
+      </button>
+    </span>
+  </h2>
+</section>
+
+<div class="det-status-view">
 <section>
   <h2>ROTB ring</h2>
   <div class="ctl">
@@ -405,8 +425,9 @@ tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
     <button data-verb="det.rotb.burst">append</button>
   </div>
 </section>
+</div>
 
-<section class="wide">
+<section class="wide det-status-view">
   <h2>Detector state</h2>
   <div class="desc">instrument.detector.* and instrument.rotb.* from
     /state and the state stream.</div>
@@ -418,6 +439,134 @@ tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
     </table>
   </div>
 </section>
+
+<div class="det-stim-view" hidden>
+<section>
+  <h2>Target</h2>
+  <div class="desc">Rates per detector and pixel on the guest-time
+    tick. Detector numbers are DSS (fpga_det = dss_det); the TM shows
+    the FSW subcollimator. A step start is a Timeline marker.</div>
+  <div class="ctl" id="stim-chips">
+    <button type="button" class="chip on" data-target="all">All 32
+    </button>
+    <button type="button" class="chip" data-target="q1">Q1</button>
+    <button type="button" class="chip" data-target="q2">Q2</button>
+    <button type="button" class="chip" data-target="q3">Q3</button>
+    <button type="button" class="chip" data-target="q4">Q4</button>
+    <button type="button" class="chip" data-target="map">Pick on
+      map…</button>
+  </div>
+  <div class="ctl" id="stim-map" hidden></div>
+  <div class="desc" id="stim-selected"></div>
+  <div class="ctl">
+    <span class="lbl">pixels</span>
+    <select id="stim-pix" title="pix, DSS ASIC channel 0..11">
+      <option value="0xFFF">all 12</option>
+      <option value="0x0FF">large only (0–7)</option>
+      <option value="0xF00">small only (8–11)</option>
+      <option value="one">one pixel…</option>
+    </select>
+    <input type="number" id="stim-pix-one" min="0" max="11" value="0"
+           data-type="int" hidden title="pix 0..11 (DSS ASIC channel)">
+  </div>
+</section>
+
+<section>
+  <h2>Stimulus</h2>
+  <div class="ctl">
+    <span class="lbl">kind</span>
+    <button type="button" class="chip on">Rate</button>
+    <button type="button" class="chip" disabled
+            title="spectra arrive in stage S2">Spectrum</button>
+    <button type="button" class="chip" disabled
+            title="single events arrive in stage S3">Single events
+    </button>
+    <button type="button" class="chip" disabled
+            title="the DSS-sequence button is wired in S3">DSS sequence
+    </button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">rate</span>
+    <input type="number" id="stim-cps" min="0" max="1000000" value="20000"
+           data-type="int" title="cps per detector, 0..1000000">
+    <span class="lbl">duration</span>
+    <input type="number" id="stim-dur" min="0.1" max="86400" step="0.1"
+           value="120" data-type="number" title="for_s, seconds">
+    <button type="button" id="stim-send">Send now</button>
+    <button type="button" id="stim-add">Add to tape</button>
+  </div>
+  <div class="desc">single events, as in the DSS tool:
+    det(22, 0, 1000) × N, wait 20 us</div>
+</section>
+
+<section class="bluebox">
+  <h2>Emulator support today vs needed</h2>
+  <div class="desc">Today: one quiet and one flare rate for all
+    detectors, and DSS sequence replay. Needed for this page:
+    per-detector and per-pixel rates, spectra, and single events —
+    detector-model work, planned separately.</div>
+</section>
+
+<section>
+  <h2>Mix tape</h2>
+  <div class="desc" id="stim-now">idle</div>
+  <div class="ctl">
+    <span class="lbl">progress</span>
+    <span id="stim-progress" class="chip">–</span>
+  </div>
+  <div class="ctl">
+    <span class="lbl">saved tapes</span>
+    <select name="name" id="stim-tapes" class="wide"
+            title="a saved tape (GET /api/v1/tapes)"></select>
+    <label class="muted"><input type="checkbox" id="stim-loop"
+      name="loop" data-type="bool"> loop</label>
+    <button data-verb="det.tape.play">play</button>
+    <button data-verb="det.tape.stop" data-args="{}" class="danger">
+      stop</button>
+    <button type="button" id="stim-reload">reload</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">save as</span>
+    <input id="stim-save-name" class="wide" placeholder="tape name">
+    <button type="button" id="stim-save">save</button>
+    <button type="button" id="stim-delete" class="danger">delete</button>
+  </div>
+  <div class="ctl" id="stim-tape-row"></div>
+  <div class="scroll">
+    <table>
+      <thead><tr><th>#</th><th>kind</th><th>target</th><th>settings</th>
+        <th>for</th><th></th></tr></thead>
+      <tbody id="stim-steps"></tbody>
+    </table>
+  </div>
+  <div class="desc">Steps run one after another; the background layer
+    runs under all of them. Every step start is a marker on the
+    Timeline. A tape is a JSON file next to the saved views; edits live
+    in the page until saved.</div>
+</section>
+
+<section>
+  <h2>ELUT alignment and ADC sky</h2>
+  <div class="ctl">
+    <span class="lbl">align</span>
+    <input type="checkbox" name="enabled" id="stim-align"
+           data-type="bool" title="det-align: the bench knob">
+    <button data-verb="det.align.set">apply</button>
+    <span id="stim-align-read" class="chip">–</span>
+  </div>
+  <div class="ctl">
+    <span class="lbl">ADC sky</span>
+    <input type="checkbox" id="stim-adc" name="adc_mode"
+           title="the tape's adc_mode field, written on save">
+    <span id="stim-adc-read" class="chip">–</span>
+  </div>
+  <div class="desc">align: science-space steps convert through the
+    loaded ELUT (the det.align report; a misaligned ELUT shows in
+    mismatch_cells). ADC sky: the tape draws through the loaded ELUT
+    like the replay does — the checkbox is the tape's adc_mode field on
+    save, the readout is the det-adc knob's.</div>
+</section>
+</div>
 </div>
 
 <div class="tab" data-tab-panel="faults" hidden>
@@ -500,6 +649,7 @@ tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
       <label><input type="checkbox" class="topic" value="log"> log</label>
       <label><input type="checkbox" class="topic" value="sample"> sample</label>
       <label><input type="checkbox" class="topic" value="param"> param</label>
+      <label><input type="checkbox" class="topic" value="stim"> stim</label>
       <label><input type="checkbox" id="follow" checked> follow</label>
     </span>
   </h2>
@@ -1544,6 +1694,7 @@ function renderDet() {
     count + " / " + cap + " (" + Math.round(100 * count / cap) + "%)";
   text($("rotb-fill"), fill);
   text($("ov-detectors"), fill);
+  stimReadout();
 }
 
 /* the tab also follows the SSE state topic: a change record or a
@@ -1567,6 +1718,309 @@ function applyStateRec(r) {
     }
   }
   renderDet();
+}
+
+/* ---- the Stimulus board (stimulus plan T5/C2): target chips, the
+   rate step, the mix tape, the align/ADC-sky box. The working tape
+   lives in the page until saved (det.tape.save); detector numbers are
+   DSS (fpga_det), the TM's are the FSW subcollimator ---- */
+const SUBCOL_FROM_FPGA_DET = [
+  0, 1, 5, 6, 4, 10, 11, 12,
+  13, 14, 9, 15, 7, 8, 2, 3,
+  30, 31, 25, 26, 21, 27, 19, 20,
+  17, 18, 16, 22, 23, 24, 28, 29,
+];  // utils.c via elut-upload.py: one FSW-sourced table per language
+const QUARTER_MASK = [0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000];
+let tape = null;          // the working tape object
+let tapeNames = [];
+let stimMask = 0xFFFFFFFF;
+let mapSel = new Set();
+
+function detSubview(id) {
+  const stim = id === "det-sub-stim";
+  for (const el of document.querySelectorAll(".det-status-view"))
+    el.hidden = stim;
+  for (const el of document.querySelectorAll(".det-stim-view"))
+    el.hidden = !stim;
+  cls($("det-sub-status"), stim ? "chip" : "chip on");
+  cls($("det-sub-stim"), stim ? "chip on" : "chip");
+  if (stim) loadTapes();
+}
+$("det-sub-status").addEventListener("click",
+  () => detSubview("det-sub-status"));
+$("det-sub-stim").addEventListener("click",
+  () => detSubview("det-sub-stim"));
+
+function blankTape() {
+  return { api: 1, name: "", loop: false, align: false, adc_mode: false,
+           background: { kind: "rate", cps: 0 }, steps: [] };
+}
+function leafTruth(p) {
+  const r = stateRows.find(([q]) => q === p);
+  return r ? r[1].truth : undefined;
+}
+
+async function loadTapes() {
+  try {
+    const r = await getJSON("tapes");
+    tapeNames = r.tapes || [];
+    const sel = $("stim-tapes");
+    const keep = sel.value;
+    sel.replaceChildren(...tapeNames.map((n) => new Option(n, n)));
+    if (tapeNames.includes(keep)) sel.value = keep;
+    if (!tape && tapeNames.length) await stimOpen(sel.value);
+    else if (!tape) { tape = blankTape(); stimRender(); }
+  } catch (e) { toast(String(e.message || e), true); }
+}
+
+async function stimOpen(name) {
+  try {
+    tape = await getJSON("tapes/" + encodeURIComponent(name));
+    $("stim-tapes").value = name;
+    $("stim-loop").checked = !!tape.loop;
+    $("stim-adc").checked = !!tape.adc_mode;
+    stimRender();
+  } catch (e) { toast(String(e.message || e), true); }
+}
+$("stim-tapes").addEventListener("change",
+  () => stimOpen($("stim-tapes").value));
+$("stim-reload").addEventListener("click", loadTapes);
+
+function stimSelected() {
+  const dets = [...Array(32).keys()].filter((i) => stimMask & (1 << i));
+  const qs = [0, 1, 2, 3].filter((q) =>
+    (stimMask & QUARTER_MASK[q]) === QUARTER_MASK[q]);
+  const how = dets.length === 32 ? "all 32" :
+    qs.length && qs.length * 8 === dets.length ?
+    "Q" + qs.map((q) => q + 1).join(" + Q") : "picked on the map";
+  text($("stim-selected"), "Selected: " + dets.length +
+       " detectors (" + how + ", DSS numbering)");
+}
+function stimSelect(mask, word) {
+  stimMask = mask >>> 0;
+  $("stim-map").hidden = word !== "map";
+  for (const b of document.querySelectorAll("#stim-chips [data-target]")) {
+    const t = b.dataset.target;
+    const on = (t === "all" && stimMask === 0xFFFFFFFF) ||
+      (t === "map" && word === "map") ||
+      (/^q[1-4]$/.test(t) && word !== "map" &&
+       (stimMask & QUARTER_MASK[Number(t.slice(1)) - 1]) ===
+       QUARTER_MASK[Number(t.slice(1)) - 1]);
+    cls(b, on ? "chip on" : "chip");
+  }
+  stimSelected();
+}
+for (const b of document.querySelectorAll("#stim-chips [data-target]")) {
+  b.addEventListener("click", () => {
+    const t = b.dataset.target;
+    if (t === "all") stimSelect(0xFFFFFFFF, t);
+    else if (t === "map") stimSelect(stimMask, t);
+    else stimSelect(QUARTER_MASK[Number(t.slice(1)) - 1], t);
+  });
+}
+(function stimMap() {
+  const box = $("stim-map");
+  const rows = [];
+  for (let q = 0; q < 4; q++) {
+    const lab = document.createElement("span");
+    cls(lab, "lbl");
+    text(lab, "Q" + (q + 1));
+    rows.push(lab);
+    for (let i = 0; i < 8; i++) {
+      const f = q * 8 + i;
+      const b = document.createElement("button");
+      b.type = "button";
+      b.dataset.det = String(f);
+      cls(b, "chip");
+      text(b, String(f));
+      b.title = "fpga_det " + f + " · subcol " + SUBCOL_FROM_FPGA_DET[f] +
+        " (the TM's numbering)";
+      b.addEventListener("click", () => {
+        if (mapSel.has(f)) mapSel.delete(f); else mapSel.add(f);
+        cls(b, mapSel.has(f) ? "chip on" : "chip");
+        let m = 0;
+        for (const d of mapSel) m |= 1 << d;
+        if (mapSel.size) stimSelect(m >>> 0, "map");
+      });
+      rows.push(b);
+    }
+  }
+  box.replaceChildren(...rows);
+})();
+$("stim-pix").addEventListener("change", () => {
+  $("stim-pix-one").hidden = $("stim-pix").value !== "one";
+});
+function stimPixMask() {
+  const v = $("stim-pix").value;
+  if (v === "one") return (1 << Number($("stim-pix-one").value || 0)) & 0xFFF;
+  return parseInt(v, 16);
+}
+
+function stimStep() {
+  return { kind: "rate", for_s: Number($("stim-dur").value) || 0.1,
+           fpga_det_mask: stimMask >>> 0, pix_mask: stimPixMask(),
+           cps: Number($("stim-cps").value) || 0 };
+}
+$("stim-add").addEventListener("click", () => {
+  if (!tape) tape = blankTape();
+  if ((tape.steps || []).length >= 64) {
+    toast("a tape holds at most 64 steps", true);
+    return;
+  }
+  tape.steps.push(stimStep());
+  stimRender();
+});
+$("stim-send").addEventListener("click", async () => {
+  const t = blankTape();
+  t.name = "send-now";
+  t.steps = [stimStep()];
+  try {
+    await post("det.tape.save", { name: "send-now", tape: t });
+    const r = await post("det.tape.play", { name: "send-now",
+                                            loop: false });
+    toast("send now ok " + JSON.stringify(r.result));
+  } catch (e) { toast(String(e.message || e), true); }
+  refresh();
+});
+$("stim-save").addEventListener("click", async () => {
+  if (!tape) tape = blankTape();
+  const name = $("stim-save-name").value.trim() || $("stim-tapes").value;
+  if (!name) { toast("a tape name is needed to save", true); return; }
+  tape.name = name;
+  tape.loop = $("stim-loop").checked;
+  tape.adc_mode = $("stim-adc").checked;
+  try {
+    await post("det.tape.save", { name, tape });
+    toast("det.tape.save ok " + name);
+    await loadTapes();
+    $("stim-tapes").value = name;
+  } catch (e) { toast(String(e.message || e), true); }
+});
+$("stim-delete").addEventListener("click", async () => {
+  const name = $("stim-tapes").value;
+  if (!name || !window.confirm("delete tape " + name + "?")) return;
+  try {
+    await post("det.tape.delete", { name });
+    toast("det.tape.delete ok " + name);
+    tape = blankTape();
+    await loadTapes();
+  } catch (e) { toast(String(e.message || e), true); }
+});
+
+function stimTargetWord(s) {
+  const m = (s.fpga_det_mask == null ? 0 : s.fpga_det_mask) >>> 0;
+  const qs = [0, 1, 2, 3].filter((q) =>
+    (m & QUARTER_MASK[q]) === QUARTER_MASK[q]);
+  let t = m === 0xFFFFFFFF ? "all 32" :
+    qs.length && (m & 0xFFFFFFFF) ===
+    qs.reduce((a, q) => a | QUARTER_MASK[q], 0) ?
+    "Q" + qs.map((q) => q + 1).join("+Q") :
+    "mask 0x" + m.toString(16).toUpperCase().padStart(8, "0");
+  const p = (s.pix_mask == null ? 0xFFF : s.pix_mask) & 0xFFF;
+  if (p !== 0xFFF) t += " · pix 0x" + p.toString(16);
+  return t;
+}
+function stimSettings(s) {
+  if (s.kind === "rate") return (s.cps == null ? "?" : s.cps) + " cps" +
+    (s.spec && s.spec !== "flat" ? " · spec" : "");
+  if (s.kind === "off") return "0 cps";
+  if (s.kind === "replay") return (s.file || "") + " @" +
+    (s.offset_ms == null ? 0 : s.offset_ms) + " ms";
+  return "det(" + s.fpga_det + ", " + s.pix + ", " +
+    (s.adc != null ? s.adc : "ebin " + s.ebin) + ") × " + s.n;
+}
+
+function stimRender() {
+  const box = $("stim-tape-row");
+  box.replaceChildren();
+  if (tape) {
+    const bg = document.createElement("div");
+    cls(bg, "stim-bg");
+    const bc = tape.background || {};
+    text(bg, "all 32 · " + (bc.cps == null ? 0 : bc.cps) +
+         " cps · whole tape");
+    box.append(bg);
+    const row = document.createElement("div");
+    cls(row, "stim-tape");
+    (tape.steps || []).forEach((s, i) => {
+      const d = document.createElement("div");
+      cls(d, "stim-step");
+      text(d, (i + 1) + " " + (s.label || s.kind));
+      d.title = "step " + (i + 1) + ": " + s.kind + ", " + s.for_s +
+        " s, cps " + s.cps;
+      d.style.flexGrow = String(Math.max(0.02, s.for_s || 0.1));
+      row.append(d);
+    });
+    box.append(row);
+  }
+  const body = $("stim-steps");
+  const rows = [];
+  ((tape && tape.steps) || []).forEach((s, i) => {
+    const tr = document.createElement("tr");
+    for (const c of [String(i + 1), s.kind, stimTargetWord(s),
+                     stimSettings(s), s.for_s + " s"]) {
+      const td = document.createElement("td");
+      text(td, c);
+      tr.append(td);
+    }
+    const act = document.createElement("td");
+    cls(act, "ctl");
+    const move = (fn) => () => {
+      const j = i + fn;
+      if (j < 0 || j >= tape.steps.length) return;
+      [tape.steps[i], tape.steps[j]] = [tape.steps[j], tape.steps[i]];
+      stimRender();
+    };
+    const up = document.createElement("button");
+    text(up, "up");
+    up.addEventListener("click", move(-1));
+    const down = document.createElement("button");
+    text(down, "down");
+    down.addEventListener("click", move(1));
+    const rm = document.createElement("button");
+    cls(rm, "danger");
+    text(rm, "remove");
+    rm.addEventListener("click", () => {
+      tape.steps.splice(i, 1);
+      stimRender();
+    });
+    act.append(up, down, rm);
+    tr.append(act);
+    rows.push(tr);
+  });
+  body.replaceChildren(...rows);
+}
+
+function stimReadout() {
+  const t = { state: leafTruth("instrument.detector.tape.state"),
+              name: leafTruth("instrument.detector.tape.name"),
+              step: leafTruth("instrument.detector.tape.step"),
+              n: leafTruth("instrument.detector.tape.n_steps"),
+              label: leafTruth("instrument.detector.tape.label") };
+  if (t.state == null) text($("stim-now"), "idle");
+  else if (t.state === "playing")
+    text($("stim-now"), "now playing: tape '" + (t.name || "?") +
+         "' · step " + t.step + " of " + t.n +
+         (t.label ? " (" + t.label + ")" : ""));
+  else text($("stim-now"), "tape " + t.state +
+         (t.name ? ": " + t.name : ""));
+  text($("stim-progress"), t.state == null ? "–" :
+       t.step + " / " + t.n);
+  const chips = $("stim-tape-row").children.length > 1
+    ? [...$("stim-tape-row").children[1].children] : [];
+  chips.forEach((d, i) =>
+    cls(d, i + 1 === (t.state === "playing" ? t.step : 0)
+        ? "stim-step active" : "stim-step"));
+  const al = { mode: leafTruth("instrument.detector.align.mode"),
+               hon: leafTruth("instrument.detector.align.honoured"),
+               fb: leafTruth("instrument.detector.align.fallback"),
+               mm: leafTruth("instrument.detector.align.mismatch_cells"),
+               cal: leafTruth("instrument.detector.align.calibration") };
+  text($("stim-align-read"), al.mode == null ? "–" :
+       al.mode + " · honoured " + al.hon + " · fallback " + al.fb +
+       " · mismatch " + al.mm + " · " + al.cal);
+  const adc = leafTruth("instrument.detector.adc.mode");
+  text($("stim-adc-read"), adc == null ? "–" : (adc ? "on" : "off"));
 }
 
 /* ---- the vocabulary: tooltips, disabled verbs, the any-verb form ---- */
@@ -1668,9 +2122,10 @@ const TL_MIN_H = 300;             // the canvas is never shorter
 const TL_PAL = ["--tl1", "--tl2", "--tl3", "--tl4", "--tl5", "--tl6",
                 "--tl7", "--tl8"];
 const TL_MARKERS = ["fault", "force", "tc", "event", "mode", "power",
-                    "scenario"];
+                    "scenario", "stim"];
 const TL_KIND_VAR = { fault: "--bad", force: "--warn", tc: "--accent",
-  event: "--ok", mode: "--tl5", power: "--tl6", scenario: "--tl8" };
+  event: "--ok", mode: "--tl5", power: "--tl6", scenario: "--tl8",
+  stim: "--tl3" };
 const TL_STARTERS = ["rotb-fill-vs-faults", "cpu-and-hk",
                      "memory-upsets", "power-and-link"];
 const TL = {
@@ -2002,6 +2457,10 @@ function tlRecord(r) {
     /* keep-alive summaries: noise, as in series.py */
   } else if (k === "fault" || k === "force" || k === "tc" || k === "power")
     tlMarkerRec(k, t, r, d);
+  else if (k === "stim")
+    tlAppendMark("stim", t, "tape '" + (d.name || "?") + "' step " +
+                 d.step + "/" + d.n_steps +
+                 (d.label ? ": " + d.label : ""));
   else if ((k === "log" || k === "expect") &&
            String(r.path || "").startsWith("scenario.")) {
     let label = String(r.path);
@@ -2695,7 +3154,8 @@ async function backfill(seq) {
 
 function stream() {
   const es = new EventSource(API + "stream?since=" + lastSeq);
-  const topics = ["cmd", "state", "tm", "tc", "fault", "expect", "mismatch", "uart", "log", "sample", "param"];
+  const topics = ["cmd", "state", "tm", "tc", "fault", "expect",
+                  "mismatch", "uart", "log", "sample", "param", "stim"];
   for (const t of topics) {
     es.addEventListener(t, (ev) => onRecord(JSON.parse(ev.data)));
   }

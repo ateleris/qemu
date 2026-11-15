@@ -71,6 +71,10 @@ stixdet_inject(uint32_t fpga_det, uint32_t pix, uint32_t ebin, uint32_t n) "det-
 stixdet_replay_scan(const char *path, uint64_t n_words, uint64_t n_events, uint64_t duration_ns, int64_t scan_ns) "replay pre-scan '%s': %" PRIu64 " words, %" PRIu64 " events (fpga_det = dss_det), duration %" PRIu64 " ns, scanned in %" PRId64 " ns"
 stixdet_replay_state(const char *state, const char *why, uint32_t t_tick, uint32_t cursor, uint64_t events_fed) "replay state=%s (%s): t_tick=%u cursor=%u events_fed=%" PRIu64
 stixdet_elut_fallback(uint32_t fpga_det, uint32_t pix, uint32_t value) "ELUT fallback: fpga_det %u pix %u degenerate row (constant %u), linear binning in use"
+stixdet_tape_load(const char *name, uint32_t n_steps, int loop, int align, int64_t vclock_ns) "tape loaded '%s': %u steps loop=%d align=%d at vclock_ns=%" PRId64
+stixdet_tape_step(uint32_t index, const char *kind, const char *label, int64_t vclock_ns) "tape step %u kind=%s label='%s' at vclock_ns=%" PRId64
+stixdet_align(uint32_t rows, uint32_t fallback, uint32_t honoured, uint32_t mismatch_cells, int64_t vclock_ns) "ELUT align: rows=%u fallback=%u honoured=%u mismatch_cells=%u at vclock_ns=%" PRId64
+stixdet_adc_map(uint32_t rows, uint32_t nonidentity_rows, int64_t vclock_ns) "ADC bin-mass map: rows=%u nonidentity_rows=%u at vclock_ns=%" PRId64
 
 # grlib_stixspw.c (STIX)
 stixspw_recv_packet_callback(int len) "TC callback: %d bytes"

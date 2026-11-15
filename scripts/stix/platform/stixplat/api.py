@@ -22,6 +22,7 @@ import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import tapes as tapes_mod
 from . import views as views_mod
 from .dispatch import VerbError
 
@@ -224,6 +225,11 @@ class Handler(BaseHTTPRequestHandler):
             rid = urllib.parse.unquote(rest)
             return self._send(200, bundle_mod.detail(
                 ctl.cfg, rid, getattr(ctl, "run_dir", None)))
+        if path == PREFIX + "/tapes":
+            return self._send(200, tapes_mod.listing(ctl.cfg))
+        if path.startswith(PREFIX + "/tapes/"):
+            name = urllib.parse.unquote(path[len(PREFIX + "/tapes/"):])
+            return self._send(200, tapes_mod.read(ctl.cfg, name))
         if path == PREFIX + "/state" or path.startswith(PREFIX + "/state/"):
             sub = path[len(PREFIX + "/state"):].lstrip("/") or None
             tree = ctl.state.get(sub)

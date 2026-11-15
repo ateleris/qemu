@@ -104,6 +104,16 @@ def leaves_from_hw(ctrl, spw, t_sim):
                     # above: they move on their own while a replay runs
                     out["instrument.detector.replay." + k] = leaf(
                         v, t_sim=t_sim)
+            # the stimulus plan (T4, C2): the tape playback, the ELUT
+            # alignment report and the ADC-sky knob, as the det section
+            # carries them. The keys move only at a step boundary or on
+            # a verb, so no VOLATILE entry (step_left_ticks stays in
+            # the model's status string, out of the hw-state)
+            for sec, base in (("tape", "instrument.detector.tape."),
+                              ("align", "instrument.detector.align."),
+                              ("adc", "instrument.detector.adc.")):
+                for k, v in (det.get(sec) or {}).items():
+                    out[base + k] = leaf(v, t_sim=t_sim)
         rb = ctrl.get("rotb")
         if rb:
             for k in ("count", "full", "enable", "rd", "wr", "capacity"):

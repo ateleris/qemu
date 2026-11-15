@@ -6890,6 +6890,18 @@ static bool sky_set_str(QTestState *qts, const char *prop, const char *val)
     return ok;
 }
 
+static bool sky_set_bool(QTestState *qts, const char *prop, bool val)
+{
+    QDict *resp = qtest_qmp(qts,
+                            "{'execute': 'qom-set',"
+                            " 'arguments': {'path': %s, 'property': %s,"
+                            " 'value': %i}}", SKY_CTRL_PATH, prop, val);
+    bool ok = qdict_haskey(resp, "return");
+
+    qobject_unref(resp);
+    return ok;
+}
+
 static bool sky_set_u32(QTestState *qts, const char *prop, uint32_t val)
 {
     QDict *resp = qtest_qmp(qts,
@@ -9393,6 +9405,1106 @@ static void stix_det7_register(void)
                    test_det_replay_trigger);
     qtest_add_func("/sparc/stix/det-replay-missing",
                    test_det_replay_missing);
+}
+
+
+/* ---- S1 mix tape, A1 det-align, C1 ADC-faithful sky (stix-det plan) ---- */
+
+/*
+ * Kept in this one appended block behind stix_det_tape_register(), like
+ * the other tracks, so a merge touches main() in one line. The tape
+ * (S1) rides the 100 ms tick: det-tape-load takes the JSON, det-tape-
+ * play arms it (D-Dj) and the step clock advances only while FSM
+ * Enable = 1. The per-pair rates, the alignment report (A1) and the
+ * ADC-faithful sky (C1) reuse the sky/replay helpers above.
+ */
+
+/* a key=value field of the det-tape-status line (det7_status_field's
+ * pattern); NULL when the property is absent */
+static char *det_tape_field(QTestState *qts, const char *key)
+{
+    g_autofree char *line = sky_get_str(qts, "det-tape-status");
+    g_autofree char *pat = g_strdup_printf("%s=", key);
+    const char *p = line ? strstr(line, pat) : NULL;
+    const char *end;
+
+    if (!p) {
+        return NULL;
+    }
+    p += strlen(pat);
+    end = strchr(p, ',');
+    return g_strndup(p, end ? (size_t)(end - p) : strlen(p));
+}
+
+/* one rate step, full fpga_det mask, optional pix mask and label */
+static char *det_tape_rate_step(const char *pix_mask, uint32_t cps,
+                                const char *for_s)
+{
+    return g_strdup_printf("{\"kind\": \"rate\", \"for_s\": %s, "
+                           "\"fpga_det_mask\": 4294967295, "
+                           "\"pix_mask\": %s, \"cps\": %u}",
+                           for_s, pix_mask ? pix_mask : "4095", cps);
+}
+
+/* qom-set det-tape-play; returns the QMP error desc (NULL on success) */
+static char *det_tape_play(QTestState *qts, bool play)
+{
+    QDict *resp = qtest_qmp(qts,
+                            play
+                            ? "{'execute': 'qom-set',"
+                              " 'arguments': {'path': %s,"
+                              " 'property': 'det-tape-play',"
+                              " 'value': true}}"
+                            : "{'execute': 'qom-set',"
+                              " 'arguments': {'path': %s,"
+                              " 'property': 'det-tape-play',"
+                              " 'value': false}}",
+                            SKY_CTRL_PATH);
+    QDict *err = qdict_get_qdict(resp, "error");
+    char *desc = err ? g_strdup(qdict_get_try_str(err, "desc")) : NULL;
+
+    qobject_unref(resp);
+    return desc;
+}
+
+/*
+ * det-tape-props: the load-time rejections (bad JSON, more than 64
+ * steps, past the 64 KiB cap, for_s 0, an unknown kind, pix_mask past
+ * 0xFFF, cps past the cap, an S2 spec, the S3 kind, subcol_mask, a
+ * masked background, a replay step without a realized table, and a
+ * replay step with the nominal trigger), and a rejected load leaves
+ * the previous tape intact. det-tape-play is refused with no tape.
+ * RED on the parent binary: det-tape-load is an unknown property.
+ */
+static void test_det_tape_props(void)
+{
+    QTestState *qts = stix_qtest_new();
+    g_autofree char *json = NULL, *steps65 = NULL;
+    g_autofree char *desc = NULL, *name = NULL;
+    GString *s = g_string_new(NULL);
+    uint32_t i;
+
+    /* a. play with no tape loaded */
+    desc = det_tape_play(qts, true);
+    g_assert_nonnull(desc);
+    g_assert_nonnull(strstr(desc, "no tape loaded"));
+    g_clear_pointer(&desc, g_free);
+    g_assert_null(sky_get_str(qts, "det-tape-load"));   /* write-only */
+
+    /* b. the rejections */
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": []");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* bad JSON */
+
+    for (i = 0; i < 65; i++) {
+        g_string_append_printf(s, "{\"kind\": \"rate\", \"for_s\": 0.1,"
+                               " \"fpga_det_mask\": 1, \"cps\": 1}%s",
+                               i < 64 ? "," : "");
+    }
+    steps65 = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                              "[%s]}", s->str);
+    g_assert_false(sky_set_str(qts, "det-tape-load", steps65));
+    g_string_truncate(s, 0);
+    for (i = 0; i < 70000; i++) {
+        g_string_append_c(s, 'a');
+    }
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"%s\", \"steps\": []}",
+                           s->str);
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* > 64 KiB */
+    g_string_truncate(s, 0);
+
+    g_free(json);
+
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"rate\", \"for_s\": 0, "
+                           "\"fpga_det_mask\": 1, \"cps\": 1}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* for_s 0 */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"kite\", \"for_s\": 0.1}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* kind */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"rate\", \"for_s\": 0.1, "
+                           "\"fpga_det_mask\": 1, \"cps\": 1, "
+                           "\"pix_mask\": 4096}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* pix_mask */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"rate\", \"for_s\": 0.1, "
+                           "\"fpga_det_mask\": 1, \"cps\": 1000001}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* cps cap */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"rate\", \"for_s\": 0.1, "
+                           "\"fpga_det_mask\": 1, \"cps\": 1, "
+                           "\"spec\": {\"line_adc\": 1000}}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* S2 spec */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"single\", \"for_s\": 0.1, "
+                           "\"fpga_det\": 22, \"pix\": 0, \"adc\": 1000,"
+                           " \"n\": 10}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* S3 kind */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"rate\", \"for_s\": 0.1, "
+                           "\"subcol_mask\": 1, \"cps\": 1}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* subcol */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"background\":"
+                           " {\"cps\": 5, \"pix_mask\": 1}, \"steps\": "
+                           "[]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* masked bg */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"replay\", \"for_s\": 0.1}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));  /* no table */
+
+    /* c. a valid tape, then a rejected load keeps it */
+    g_string_truncate(s, 0);
+    g_string_append(s, "{\"kind\": \"rate\", \"for_s\": 1, "
+                       "\"fpga_det_mask\": 4294967295, \"cps\": 100}");
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"keeper\", \"loop\": "
+                           "true, \"background\": {\"cps\": 20}, "
+                           "\"steps\": [%s]}", s->str);
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    name = det_tape_field(qts, "name");
+    g_assert_cmpstr(name, ==, "keeper");
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"t\", \"steps\": "
+                           "[{\"kind\": \"rate\", \"for_s\": 0}]}");
+    g_assert_false(sky_set_str(qts, "det-tape-load", json));
+    g_clear_pointer(&name, g_free);
+    name = det_tape_field(qts, "name");
+    g_assert_cmpstr(name, ==, "keeper");    /* the previous tape intact */
+    g_clear_pointer(&name, g_free);
+
+    g_string_free(s, true);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-tape-status: idle -> ready (the load) -> playing (the play
+ * applies at the next tick, step=1/N) -> done (the last step ended
+ * without loop); loop=true wraps to step 1; play=false mid-step gives
+ * stopped; a device reset keeps the tape at state ready. The status
+ * line is one atomic key=value line.
+ * RED on the parent binary: det-tape-load is an unknown property.
+ */
+static void test_det_tape_status(void)
+{
+    QTestState *qts = stix_qtest_new();
+    g_autofree char *json = NULL;
+    g_autofree char *desc = NULL;
+
+    g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
+                    "state=idle,name=,step=0/0,label=,step_left_ticks=0,"
+                    "loop=false,align=false");
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"two\", \"steps\": "
+                           "[%s, {\"kind\": \"off\", \"for_s\": 0.2, "
+                           "\"fpga_det_mask\": 4294967295}]}",
+                           det_tape_rate_step("4095", 0, "0.2"));
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
+                    "state=ready,name=two,step=1/2,label=,"
+                    "step_left_ticks=2,loop=false,align=false");
+
+    /* the play applies at the first tick after SetEnable */
+    idefx_power_all(qts);
+    det_start(qts, 1);                  /* a 2-tick QL period */
+    g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
+                    "state=ready,name=two,step=1/2,label=,"
+                    "step_left_ticks=2,loop=false,align=false");
+    desc = det_tape_play(qts, true);
+    g_assert_null(desc);
+    det_step_ticks(qts, 1);
+    g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
+                    "state=playing,name=two,step=1/2,label=,"
+                    "step_left_ticks=2,loop=false,align=false");
+    det_step_ticks(qts, 1);
+    det_step_ticks(qts, 1);             /* step 1 done: step 2 applies */
+    g_assert_cmpstr(det_tape_field(qts, "step"), ==, "2/2");
+    det_step_ticks(qts, 2);             /* step 2 done, no loop */
+    g_assert_cmpstr(det_tape_field(qts, "state"), ==, "done");
+    g_assert_cmpstr(det_tape_field(qts, "step_left_ticks"), ==, "0");
+
+    /* loop=true wraps: a play after done restarts at step 0 */
+    g_free(json);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"loop\", \"loop\": "
+                           "true, \"steps\": [%s, {\"kind\": \"off\", "
+                           "\"for_s\": 0.2, \"fpga_det_mask\": "
+                           "4294967295}]}",
+                           det_tape_rate_step("4095", 0, "0.2"));
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_true(sky_set_str(qts, "det-source", "synthetic"));
+    desc = det_tape_play(qts, true);
+    g_assert_null(desc);
+    det_step_ticks(qts, 5);             /* 2.5 steps: wrapped into step 2 */
+    g_assert_cmpstr(det_tape_field(qts, "state"), ==, "playing");
+    det_step_ticks(qts, 5);             /* wrapped: step 1 again */
+    g_assert_cmpstr(det_tape_field(qts, "step"), ==, "1/2");
+
+    /* play=false mid-step: stopped; the scene knobs resume */
+    desc = det_tape_play(qts, false);
+    g_assert_null(desc);
+    det_step_ticks(qts, 1);
+    g_assert_cmpstr(det_tape_field(qts, "state"), ==, "stopped");
+    det_step_ticks(qts, 10);
+    g_assert_cmpstr(det_tape_field(qts, "state"), ==, "stopped");
+
+    /* a device reset stops playback and keeps the tape (state ready) */
+    qtest_system_reset(qts);
+    g_assert_cmpstr(sky_get_str(qts, "det-tape-status"), ==,
+                    "state=ready,name=loop,step=1/2,label=,"
+                    "step_left_ticks=0,loop=true,align=false");
+    idefx_power_all(qts);
+    det_start(qts, 1);
+    desc = det_tape_play(qts, true);
+    g_assert_null(desc);
+    det_step_ticks(qts, 1);
+    g_assert_cmpstr(det_tape_field(qts, "state"), ==, "playing");
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-tape-replay: a tape [rate 1 s, replay 2 s offset_ms 0, off 1 s]
+ * over the det-replay-decode synthetic file, with det-replay-trigger=
+ * qmp set first (a nominal trigger would start the replay at NOMINAL
+ * entry, before the tape reaches the step). Before the replay step the
+ * status reads armed and no replay counts land; during the step it
+ * reads running and the LACC bank gets the events; the step end stops
+ * the replay (stopped) and the source reverts, so the off step's bank
+ * is empty.
+ * RED on the parent binary: det-tape-load is an unknown property.
+ */
+static void test_det_tape_replay(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL, *json = NULL;
+    QTestState *qts;
+    SkyBank *b = g_new0(SkyBank, 1);
+
+    det7_setup(&f);
+    det7_word(&f, DET7_WORD(2262, 3, 2, 0));    /* e1: t_tick 0, ebin 4 */
+    det7_pad(&f, 500 * 1000 * 1000);            /* -> t_tick 5 */
+    det7_word(&f, DET7_WORD(2393, 5, 10, 0));   /* e2: t_tick 5, ebin 6 */
+    det7_pad(&f, 10 * 1000 * 1000 * 1000ULL);
+    /* e3 past the step: never reached, so the replay is still running
+     * (not ended: EOF is the last event consumed) when the step ends */
+    det7_word(&f, DET7_WORD(2393, 5, 10, 0));
+    det7_write(&f, &dir, &path);
+
+    qts = det7_qtest(path, NULL);
+    g_assert_true(sky_set_str(qts, "det-replay-trigger", "qmp"));
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);           /* 1 s periods, no nominal swap */
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"rep\", \"steps\": ["
+                           "{\"kind\": \"rate\", \"for_s\": 1, "
+                           "\"fpga_det_mask\": 4294967295, \"cps\": 0}, "
+                           "{\"kind\": \"replay\", \"for_s\": 2, "
+                           "\"file\": \"%s\", \"offset_ms\": 0}, "
+                           "{\"kind\": \"off\", \"for_s\": 1, "
+                           "\"fpga_det_mask\": 4294967295}]}", path);
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_null(det_tape_play(qts, true));
+
+    /* step 1 (rate 0): bank 0 closes empty, the replay stays armed */
+    det_step_ticks(qts, 10);
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "armed");
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+
+    /* the replay step: running, the events land in the closed bank */
+    det_step_ticks(qts, 10);            /* tick 11: the step applies */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "running");
+    det_step_ticks(qts, 10);            /* tick 20: bank 1 closes */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "running");
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[3][2][4], ==, 1);
+    g_assert_cmpuint(b->lacc[5][10][6], ==, 1);
+    g_assert_cmpuint(sky_total(b), ==, 2);
+
+    /* the step end (tick 31) stops the replay; the off step's banks
+     * are empty */
+    det_step_ticks(qts, 10);            /* tick 30: bank 2 closes */
+    sky_read_bank(qts, 2, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+    det_step_ticks(qts, 1);             /* tick 31: the replay step ends */
+    g_assert_cmpstr(det7_status_field(qts, "state"), ==, "stopped");
+    det_step_ticks(qts, 11);            /* the off step runs out: done */
+    g_assert_cmpstr(det_tape_field(qts, "state"), ==, "done");
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-tape-rate: background 100 cps (unmasked), steps [rate Q1+Q3
+ * (fpga_det_mask 0x00FF00FF) 20000 cps for 2 s, off for 1 s], played on
+ * the tick right after a QL swap (the for_s 2 step covers exactly two
+ * whole periods). Every assertion reads the bank the swap just closed:
+ * the masked fpga_det 0 and 16 hold 20000 +- 5sigma (sqrt(20000) = 141),
+ * the unmasked fpga_det 8 the 100 cps background; the off step's bank
+ * is exactly 0 on all 384 cells (off beats the background); play=false
+ * then reverts to quiet-cps 0 (another all-zero bank). ClearEnable
+ * mid-step freezes the step countdown (step_left_ticks unchanged
+ * across a paused second).
+ * RED on the parent binary: det-tape-load is an unknown property.
+ */
+static void test_det_tape_rate(void)
+{
+    QTestState *qts = stix_qtest_new();
+    SkyBank *b = g_new0(SkyBank, 1);
+    g_autofree char *json = NULL, *left1 = NULL, *left2 = NULL;
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 0));
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 10);            /* the first swap */
+    g_assert_cmpuint(FSMSTA_ACTIVEQL(det_sta(qts)), ==, 1);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"flare\", "
+                           "\"background\": {\"cps\": 100}, \"steps\": ["
+                           "{\"kind\": \"rate\", \"for_s\": 2, "
+                           "\"fpga_det_mask\": 16711935, \"cps\": "
+                           "20000}, {\"kind\": \"off\", \"for_s\": 1, "
+                           "\"fpga_det_mask\": 4294967295}]}");
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_null(det_tape_play(qts, true));
+
+    /* the two step-1 swaps: masked pairs flare, unmasked background */
+    det_step_ticks(qts, 20);
+    g_assert_cmpstr(det_tape_field(qts, "step"), ==, "1/2");
+    sky_read_bank(qts, 1, b);
+    sky_assert_poisson("fpga_det 0 (step 1)", sky_fpga_det_sum(b, 0),
+                       20000, 5);
+    sky_assert_poisson("fpga_det 16 (step 1)", sky_fpga_det_sum(b, 16),
+                       20000, 5);
+    sky_assert_poisson("fpga_det 8 (background)", sky_fpga_det_sum(b, 8),
+                       100, 5);
+    sky_read_bank(qts, 2, b);
+    sky_assert_poisson("fpga_det 0 bank 2", sky_fpga_det_sum(b, 0),
+                       20000, 5);
+
+    /* the off step: all 384 cells exactly 0 (off beats the background) */
+    det_step_ticks(qts, 10);
+    g_assert_cmpstr(det_tape_field(qts, "step"), ==, "2/2");
+    sky_read_bank(qts, 3, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+
+    /* play=false reverts to quiet-cps 0: the next bank is all-zero */
+    g_assert_null(det_tape_play(qts, false));
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 0, b);
+    g_assert_cmpuint(sky_total(b), ==, 0);
+
+    /* ClearEnable mid-step freezes the step countdown */
+    g_assert_null(det_tape_play(qts, true));    /* restart at step 0 */
+    det_step_ticks(qts, 5);
+    det_cmd_or(qts, FSMCMD_CLEARENABLE);
+    left1 = det_tape_field(qts, "step_left_ticks");
+    det_step_ticks(qts, 10);                    /* paused second */
+    left2 = det_tape_field(qts, "step_left_ticks");
+    g_assert_cmpstr(left1, ==, left2);
+    det_cmd_or(qts, FSMCMD_SETENABLE);          /* resume */
+    det_step_ticks(qts, 1);
+    g_assert_cmpstr(det_tape_field(qts, "state"), ==, "playing");
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-tape-pixmask: background cps 0 (so "zero" is exact) and a step
+ * with pix_mask 0xF00 (small pix 8-11 only): the large-pix cells are
+ * exactly 0 and the small-pix cells about 0.22/8.88 of the rate per
+ * pix (the template shares still apply).
+ * RED on the parent binary: det-tape-load is an unknown property.
+ */
+static void test_det_tape_pixmask(void)
+{
+    QTestState *qts = stix_qtest_new();
+    SkyBank *b = g_new0(SkyBank, 1);
+    g_autofree char *json = NULL;
+    uint32_t pix;
+
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 0));
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 10);            /* the first swap */
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"small\", \"steps\": "
+                           "[{\"kind\": \"rate\", \"for_s\": 2, "
+                           "\"fpga_det_mask\": 4294967295, "
+                           "\"pix_mask\": 3840, \"cps\": 20000}]}");
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_null(det_tape_play(qts, true));
+
+    det_step_ticks(qts, 10);            /* the first whole step period */
+    sky_read_bank(qts, 1, b);
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        if (pix < 8) {
+            g_assert_cmpuint(sky_pix_sum(b, 0, pix), ==, 0);
+        } else {
+            sky_assert_poisson("small pix (0.22/8.88 of 20000)",
+                               sky_pix_sum(b, 0, pix),
+                               20000.0 * 0.22 / SKY_PIX_W_TOTAL, 5);
+        }
+    }
+    g_assert_cmpuint(sky_fpga_det_sum(b, 5), >, 0);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/* one seeded run of the det-tape-seed tape: the finished bank 1 */
+static void det_tape_seeded_bank(uint32_t seed, SkyBank *b)
+{
+    g_autofree char *arg = g_strdup_printf(
+        "-global grlib-stixctrl.det-seed=%u", seed);
+    g_autofree char *json = NULL;
+    QTestState *qts = stix_qtest_new_extra(arg);
+
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 10);            /* the first swap */
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"seed\", "
+                           "\"background\": {\"cps\": 100}, \"steps\": ["
+                           "{\"kind\": \"rate\", \"for_s\": 2, "
+                           "\"fpga_det_mask\": 16711935, \"cps\": "
+                           "20000}, {\"kind\": \"off\", \"for_s\": 1, "
+                           "\"fpga_det_mask\": 4294967295}]}");
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_null(det_tape_play(qts, true));
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-tape-seed: the same seed and tape give identical banks (icount
+ * determinism in guest time; the det-counts-seed pattern), a different
+ * seed differs.
+ * RED on the parent binary: det-tape-load is an unknown property.
+ */
+static void test_det_tape_seed(void)
+{
+    SkyBank *a = g_new0(SkyBank, 1);
+    SkyBank *b = g_new0(SkyBank, 1);
+    SkyBank *c = g_new0(SkyBank, 1);
+
+    det_tape_seeded_bank(7, a);
+    det_tape_seeded_bank(7, b);
+    det_tape_seeded_bank(8, c);
+    g_assert_cmpuint(sky_total(a), >, 0);
+    g_assert_cmpint(memcmp(a, b, sizeof(*a)), ==, 0);
+    g_assert_cmpint(memcmp(a, c, sizeof(*a)), !=, 0);
+    g_free(a);
+    g_free(b);
+    g_free(c);
+}
+
+/*
+ * det-tape-guard (D-Dj; the det-chunk-guard pattern with the tape
+ * running): steps changing under clock_step, every CTRL MMIO path
+ * still answers — the detector registers, the composed rotbCmdSta,
+ * GETBLOCK and the block window, and IRQ 3 still pulses. A guard left
+ * engaged by the tape's timer path would refuse all of them.
+ * RED on the parent binary: det-tape-load is an unknown property.
+ */
+static void test_det_tape_guard(void)
+{
+    QTestState *qts = rotb_qtest_new(128);
+    g_autofree char *json = NULL;
+    uint32_t i;
+
+    rotb_cfg(qts, true, false);
+    ctrl_write(qts, CTRL_FSMCMD, FSMCMD_QLIRQEN);
+    det_start_nom(qts, 9, 0, 9, 0xFFFFFFFFu);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"guard\", \"loop\": "
+                           "true, \"steps\": [%s, %s]}",
+                           det_tape_rate_step("4095", 2000, "0.1"),
+                           det_tape_rate_step("4095", 0, "0.1"));
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_null(det_tape_play(qts, true));
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+
+    /* 20 ticks = 10 step changes, 2 QL swaps, 2 chunks (a third would
+     * not fit the 128-block ring: 3 x 49) */
+    for (i = 0; i < 20; i++) {
+        det_step_ticks(qts, 1);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, FSMCMD_QLIRQEN);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMINTTIME), ==, 9u << 16);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+    g_assert_true(det_irq_pending(qts));
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR);
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS - 1);
+    g_assert_cmphex(qtest_readl(qts, ROTB_WINDOW) >> 16, ==,
+                    CHUNK_DESC_DETECTOR | 1u);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-align-status (A1): with align on and a fresh flash the
+ * classification runs at the NOMINAL entry edge (today it would not:
+ * it needs replay-dss) and reads rows=384, fallback=384, honoured=0,
+ * mismatch_cells=0 (no replay table: calibration=none, the comparison
+ * not computed); writing one honoured row flips the next swap to
+ * fallback=383, honoured=1. With align off (the default) the
+ * classification does not run: mode=off and no stixdet_align line in
+ * a -D trace after swaps (the vacuity guard).
+ * RED on the parent binary: det-align is an unknown property.
+ */
+static void test_det_align_status(void)
+{
+    g_autofree uint8_t *row = g_malloc(4096);
+    g_autofree gchar *log = NULL, *extra = NULL, *text = NULL;
+    QTestState *qts;
+    int fd;
+
+    qts = stix_qtest_new();
+    g_assert_true(sky_set_bool(qts, "det-align", true));
+    g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
+                    "mode=on,rows=384,fallback=0,honoured=0,"
+                    "mismatch_cells=0,unassigned_cells=0,calibration="
+                    "none");
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);           /* the edge classifies */
+    g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
+                    "mode=on,rows=384,fallback=384,honoured=0,"
+                    "mismatch_cells=0,unassigned_cells=0,calibration="
+                    "none");
+
+    /* one honoured row: the next swap classifies it honoured */
+    memset(row, 0, 4096);
+    row[100] = 5;                       /* non-constant: honoured */
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 5), row, 4096);
+    det_step_ticks(qts, 10);
+    g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
+                    "mode=on,rows=384,fallback=383,honoured=1,"
+                    "mismatch_cells=0,unassigned_cells=0,calibration="
+                    "none");
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* align off (the default): mode=off, no stixdet_align in the log */
+    fd = g_file_open_tmp("stix-det-align-XXXXXX", &log, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    extra = g_strdup_printf("-trace stixdet_align -D %s", log);
+    qts = stix_qtest_new_extra(extra);
+    idefx_power_all(qts);
+    sky_start(qts, 9, 0xFFF);
+    det_step_ticks(qts, 20);
+    text = det7_read_log(log);
+    g_assert_null(strstr(text, "stixdet_align"));
+    g_assert_cmpstr(sky_get_str(qts, "det-align-status"), ==,
+                    "mode=off,rows=384,fallback=0,honoured=0,"
+                    "mismatch_cells=0,unassigned_cells=0,calibration="
+                    "none");
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    unlink(log);
+}
+
+/* ---- C1: the ADC-faithful sky (det-adc-mode) ---- */
+
+/*
+ * the A2-law row for baseline @base (the calibration's edges): val = 0
+ * for adc <= base (B0 = 0), else the D-7 fallback bin — the honoured
+ * binning equals the calibration, so the map is the identity
+ */
+static void det_adc_derived_row(uint8_t *row, uint32_t base)
+{
+    uint32_t adc;
+
+    for (adc = 0; adc < 4096; adc++) {
+        row[adc] = adc <= base ? 0 :
+                   (uint8_t)((adc - base) * 32u / (4096u - base));
+    }
+}
+
+/* the deliberately wrong row: the base-0 edge grid, val = adc / 128 */
+/* the quiet-sky ebin-18 mean of one large-pix cell at 2000 cps (the
+ * cps spreads over the pixel weights, cf. det-counts-seed) */
+#define DET_ADC_CELL18 (2000.0 / SKY_PIX_W_TOTAL * SKY_QUIET_EBIN18)
+
+static void det_adc_wrong_row(uint8_t *row)
+{
+    uint32_t adc;
+
+    for (adc = 0; adc < 4096; adc++) {
+        row[adc] = (uint8_t)(adc / 128u);
+    }
+}
+
+/* a .dssevs whose 0xE setup words carry @base for every dss_det */
+static void det_adc_file_baselines(Det7File *f, uint32_t base)
+{
+    uint32_t dss_det;
+
+    for (dss_det = 0; dss_det < 32; dss_det++) {
+        det7_word(f, DET7_WORD(75, 0xD, dss_det, 0));
+        det7_word(f, DET7_WORD(base, 0xE, dss_det, 0));
+    }
+}
+
+/* one quiet-sky run at @cps with the given mode, the ELUT rows written
+ * from the calibration (base 2000) when @write_rows: bank 1 + chunk 1 */
+static void det_adc_run(uint32_t seed, uint32_t cps, bool mode,
+                        bool write_rows, const char *replay_file,
+                        SkyBank *b, NomChunk *c)
+{
+    g_autofree gchar *extra = NULL, *blocks = NULL;
+    g_autofree uint8_t *row = write_rows ? g_malloc(4096) : NULL;
+    QTestState *qts;
+    uint32_t pix, fpga_det;
+
+    if (rotb_blocks_supported()) {
+        blocks = g_strdup(" -global grlib-stixctrl.rotb-blocks=128");
+    }
+    extra = g_strdup_printf(
+        "-global grlib-stixctrl.det-replay-file=%s "
+        "-global grlib-stixctrl.det-seed=%u%s", replay_file, seed,
+        blocks ? blocks : "");
+    qts = stix_qtest_new_extra(extra);
+    if (mode) {
+        g_assert_true(sky_set_bool(qts, "det-adc-mode", true));
+    }
+    if (write_rows) {
+        det_adc_derived_row(row, 2000);
+        for (pix = 0; pix < SKY_N_PIX; pix++) {
+            for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+                qtest_memwrite(qts, DET7_ELUT_ADDR(pix, fpga_det), row,
+                               4096);
+            }
+        }
+    }
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", cps));
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+    sky_start_nom(qts, 9, 0xFFF, 0, 9, 0xFFFFFFFFu);
+    det_step_ticks(qts, 20);            /* QL banks 0+1, chunk 1 */
+    sky_read_bank(qts, 1, b);
+    nom_read_chunk(qts, c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+/*
+ * det-adc-off: with the mode off (the default) the det-counts-seed
+ * stimulus gives bit-identical banks — no RNG draws, no folds — and
+ * setting or changing det-cal-kev-full does not perturb them.
+ * RED on the parent binary: det-cal-kev-full is an unknown property.
+ */
+static void test_det_adc_off(void)
+{
+    SkyBank *a = g_new0(SkyBank, 1);
+    SkyBank *b = g_new0(SkyBank, 1);
+    SkyBank *c = g_new0(SkyBank, 1);
+    QTestState *qts;
+
+    /* the reference: the plain det-counts-seed stimulus */
+    sky_seeded_bank(7, a);
+
+    /* det-cal-kev-full set from the command line: unchanged */
+    qts = stix_qtest_new_extra("-global grlib-stixctrl.det-seed=7 "
+                               "-global grlib-stixctrl.det-cal-kev-full="
+                               "2000");
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH,
+                                     "det-cal-kev-full"), ==, 2000);
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_assert_cmpint(memcmp(a, b, sizeof(*a)), ==, 0);
+
+    /* det-cal-kev-full set and changed at run time: unchanged */
+    qts = stix_qtest_new_extra("-global grlib-stixctrl.det-seed=7");
+    g_assert_true(sky_set_u32(qts, "det-cal-kev-full", 2000));
+    g_assert_true(sky_set_u32(qts, "det-cal-kev-full", 3000));
+    g_assert_true(sky_set_bool(qts, "det-adc-mode", false));
+    idefx_power_all(qts);
+    sky_start(qts, 39, 0xFFF);
+    det_step_ticks(qts, 40);
+    sky_read_bank(qts, 0, c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_assert_cmpint(memcmp(a, c, sizeof(*a)), ==, 0);
+
+    g_free(a);
+    g_free(b);
+    g_free(c);
+}
+
+/*
+ * det-adc-derived: mode on, every ELUT row written from the
+ * calibration's edges (the A2 law, baselines 2000): every LACC and
+ * EACC cell equals the mode-off run exactly (same seed, fresh
+ * instance) — the round trip is mass-preserving and bin-exact.
+ * RED on the parent binary: det-adc-mode is an unknown property.
+ */
+static void test_det_adc_derived(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL;
+    SkyBank *b = g_new0(SkyBank, 1), *b2 = g_new0(SkyBank, 1);
+    NomChunk *c = g_new0(NomChunk, 1), *c2 = g_new0(NomChunk, 1);
+    uint32_t pix, fpga_det, ebin;
+    int i;
+
+    det_adc_file_baselines(&f, 2000);
+    det7_write(&f, &dir, &path);
+
+    det_adc_run(7, 2000, false, false, path, b, c);
+    det_adc_run(7, 2000, true, true, path, b2, c2);
+
+    /* mode off == mode on, cell for cell, LACC and the chunk's EACC */
+    g_assert_cmpint(memcmp(b, b2, sizeof(*b)), ==, 0);
+    g_assert_cmpint(memcmp(c->eacc, c2->eacc, sizeof(c->eacc)), ==, 0);
+    g_assert_cmpint(memcmp(c->etrg_grp, c2->etrg_grp,
+                           sizeof(c->etrg_grp)), ==, 0);
+    /* sanity: the run really produced counts in the quiet lines */
+    g_assert_cmpuint(sky_total(b), >, 0);
+    g_assert_cmpuint(b->lacc[0][0][18], >, 0);
+
+    /* the mode-on run is byte-identical when repeated (the fold's
+     * guest-time determinism) */
+    det_adc_run(7, 2000, true, true, path, b2, c2);
+    g_assert_cmpint(memcmp(b, b2, sizeof(*b)), ==, 0);
+    i = 0;
+    for (pix = 0; pix < SKY_N_PIX; pix++) {
+        for (fpga_det = 0; fpga_det < SKY_N_FPGA_DET; fpga_det++) {
+            for (ebin = 0; ebin < SKY_N_EBIN; ebin++, i++) {
+                g_assert_cmpuint(c->eacc[pix][fpga_det][ebin], ==,
+                                 c2->eacc[pix][fpga_det][ebin]);
+            }
+        }
+    }
+
+    g_free(b);
+    g_free(b2);
+    g_free(c);
+    g_free(c2);
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-adc-wrong: mode on, one row deliberately wrong (the base-0 edge
+ * grid while the file's baseline is 1800 — the drawn ebin-18 adc range
+ * 3092..3163 lands in ebin 24): the target-ebin cell collapses and the
+ * mass arrives at ebin 24 (the arrival, not only the loss) in LACC and
+ * in the next chunk's EACC; det-align-status counts mismatches; a
+ * det-inject deposit lands at its requested ebin bit-exact (the fold
+ * splits only the Poisson part).
+ * RED on the parent binary: det-adc-mode is an unknown property.
+ */
+static void test_det_adc_wrong(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL, *extra = NULL;
+    g_autofree gchar *blocks = NULL, *align_line = NULL;
+    g_autofree uint8_t *row = g_malloc(4096);
+    SkyBank *b = g_new0(SkyBank, 1);
+    NomChunk *c = g_new0(NomChunk, 1);
+    QTestState *qts;
+
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+
+    if (rotb_blocks_supported()) {
+        blocks = g_strdup(" -global grlib-stixctrl.rotb-blocks=128");
+    }
+    extra = g_strdup_printf(
+        "-global grlib-stixctrl.det-replay-file=%s "
+        "-global grlib-stixctrl.det-seed=7%s", path,
+        blocks ? blocks : "");
+    qts = stix_qtest_new_extra(extra);
+    g_assert_true(sky_set_bool(qts, "det-adc-mode", true));
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 2000));
+    det_adc_wrong_row(row);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 0), row, 4096);
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+    sky_start_nom(qts, 9, 0xFFF, 0, 9, 0xFFFFFFFFu);
+
+    /* a deposit mid-run lands bit-exact at its own ebin (12 is a dest
+     * no sim ebin of this row reaches: the fold adds nothing there) */
+    det_step_ticks(qts, 20);
+    /* drain the two chunks so far: the 128-block ring holds only two */
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS);
+    nom_read_chunk(qts, c);
+    nom_read_chunk(qts, c);
+    g_assert_true(sky_set_str(qts, "det-inject",
+                              "fpga_det=0,pix=0,ebin=12,count=250"));
+    det_step_ticks(qts, 10);            /* tick 30: QL bank 2 closes */
+    sky_read_bank(qts, 2, b);
+    g_assert_cmpuint(b->lacc[0][0][12], ==, 250);
+    /* the ebin-18 mass moved to ebin 24 (the base-0 grid) */
+    g_assert_cmpuint(b->lacc[0][0][18], <, DET_ADC_CELL18 / 2);
+    sky_assert_poisson("wrong row: ebin 18 arrives at 24",
+                       b->lacc[0][0][24], DET_ADC_CELL18, 5);
+    /* the report counts the mismatches against the 1800 calibration */
+    align_line = sky_get_str(qts, "det-align-status");
+    g_assert_nonnull(align_line);
+    {
+        const char *p = strstr(align_line, "mismatch_cells=");
+        long cells;
+
+        g_assert_nonnull(p);
+        cells = strtol(p + strlen("mismatch_cells="), NULL, 10);
+        g_assert_cmpint(cells, >=, 1);
+    }
+
+    /* the chunk the tick-30 nominal swap built (the same 20..30 period
+     * as QL bank 2) carries the deposit and the same misbin (the
+     * det-inject-chunk decode) */
+    g_assert_cmpuint(rotb_count(qts), ==, CHUNK_BLOCKS);
+    nom_read_chunk(qts, c);
+    g_assert_cmpuint(c->eacc[0][0][12], ==, 250);
+    g_assert_cmpuint(c->eacc[0][0][18], <, DET_ADC_CELL18 / 2);
+    sky_assert_poisson("chunk: ebin 18 at 24", c->eacc[0][0][24],
+                       DET_ADC_CELL18, 5);
+
+    g_free(b);
+    g_free(c);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-adc-map-invalidate: mode on with a matching (derived) row; a
+ * mid-run rewrite of that row moves the bank closed by the FIRST swap
+ * after it (the rebuild runs at the start of the QL swap, before the
+ * materialize — deliberately unlike the replay's event-time bank-1
+ * precedent), and rewriting back moves the next bank back.
+ * RED on the parent binary: det-adc-mode is an unknown property.
+ */
+static void test_det_adc_map_invalidate(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL, *extra = NULL;
+    g_autofree gchar *blocks = NULL;
+    g_autofree uint8_t *derived = g_malloc(4096), *wrong = g_malloc(4096);
+    SkyBank *b = g_new0(SkyBank, 1);
+    QTestState *qts;
+
+    /* base 1800: the wrong row moves ebin 18 whole onto ebin 24 */
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+
+    if (rotb_blocks_supported()) {
+        blocks = g_strdup(" -global grlib-stixctrl.rotb-blocks=128");
+    }
+    extra = g_strdup_printf(
+        "-global grlib-stixctrl.det-replay-file=%s "
+        "-global grlib-stixctrl.det-seed=7%s", path,
+        blocks ? blocks : "");
+    qts = stix_qtest_new_extra(extra);
+    g_assert_true(sky_set_bool(qts, "det-adc-mode", true));
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 2000));
+    det_adc_derived_row(derived, 1800);
+    det_adc_wrong_row(wrong);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 0), derived, 4096);
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+    sky_start(qts, 9, 0xFFF);
+
+    /* bank 0: the matching row folds as the identity (ebin 18 holds) */
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 0, b);
+    sky_assert_poisson("identity row: ebin 18", b->lacc[0][0][18],
+                       DET_ADC_CELL18, 5);
+    g_assert_cmpuint(b->lacc[0][0][24], <, DET_ADC_CELL18 / 2);
+
+    /* the first swap after the rewrite folds with the new map */
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 0), wrong, 4096);
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[0][0][18], <, DET_ADC_CELL18 / 2);
+    sky_assert_poisson("rewritten row: ebin 18 at 24", b->lacc[0][0][24],
+                       DET_ADC_CELL18, 5);
+
+    /* rewriting back moves the next bank back */
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 0), derived, 4096);
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 2, b);
+    sky_assert_poisson("restored row: ebin 18", b->lacc[0][0][18],
+                       DET_ADC_CELL18, 5);
+    g_assert_cmpuint(b->lacc[0][0][24], <, DET_ADC_CELL18 / 2);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-adc-props: det-cal-kev-full 0 and 4097 are refused (1..4096);
+ * the tape adc_mode field overrides the knob while the tape plays and
+ * reverts on stop (the det-tape-rate banks witness it: the wrong row
+ * folds only while the tape plays); the status line parses.
+ * RED on the parent binary: det-adc-mode is an unknown property.
+ */
+static void test_det_adc_props(void)
+{
+    Det7File f = { 0 };
+    g_autofree gchar *dir = NULL, *path = NULL, *extra = NULL;
+    g_autofree gchar *json = NULL, *blocks = NULL;
+    g_autofree uint8_t *wrong = g_malloc(4096);
+    SkyBank *b = g_new0(SkyBank, 1);
+    QTestState *qts;
+
+    qts = stix_qtest_new();
+    g_assert_cmpint(stix_qom_counter(qts, SKY_CTRL_PATH,
+                                     "det-cal-kev-full"), ==, 160);
+    g_assert_cmpstr(sky_get_str(qts, "det-adc-status"), ==,
+                    "mode=off,kev_full=160,base_source=zero,map_rows=0");
+    g_assert_false(sky_set_u32(qts, "det-cal-kev-full", 0));
+    g_assert_false(sky_set_u32(qts, "det-cal-kev-full", 4097));
+    g_assert_true(sky_set_u32(qts, "det-cal-kev-full", 4096));
+    g_assert_cmpstr(sky_get_str(qts, "det-adc-status"), ==,
+                    "mode=off,kev_full=4096,base_source=zero,map_rows=0");
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+
+    /* the tape adc_mode override: knob off, tape on, a wrong row */
+    det_adc_file_baselines(&f, 1800);
+    det7_write(&f, &dir, &path);
+    if (rotb_blocks_supported()) {
+        blocks = g_strdup(" -global grlib-stixctrl.rotb-blocks=128");
+    }
+    extra = g_strdup_printf(
+        "-global grlib-stixctrl.det-replay-file=%s "
+        "-global grlib-stixctrl.det-seed=7%s", path,
+        blocks ? blocks : "");
+    qts = stix_qtest_new_extra(extra);
+    g_assert_true(sky_set_u32(qts, "det-quiet-cps", 2000));
+    det_adc_wrong_row(wrong);
+    qtest_memwrite(qts, DET7_ELUT_ADDR(0, 0), wrong, 4096);
+    idefx_power_all(qts);
+    rotb_cfg(qts, true, false);
+    sky_start(qts, 9, 0xFFF);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"adc\", "
+                           "\"adc_mode\": true, \"steps\": [%s]}",
+                           det_tape_rate_step("4095", 2000, "2"));
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_null(det_tape_play(qts, true));
+
+    det_step_ticks(qts, 10);            /* the first swap: map built */
+    g_assert_cmpstr(sky_get_str(qts, "det-adc-status"), ==,
+                    "mode=on,kev_full=160,base_source=replay,"
+                    "map_rows=384");
+    det_step_ticks(qts, 10);            /* bank 1: the tape folds */
+    sky_read_bank(qts, 1, b);
+    g_assert_cmpuint(b->lacc[0][0][18], <, DET_ADC_CELL18 / 2);
+    sky_assert_poisson("tape adc_mode: ebin 18 at 24", b->lacc[0][0][24],
+                       DET_ADC_CELL18, 5);
+
+    /* stop: the knob (off) rules again, the next bank does not fold */
+    g_assert_null(det_tape_play(qts, false));
+    det_step_ticks(qts, 1);
+    g_assert_cmpstr(sky_get_str(qts, "det-adc-status"), ==,
+                    "mode=off,kev_full=160,base_source=replay,"
+                    "map_rows=384");
+    det_step_ticks(qts, 10);
+    sky_read_bank(qts, 2, b);
+    sky_assert_poisson("stopped: ebin 18 back", b->lacc[0][0][18],
+                       DET_ADC_CELL18, 5);
+    g_assert_cmpuint(b->lacc[0][0][24], <, DET_ADC_CELL18 / 2);
+
+    g_free(b);
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+    g_unlink(path);
+    g_rmdir(dir);
+    g_free(f.w);
+}
+
+/*
+ * det-adc-guard (the det-tape-guard pattern with the mode on): steps
+ * changing under clock_step with the ADC mode on (the map rebuilds at
+ * every swap), every CTRL MMIO path still answers.
+ * RED on the parent binary: det-adc-mode is an unknown property.
+ */
+static void test_det_adc_guard(void)
+{
+    QTestState *qts = rotb_qtest_new(128);
+    g_autofree char *json = NULL;
+    uint32_t i;
+
+    g_assert_true(sky_set_bool(qts, "det-adc-mode", true));
+    rotb_cfg(qts, true, false);
+    ctrl_write(qts, CTRL_FSMCMD, FSMCMD_QLIRQEN);
+    det_start_nom(qts, 9, 0, 9, 0xFFFFFFFFu);
+    json = g_strdup_printf("{\"api\": 1, \"name\": \"adcguard\", "
+                           "\"adc_mode\": true, \"loop\": true, "
+                           "\"steps\": [%s, %s]}",
+                           det_tape_rate_step("4095", 2000, "0.1"),
+                           det_tape_rate_step("4095", 0, "0.1"));
+    g_assert_true(sky_set_str(qts, "det-tape-load", json));
+    g_assert_null(det_tape_play(qts, true));
+    qtest_writel(qts, IRQMP_CLEAR, DET_IRQ_BIT);
+
+    for (i = 0; i < 20; i++) {    /* 2 chunks: 3 x 49 > 128 */
+        det_step_ticks(qts, 1);
+    }
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS);
+    g_assert_cmphex(ctrl_read(qts, CTRL_FSMCMD), ==, FSMCMD_QLIRQEN);
+    g_assert_cmphex(det_sta(qts) & FSMSTA_ENABLE, ==, FSMSTA_ENABLE);
+    g_assert_true(det_irq_pending(qts));
+    rotb_cmd(qts, ROTB_CMD_GETBLOCK);
+    g_assert_cmpuint(rotb_count(qts), ==, 2 * CHUNK_BLOCKS - 1);
+
+    qtest_quit(qts);
+    stix_qtest_cleanup();
+}
+
+static void stix_det_tape_register(void)
+{
+    /* S1: the mix tape */
+    qtest_add_func("/sparc/stix/det-tape-props", test_det_tape_props);
+    qtest_add_func("/sparc/stix/det-tape-status", test_det_tape_status);
+    qtest_add_func("/sparc/stix/det-tape-replay", test_det_tape_replay);
+    qtest_add_func("/sparc/stix/det-tape-rate", test_det_tape_rate);
+    qtest_add_func("/sparc/stix/det-tape-pixmask", test_det_tape_pixmask);
+    qtest_add_func("/sparc/stix/det-tape-seed", test_det_tape_seed);
+    qtest_add_func("/sparc/stix/det-tape-guard", test_det_tape_guard);
+    /* A1: the alignment report */
+    qtest_add_func("/sparc/stix/det-align-status", test_det_align_status);
+    /* C1: the ADC-faithful sky */
+    qtest_add_func("/sparc/stix/det-adc-off", test_det_adc_off);
+    qtest_add_func("/sparc/stix/det-adc-derived", test_det_adc_derived);
+    qtest_add_func("/sparc/stix/det-adc-wrong", test_det_adc_wrong);
+    qtest_add_func("/sparc/stix/det-adc-map-invalidate",
+                   test_det_adc_map_invalidate);
+    qtest_add_func("/sparc/stix/det-adc-props", test_det_adc_props);
+    qtest_add_func("/sparc/stix/det-adc-guard", test_det_adc_guard);
 }
 
 
@@ -16533,6 +17645,7 @@ int main(int argc, char **argv)
         qtest_add_func("/sparc/stix/det-inject-reset",
                        test_det_inject_reset);
         stix_det7_register();
+        stix_det_tape_register();
         stix_platform_register();
         stix_att_register();
         stix_flashdmg_register();

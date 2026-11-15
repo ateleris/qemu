@@ -103,6 +103,41 @@ typedef enum StixDetRotbResult {
 #define STIX_DET_IDEFX_N_REG 14u
 #define STIX_DET_IDEFX_REG_BYTES 24u    /* R3: 192 bits */
 
+/* the mix tape (S1): at most 64 steps, at most 64 KiB of JSON */
+#define STIX_DET_TAPE_MAX_STEPS 64u
+#define STIX_DET_TAPE_MAX_BYTES (64u * 1024u)
+
+/* the tape step kinds (S1 ships rate/replay/off; single is S3) */
+typedef enum StixDetTapeKind {
+    STIX_DET_TAPE_RATE,
+    STIX_DET_TAPE_REPLAY,
+    STIX_DET_TAPE_OFF,
+    STIX_DET_TAPE_SINGLE,       /* parsed but rejected in S1 (S3) */
+    STIX_DET_TAPE_KIND__MAX,
+} StixDetTapeKind;
+
+/* one tape step (S1): kind rate|replay|off (single is S3), fpga_det/pix
+ * masks, cps; label is optional. The fpga_det_mask/pix_mask bits are
+ * fpga_det/pix indexed (plan T1). */
+typedef struct StixDetTapeStep {
+    uint8_t kind;               /* StixDetTapeKind */
+    double for_s;               /* 0.1..86400 s on guest time */
+    uint32_t fpga_det_mask;
+    uint32_t pix_mask;          /* 0..0xFFF, pix bits */
+    uint32_t cps;               /* counts/s per fpga_det (rate steps) */
+    char *label;                /* optional, <= 64 chars */
+} StixDetTapeStep;
+
+/* the tape's state word (det-tape-status, hw-state det.tape.state) */
+typedef enum StixDetTapeState {
+    STIX_DET_TAPE_IDLE,         /* nothing loaded */
+    STIX_DET_TAPE_READY,        /* loaded, not playing */
+    STIX_DET_TAPE_PLAYING,
+    STIX_DET_TAPE_DONE,         /* the last step ended without loop */
+    STIX_DET_TAPE_STOPPED,      /* det-tape-play=false mid-playback */
+    STIX_DET_TAPE__MAX,
+} StixDetTapeState;
+
 /* one grp's slow-control transaction decoder (D-De) */
 typedef struct StixIdefxDecoder {
     uint8_t phase;      /* STIX_IDEFX_IDLE, _SC_ADDR, _SC_DATA */
@@ -272,6 +307,49 @@ typedef struct StixDetState {
     /* the template (D-Df), built at realize: pix share and ebin shares */
     double pix_share[STIX_DET_N_PIX_ACC];
     double ebin_share[STIX_DET_N_PROFILE][STIX_DET_N_EBIN];
+    /*
+     * S1, the mix tape: det-tape-load (JSON) fills steps; det-tape-play
+     * arms the request (D-Dj) the next tick starts on; the step clock
+     * rides the 100 ms tick (only while FSM Enable = 1). A device reset
+     * stops playback and keeps the tape (state ready).
+     */
+    StixDetTapeStep tape_steps[STIX_DET_TAPE_MAX_STEPS];
+    uint32_t tape_n_steps;
+    uint32_t tape_step;         /* the running step's index */
+    uint32_t tape_left_ticks;   /* ticks left in the running step */
+    uint32_t tape_bg_cps;       /* the background layer, counts/s per
+                                 * fpga_det (unmasked: all 384 pairs) */
+    bool tape_in_replay;        /* a replay step switched the source */
+    char *tape_name;            /* 1..64 chars */
+    bool tape_loop;
+    bool tape_align;            /* the tape-level default of "align" */
+    bool tape_adc_mode;         /* overrides det-adc-mode while playing */
+    uint8_t tape_state;         /* StixDetTapeState */
+    bool tape_play_req;         /* det-tape-play=true, applied next tick */
+    bool tape_stop_req;         /* det-tape-play=false, applied next tick */
+    /*
+     * A1: det-align turns the ELUT row classification on always (it
+     * already runs for replay-dss) and keeps its summary for
+     * det-align-status and hw-state det.align. Survives a device reset.
+     */
+    bool align;
+    uint32_t align_rows;
+    uint32_t align_fallback;
+    uint32_t align_honoured;
+    uint32_t align_mismatch_cells;
+    uint32_t align_unassigned_cells;
+    bool align_has_table;       /* a replay table gave the sim baseline */
+    /*
+     * C1: det-adc-mode folds the drawn sky through the loaded ELUT via
+     * the cached per-row bin-mass map; det-cal-kev-full anchors the
+     * keV <-> adc law. Both survive a device reset.
+     */
+    bool adc_mode;
+    uint32_t adc_kev_full;      /* keV mapped to adc 4096, 1..4096 */
+    bool adc_map_valid;
+    bool adc_map_armed;         /* rebuild at the next classification point */
+    double adc_map[STIX_DET_N_FPGA_DET][STIX_DET_N_PIX_ACC]
+                  [STIX_DET_N_EBIN][STIX_DET_N_EBIN];
 } StixDetState;
 
 bool stix_det_realize(StixDetState *d, STIXCTRL *owner, stixCtrlRegs_s *reg,
@@ -312,6 +390,16 @@ bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value);
  * Pure: nothing advanced, nothing traced. The caller owns @det.
  */
 void stix_det_hw_state(StixDetState *d, QDict *det);
+
+/*
+ * A1 (fixed now for S2/S3): an adc whose loaded ELUT row (pix @pix,
+ * fpga_det @fpga_det) maps to @ebin — the midpoint of that adc run in
+ * the honoured row. -1 when the row is degenerate (the caller uses the
+ * sim calibration) or no adc maps to @ebin (the caller counts a
+ * preimage_miss). Not called before S2.
+ */
+int stix_det_align_adc(StixDetState *d, uint32_t fpga_det, uint32_t pix,
+                       uint32_t ebin);
 
 /*
  * Provided by grlib_stixctrl.c for the detector model (D-5):

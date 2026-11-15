@@ -16,9 +16,12 @@ Series ids:
   order (the labels), so the axis order is stable; the catalogue entry
   says `cal`: "poly"|"interp"|"text"|"raw";
 - marker kinds `fault`, `force`, `tc`, `event`, `mode`, `power`,
-  `scenario` — one point per record, the label is the hover text
-  (`TC(237,18) param 312 = 0`, `EID 0x0021 mode change`, ...);
+  `scenario`, `stim` — one point per record, the label is the hover text
+  (`TC(237,18) param 312 = 0`, `EID 0x0021 mode change`, `tape 'flare'
+  step 2/4: flare Q1+Q3`, ...);
   `scenario` = log/expect records whose path starts with `scenario.`;
+  `stim` = the stimulus plan's tape step starts (one `stim` record per
+  instrument.detector.tape.step change).
 - `param:<index>` — a `param` record's new value (the FSW parameters
   table's changes, fsw-params plan T2), the label is the name.
 
@@ -34,7 +37,8 @@ returning its first t and the last/min/max value, so spikes survive.
 
 import threading
 
-MARKERS = ("fault", "force", "tc", "event", "mode", "power", "scenario")
+MARKERS = ("fault", "force", "tc", "event", "mode", "power", "scenario",
+           "stim")
 LABEL_CAP = 240          # a bucket's joined marker labels
 
 
@@ -121,7 +125,7 @@ class SeriesIndex:
             self._tm(t, data)
         elif kind == "tc" and obj.get("path") == "platform.keepalive":
             pass    # the TC(20,128) summaries every 10 s: noise, not events
-        elif kind in ("fault", "force", "tc", "power"):
+        elif kind in ("fault", "force", "tc", "power", "stim"):
             self._marker(kind, t, obj, data)
         elif kind == "param":
             idx, new = data.get("index"), data.get("new")
@@ -207,6 +211,14 @@ class SeriesIndex:
             p = data.get("param")
             if isinstance(p, dict) and "index" in p:
                 label += " param %s = %s" % (p.get("index"), p.get("value"))
+        elif kind == "stim":
+            # the hover text of a tape step start (the stimulus plan:
+            # "Every step start is a marker on the Timeline")
+            label = "tape '%s' step %s/%s" % (data.get("name"),
+                                              data.get("step"),
+                                              data.get("n_steps"))
+            if data.get("label"):
+                label += ": %s" % (data["label"],)
         else:                           # power
             label = "power %s (%s)" % (data.get("event") or "?",
                                        data.get("state") or "?")

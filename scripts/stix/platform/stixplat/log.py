@@ -6,7 +6,7 @@ Every record is
   {"v":1,"seq":N,"sim_time":<ns>,"boot_id":B,"vclock_ns":<ns|null>,
    "wall_time":"...Z","source":"ctl|qemu|fsw|tm|tc|scn|api",
    "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|
-           uart|log|debug|sample|param","path":"<state path or verb>",
+           uart|log|debug|sample|param|stim","path":"<state path or verb>",
    "data":{...}}
 plus "sim_est": true when the controller could not sample the time
 exactly. The serialised line is built once; the same bytes go to
@@ -24,16 +24,17 @@ import threading
 SCHEMA_VERSION = 1
 SOURCES = ("ctl", "qemu", "fsw", "tm", "tc", "scn", "api")
 KINDS = ("cmd", "result", "state", "power", "tm", "tc", "fault", "force",
-         "expect", "mismatch", "uart", "log", "debug", "sample", "param")
+         "expect", "mismatch", "uart", "log", "debug", "sample", "param", "stim")
 FIELDS = ("v", "seq", "sim_time", "boot_id", "vclock_ns", "wall_time",
           "source", "kind", "path", "data")
 
-# D-PLn kind -> SSE topic
+# D-PLn kind -> SSE topic (stim: its own topic, one record per tape
+# step start — the stimulus plan's Timeline marker)
 _TOPIC = {"cmd": "cmd", "result": "cmd", "state": "state",
           "power": "state", "fault": "fault", "force": "fault",
           "debug": "log", "sample": "sample"}
 TOPICS = ("cmd", "state", "tm", "tc", "fault", "expect", "mismatch",
-          "uart", "log", "sample", "param")
+          "uart", "log", "sample", "param", "stim")
 
 
 def topic_of(kind):

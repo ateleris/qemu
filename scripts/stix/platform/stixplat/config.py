@@ -84,14 +84,19 @@ DEFAULTS = {
     "timeline": {"sample_s": -1.0,
                  "sample_paths": [
                      "instrument.rotb.*", "instrument.detector.*cps",
-                     "instrument.detector.flare", "idpu.watchdog.count",
+                     "instrument.detector.flare",
+                     "instrument.detector.tape.*",
+                     "instrument.detector.align.*",
+                     "instrument.detector.adc.*",
+                     "idpu.watchdog.count",
                      "idpu.spw.counters.*", "instrument.memory.*",
                      "platform.keepalive.*", "platform.timesync.verdict",
                      "platform.power", "idpu.spw.link_down"],
-                 # A2: "" would disable; views_dir "" = <run_root>/views
+                 # A2: "" would disable; views_dir "" = <run_root>/views,
+                 # tapes_dir "" = <run_root>/tapes (the stimulus plan)
                  "idb_json": "~/dev/ATS-GroundStation-stix/definitions/"
                              "telemetry/stix_idb_tlm.json",
-                 "idb_sqlite": "", "views_dir": ""},
+                 "idb_sqlite": "", "views_dir": "", "tapes_dir": ""},
     "log": {"max_log_mb": 50, "max_log_files": 5, "ring": 20000},
     # run bundles (2026-11-15 run-bundles plan): the manifest +
     # decisions writer, and the HK fields that yield hk_step decisions

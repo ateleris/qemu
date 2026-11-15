@@ -19,6 +19,7 @@ from . import flashlib
 from . import idb as idb_mod
 from . import params as params_mod
 from . import tcbuild
+from . import tapes as tapes_mod
 from .dispatch import VerbError
 from .force import Forcing
 from .keepalive import KeepAlive
@@ -28,6 +29,17 @@ from .timesync import TimeSync
 
 STIXSPW = "/machine/stixspw"
 STIXCTRL = "/machine/stixctrl"
+
+
+def split_kv(line):
+    """The device status strings' key=value comma splitter (the
+    det-rotb-burst, det-tape-status, det-align-status and
+    det-adc-status lines)."""
+    out = {}
+    for kv in line.split(","):
+        k, _, v = kv.partition("=")
+        out[k.strip()] = v.strip()
+    return out
 
 
 class Platform:
@@ -45,6 +57,8 @@ class Platform:
         self.seq14 = 0                  # source 14 on APID 0x5AC
         self.seq_gs = 0                 # GS emulation (source 121)
         self._seq14_sent = {}           # seq -> monotonic send time
+        self._tape_seen = False         # the tape step leaf seen (T4)
+        self._last_step = None          # the tape step last seen (T4)
         # A2: the HK decoder is given to the relay before its threads
         # start; None (with one timeline.idb record) when the IDB JSON
         # is missing or broken
@@ -156,6 +170,46 @@ class Platform:
             "platform.keepalive.suppressed": ka["suppressed"],
             "platform.timesync.verdict": last["verdict"] if last else
             "none"})
+        self._stim_step()
+
+    def _stim_step(self):
+        """T4: one `stim` record per instrument.detector.tape.step
+        change (the poller refreshes the leaves; the play/stop verbs
+        call their own after their QOM writes). The leaf's creation —
+        at boot, or again after a power-off cleared the tree — is no
+        record, and neither is a step that holds."""
+        lf = self.ctl.state.get("instrument.detector.tape.step")
+        if lf is None:
+            self._tape_seen = False
+            self._last_step = None
+            return
+        step = lf["truth"]
+        if not self._tape_seen:
+            self._tape_seen = True
+            self._last_step = step
+            return
+        if step == self._last_step:
+            return
+        self._last_step = step
+
+        def leaf(p):
+            x = self.ctl.state.get("instrument.detector.tape." + p)
+            return x["truth"] if x else None
+        self.log.emit("ctl", "stim", "instrument.detector.tape.step",
+                      {"name": leaf("name"), "step": step,
+                       "n_steps": leaf("n_steps"), "label": leaf("label"),
+                       "kind": leaf("kind")})
+
+    def _stim_emit(self, status, kind=""):
+        """The play/stop verbs' own stim record, from the status they
+        just parsed (the leaves catch up at the next poll)."""
+        self._tape_seen = True
+        self._last_step = status.get("step")
+        self.log.emit("ctl", "stim", "instrument.detector.tape.step",
+                      {"name": status.get("name"), "step":
+                       status.get("step"), "n_steps":
+                       status.get("n_steps"), "label":
+                       status.get("label"), "kind": kind})
 
     # -- power hooks (D-PLk on_power) -----------------------------------------
     def _on_power(self, event, power):
@@ -241,6 +295,38 @@ class Platform:
                   "frame into the ROTB ring now; returns the parsed "
                   "burst status (409 while STIX is off or the device "
                   "refuses: no live chunk, 0 or over the chunk count)")
+        d.add("det.tape.save", self.v_tape_save,
+              args={"name": {"type": "string", "required": True},
+                    "tape": {"type": "object", "required": True}},
+              doc="save a mix tape as <name>.json in the tapes dir "
+                  "([timeline] tapes_dir, default next to the views); "
+                  "the model's schema, validated here first (400 with "
+                  "the step index)")
+        d.add("det.tape.delete", self.v_tape_delete,
+              args={"name": {"type": "string", "required": True}},
+              doc="delete a saved mix tape (404 unknown)")
+        d.add("det.tape.play", self.v_tape_play,
+              args={"name": {"type": "string", "required": True},
+                    "loop": {"type": "boolean"}},
+              doc="load a saved mix tape into the model and start it on "
+                  "the guest-time tick (det-tape-load then "
+                  "det-tape-play); loop overrides the tape's own; the "
+                  "answer is the parsed det-tape-status (409 while STIX "
+                  "is off or the model refuses)")
+        d.add("det.tape.stop", self.v_tape_stop,
+              doc="stop the playing tape (det-tape-play false); the "
+                  "rates revert to the scene knobs; the answer is the "
+                  "parsed det-tape-status")
+        d.add("det.align.set", self.v_align_set,
+              args={"enabled": {"type": "boolean", "required": True}},
+              doc="the ELUT-alignment bench knob (det-align) + the "
+                  "parsed det-align-status report; a misaligned loaded "
+                  "ELUT then shows in mismatch_cells")
+        d.add("det.adc.set", self.v_adc_set,
+              args={"enabled": {"type": "boolean", "required": True}},
+              doc="the ADC-faithful sky knob (det-adc-mode, default "
+                  "off) + the parsed det-adc-status; when on, the "
+                  "synthetic sky folds through the loaded FPGA ELUT")
         d.add("fault.inject", self.faults.inject,
               args={"id": {"type": "string", "required": True},
                     "params": {"type": "object"},
@@ -361,10 +447,7 @@ class Platform:
             status = self._q().qom_get(STIXCTRL, "det-rotb-burst-status")
         except QmpError as e:
             raise VerbError(409, "det-rotb-burst-status: %s" % e)
-        out = {}
-        for kv in status.split(","):
-            k, _, v = kv.partition("=")
-            out[k.strip()] = v.strip()
+        out = split_kv(status)
         try:
             return {"requested": int(out["requested"]),
                     "appended": int(out["appended"]),
@@ -372,6 +455,96 @@ class Platform:
                     "rotb_count": int(out["rotb_count"])}
         except (KeyError, ValueError):
             raise VerbError(500, "det-rotb-burst-status %r" % status)
+
+    # -- the detector tape and ELUT alignment (stimulus plan T3, A1, C2)
+    def _det_status(self, prop, casts):
+        """A read-only det status string, parsed (409 off, 500 a line
+        that does not parse)."""
+        try:
+            line = self._q().qom_get(STIXCTRL, prop)
+        except QmpError as e:
+            raise VerbError(409, "%s: %s" % (prop, e))
+        out = split_kv(line)
+        try:
+            return {k: cast(out[k]) for k, cast in casts.items()}
+        except (KeyError, ValueError):
+            raise VerbError(500, "%s %r" % (prop, line))
+
+    @staticmethod
+    def _tape_status_casts():
+        return {"state": str, "name": str, "label": str,
+                "step_left_ticks": int,
+                "loop": lambda v: v == "true",
+                "align": lambda v: v == "true"}
+
+    def _tape_status(self):
+        """det-tape-status, with step=K/N split into step and n_steps."""
+        try:
+            line = self._q().qom_get(STIXCTRL, "det-tape-status")
+        except QmpError as e:
+            raise VerbError(409, "det-tape-status: %s" % e)
+        out = split_kv(line)
+        casts = self._tape_status_casts()
+        try:
+            r = {k: cast(out[k]) for k, cast in casts.items()}
+            step, _, n = out["step"].partition("/")
+            r["step"] = int(step)
+            r["n_steps"] = int(n)
+            return r
+        except (KeyError, ValueError):
+            raise VerbError(500, "det-tape-status %r" % line)
+
+    def v_tape_save(self, name, tape):
+        """Save the tape as <name>.json in the tapes dir (the model's
+        schema, validated client-side first)."""
+        return tapes_mod.save(self.cfg, name, tape)
+
+    def v_tape_delete(self, name):
+        tapes_mod.delete(self.cfg, name)
+        return {"deleted": name}
+
+    def v_tape_play(self, name, loop=None):
+        """Load the saved tape into the model and start it (the loop
+        argument overrides the tape's own, as in the schema). The read
+        and the validation come before any QMP."""
+        tape = tapes_mod.read(self.cfg, name)       # 400/404 first
+        if loop is not None:
+            tape = dict(tape)
+            tape["loop"] = loop
+        self._qom_set("det-tape-load", json.dumps(tape), STIXCTRL)
+        self._qom_set("det-tape-play", True, STIXCTRL)
+        r = self._tape_status()
+        self._stim_emit(r, self._tape_step_kind(tape, r["step"]))
+        return r
+
+    def v_tape_stop(self):
+        self._qom_set("det-tape-play", False, STIXCTRL)
+        r = self._tape_status()
+        self._stim_emit(r)
+        return r
+
+    @staticmethod
+    def _tape_step_kind(tape, step):
+        """The kind of the step the status points at (1-based)."""
+        steps = tape.get("steps") or []
+        if isinstance(step, int) and 1 <= step <= len(steps):
+            return steps[step - 1].get("kind")
+        return ""
+
+    def v_align_set(self, enabled):
+        """A1's verb: the det-align bench knob + the parsed report."""
+        self._qom_set("det-align", enabled, STIXCTRL)
+        return self._det_status("det-align-status", {
+            "mode": str, "rows": int, "fallback": int, "honoured": int,
+            "mismatch_cells": int, "unassigned_cells": int,
+            "calibration": str})
+
+    def v_adc_set(self, enabled):
+        """C2's verb: the det-adc-mode bench knob + the parsed status."""
+        self._qom_set("det-adc-mode", enabled, STIXCTRL)
+        return self._det_status("det-adc-status", {
+            "mode": str, "kev_full": int, "base_source": str,
+            "map_rows": int})
 
     @staticmethod
     def _flash_name(name):

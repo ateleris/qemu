@@ -79,6 +79,42 @@
 # --flare --negative sends det-flare false at @135 (no flip; the QMP
 # path stays exercised) and passes only when exactly ql-contrast
 # fails.
+# --tape (stimulus plan T6) plays the gate's mix tape on the model's
+# 100 ms tick instead of the scene knobs. The base is det-source=
+# synthetic (the model default; the play setter refuses `zero`) with
+# -global grlib-stixctrl.det-quiet-cps=0: the only sky is the tape's.
+# @75 QMP loads the tape (write-only det-tape-load, JSON) and plays it:
+# background 20 cps on all 32 fpga_det; steps: rate Q1+Q3 (fpga_det
+# 0-7, 16-23) 2000 cps for 60 s, then off (all 32) 30 s. The play lands
+# inside the T_nom +- 10 s window (the @70 TC's arrival is due within
+# 10 s), so the rate step covers the first 8 QL periods that SSID 32
+# sums. The base flush check is a new ql-check.py --expect-tape-flush
+# (T_exit - T_nom): the D-3 product set, cadences and header defaults,
+# content asserted non-zero only (--expect-zero-flush would fail by
+# design: the 20 cps background runs from the play until the off step;
+# --expect-sky-flush's line-bin and ebin asserts are the flare
+# template's, not the tape's). A new check, tape, runs
+# ql-check.py --ssid32-subcols 0,1,5,6,4,10,11,12,30,31,25,26,21,27,19,20
+# (SUBCOL_FROM_FPGA_DET[f] for the masked f) --tape-lc ON OFF OFF_END
+# as ONE verdict: in the one SSID 32 dump every masked subcol holds
+# byte 4 (ebin 3, a flat-share ebin of the quiet template, 0.10/11)
+# >= 0x30 (2000 cps x 32 s ~= 580 counts) and every unmasked subcol
+# stays at the background floor, byte 4 < 0x10 (20 cps x 32 s ~= 6
+# counts, the ql-inject bound - not zero: the background fills all 32);
+# the rate step's SSID 30 band-0 median is >= 8 compressed steps above
+# the off step's, and the off-window samples are exactly 0 (the off
+# step beats the background end to end through the FSW). The SSID 30
+# rule lives inside tape because check_lc_contrast's quiet-before-
+# switch window does not exist here (the play is at ~T_nom).
+# --tape --negative plays only the off step (30 s) and fails exactly
+# tape (no elevated subcol, and the SSID 30 rule fails too with no rate
+# step - which is why it lives inside tape); its base flush is
+# --expect-zero-flush (the off step beats the background from the play,
+# so the flush is the D-3 zero one). The D-5 chunk check is skipped in
+# the tape modes: the rate step's ~1 s integrations have no scene flare
+# window for chunk-trace-check, whose 200-tick quiet rule is the flare
+# mode's; the ROTB path stays witnessed by uart-chunk.
+# --tape combines with neither --flare nor --no-rotb.
 # ROTB science chunks (D-5), in every mode: QEMU also traces
 # stixdet_scene, stixdet_nominal_swap, stixdet_chunk, stixdet_chunk_drop
 # and stixctrl_rotb_cmd into the same trace file, and
@@ -149,9 +185,11 @@
 # TMTC port, <run dir>-s<k>, and slot=k busy= load= on the verdict.
 #
 # Usage: detector-smoke.sh <qemu-binary> [--flare] [--negative]
-#                           [--no-rotb] [--dry-run] [--check-guard]
+#                           [--no-rotb] [--tape] [--dry-run]
+#                           [--check-guard]
 #   (--flare carries the D-6 det-inject deposit at @85; see above)
 #   --no-rotb combines with neither --flare nor --negative.
+#   --tape combines with neither --flare nor --no-rotb.
 #   STIX_ASW_ELF            as in tc-smoke.sh
 #   STIX_DETECTOR_RUN_DIR   run dir (default /tmp/stix-detector-run).
 #                           Canonicalised, then anything at or above
@@ -181,10 +219,11 @@
 set -euo pipefail
 
 QEMU_BIN_ARG="${1:?usage: detector-smoke.sh <qemu-binary> \
-[--flare] [--negative] [--no-rotb] [--dry-run] [--check-guard]}"
+[--flare] [--negative] [--no-rotb] [--tape] [--dry-run] [--check-guard]}"
 NEGATIVE=0
 FLARE=0
 NO_ROTB=0
+TAPE=0
 DRY_RUN=0
 CHECK_GUARD=0
 for a in "${@:2}"; do
@@ -198,6 +237,9 @@ for a in "${@:2}"; do
         --no-rotb)
             [ "$NO_ROTB" -eq 0 ] || { echo "--no-rotb given twice"; exit 2; }
             NO_ROTB=1 ;;
+        --tape)
+            [ "$TAPE" -eq 0 ] || { echo "--tape given twice"; exit 2; }
+            TAPE=1 ;;
         --dry-run)
             [ "$DRY_RUN" -eq 0 ] || { echo "--dry-run given twice"; exit 2; }
             DRY_RUN=1 ;;
@@ -211,6 +253,11 @@ done
 if [ "$NO_ROTB" -eq 1 ] && { [ "$FLARE" -eq 1 ] || [ "$NEGATIVE" -eq 1 ]; }
 then
     echo "--no-rotb combines with neither --flare nor --negative"
+    exit 2
+fi
+if [ "$TAPE" -eq 1 ] && { [ "$FLARE" -eq 1 ] || [ "$NO_ROTB" -eq 1 ]; }
+then
+    echo "--tape combines with neither --flare nor --no-rotb"
     exit 2
 fi
 
@@ -275,6 +322,8 @@ MODE_SFX=""
 [ "$FLARE" -eq 1 ] && MODE_SFX="-flare"
 [ "$FLARE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-flareneg"
 [ "$NO_ROTB" -eq 1 ] && MODE_SFX="-norotb"
+[ "$TAPE" -eq 1 ] && MODE_SFX="-tape"
+[ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ] && MODE_SFX="-tapeneg"
 RUN_DIR="$(stix_slot_dir "$RUN_DIR$MODE_SFX")"
 guard_shared
 QMP_SOCK="$RUN_DIR/qmp.sock"
@@ -343,6 +392,33 @@ if [ "$FLARE" -eq 1 ]; then
     )
 fi
 
+# T6: the gate's mix tape, loaded and played at @75 (two QMP groups;
+# see the header). The negative plays only the off step, so the flush
+# is the D-3 zero one and only the tape check fails.
+TAPE_STEPS_RATE="$(printf '%s' \
+    '{"kind": "rate", "for_s": 60, "cps": 2000, "label": "flare Q1+Q3",'
+    ' "fpga_det_mask": 16711935}')"
+TAPE_STEPS_OFF="$(printf '%s' \
+    '{"kind": "off", "for_s": 30, "label": "off",'
+    ' "fpga_det_mask": 4294967295}')"
+TAPE_STEPS="$TAPE_STEPS_RATE, $TAPE_STEPS_OFF"
+[ "$NEGATIVE" -eq 0 ] || TAPE_STEPS="$TAPE_STEPS_OFF"
+TAPE="$(printf '%s' \
+    '{"api": 1, "name": "gate-det-tape", "loop": false,'
+    ' "background": {"cps": 20}, "steps": ['"$TAPE_STEPS"']}')"
+TAPE_ESC="$(printf '%s' "$TAPE" | sed 's/"/\\"/g')"
+TAPE_ARGS=()
+if [ "$TAPE" -eq 1 ]; then
+    TAPE_ARGS=(
+        --qmp "$QMP_SOCK"
+        --send-at 75
+        --qmp-cmd "$(qom_set /machine/stixctrl det-tape-load \
+            "\"$TAPE_ESC\"")"
+        --send-at 75
+        --qmp-cmd "$(qom_set /machine/stixctrl det-tape-play true)"
+    )
+fi
+
 # TM(5,x) on 0x5A7, the subtype from the EID's severity nibble (1 ->
 # TM(5,1), 5 -> TM(5,2), 9 -> TM(5,3)); TM(21,6) QL on 0x5DC, matched
 # on the SSID (the first application byte).
@@ -379,6 +455,7 @@ PROBE_ARGS=(
     --forbid "0x5A1:1:8"
     --forbid "0x5A7:5:1:142e"
     ${FLARE_ARGS[@]+"${FLARE_ARGS[@]}"}
+    ${TAPE_ARGS[@]+"${TAPE_ARGS[@]}"}
     --send-at 215 --send-hex "$TC_CONF2"
     --expect "0x5A1:1:1:1DACC005"
     --expect "0x5A7:5:1:00210504@10"
@@ -402,9 +479,18 @@ QEMU_ARGS=(
     -trace "events=$RUN_DIR/idefx.events,file=$RUN_DIR/idefx.trace"
 )
 if [ "$FLARE" -eq 0 ]; then
-    # the tiers 0+1 zero sky of the D-3 checks
-    QEMU_ARGS+=(-global grlib-stixctrl.det-source=zero)
-    if [ "$NEGATIVE" -eq 1 ]; then
+    # the tiers 0+1 zero sky of the D-3 checks; --tape keeps the model's
+    # default synthetic source (the play setter refuses zero) with the
+    # quiet rate 0: the only sky is the tape's
+    if [ "$TAPE" -eq 1 ]; then
+        QEMU_ARGS+=(-global grlib-stixctrl.det-quiet-cps=0)
+    else
+        QEMU_ARGS+=(-global grlib-stixctrl.det-source=zero)
+    fi
+    if [ "$NEGATIVE" -eq 1 ] && [ "$TAPE" -eq 0 ]; then
+        # the plain negative's CmdReady-0 run; --tape --negative keeps
+        # det-idefx on (like --flare --negative) so it fails exactly
+        # the tape check
         QEMU_ARGS+=(-global grlib-stixctrl.det-idefx=off)
     fi
     if [ "$NO_ROTB" -eq 1 ]; then
@@ -415,6 +501,7 @@ MODE="positive"
 [ "$NEGATIVE" -eq 1 ] && MODE="negative"
 [ "$FLARE" -eq 1 ] && MODE="flare $MODE"
 [ "$NO_ROTB" -eq 1 ] && MODE="no-rotb"
+[ "$TAPE" -eq 1 ] && MODE="tape $MODE"
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY RUN — the commands detector-smoke would run ($MODE):"
@@ -456,8 +543,8 @@ touch .unfinished
 # appended to, so it must start empty.
 rm -f flash.bin uart.detector.raw uart.detector.txt detector.probe.log \
       qemu-stdout.detector.log idefx.trace ql.dump.hex ql.check.log \
-      ql.contrast.log ql.inject.log trace.check.log chunk.check.log \
-      chunk-flare.check.log qmp.sock
+      ql.contrast.log ql.inject.log ql.tape.log trace.check.log \
+      chunk.check.log chunk-flare.check.log qmp.sock
 truncate -s 17716740096 flash.bin
 # the trace events: the IDeF-X words, and the FSM strobes that mark the
 # NOMINAL window in the same file (one -trace option: a second one would
@@ -627,9 +714,13 @@ echo "clock: wall/monotonic over the run $(echo $CLOCK_START $CLOCK_END |
     awk '{ if ($4 > $2) printf "%.3f", ($3 - $1) / ($4 - $2);
            else print "?" }') (for the record; no check uses the wall clock)"
 
-# 2. the QL flush content (zero sky, or with --flare the synthetic sky)
+# 2. the QL flush content (zero sky, or with --flare the synthetic sky,
+# or with --tape the tape's: content non-zero only, T6)
 QL_FLUSH_ARG=--expect-zero-flush
 [ "$FLARE" -eq 1 ] && QL_FLUSH_ARG=--expect-sky-flush
+if [ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 0 ]; then
+    QL_FLUSH_ARG=--expect-tape-flush
+fi
 if [ -z "$NOM_SECONDS" ]; then
     echo "CHECK ql: FAIL (no NOMINAL window: 0021 04 05 or 0021 05 04" \
         "not seen)"
@@ -724,6 +815,57 @@ if [ "$FLARE" -eq 1 ]; then
     fi
 fi
 
+# 2d. --tape: the tape check (T6), one verdict: the SSID 32 subcol rule
+# and the SSID 30 rate/off rule, in one ql-check invocation. The
+# windows come from the play QMP send's monotonic stamp minus T_nom
+# (the step clock is guest time; the send at @75 lands at T_nom +- 5 s,
+# close enough for the 4 s cadence). The negative has no rate step: its
+# off step runs from the play, so the SSID 30 rate window is empty and
+# the check fails - as planned, inside tape.
+if [ "$TAPE" -eq 1 ]; then
+    PLAY_M="$(grep -m1 '>> qmp .*det-tape-play' detector.probe.log |
+        sed -n 's/.*\[m=\([0-9][0-9.]*\)\].*/\1/p')" || true
+    if [ -z "$NOM_SECONDS" ] || [ -z "$PLAY_M" ] || \
+            [ ! -s ql.dump.hex ]; then
+        echo "CHECK tape: FAIL (no NOMINAL window, no play QMP send," \
+            "or no 0x5DC packet dumped)"
+        FAILED+=(tape)
+        add_why tape "no window, no play send or no dump"
+    else
+        read -r TAPE_ON TAPE_OFF TAPE_OFF_END < <(awk -v t="$T_NOM_M" \
+            -v p="$PLAY_M" 'BEGIN {
+                on = p - t; printf "%.1f %.1f %.1f\n", on, on + 60,
+                                on + 90 }')
+        # the negative's only step is the off one: off starts at the play
+        if [ "$NEGATIVE" -eq 1 ]; then
+            read -r TAPE_ON TAPE_OFF TAPE_OFF_END < <(awk -v t="$T_NOM_M" \
+                -v p="$PLAY_M" 'BEGIN {
+                    on = p - t; printf "%.1f %.1f %.1f\n", on, on, on + 30 }')
+        fi
+        echo "tape: played at T_nom +$TAPE_ON s, rate step to" \
+            "T_nom +$TAPE_OFF s, off step to T_nom +$TAPE_OFF_END s"
+        set +e
+        python3 "$QLCHECK" ql.dump.hex \
+            --ssid32-subcols \
+            "0,1,5,6,4,10,11,12,30,31,25,26,21,27,19,20" \
+            --tape-lc "$TAPE_ON" "$TAPE_OFF" "$TAPE_OFF_END" \
+            > ql.tape.log 2>&1
+        QLT_RC=$?
+        set -e
+        grep -E '^QL-CHECK' ql.tape.log || true
+        if [ "$QLT_RC" -eq 0 ]; then
+            echo "CHECK tape: ok (masked subcols elevated at ebin 3," \
+                "the background floor elsewhere, the rate/off LC" \
+                "contrast, the off window exactly 0)"
+        else
+            echo "CHECK tape: FAIL ($(ql_why ql.tape.log); ql-check" \
+                "rc=$QLT_RC; see ql.tape.log)"
+            FAILED+=(tape)
+            add_why tape "$(ql_why ql.tape.log)"
+        fi
+    fi
+fi
+
 # 3. the UART, NULs stripped
 tr -d '\000' < uart.detector.raw > uart.detector.txt
 UART_BASE_OK=1
@@ -796,10 +938,11 @@ fi
 # and hold no IDeF-X command word at all (det-idefx=off fires no
 # stixdet_idefx_cmd); only then does trace-verif count as failed as
 # planned. A missing or unreadable trace fails the gate in both modes.
-# The --flare modes keep det-idefx on, so even --flare --negative takes
-# the positive branch here.
+# The --flare and --tape modes keep det-idefx on, so even their
+# negatives take the positive branch here.
 IDEFX_NEG=0
-[ "$NEGATIVE" -eq 1 ] && [ "$FLARE" -eq 0 ] && IDEFX_NEG=1
+[ "$NEGATIVE" -eq 1 ] && [ "$FLARE" -eq 0 ] && [ "$TAPE" -eq 0 ] && \
+    IDEFX_NEG=1
 # Neither branch compares a time with another clock: the runs are
 # placed in NOMINAL by the FSM strobes' order in the same trace.
 TRACE_ARGS=(idefx.trace)
@@ -829,32 +972,41 @@ fi
 # 5. the ROTB science chunks (D-5), from the same trace: every swap
 # made a chunk, quiet integrations at the max time, the FSW drained the
 # ring. --no-rotb: swaps but no chunk at all (det-rotb=off), which counts
-# as failed as planned.
-CHUNK_ARGS=(idefx.trace)
-if [ "$NO_ROTB" -eq 1 ]; then
-    CHUNK_ARGS+=(--expect-none)
-elif [ "$FLARE" -eq 1 ]; then
-    CHUNK_ARGS+=(--min-quiet 1)
-fi
-set +e
-python3 "$CHUNKCHECK" "${CHUNK_ARGS[@]}" > chunk.check.log 2>&1
-CHUNK_RC=$?
-set -e
-cat chunk.check.log
-if [ "$NO_ROTB" -eq 1 ]; then
-    if [ "$CHUNK_RC" -eq 0 ]; then
-        echo "CHECK chunk: FAIL as planned (nominal swaps, no chunk)"
-        FAILED+=(chunk)
-    else
-        echo "CHECK chunk: FAIL (rc=$CHUNK_RC; --no-rotb wants nominal" \
-            "swaps and no chunk)"
-        FAILED+=(chunk-not-none)
-    fi
-elif [ "$CHUNK_RC" -eq 0 ]; then
-    echo "CHECK chunk: ok"
+# as failed as planned. --tape: skipped - the rate step's ~1 s
+# integrations have no scene flare window for chunk-trace-check (its
+# 200-tick quiet rule is the flare mode's); the ROTB path stays
+# witnessed by uart-chunk.
+if [ "$TAPE" -eq 1 ]; then
+    echo "CHECK chunk: skipped (--tape: the rate step's 1 s" \
+        "integrations are not the D-5 quiet cadence; chunk-trace-check" \
+        "has no tape window)"
 else
-    echo "CHECK chunk: FAIL (rc=$CHUNK_RC; see chunk.check.log)"
-    FAILED+=(chunk)
+    CHUNK_ARGS=(idefx.trace)
+    if [ "$NO_ROTB" -eq 1 ]; then
+        CHUNK_ARGS+=(--expect-none)
+    elif [ "$FLARE" -eq 1 ]; then
+        CHUNK_ARGS+=(--min-quiet 1)
+    fi
+    set +e
+    python3 "$CHUNKCHECK" "${CHUNK_ARGS[@]}" > chunk.check.log 2>&1
+    CHUNK_RC=$?
+    set -e
+    cat chunk.check.log
+    if [ "$NO_ROTB" -eq 1 ]; then
+        if [ "$CHUNK_RC" -eq 0 ]; then
+            echo "CHECK chunk: FAIL as planned (nominal swaps, no chunk)"
+            FAILED+=(chunk)
+        else
+            echo "CHECK chunk: FAIL (rc=$CHUNK_RC; --no-rotb wants nominal" \
+                "swaps and no chunk)"
+            FAILED+=(chunk-not-none)
+        fi
+    elif [ "$CHUNK_RC" -eq 0 ]; then
+        echo "CHECK chunk: ok"
+    else
+        echo "CHECK chunk: FAIL (rc=$CHUNK_RC; see chunk.check.log)"
+        FAILED+=(chunk)
+    fi
 fi
 # 5b. --flare: the integrations inside the flare window end at 1 s
 if [ "$FLARE" -eq 1 ]; then
@@ -897,6 +1049,23 @@ if [ "$FLARE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
         "'${GOT}', want 'ql-contrast chunk-flare'$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
+if [ "$TAPE" -eq 1 ] && [ "$NEGATIVE" -eq 1 ]; then
+    # PASS only when exactly the tape check fails as planned: only the
+    # off step plays, so no masked subcol is elevated and the SSID 30
+    # rate window is empty; the zero-sky flush, probe, UART and trace
+    # checks must pass.
+    if [ "$GOT" = "tape" ]; then
+        echo "DETECTOR-SMOKE (tape negative): PASS (failed exactly as" \
+            "planned: only the off step played - no elevated subcol," \
+            "no rate step, no LC contrast; everything else passed)" \
+            "${STIX_SLOT_TAG}"
+        pass_cleanup
+        exit 0
+    fi
+    echo "DETECTOR-SMOKE (tape negative): FAIL (failed checks:" \
+        "'${GOT}', want 'tape'$WHY_QL)${STIX_SLOT_TAG}"
+    exit 1
+fi
 if [ "$NO_ROTB" -eq 1 ]; then
     # PASS only when exactly the two chunk checks fail as planned
     if [ "$GOT" = "uart-chunk chunk" ]; then
@@ -931,9 +1100,11 @@ if [ "$NEGATIVE" -eq 1 ]; then
         "failures; got $IDEFX_W and $IDEFX_R$WHY_QL)${STIX_SLOT_TAG}"
     exit 1
 fi
-# the D-3 positive keeps its verdict wording; --flare names its mode
+# the D-3 positive keeps its verdict wording; --flare and --tape name
+# their mode
 TAG="DETECTOR-SMOKE"
 [ "$FLARE" -eq 1 ] && TAG="DETECTOR-SMOKE ($MODE)"
+[ "$TAPE" -eq 1 ] && TAG="DETECTOR-SMOKE (tape)"
 if [ -n "$GOT" ]; then
     echo "$TAG: FAIL (failed checks: $GOT$WHY_QL)${STIX_SLOT_TAG}"
     exit 1

@@ -81,10 +81,43 @@ below MAX_QUIET in every other sample (the quiet sky there). The other
 bytes of the target sample are only compared with its subcol +- 1
 neighbours' range and logged (the plan's [L] item).
 
+--expect-tape-flush SECONDS is the detector-smoke --tape base check
+(stimulus plan T6): the same products, headers and cadences as above,
+but the content is asserted non-zero ONLY (per SSID 30/31/32/33 at
+least one non-zero value byte): the tape runs a 20 cps background from
+the play until the `off` step and the scene's quiet rate afterwards,
+so the later samples are zero by design. SSID 34 flags are counted,
+not asserted.
+
+--ssid32-subcols SUBCOLS is the --tape SSID 32 rule (T6): in the last
+SSID 32 dump, every sample whose detector byte (subcol) is in the
+comma-separated masked list holds >= 0x30 at byte 4 (ebin 3, a
+flat-share ebin of the quiet template, 0.10/11: 2000 cps x 32 s ~=
+580 counts), every other sample stays < 0x10 there (the 20 cps
+background floor, ~= 6 counts - the ql-inject bound, not zero). A dump
+with several products (align-smoke's two NOMINAL windows) reads the
+last.
+
+--ssid32-byte SUBCOL EBIN [MIN MAX] is the byte check of the align/ADC
+gates (A3/C3): the sample with detector byte SUBCOL holds a byte at
+EBIN (0-based ebin index) within [MIN, MAX] (compressed S0 bytes,
+monotone; default 0..255). The byte and its decoded [lo, hi) are
+printed, so a gate can take them as a reference for a 5-sigma window.
+
+--tape-lc ON OFF OFF_END is the --tape SSID 30 rule (T6), one verdict
+with --ssid32-subcols: the rate step's band-0 median is >= 8 compressed
+steps above the `off` step's, and the off-window samples are exactly 0
+(the `off` step beats the background end to end through the FSW).
+ON/OFF/OFF_END are the rate-step start, the `off`-step start and its
+end, in seconds of NOMINAL (sample i covers [4 i, 4 i + 4) s).
+
 Usage:
   ql-check.py DUMP [--samples] [--expect-zero-flush SECONDS]
               [--expect-sky-flush SECONDS] [--lc-contrast ON OFF]
               [--ssid32-inject SUBCOL EBIN MIN_SPIKE MAX_QUIET]
+              [--expect-tape-flush SECONDS] [--ssid32-subcols SUBCOLS]
+              [--ssid32-byte SUBCOL EBIN [MIN MAX]]
+              [--tape-lc ON OFF OFF_END]
   ql-check.py --self-test
 Exit codes: 0 decoded (and the check passed), 1 a decode error or a
 failed check, 2 bad usage or an unreadable file. stdlib only.
@@ -617,6 +650,157 @@ def check_zero_flush(products, seconds):
     return fails
 
 
+# --- the detector-smoke --tape checks (stimulus plan T6) ----------------
+
+def check_tape_flush(products, seconds, out=None):
+    """The --tape base flush: the D-3 product set, cadences and header
+    defaults (check_products), with the content asserted non-zero ONLY:
+    the tape runs a 20 cps background from the play until the `off`
+    step and the scene's quiet rate afterwards, so every later sample
+    is zero by design and the per-sample rules of --expect-zero-flush /
+    --expect-sky-flush would fail. SSID 34 flags are counted, not
+    asserted. Returns a list of failures."""
+    fails = []
+    smp = check_products(products, seconds, fails)
+    for ssid in (30, 31, 32, 33):
+        if ssid not in smp:
+            continue
+        if not any(v for s in smp[ssid] for v in sample_values(ssid, s)):
+            fails.append(f"SSID {ssid}: no non-zero value byte (the "
+                         f"tape's background and rate steps never "
+                         f"showed)")
+    if out is not None and 34 in smp:
+        flagged = sum(1 for s in smp[34] if s["status"])
+        print(f"QL-CHECK SSID 34: {flagged} of {len(smp[34])} periods "
+              f"flagged (counted, not asserted)", file=out)
+    return fails
+
+
+# byte 4 of an SSID 32 sample = ebin 3 (the sample is subcol, then
+# ebin 0..31, trigger, offset): a flat-share ebin of the quiet template,
+# 0.10/11. The tape's rate step covers the first 8 QL periods SSID 32
+# sums, so a masked subcol holds 2000 cps x 32 s x 0.10/11 ~= 580 counts
+# (S0 >= 0x30) and an unmasked one the 20 cps background floor
+# ~= 6 counts (>= 0, < 0x10 - the ql-inject bound, not zero: the
+# background fills all 32).
+TAPE_EBIN = 3
+TAPE_MIN_MASKED = 0x30
+TAPE_MAX_UNMASKED = 0x10
+
+
+def one_ssid32(products, want="the check"):
+    """The last SSID 32 product, or the failure list (the tape and
+    align gates read the exit flush; a dump with more than one product
+    - align-smoke's two NOMINAL windows - uses the last)."""
+    prods = products.get(32, [])
+    if not prods:
+        return None, [f"SSID 32: {len(prods)} products, want at least 1 "
+                      f"({want})"]
+    return prods[-1], []
+
+
+def check_ssid32_subcols(products, masked, out=None):
+    """The --tape check on the one SSID 32 dump: every sample whose
+    detector byte (subcol) is in @masked holds >= TAPE_MIN_MASKED at
+    byte 4 (ebin 3), every other sample stays < TAPE_MAX_UNMASKED
+    there. Returns a list of failures."""
+    prod, fails = one_ssid32(products, "--ssid32-subcols")
+    if prod is None:
+        return fails
+    smp = {s["subcol"]: s for s in prod["samples"]}
+    for sc in range(NUM_SUBCOL):
+        s = smp.get(sc)
+        if s is None:
+            fails.append(f"SSID 32: no sample with subcol {sc}")
+            continue
+        byte = s["ebin"][TAPE_EBIN]
+        if sc in masked and byte < TAPE_MIN_MASKED:
+            fails.append(f"SSID 32: masked subcol {sc} byte "
+                         f"{TAPE_EBIN + 1} (ebin {TAPE_EBIN}) is "
+                         f"0x{byte:02x}, want >= 0x{TAPE_MIN_MASKED:02x}")
+        if sc not in masked and byte >= TAPE_MAX_UNMASKED:
+            fails.append(f"SSID 32: unmasked subcol {sc} byte "
+                         f"{TAPE_EBIN + 1} (ebin {TAPE_EBIN}) is "
+                         f"0x{byte:02x}, want < 0x{TAPE_MAX_UNMASKED:02x} "
+                         f"(the background floor)")
+    if out is not None:
+        got = ", ".join("%d:0x%02x" % (sc, smp[sc]["ebin"][TAPE_EBIN])
+                        for sc in sorted(smp))
+        print(f"QL-CHECK SSID 32 ebin {TAPE_EBIN} bytes (last of "
+              f"{len(products.get(32, []))} product(s)): {got}",
+              file=out)
+    return fails
+
+
+def check_ssid32_byte(products, subcol, ebin, min_c=0, max_c=0xFF,
+                      out=None):
+    """The one SSID 32 sample with detector byte @subcol holds a byte
+    at @ebin (0-based ebin index) within [min_c, max_c] (compressed S0
+    bytes, monotone in the count); prints the byte and its decoded
+    [lo, hi) so a gate can take it as a reference. Returns a list of
+    failures."""
+    prod, fails = one_ssid32(products, "--ssid32-byte")
+    if prod is None:
+        return fails
+    tgt = [s for s in prod["samples"] if s["subcol"] == subcol]
+    if len(tgt) != 1:
+        return fails + [f"SSID 32: {len(tgt)} samples with subcol "
+                        f"{subcol}, want 1"]
+    byte = tgt[0]["ebin"][ebin]
+    lo, hi = s0_decode(byte)
+    if out is not None:
+        print(f"QL-CHECK SSID 32 byte: subcol {subcol} ebin {ebin} "
+              f"byte 0x{byte:02x} (decoded >= {lo}, < {hi})", file=out)
+    if byte < min_c:
+        fails.append(f"SSID 32: subcol {subcol} ebin {ebin} byte "
+                     f"0x{byte:02x} is below the floor 0x{min_c:02x}")
+    if byte > max_c:
+        fails.append(f"SSID 32: subcol {subcol} ebin {ebin} byte "
+                     f"0x{byte:02x} is above the bound 0x{max_c:02x}")
+    return fails
+
+
+def check_tape_lc(products, on_s, off_s, off_end_s, out=None):
+    """The --tape SSID 30 rule, one verdict: the rate step's band-0
+    median is >= 8 compressed steps above the `off` step's, and the
+    off-window samples are exactly 0 (the `off` step beats the
+    background end to end through the FSW). ON/OFF/OFF_END are the
+    rate-step start, the `off`-step start and its end, in seconds of
+    NOMINAL (sample i covers [4 i, 4 i + 4) s)."""
+    prods = products.get(30, [])
+    if len(prods) != 1:
+        return [f"SSID 30: {len(prods)} products, want 1"]
+    cad = CADENCE_S[30]
+    smp = prods[0]["samples"]
+    rate = [s["lc_band"][0] for i, s in enumerate(smp)
+            if cad * i >= on_s and cad * (i + 1) <= off_s]
+    off = [s["lc_band"][0] for i, s in enumerate(smp)
+           if cad * i >= off_s and cad * (i + 1) <= off_end_s]
+    mr, mo = median(rate), median(off)
+    if out is not None:
+        fmt = (lambda m: "none" if m is None else
+               f"0x{m:02x} (>= {s0_decode(m)[0]})")
+        print(f"QL-CHECK tape LC band 0: rate median {fmt(mr)} over "
+              f"{len(rate)} samples, off median {fmt(mo)} over "
+              f"{len(off)} samples (rate from +{on_s:g} s, off "
+              f"+{off_s:g}..{off_end_s:g} s)", file=out)
+    if len(rate) < CONTRAST_MIN_SAMPLES or \
+            len(off) < CONTRAST_MIN_SAMPLES:
+        return [f"SSID 30: {len(rate)} rate and {len(off)} off samples, "
+                f"want >= {CONTRAST_MIN_SAMPLES} each"]
+    fails = []
+    if mr - mo < CONTRAST_MIN_STEPS:
+        fails.append(f"SSID 30 band 0: the rate median 0x{mr:02x} is "
+                     f"{mr - mo} compressed steps above the off median "
+                     f"0x{mo:02x}, want >= {CONTRAST_MIN_STEPS}")
+    for i, s in enumerate(smp):
+        if cad * i >= off_s and cad * (i + 1) <= off_end_s and \
+                any(sample_values(30, s)):
+            fails.append(f"SSID 30: the off-window sample {i} is not "
+                         f"exactly 0 (band 0 0x{s['lc_band'][0]:02x})")
+    return fails
+
+
 # --- self-test ---------------------------------------------------------
 
 def build_packet(ssid_body, seg=SEG_STANDALONE, seq=0):
@@ -840,8 +1024,101 @@ def self_test():
 
     self_test_sky(zero_lines, secs, n4, n8)
     self_test_inject()
+    self_test_tape(zero_lines, secs, n4, n8)
     print("QL-CHECK SELF-TEST: PASS")
     return 0
+
+
+def self_test_tape(zero_lines, secs, n4, n8):
+    """The T6 checks: a tape flush passes --expect-tape-flush and an
+    all-zero one fails four SSIDs; the SSID 32 subcol rule and the byte
+    check with their bounds and multi-product picks; the SSID 30
+    rate/off contrast with its exact-zero off window."""
+    def flush(spectra, lc_first=0x30, bg=0x22, var=0x30):
+        lc = [([lc_first if i == 0 else 0, 0, 0, 0, 0], 0, 0)
+              for i in range(n4)]
+        return [build_packet(ssid30_body(lc)).hex(),
+                build_packet(ssid31_body(n8, bg), seq=1).hex(),
+                build_packet(ssid32_body(spectra), seq=2).hex(),
+                build_packet(ssid33_body(n4, var), seq=3).hex(),
+                build_packet(ssid34_body(n4), seq=4).hex()]
+
+    spectra = [(sc, [0x30 if sc == 0 and e == 3 else 0
+                     for e in range(NUM_EBIN)]) for sc in range(NUM_SUBCOL)]
+    prods = decode_lines(flush(spectra))
+    f = check_tape_flush(prods, secs)
+    assert f == [], f
+    f = check_tape_flush(decode_lines(zero_lines), secs)
+    assert len(f) == 4 and all("no non-zero value byte" in x for x in f), f
+
+    # SSID 32 subcol rule: masked subcols 0 and 5 at 0x30, the rest at
+    # the background floor 0x05; a masked byte below the floor and an
+    # unmasked byte at the bound each fail; the last product wins
+    def spectra_at(masked_byte, unmasked_byte, ebin=TAPE_EBIN):
+        return [(sc, [masked_byte if (sc in (0, 5)) and e == ebin
+                      else unmasked_byte if e == ebin else 0
+                      for e in range(NUM_EBIN)])
+                for sc in range(NUM_SUBCOL)]
+
+    prods = decode_lines(flush(spectra_at(0x30, 0x05)))
+    assert check_ssid32_subcols(prods, {0, 5}) == []
+    prods = decode_lines(flush(spectra_at(0x2F, 0x05)))
+    f = check_ssid32_subcols(prods, {0, 5})
+    assert len(f) == 2 and all("masked subcol" in x for x in f), f
+    prods = decode_lines(flush(spectra_at(0x30, 0x10)))
+    f = check_ssid32_subcols(prods, {0, 5})
+    assert len(f) == 30 and all("unmasked subcol" in x for x in f), f
+    # a failing first product, a passing second: the last one wins
+    two = flush(spectra_at(0x2F, 0x05))[:3]
+    two += [build_packet(ssid32_body(spectra_at(0x31, 0x05)),
+                         seg=SEG_STANDALONE, seq=3).hex()]
+    prods = decode_lines(two)
+    assert check_ssid32_subcols(prods, {0, 5}) == []
+    two = flush(spectra_at(0x31, 0x05))[:3]
+    two += [build_packet(ssid32_body(spectra_at(0x2E, 0x05)),
+                         seg=SEG_STANDALONE, seq=3).hex()]
+    f = check_ssid32_subcols(decode_lines(two), {0, 5})
+    assert len(f) == 2 and "0x2e" in f[0], f   # the second product
+
+    # SSID 32 byte check: print, bounds, missing subcol
+    prods = decode_lines(flush(spectra))
+    assert check_ssid32_byte(prods, 0, 3, 0x30, 0x30) == []
+    f = check_ssid32_byte(prods, 0, 3, 0x31, 0xFF)
+    assert len(f) == 1 and "below the floor" in f[0], f
+    f = check_ssid32_byte(prods, 0, 3, 0, 0x2F)
+    assert len(f) == 1 and "above the bound" in f[0], f
+    f = check_ssid32_byte(prods, 0, 7, 0x24, 0x24)
+    assert len(f) == 1 and "below the floor" in f[0], f
+    spectra_no0 = [s for s in spectra if s[0] != 0]
+    prods = decode_lines(flush(spectra_no0))
+    f = check_ssid32_byte(prods, 0, 3)
+    assert len(f) == 1 and "want 1" in f[0], f
+
+    # SSID 30 rate/off contrast: 40 samples, rate window 8..32, off
+    # 32..56; a zero off window and a >= 8-step contrast pass; a
+    # non-zero off sample, a small contrast and a missing rate window
+    # each fail
+    def lc(band0_at):
+        return [([band0_at(i), 0, 0, 0, 0], 0, 0) for i in range(40)]
+
+    on, off, off_end = 8.0, 32.0, 56.0
+    body = lc(lambda i: 0x48 if 8 <= 4 * i < 32 else 0)
+    prods = decode_lines([build_packet(ssid30_body(body)).hex()])
+    assert check_tape_lc(prods, on, off, off_end) == []
+    body = lc(lambda i: 0x48 if 8 <= 4 * i < 32 else
+              (0x01 if 32 <= 4 * i < 36 else 0))
+    prods = decode_lines([build_packet(ssid30_body(body)).hex()])
+    f = check_tape_lc(prods, on, off, off_end)
+    assert len(f) == 1 and "not exactly 0" in f[0], f
+    body = lc(lambda i: 0x04 if 8 <= 4 * i < 32 else 0)
+    prods = decode_lines([build_packet(ssid30_body(body)).hex()])
+    f = check_tape_lc(prods, on, off, off_end)
+    assert len(f) == 1 and "compressed steps above" in f[0], f
+    f = check_tape_lc(prods, 40.0, 41.0, 56.0)
+    assert len(f) == 1 and "rate and" in f[0], f
+    prods = decode_lines([build_packet(ssid34_body(2)).hex()])
+    assert check_tape_lc(prods, on, off, off_end) == \
+        ["SSID 30: 0 products, want 1"]
 
 
 def self_test_sky(zero_lines, secs, n4, n8):
@@ -976,6 +1253,34 @@ def main():
                          "32 dump: the sample with detector byte SUBCOL "
                          "holds >= MIN_SPIKE at byte EBIN, every other "
                          "sample stays < MAX_QUIET there")
+    ap.add_argument("--expect-tape-flush", type=float, metavar="SECONDS",
+                    help="check the NOMINAL-exit flush of a tape run "
+                         "(stimulus plan T6): the D-3 product set, "
+                         "cadences and headers, content asserted "
+                         "non-zero only")
+    ap.add_argument("--ssid32-subcols", metavar="SUBCOLS",
+                    help="the --tape SSID 32 rule (T6): in the last "
+                         "SSID 32 dump, every sample whose detector "
+                         "byte is in this comma-separated masked list "
+                         "holds >= 0x30 at byte 4 (ebin 3), every "
+                         "other sample stays < 0x10 there")
+    ap.add_argument("--ssid32-byte", type=int_arg, nargs="+",
+                    metavar="N",
+                    help="the byte check of the align/ADC gates (A3/C3): "
+                         "the sample with detector byte SUBCOL holds a "
+                         "byte at EBIN (0-based ebin index) within "
+                         "[MIN, MAX] (compressed S0 bytes; default "
+                         "0..255); prints the byte and its decoded "
+                         "[lo, hi) as the reference")
+    ap.add_argument("--tape-lc", type=float, nargs=3,
+                    metavar=("ON", "OFF", "OFF_END"),
+                    help="the --tape SSID 30 rule (T6), one verdict "
+                         "with --ssid32-subcols: the rate step's band-0 "
+                         "median >= 8 compressed steps above the off "
+                         "step's, the off-window samples exactly 0; "
+                         "ON/OFF/OFF_END are the rate-step start, the "
+                         "off-step start and its end, in seconds of "
+                         "NOMINAL")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -1001,6 +1306,39 @@ def main():
     if args.expect_sky_flush is not None:
         fails += check_sky_flush(products, args.expect_sky_flush)
         passed.append("synthetic-sky flush, all five SSIDs")
+    if args.expect_tape_flush is not None:
+        fails += check_tape_flush(products, args.expect_tape_flush,
+                                  out=sys.stdout)
+        passed.append("tape-sky flush, all five SSIDs (content non-zero "
+                      "only)")
+    if args.ssid32_subcols is not None:
+        try:
+            masked = [int_arg(x) for x in args.ssid32_subcols.split(",")]
+        except ValueError:
+            print("QL-CHECK: ERROR (--ssid32-subcols: not a list of "
+                  "integers)")
+            return 2
+        if any(not 0 <= sc < NUM_SUBCOL for sc in masked):
+            print("QL-CHECK: ERROR (--ssid32-subcols: a subcol outside "
+                  "0..31)")
+            return 2
+        fails += check_ssid32_subcols(products, set(masked),
+                                      out=sys.stdout)
+        passed.append(f"SSID 32 tape subcols (masked {masked})")
+    if args.ssid32_byte is not None:
+        if len(args.ssid32_byte) not in (2, 4):
+            print("QL-CHECK: ERROR (--ssid32-byte wants SUBCOL EBIN "
+                  "[MIN MAX])")
+            return 2
+        subcol, ebin = args.ssid32_byte[0], args.ssid32_byte[1]
+        mn = args.ssid32_byte[2] if len(args.ssid32_byte) == 4 else 0
+        mx = args.ssid32_byte[3] if len(args.ssid32_byte) == 4 else 0xFF
+        fails += check_ssid32_byte(products, subcol, ebin, mn, mx,
+                                   out=sys.stdout)
+        passed.append(f"SSID 32 byte (subcol {subcol}, ebin {ebin})")
+    if args.tape_lc is not None:
+        fails += check_tape_lc(products, *args.tape_lc, out=sys.stdout)
+        passed.append("SSID 30 tape rate/off contrast")
     if args.lc_contrast is not None:
         fails += check_lc_contrast(products, *args.lc_contrast,
                                    out=sys.stdout)

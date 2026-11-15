@@ -6,6 +6,7 @@ and clocks for the rest. Every case prints one line; the last line is
 "SELF-TEST: PASS" or "SELF-TEST: FAIL".
 """
 
+import fnmatch
 import gzip
 import hashlib
 import http.client
@@ -31,6 +32,7 @@ from . import idb as idb_mod
 from . import keepalive as keepalive_mod
 from . import params as params_mod
 from . import series as series_mod
+from . import tapes as tapes_mod
 from . import tcbuild
 from . import timeline as timeline_mod
 from . import timesync
@@ -187,7 +189,8 @@ def t_config(env):
     c = config_mod.load()
     check(c["timeline"]["sample_s"] == -1.0 and
           c["timeline"]["idb_json"].startswith("~/dev/") and
-          c["timeline"]["views_dir"] == "",
+          c["timeline"]["views_dir"] == "" and
+          c["timeline"]["tapes_dir"] == "",
           "the timeline defaults")
     for bad in ('[timeline]\nsample_s = 0.4\n',
                 '[timeline]\nsample_s = 61\n',
@@ -2725,6 +2728,236 @@ def t_det_burst(env):
         ctl.shutdown()
 
 
+TAPE = {"api": 1, "name": "flare on Q1+Q3", "loop": False,
+        "background": {"kind": "rate", "cps": 20},
+        "steps": [{"kind": "rate", "for_s": 120,
+                   "fpga_det_mask": 0x00FF00FF, "cps": 20000},
+                  {"kind": "off", "for_s": 30,
+                   "fpga_det_mask": 0xFFFFFFFF}]}
+
+
+def t_tapes_crud(env):
+    """T3: the tape files: name rules before any file access, the
+    model's schema validated client-side (400 with the step index),
+    save/list/read/delete round trip; nothing written on a refusal."""
+    d = os.path.join(env.tmp, "tapes-root")
+    tdir = os.path.join(d, "tapes")
+    ctl = env.controller(retention={"run_root": d})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        for bad in ("../x", "a/b", "", ".hidden", "x" * 65, "a b", 5):
+            e = raises(VerbError, tapes_mod.check_name, bad)
+            check(e.status == 400, "a bad name is 400: %r" % (bad,))
+        for ok in ("a", "Z9._-", "x" * 64):
+            tapes_mod.check_name(ok)
+        st, _, body = _http(port, "POST", "/api/v1/cmd/det.tape.save",
+                            body=json.dumps({"name": "flare-q1q3",
+                                             "tape": TAPE}).encode(),
+                            headers=_post())
+        check(st == 200, "det.tape.save: %d %r" % (st, body[:120]))
+        check(os.path.isfile(os.path.join(tdir, "flare-q1q3.json")),
+              "the file is in the tapes dir")
+        st, _, body = _http(port, "GET", "/api/v1/tapes")
+        lst = json.loads(body)
+        check(st == 200 and lst["dir"] == tdir and
+              lst["tapes"] == ["flare-q1q3"], "GET /tapes: %r" % lst)
+        st, _, body = _http(port, "GET", "/api/v1/tapes/flare-q1q3")
+        check(st == 200 and
+              json.loads(body)["steps"][0]["fpga_det_mask"] == 0x00FF00FF,
+              "read back: %d" % st)
+        st, _, _ = _http(port, "GET", "/api/v1/tapes/no-such")
+        check(st == 404, "an unknown tape is 404")
+        # an invalid tape: 400 naming the step index, nothing written
+        bad_step = [{"kind": "warp", "for_s": 2, "fpga_det_mask": 1,
+                     "cps": 1}]
+        bad_for = [dict(TAPE["steps"][0]), dict(TAPE["steps"][0],
+                                                for_s=0)]
+        for steps, idx in ((bad_step, 0), (bad_for, 1)):
+            tape = dict(TAPE, steps=steps)
+            st, _, body = _http(port, "POST", "/api/v1/cmd/det.tape.save",
+                                body=json.dumps({"name": "bad",
+                                                 "tape": tape}).encode(),
+                                headers=_post())
+            err = json.loads(body).get("error", "")
+            check(st == 400 and "step %d" % idx in err,
+                  "invalid tape step %d: %d %r" % (idx, st, err))
+        check(not os.path.exists(os.path.join(tdir, "bad.json")),
+              "an invalid tape wrote nothing")
+        # the other schema refusals (T1's list), through the module
+        for tape, why in ((dict(TAPE, api=2), "api"),
+                          (dict(TAPE, steps=[dict(TAPE["steps"][0],
+                                                  pix_mask=0x1000)]),
+                           "pix_mask"),
+                          (dict(TAPE, steps=[dict(TAPE["steps"][0],
+                                                  cps=1000001)]),
+                           "cps"),
+                          (dict(TAPE, steps=[dict(TAPE["steps"][0],
+                                                  subcol_mask=1)]),
+                           "subcol_mask"),
+                          (dict(TAPE, background=dict(TAPE["background"],
+                                                      for_s=5)),
+                           "background"),
+                          (dict(TAPE, steps=[dict(TAPE["steps"][0])
+                                             for _ in range(65)]),
+                           "at most 64")):
+            e = raises(VerbError, tapes_mod.validate, tape)
+            check(e.status == 400 and why in str(e), "%s: %s" % (why, e))
+        # the S2/S3 shapes parse (the model is the authority at load)
+        tapes_mod.validate(dict(TAPE, steps=[dict(TAPE["steps"][0],
+                                                  spec={"line_adc": 1000}),
+                                             dict(TAPE["steps"][0],
+                                                  kind="single",
+                                                  fpga_det=22, pix=0,
+                                                  adc=1000, n=1000)]))
+        # names in the path and through the verb, before any file access
+        st, _, _ = _http(port, "GET", "/api/v1/tapes/%2e%2e%2fx")
+        check(st == 400, "a bad name in the path too")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/det.tape.save",
+                         body=b'{"name": "../x", "tape": {}}',
+                         headers=_post())
+        check(st == 400, "a bad save name: %d" % st)
+        check(not os.path.exists(os.path.join(d, "x.json")),
+              "nothing written outside the tapes dir")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/det.tape.delete",
+                         body=b'{"name": "flare-q1q3"}', headers=_post())
+        check(st == 200, "deleted")
+        st, _, _ = _http(port, "POST", "/api/v1/cmd/det.tape.delete",
+                         body=b'{"name": "flare-q1q3"}', headers=_post())
+        check(st == 404, "gone")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+
+
+def t_tapes_play_stop(env):
+    """T3: det.tape.play reads the file, loads then plays in order and
+    returns the parsed det-tape-status keys; stop plays false; both are
+    409 while STIX is off, an unknown tape is 404 before any QMP."""
+    from . import verbs as verbs_mod
+    for v in ("det.adc.set", "det.align.set", "det.tape.delete",
+              "det.tape.play", "det.tape.save", "det.tape.stop"):
+        check(v in verbs_mod.VERBS, "%s in the registry" % v)
+    d = os.path.join(env.tmp, "tapes-play-root")
+    ctl = env.controller(retention={"run_root": d})
+    try:
+        cmd = ctl.command
+        # the file comes first (400/404 before any QMP), so save it
+        # while off; the play then needs the QMP: 409
+        cmd("det.tape.save", {"name": "t1", "tape": TAPE})
+        e = raises(VerbError, cmd, "det.tape.play", {"name": "t1"})
+        check(e.status == 409 and "off" in str(e), "play while off: %s" % e)
+        e = raises(VerbError, cmd, "det.tape.stop", {})
+        check(e.status == 409, "stop while off: %s" % e)
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        e = raises(VerbError, cmd, "det.tape.play", {"name": "no-such"})
+        check(e.status == 404 and "no tape" in str(e),
+              "an unknown tape before any QMP: %s" % e)
+        cmd("det.tape.save", {"name": "t1", "tape": TAPE})
+        r = cmd("det.tape.play", {"name": "t1", "loop": True})
+        check(r["state"] == "playing" and r["name"] == "flare on Q1+Q3"
+              and r["step"] == 1 and r["n_steps"] == 2 and
+              r["loop"] is True and r["align"] is False,
+              "the parsed status: %r" % r)
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check([x[1] for x in sets[-2:]] == ["det-tape-load",
+                                            "det-tape-play"],
+              "load then play, in order: %r" % sets[-2:])
+        loaded = json.loads(sets[-2][2])
+        check(loaded["loop"] is True and loaded["name"] == "flare on Q1+Q3",
+              "the loop override rode the loaded JSON: %r" % loaded)
+        r = cmd("det.tape.stop", {})
+        check(r["state"] == "stopped", "stop: %r" % r)
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-1] == ["/machine/stixctrl", "det-tape-play", False],
+              "stop played false: %r" % sets[-1])
+        # det.align.set rides the same knob + parsed-status pattern (A1)
+        r = cmd("det.align.set", {"enabled": True})
+        check(r["mode"] == "on" and r["rows"] == 384 and
+              r["calibration"] == "none",
+              "det.align.set: %r" % r)
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-1] == ["/machine/stixctrl", "det-align", True],
+              "det-align set: %r" % sets[-1])
+    finally:
+        ctl.shutdown()
+
+
+def t_tapes_numbering(env):
+    """T3: the DSS/FSW numbering is the one FSW-sourced table per
+    language: tapes.py's copy and the UI's equal elut-upload.py's
+    SUBCOL_FROM_FPGA_DET."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "stix_elut_upload",
+        os.path.join(HERE, "..", "..", "elut-upload.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    check(tapes_mod.SUBCOL_FROM_FPGA_DET == mod.SUBCOL_FROM_FPGA_DET,
+          "tapes.py's table: %r" % (tapes_mod.SUBCOL_FROM_FPGA_DET,))
+    with open(api_mod.UI_PAGE, encoding="utf-8") as f:
+        page = f.read()
+    m = re.search(r"const SUBCOL_FROM_FPGA_DET = \[([^\]]*)\]", page)
+    check(m is not None, "no JS numbering table in the page")
+    got = [int(x) for x in m.group(1).split(",") if x.strip()]
+    check(got == mod.SUBCOL_FROM_FPGA_DET,
+          "the UI's table: %r" % (got,))
+
+
+def t_adc_verb(env):
+    """C2: det.adc.set {enabled} sets det-adc-mode and returns the
+    parsed det-adc-status; 409 while STIX is off; the arg is a bool."""
+    from . import verbs as verbs_mod
+    check("det.adc.set" in verbs_mod.VERBS, "in the registry")
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        e = raises(VerbError, cmd, "det.adc.set", {"enabled": True})
+        check(e.status == 409 and "off" in str(e), "off: %s" % e)
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        r = cmd("det.adc.set", {"enabled": True})
+        check(r == {"mode": "on", "kev_full": 160, "base_source": "zero",
+                    "map_rows": 0}, "the parsed status: %r" % r)
+        sets = ctl.power.qmp.execute("x-fake-set-log")
+        check(sets[-1] == ["/machine/stixctrl", "det-adc-mode", True],
+              "the knob set: %r" % sets[-1])
+        r = cmd("det.adc.set", {"enabled": False})
+        check(r["mode"] == "off", "off again: %r" % r)
+        e = raises(VerbError, cmd, "det.adc.set", {"enabled": 1})
+        check(e.status == 400, "the arg is a boolean: %s" % e)
+    finally:
+        ctl.shutdown()
+
+
+def t_adc_leaves(env):
+    """C2: the hw-state's det.adc maps to instrument.detector.adc.
+    {mode, kev_full, base_source, map_rows}; the sampler glob matches
+    them and nothing else new (the sampler_paths pattern)."""
+    ctl = env.controller()
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        wait_for(lambda: ctl.state.get("instrument.detector.adc")
+                 is not None, what="the adc leaves")
+        a = ctl.state.get("instrument.detector.adc")
+        check(a["mode"]["truth"] is False and
+              a["kev_full"]["truth"] == 160 and
+              a["base_source"]["truth"] == "zero" and
+              a["map_rows"]["truth"] == 0, "the four leaves: %r" % a)
+    finally:
+        ctl.shutdown()
+    _glob_case({"instrument.detector.adc.mode": False,
+                "instrument.detector.adc.kev_full": 160,
+                "instrument.detector.adc.base_source": "zero",
+                "instrument.detector.adc.map_rows": 0,
+                "instrument.detector.source": "synthetic"},
+               must={"instrument.detector.adc.mode"},
+               must_not={"instrument.detector.source"})
+
+
 def t_flashlib(env):
     """FF plan Task 4: the flash library — save/list/load on temp dirs
     with a small sparse file standing in for flash.bin, the name rules,
@@ -3237,7 +3470,7 @@ UI_TABS = ("overview", "platform", "idpu", "detectors", "faults",
            "scenarios", "logs", "state", "runs", "setup", "timeline")
 UI_ENDPOINTS = {"status", "time", "faults", "params", "verbs", "state",
                 "log", "stream", "scenarios", "cmd", "series", "views",
-                "runs"}
+                "runs", "tapes"}
 # timeline plan C1: the ids the plotter panel must have
 UI_TIMELINE_IDS = {"tl-view", "tl-window", "tl-search", "tl-hits",
                    "tl-add", "tl-save", "tl-save-name", "tl-delete",
@@ -3248,6 +3481,14 @@ UI_TIMELINE_IDS = {"tl-view", "tl-window", "tl-search", "tl-hits",
 # and the State tab's filters
 UI_MOCKUP_IDS = {"faults", "fault-cats", "faults-active", "plat-faults",
                  "hdr-run", "log-search", "state-diff", "state-faulted"}
+# stimulus plan T5/C2: the Detectors tab's Status/Stimulus sub-view —
+# the tape select, the loop checkbox, the play/stop buttons (their
+# data-verb is checked in t_ui_stimulus), the step table container, the
+# align toggle and the ADC-sky box
+UI_STIMULUS_IDS = {"det-sub-status", "det-sub-stim", "stim-tapes",
+                   "stim-loop", "stim-align", "stim-adc", "stim-steps",
+                   "stim-now", "stim-progress", "stim-align-read",
+                   "stim-adc-read", "stim-selected"}
 
 
 def _csp_hashes(page, tag):
@@ -3544,6 +3785,45 @@ def t_ui_mockup_d(env):
           % (UI_VERBS - used))
 
 
+def t_ui_stimulus(env):
+    """Stimulus plan T5/C2: the Detectors tab gains the Status/Stimulus
+    sub-view: the tape select, loop checkbox, play/stop buttons (their
+    data-verb), the step table container and the align + ADC-sky
+    toggles exist, the new verbs are all served, and the page rules
+    still hold."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+        st, _, body2 = _http(port, "GET", "/api/v1/verbs")
+        check(st == 200, "GET /verbs: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    page = body.decode()
+    p = _UiParser()
+    p.feed(page)
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check(UI_STIMULUS_IDS <= ids, "stimulus ids missing %r"
+          % sorted(UI_STIMULUS_IDS - ids))
+    used = {v for v, _ in p.verbs}
+    check({"det.tape.play", "det.tape.stop", "det.align.set"} <= used,
+          "the stimulus data-verbs missing %r"
+          % ({"det.tape.play", "det.tape.stop", "det.align.set"} - used))
+    served = {v["verb"] for v in json.loads(body2)["verbs"]}
+    check({"det.tape.play", "det.tape.stop", "det.tape.save",
+           "det.tape.delete", "det.align.set", "det.adc.set"} <= served,
+          "the stimulus verbs not all served: %r" % sorted(served))
+    for tag, a in p.attrs:
+        check("style" not in a and not [k for k in a if k.startswith("on")],
+              "<%s %r>: style attribute or inline handler" % (tag, a))
+    for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
+        check(bad not in page.lower(), "the page uses %s" % bad)
+
+
 SETUP_KEYS = {"binary", "elf", "elf_sha256", "icount_shift", "pace",
               "memory", "timecode_source", "obt_continuity",
               "on_guest_reset", "sample_s"}
@@ -3729,6 +4009,54 @@ def t_sampler_off_in_run_mode(env):
               "interactive: 1 s")
     finally:
         ctl.shutdown()
+
+
+def _glob_case(leaves, must, must_not):
+    """The sampler-glob pattern (T4, C2): against the config's default
+    sample_paths, exactly the leaves a glob matches are sampled — the
+    new ones among them, the decoys not."""
+    paths = config_mod.load()["timeline"]["sample_paths"]
+    leaves = {p: state_mod.leaf(v) for p, v in leaves.items()}
+    clk, st, lg, s, t = _sampler_rig(paths, leaves)
+    s.start()
+    _sampler_tick(clk, t)
+    recs = _sample_recs(lg)
+    check(len(recs) == 1, "one record per tick: %d" % len(recs))
+    got = set(recs[0].obj["data"])
+    want = {p for p in leaves
+            if any(fnmatch.fnmatchcase(p, g) for g in paths)}
+    check(got == want, "sampled exactly the matched: %r vs %r"
+          % (sorted(got), sorted(want)))
+    check(must <= got, "the new leaves sampled: %r" % sorted(must - got))
+    check(not (set(must_not) & got), "a decoy sampled: %r"
+          % sorted(set(must_not) & got))
+
+
+def t_sampler_paths(env):
+    """T4: the new sample_paths globs match the tape and align leaves
+    (and C2's adc) and nothing else new."""
+    _glob_case({"instrument.detector.tape.state": "idle",
+                "instrument.detector.tape.name": "",
+                "instrument.detector.tape.step": 0,
+                "instrument.detector.tape.n_steps": 0,
+                "instrument.detector.tape.label": "",
+                "instrument.detector.tape.kind": "",
+                "instrument.detector.tape.loop": False,
+                "instrument.detector.tape.align": False,
+                "instrument.detector.align.mode": "off",
+                "instrument.detector.align.fallback": 0,
+                "instrument.detector.align.calibration": "none",
+                "instrument.detector.adc.mode": False,
+                "instrument.detector.source": "synthetic",
+                "instrument.detector.tapes.x": 1,
+                "instrument.rotb.count": 0},
+               must={"instrument.detector.tape.state",
+                     "instrument.detector.tape.step",
+                     "instrument.detector.tape.label",
+                     "instrument.detector.align.mode",
+                     "instrument.detector.adc.mode"},
+               must_not={"instrument.detector.source",
+                         "instrument.detector.tapes.x"})
 
 
 _IDB_SYNTH = {
@@ -4962,6 +5290,59 @@ def t_series_markers(env):
     check(q["tc"]["t"] == [2000], "keep-alive is no TC marker: %r" % q["tc"])
 
 
+def t_tape_markers(env):
+    """T4: one stim record per instrument.detector.tape.step change
+    (none while the step holds, none for the leaf's creation), the
+    record passes check_record, the series catalogue lists the stim
+    marker and its hover label is the tape step's."""
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        wait_for(lambda: ctl.state.get("instrument.detector.tape")
+                 is not None, what="the tape leaves")
+
+        def stims():
+            return [r for r in ctl.log.since(0) if r.kind == "stim"]
+        check(not stims(), "no stim record at boot")
+        q = ctl.power.qmp
+        q.execute("x-fake-tape-state", {"state": {
+            "state": "playing", "name": "flare", "step": 1, "n_steps": 2,
+            "label": "quiet", "kind": "rate"}})
+        wait_for(lambda: (ctl.state.get(
+            "instrument.detector.tape.step") or {}).get("truth") == 1,
+            what="step 1")
+        wait_for(lambda: len(stims()) == 1, what="the 0 -> 1 record")
+        check(stims()[0].obj["data"]["step"] == 1, "the first record")
+        q.execute("x-fake-tape-state", {"state": {
+            "step": 2, "label": "flare Q1+Q3", "kind": "off"}})
+        wait_for(lambda: len(stims()) == 2, what="the 1 -> 2 record")
+        rec = stims()[-1]
+        log_mod.check_record(rec.obj)
+        check(rec.obj["source"] == "ctl" and rec.topic == "stim" and
+              rec.obj["path"] == "instrument.detector.tape.step" and
+              rec.obj["data"] == {"name": "flare", "step": 2,
+                                  "n_steps": 2,
+                                  "label": "flare Q1+Q3", "kind": "off"},
+              "the record: %r" % rec.obj)
+        q.execute("x-fake-tape-state", {"state": {"step": 2}})
+        time.sleep(0.4)                # several polls, all stable
+        check(len(stims()) == 2, "no record while the step holds: %d"
+              % len(stims()))
+        cat = {e["id"]: e for e in ctl.series.catalogue()}
+        check(cat.get("stim", {}).get("kind") == "marker",
+              "the catalogue lists the stim marker: %r"
+              % (cat.get("stim"),))
+        qd = ctl.series.query(["stim"], max_points=10)
+        check(qd["stim"]["labels"] ==
+              ["tape 'flare' step 1/2: quiet",
+               "tape 'flare' step 2/2: flare Q1+Q3"],
+              "the hover labels: %r" % qd["stim"]["labels"])
+    finally:
+        ctl.shutdown()
+
+
 def t_series_cap(env):
     """A4: over-cap drops the oldest points per series and the
     catalogue notes truncated_before."""
@@ -6033,6 +6414,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("keep-alive: rx trace filter", t_keepalive_trace),
          ("sampler record shape (A1)", t_sampler_record_shape),
          ("sampler by mode (A1)", t_sampler_off_in_run_mode),
+         ("sampler paths: tape/align/adc (T4)", t_sampler_paths),
          ("scenario: validation", t_scn_validate),
          ("scenario: runner", t_scn_runner),
          ("scenario: variants, T0, after", t_scn_variants),
@@ -6069,6 +6451,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
           t_series_decimate_keeps_spikes),
          ("series: enum steps (A4)", t_series_enum_steps),
          ("series: markers (A4)", t_series_markers),
+         ("series: tape step markers (T4)", t_tape_markers),
          ("series: cap (A4)", t_series_cap),
          ("series: concurrent feed and read (A4)", t_series_concurrent),
          ("series API: bad input (A4)", t_series_api_bad_input),
@@ -6096,6 +6479,11 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
          ("state: t_changed (D4)", t_state_t_changed),
          ("detector burst verb (FF)", t_det_burst),
+         ("detector tapes: files + schema (T3)", t_tapes_crud),
+         ("detector tapes: play/stop verbs (T3)", t_tapes_play_stop),
+         ("detector tapes: the numbering table (T3)", t_tapes_numbering),
+         ("detector adc verb (C2)", t_adc_verb),
+         ("detector adc leaves (C2)", t_adc_leaves),
          ("flash library (FF)", t_flashlib),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
@@ -6107,6 +6495,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: timeline (C1)", t_ui_timeline),
          ("UI: runs board (S1)", t_ui_runs),
          ("UI: mockup port (D)", t_ui_mockup_d),
+         ("UI: stimulus board (T5)", t_ui_stimulus),
          ("setup status (timeline B2)", t_setup_status),
          ("UI: the live check (smokes)", t_ui_check)]
 

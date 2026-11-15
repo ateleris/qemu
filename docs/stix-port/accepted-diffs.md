@@ -3580,7 +3580,13 @@ has the index-space table, the recipe and the template flash.
 - **B0 = 0, B32 = 0** (user decision 2026-11-11): B[1..31] are the CSV
   edges, so ebin 0 covers `adc` 0..e[0]−1 and ebin 31 covers
   e[30]..4095; nothing is unassigned. The ops value of the lowest
-  boundary is unknown here.
+  boundary is unknown here. Amended additively by the derived CSV's
+  `--b0` (A2/D6, §52): a non-zero *integral* offset column becomes
+  B[0] — sub-baseline adc is then unassigned, dropped like the DSS —
+  while the flight files' fractional scale offset stays ignored, and
+  `check-dump --skip-sensitivity` (A2/D7) skips the D-Eg sensitivity
+  self-check for uniform-baseline CSVs (identical rows make it exit 2
+  by design; the skip is said on the record).
 - **The gate** (`scripts/stix/elut-smoke.sh`, optional, SKIP 77 without
   `STIX_ELUT_CSV` or the ELF) boots twice on one fresh private flash
   (an empty sparse `flash.bin`, as §41's fresh-flash gates):
@@ -4006,6 +4012,11 @@ never the user's file; all RED on the D-6 binary, where
   `state=idle`.
 
 **Deviations from the plan's D-7 section:**
+- since the alignment track (§52) the classification also runs under
+  `det-align` and `det-adc-mode` (not only `det-source=replay-dss`) and
+  emits one summary trace per classification, `stixdet_align(rows,
+  fallback, honoured, mismatch_cells, vclock_ns)` — the E-4 vacuity
+  note above gains its per-classification summary;
 - the optional `detector-smoke.sh --replay` gate (SKIP 77 without
   `STIX_DSSEVS_FILE`, the SSID 32/SSID 30 checks, the fallback-trace
   assertion) is **not built yet**: this change delivers the replay,
@@ -4077,6 +4088,11 @@ missing or surprising behaviour is not mistaken for a bug (plan D-8,
   stay dark with the known file. Only QLDetPerf is known to react to
   dark detectors; the live `--replay` gate run that would confirm
   nothing else reacts is still pending (no `--replay` gate yet, §37).
+- **Sub-baseline adc bins to `ebin` 0 unless the derived CSV's `--b0`**
+  (§52, A2/D6): the derived ELUT under `B0 = 0` bins `adc <= base` to
+  `ebin` 0 where the D-7 fallback (and the DSS) drops it — outside the
+  LC bands and the QLDetPerf mask, so benign; with `--b0` the offset
+  column makes it unassigned instead.
 - **The optional `detector-smoke.sh --replay` gate is not built**
   (§37): the SSID 32/SSID 30 replay checks and the SKIP-77
   `STIX_DSSEVS_FILE` mode are pending, and §37's gate record stays
@@ -5962,3 +5978,153 @@ standalone use).
 D-PLj request filter, loopback bind and 403 rules as `--view-run`;
 nothing is written into the viewed run dir (self-tested). The one
 slot keeps the process's footprint bounded.
+
+## 52. ELUT alignment (baseline: none)
+
+Owner requirement (2026-11-15): "if I wanted to, that you could support
+alignment between the ELUT in the flight software and also the detector
+simulation … if the flight software doesn't have the properly
+configured ELUT that matches the DSS, I don't count properly." Plan:
+`2026-11-15-stimulus-plan.md`, alignment track A1-A3 and decision
+D5-D7; gate record pending (A3's `align-smoke.sh`).
+
+Three pieces:
+
+- **(b) The derive tool** (`scripts/stix/elut-derive.py`, A2, stdlib
+  only): writes a flight-shaped CSV from the sim's per-detector
+  baseline law — the D-7 linear law per `dss_det`, bin width
+  `W = 4096 - base`, edge `e[k] = base + ceil((k+1)·W/32)`, one row
+  per (`subcol = SUBCOL_FROM_FPGA_DET[fpga_det]`, `pix`), all 12 `pix`
+  of a subcol identical — from a `.dssevs` file's 0xE setup words
+  (`--dssevs`, every `dss_det` 0..31 needs exactly one 0xE word) or
+  from `--base` JSON. Validation `0 <= base <= 4064`: the real bound
+  is `W >= 32` (below it the ceil edges are not distinct); the error
+  names the `dss_det`.
+  - **The round-trip theorem the tool self-tests:** with `B0 = B32 = 0`
+    (D-Eb unchanged) and edges on the fallback's transition points, the
+    honoured binning of the derived ELUT equals the D-7 fallback
+    binning for every `adc > base` (at each edge
+    `floor(ceil((k+1)W/32)·32/W) = k+1` since `32/W <= 1`, and between
+    two edges both sides stay in bin k+1; the honoured oracle puts
+    `adc = e[k]` in bin k+1, `elut-upload.py apply_row`). Round edges
+    would break it: `base 1800, e[2] = 2015` gives honoured 3 but
+    fallback 2. So a derived CSV, once uploaded, reads
+    `det-align-status` `mismatch_cells = 0` and `calibration =
+    dss-linear` by construction.
+  - **The B0 nuance:** `adc <= base` bins to `ebin` 0 under `B0 = 0`
+    while the fallback drops it — benign, `ebin` 0 is outside the LC
+    bands (1-27) and the QLDetPerf mask (1-30). Resolved additively by
+    **`--b0` (D6)**: with the flag the CSV's offset column carries the
+    baseline (or a given B) and `elut-upload.py` honours a non-zero
+    *integral* offset column as `B[0]` (the flight files' fractional
+    scale offset there stays ignored, so D-Eb stands for them), making
+    sub-baseline `adc` unassigned — dropped, like the DSS. The one
+    `adc == B0` still lands in `ebin` 0 (the FSW loop's half-open
+    boundary rule). Without the flag the output is byte-identical to
+    today's.
+- **(c) The classification report** (A1): the ELUT row classification
+  (until now only while `det-source=replay-dss`) also runs whenever
+  `det-align` is on or `det-adc-mode` is on (§53), at the SetEnable
+  edge and each QL swap, and emits one summary trace
+  `stixdet_align(rows, fallback, honoured, mismatch_cells, vclock_ns)`
+  per classification — the E-4 vacuity gap closed: the classification
+  itself becomes visible. `det-align-status` (read-only string)
+  reports `mode=off|on,rows=384,fallback=F,honoured=H,mismatch_cells=M,
+  unassigned_cells=U,calibration=none|dss-linear`, where
+  `mismatch_cells` counts (over honoured rows only) the adc whose
+  honoured ebin differs from the sim calibration's linear bin
+  (`calibration=none` marks the comparison as not computed, not a
+  zero-mismatch verdict), and `unassigned_cells` the adc with ELUT
+  value 32. For a flight ELUT the mismatch is large — that is the "the
+  ELUT does not match the DSS" signal; for a derived CSV it is 0 by
+  construction. `det-align` is a scene knob (default off, survives a
+  device reset like `det-source`); the hw-state `det.align` object
+  feeds the platform's `instrument.detector.align.*` leaves.
+- **(a) The per-step `align` option**: fixed now (the tape field
+  `"align"`, the `stix_det_align_adc` preimage helper), consumed by
+  S2/S3's science-space stimuli.
+
+**The gate** (`scripts/stix/align-smoke.sh`, A3): one fresh-flash boot,
+the gate's own synthetic `.dssevs` (one 0xE word per `dss_det`, base
+`1800 + 10·d`, distinct so check-dump's D-Eg sensitivity stays
+meaningful; ~6200 events at 1 per 100 ms tick on `fpga_det` 0, `pix` 0,
+`adc` 2050 — both binnings put 2050 in `ebin` 3). Leg 1 (fresh flash):
+`det-align-status` `fallback=384,honoured=0`, the fallback trace
+present, the SSID 32 counts at `subcol` 0 byte 4 (`ebin` 3) — the
+vacuity guards are three independent witnesses (trace, status, TM).
+Leg 2: derive → encode → TC(237,8) → `fallback=0,honoured=384,
+mismatch_cells=0,calibration=dss-linear`, no fallback trace after the
+upload, `check-dump --csv derived.csv` PASS, and the SSID 32 bin
+unchanged at `ebin` 3 — the observable bin did not move when the ELUT
+arrived. `--negative` skips the upload and must fail exactly
+`align-leg2`. The chunk path is witnessed by the `stixdet_chunk`
+trace's EACC total (the replay counts reach EACC through `add_counts`'
+`inj_nom`); the per-cell chunk decode of the `det-inject-chunk` qtest
+is not reachable from a host gate (the ROTB ring is host RAM behind an
+IO window), so the cell-level proof stays with the qtests.
+
+## 53. ADC-faithful sky mode (baseline: off)
+
+Decision D1 (owner, 2026-11-15): the synthetic sky and the ROTB chunk
+(EACC) path can draw ADC values through a per-pixel simulation
+calibration and then bin through the FPGA ELUT the FSW loaded
+(`val[pix][fpga_det][adc]` at 0xE0000000), so a misaligned ELUT
+miscounts the sky exactly as on hardware (the AX rotating-fill
+symptom, reproduced on demand). Default off: §34, every existing gate
+and golden unchanged; the mode adds no RNG draws and no folds when off
+(`det-adc-off` pins the `det-counts-seed` stimulus bit-identically).
+
+- **The calibration (D5):** per (`dss_det`, `pix`), linear
+  `adc(keV) = base + gain·keV` with `base` from the realized replay
+  table's 0xE word (0 without one — the status reports
+  `base_source=zero`) and `gain = (4096 - base)/K`, `K` =
+  `det-cal-kev-full` (default 160 keV full scale, a documented sim
+  anchor, not instrument truth). The ebin grid it defines,
+  `E(e) = base + ceil(e·W/32)`, is exactly the D-7 fallback grid and
+  exactly the edges `elut-derive.py` writes, so the derived ELUT, the
+  fallback and the calibration agree by construction.
+- **The cached per-row bin-mass map (C1):** while the mode is on, each
+  (`fpga_det`, `pix`) row gets a 32×32 fraction table built by one walk
+  over its 4096 ELUT bytes (honoured row: destination `val[adc]`, 32
+  drops; degenerate row: the fallback's bin, `adc <= base` dropped),
+  rebuilt at the SetEnable 0→1 edge and at the START of `ql_swap` —
+  before `materialize`, so the bank closed by the first swap after a
+  mid-period TC(237,8) rewrite already folds with the new map
+  (deliberately unlike the replay's event-time bank-1 precedent,
+  §37). There is no write hook: a TC(237,8) apply is a guest CPU store
+  into plain RAM and notifies the model of nothing, so pickup is purely
+  the swap/edge rebuild, like the replay classification. **Cost:** one
+  full 384 × 4096 walk per classification point while the mode is on
+  (ELUT writes are undetectable; the walk is always 4096 bytes/row,
+  more than the classify's early-exit) — host ~ms per swap, zero when
+  off, never per event.
+- **The draw fold:** the tick keeps its ebin-space exposure and
+  per-ebin Poisson draws (same loop order, same RNG stream shape); at
+  the draw, each drawn count is split over the map row by largest
+  remainder — deterministic integer arithmetic, no new RNG — into the
+  destination ebins, for LACC and, through the same `draw_acc`, the
+  nominal EACC chunk. Totals per (`fpga_det`, `pix`) are unchanged by
+  the mode except where the row itself drops (a honoured row's
+  32-valued cells; a degenerate row's `adc <= base`, a 1/len₀ sliver of
+  `ebin` 0 — benign per §52's note). Deposits (`det-inject`), replay
+  events and S3 `single` steps are science-space and stay out of the
+  fold (the fold splits only the Poisson part; `draw_acc` adds `inj`
+  after the draw).
+- **The AX miscount, end to end (C3's legs):** leg 3 (`adc-reference`)
+  captures the mode-off quiet sky at `subcol` 0 byte 19 (`ebin` 18, the
+  quiet template's 45 % line); leg 4 (`adc-mismatch`) uploads a
+  deliberately wrong ELUT (derived from base 0 — shifted: the drawn
+  ebin-18 adc range, 3092-3164 for base 1800, lands in `ebin` 24 under
+  the base-0 row) and asserts `mismatch_cells >= 1`,
+  `calibration=dss-linear`, byte 19 empty while the counts ARRIVE at
+  `ebin` 24 within 5σ of the leg-3 reference (a mass-losing fold must
+  fail); leg 5 (`adc-aligned`) runs the §52 derive/upload chain —
+  `mismatch_cells = 0`, byte 19 back at the reference — twice, with
+  byte-identical SSID 32 ebin bytes (the fold's guest-time
+  determinism). `--negative` skips leg 5's upload and must fail
+  exactly `adc-aligned`.
+- **The stix_det.h helper fixed for S2/S3:**
+  `int stix_det_align_adc(StixDetState *d, uint32_t fpga_det,
+  uint32_t pix, uint32_t ebin)` — the preimage of the loaded ELUT row
+  (the adc whose row maps to `ebin`), or −1 when the row is degenerate
+  or no adc maps to it. Not called before S2.

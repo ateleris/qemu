@@ -9,12 +9,14 @@ qom-list-properties for grlib-stixflash WITHOUT inverted-storage.
 Otherwise it serves QMP on the -qmp unix socket like a frozen (-S)
 leon3: cont/stop/quit, the RESUME/STOP/SHUTDOWN/RESET events, qom-get
 vclock-ns, obt and both hw-state JSONs (the ctrl one carries the
-attenuator, edac, det and rotb sections, PL-11b/PL-11c), qom-set obt,
-the upset verbs on the EDAC (they move the hw-state's poisons and
-counters), the det-rotb-burst pair (the FF plan's burst), memsave (the
-fsw-params RAM snapshot: zeros into the asked file, in the cwd), and the
-test-only x-fake-guest-reset, which behaves per -no-reboot / -action
-like QEMU.
+attenuator, edac, det and rotb sections, PL-11b/PL-11c, with the det
+section's tape/align/adc stimulus blocks), qom-set obt, the upset verbs
+on the EDAC (they move the hw-state's poisons and counters), the
+det-rotb-burst pair (the FF plan's burst), the det tape/align/adc QOM
+pairs (the stimulus plan T3/C2), memsave (the fsw-params RAM snapshot:
+zeros into the asked file, in the cwd), and the test-only
+x-fake-guest-reset and x-fake-tape-state, which behave per -no-reboot /
+-action like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
 `noqmp` accepts the QMP connection and never answers; `badstate`
 serves a hw-state without its keys.
@@ -39,7 +41,8 @@ ATTENUATOR = ("attenuator.sensor_ab.stuck_open",
               "attenuator.mechanism.jammed", "attenuator.current.zero",
               "attenuator.current.offset")
 SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject",
-            "upset-inject", "upset-clear") + ATTENUATOR + \
+            "upset-inject", "upset-clear", "det-tape-load", "det-tape-play",
+            "det-align", "det-adc-mode") + ATTENUATOR + \
     tuple("adc-inject[%d]" % ch for ch in range(128))
 # read-back before the first set: the booleans are false, the offset 0
 ATT_DEFAULT = {"attenuator.current.offset": 0}
@@ -104,6 +107,18 @@ class Fake:
             "requested=0,appended=0,stop=done,rotb_count=0"
         self.rotb_blocks = 0
         self.set_log = []
+        # the stimulus plan (T3/T4/C2): the tape playback, the ELUT
+        # alignment report and the ADC-sky knob, as the det section of
+        # the hw-state carries them at their defaults; the tape QOM
+        # trio stores and reports like the device's store-then-apply
+        self.tape = {"state": "idle", "name": "", "step": 0, "n_steps": 0,
+                     "label": "", "kind": "", "loop": False, "align": False}
+        self.tape_json = None
+        self.align = {"mode": "off", "rows": 384, "fallback": 0,
+                      "honoured": 0, "mismatch_cells": 0,
+                      "unassigned_cells": 0, "calibration": "none"}
+        self.adc = {"mode": False, "kev_full": 160, "base_source": "zero",
+                    "map_rows": 0}
         # the EDAC state the hw-state section shows (stix_edac.c:
         # 714-759): no poisons armed, the counters at zero. The bram
         # has no EDAC: no counters and its upsets arm no poison (M-5),
@@ -171,6 +186,28 @@ class Fake:
             self.running = False
             self.event("STOP")
 
+    def tape_status(self):
+        t = self.tape
+        return ("state=%s,name=%s,step=%d/%d,label=%s,step_left_ticks=0,"
+                "loop=%s,align=%s"
+                % (t["state"], t["name"], t["step"], t["n_steps"],
+                   t["label"], "true" if t["loop"] else "false",
+                   "true" if t["align"] else "false"))
+
+    def align_status(self):
+        a = self.align
+        return ("mode=%s,rows=%d,fallback=%d,honoured=%d,"
+                "mismatch_cells=%d,unassigned_cells=%d,calibration=%s"
+                % (a["mode"], a["rows"], a["fallback"], a["honoured"],
+                   a["mismatch_cells"], a["unassigned_cells"],
+                   a["calibration"]))
+
+    def adc_status(self):
+        a = self.adc
+        return ("mode=%s,kev_full=%d,base_source=%s,map_rows=%d"
+                % ("on" if a["mode"] else "off", a["kev_full"],
+                   a["base_source"], a["map_rows"]))
+
     def hw_ctrl(self):
         v = self.vclock()
         return {"schema": 5, "vclock_ns": v,
@@ -198,7 +235,10 @@ class Fake:
                         "replay": {"state": "idle", "pos_ns": 0,
                                    "events": 0, "dropped": 0,
                                    "unsupported": 0, "table": "",
-                                   "count": 0, "duration_ns": 0}},
+                                   "count": 0, "duration_ns": 0},
+                        "tape": dict(self.tape),
+                        "align": dict(self.align),
+                        "adc": dict(self.adc)},
                 # the ROTB ring (grlib_stixctrl.c, PL-11c): empty and
                 # disabled, the default capacity
                 "rotb": {"count": 0, "full": False, "enable": False,
@@ -337,6 +377,12 @@ class Fake:
             if prop == "hw-state":
                 return json.dumps(self.hw_ctrl() if "ctrl" in a["path"]
                                   else self.hw_spw())
+            if prop == "det-tape-status":
+                return self.tape_status()
+            if prop == "det-align-status":
+                return self.align_status()
+            if prop == "det-adc-status":
+                return self.adc_status()
             if (a["path"], prop) in self.props:
                 return self.props[(a["path"], prop)]
             if prop in ATTENUATOR:
@@ -365,6 +411,36 @@ class Fake:
                     self.upset_inject(a["value"])
                 elif a["path"] == EDAC and prop == "upset-clear":
                     self.upset_clear(a["value"])
+                elif prop == "det-tape-load":
+                    try:
+                        tape = json.loads(a["value"])
+                    except ValueError:
+                        raise KeyError("det-tape-load: bad tape JSON")
+                    self.tape_json = tape
+                    steps = tape.get("steps") or []
+                    self.tape.update({"state": "ready",
+                                      "name": tape.get("name", ""),
+                                      "step": 0, "n_steps": len(steps),
+                                      "label": "", "kind": "",
+                                      "loop": bool(tape.get("loop", False)),
+                                      "align": bool(tape.get("align",
+                                                             False))})
+                elif prop == "det-tape-play":
+                    if a["value"]:
+                        if self.tape_json is None:
+                            raise KeyError("det-tape-play: no tape")
+                        steps = self.tape_json.get("steps") or []
+                        self.tape.update({"state": "playing", "step": 1,
+                                          "label": steps[0].get("label", "")
+                                          if steps else "",
+                                          "kind": steps[0].get("kind", "")
+                                          if steps else ""})
+                    elif self.tape["state"] == "playing":
+                        self.tape["state"] = "stopped"
+                elif prop == "det-align":
+                    self.align["mode"] = "on" if a["value"] else "off"
+                elif prop == "det-adc-mode":
+                    self.adc["mode"] = bool(a["value"])
                 # a plain store; the self-test reads it back
                 self.props[(a["path"], prop)] = a["value"]
                 self.set_log.append((a["path"], prop, a["value"]))
@@ -379,6 +455,15 @@ class Fake:
             # is non-zero then differ on the controller's next refresh.
             with open(a.get("filename") or "params-ram.bin", "wb") as f:
                 f.write(bytes(int(a.get("size") or 0)))
+            return {}
+        if ex == "x-fake-tape-state":
+            # the tape_markers rig: move the hw-state's det.tape section
+            # like a playing tape would (the model's own tick rules are
+            # the real device's, qtest-covered)
+            st = a.get("state")
+            if not isinstance(st, dict):
+                raise KeyError("x-fake-tape-state needs {state: {...}}")
+            self.tape.update(st)
             return {}
         if ex == "x-fake-guest-reset":
             threading.Timer(0.05, self.guest_reset).start()

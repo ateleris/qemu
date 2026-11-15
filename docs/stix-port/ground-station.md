@@ -564,6 +564,38 @@ Notes:
   yet** on this tree; the replay model is covered by the `det-replay-*`
   qtests (`accepted-diffs.md` §37).
 
+### ELUT alignment recipe (derive → upload → align-status)
+
+When the counts land in the wrong science bins because the FSW's ELUT
+does not match the detector simulation (the owner's rotating-fill
+symptom), the alignment track (`accepted-diffs.md` §52) tells you where
+and fixes it:
+
+1. **Turn the report on**: `qom_set $RUN/qmp.sock /machine/stixctrl
+   det-align true` (a scene knob, default off; it survives a device
+   reset). The model then classifies all 384 ELUT rows at every
+   NOMINAL entry and QL swap and traces one `stixdet_align` summary
+   line per classification; `qom_get $RUN/qmp.sock /machine/stixctrl
+   det-align-status` reads
+   `mode=on,rows=384,fallback=F,honoured=H,mismatch_cells=M,
+   unassigned_cells=U,calibration=…`. On a fresh flash everything is
+   degenerate: `fallback=384,honoured=0` — the replay bins linearly
+   above the file's baseline (the D-7 fallback, §37) and `stixdet_
+   elut_fallback` traces each row once.
+2. **Read the verdict**: with a real (non-degenerate) ELUT loaded,
+   `honoured=384` and `mismatch_cells` counts the adc whose honoured
+   bin differs from the sim calibration's linear bin — large for a
+   flight ELUT, `0` for a derived one. `calibration=none` means the
+   comparison did not run (no replay table to take the bases from),
+   not that there is no mismatch.
+3. **Fix it**: derive the CSV from the sim's baselines and upload it —
+   `elut-derive.py derive --dssevs <file> --out derived.csv`, then the
+   ELUT chain above; `mismatch_cells` drops to 0 and the quick-look
+   spectra keep their bins. The gate is `scripts/stix/align-smoke.sh`
+   (`accepted-diffs.md` §52); the ADC-faithful variant that reproduces
+   the miscount with the synthetic sky is its `--adc` mode (§53, and
+   "The ADC-faithful sky recipe" in the ELUT section).
+
 ### Index spaces (TM detector and pixel indices)
 
 Detector and pixel numbers are renamed several times between the ASIC
@@ -822,6 +854,45 @@ expectations.
 
 The FSW accepts both TCs only in CONFIGURATION or MAINTENANCE.
 
+### Deriving the CSV from the simulator (alignment)
+
+When the FSW's ELUT should match the detector simulation instead of the
+flight table (the alignment track, `accepted-diffs.md` §52), derive the
+CSV from the sim's per-detector baseline law and upload it through the
+chain above:
+
+```bash
+python3 scripts/stix/elut-derive.py derive --dssevs <file.dssevs> \
+    --out derived.csv     # baselines from the file's 0xE setup words
+# or: --base '{"0": 1800, "1": 1810, ...}' (all 32 keys)
+python3 scripts/stix/elut-upload.py encode --csv derived.csv --lut-id 1 \
+    --emit hex            # then the same send/apply/check-dump chain
+python3 scripts/stix/elut-upload.py check-dump --csv derived.csv \
+    --dump elut-dump.bin
+```
+
+- The edges are the sim calibration's: per `dss_det`, the D-7 linear
+  law `e[k] = base + ceil((k+1)·W/32)` with `W = 4096 − base`
+  (baselines 0..4064; the error names the `dss_det`). Every `dss_det`
+  0..31 needs exactly one 0xE word in the `.dssevs`. Once uploaded,
+  the model's `det-align-status` reads `mismatch_cells = 0` and
+  `calibration=dss-linear` — the honoured binning then equals the
+  model's fallback for every `adc > base` (the round-trip theorem,
+  self-tested by `elut-derive.py --self-test`).
+- **`--b0[=B]`** (additive, D6): writes B into the CSV's offset column
+  (no value: each row's own DSS baseline), and `elut-upload.py` then
+  encodes `B[0] = B` — sub-baseline `adc` becomes unassigned (dropped,
+  like the DSS) instead of `ebin` 0. Without the flag the offset column
+  is 0 and the encoding is byte-identical to the D-Eb one; the flight
+  files' fractional offset column (e.g. `900.5`) is never honoured.
+- **check-dump's sensitivity caveat:** the checker first proves it can
+  tell the true `fpga_det → subcol` mapping from the identity and the
+  reversed one on THIS CSV, and exits 2 ("cannot detect a mapping bug")
+  when all rows are identical — a uniform-baseline CSV (every
+  `dss_det` the same base) cannot. `check-dump --skip-sensitivity`
+  skips that self-check for such files and says so on the record (D7);
+  the gates keep distinct baselines so it never needs the flag.
+
 ### What success looks like
 
 - every TC(237,7) and the TC(237,8): TM(1,1) and TM(1,7), never TM(1,8);
@@ -878,6 +949,33 @@ lines at 2182-3820. The flight ELUT has 150 keV at `adc` 2223-2303, so
 ADC scale is not the flight calibration. detector-smoke always makes a
 fresh flash, so the gates are not affected; a replay started by hand on
 a template or a GS run dir holding one is.
+
+### The ADC-faithful sky recipe (alignment end to end)
+
+`det-adc-mode` (a scene knob on `/machine/stixctrl`, default off,
+`accepted-diffs.md` §53) makes the synthetic sky draw through the
+loaded FPGA ELUT exactly like replay events, so a misaligned ELUT
+miscounts the sky as on hardware:
+
+1. Start QEMU with a QMP socket and a fresh run dir, as in "Fault
+   injection", plus the baselines: `-global
+   grlib-stixctrl.det-replay-file=<a .dssevs with 0xE words>` (realize
+   time; it only sets the calibration's per-`dss_det` bases) and
+   `-global grlib-stixctrl.det-adc-mode=true`.
+2. Enter NOMINAL: the sky counts arrive in the **wrong** bins when the
+   loaded ELUT does not match the calibration — the AX rotating-fill
+   symptom. `qom_get` `det-align-status` shows where:
+   `mismatch_cells` large, `calibration=dss-linear`.
+3. The fix is the derive/upload chain above (`elut-derive.py derive` →
+   `elut-upload.py encode` → TC(237,8)): the derived ELUT matches the
+   calibration, `mismatch_cells = 0`, and the quick-look spectra move
+   back to their intended bins. The gate is
+   `align-smoke.sh --adc` (legs `adc-reference`, `adc-mismatch`,
+   `adc-aligned`).
+
+With the mode off (the default) the sky is generated directly in
+`ebin` space and bypasses the ELUT entirely (§34's deviation stands) —
+`det-align-status` then says nothing about the sky.
 
 ## Fault injection
 

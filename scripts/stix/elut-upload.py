@@ -9,7 +9,9 @@ encode      turns a flight ELUT CSV into the TC(237,7) x 96 + TC(237,8)
 check-dump  checks a QMP pmemsave dump of the FPGA ELUT (12 x 32 x 4096
             bytes at 0xE0000000) against the CSV, through the FSW's
             fpga_det -> subcol mapping; exit 0 pass, 1 mismatch, 2
-            environment or sensitivity failure.
+            environment or sensitivity failure. --skip-sensitivity
+            skips the D-Eg sensitivity self-check for uniform-baseline
+            CSVs (A2/D7: identical rows make it exit 2 by design).
 self-test   runs the built-in tests (no file needed).
 
 Index spaces (plan "Index spaces"); every name says which one it is in:
@@ -29,7 +31,10 @@ identity: only fpga_det 0, 1 and 4 map to themselves.
 
 Boundaries (D-Eb, user decision 2026-11-11): B[0] = 0, B[1..31] = the
 CSV's 31 ADC edges, B[32] = 0. So ebin 0 covers adc 0..e[0]-1, ebin 31
-covers e[30]..4095, and no adc is left unassigned.
+covers e[30]..4095, and no adc is left unassigned. Amended additively
+by the derived CSV's --b0 (A2/D6): a non-zero *integral* offset column
+becomes B[0] (so sub-baseline adc is unassigned, dropped like the DSS);
+the flight files' fractional scale offset there stays ignored.
 
 The CSV is referenced by path only (--csv or STIX_ELUT_CSV); its rows are
 never copied anywhere. The record line on stderr gives its path, sha256,
@@ -85,7 +90,7 @@ class CsvError(ValueError):
 
 # ---------------------------------------------------------------- CSV
 
-def parse_csv_text(text, name="<csv>"):
+def parse_csv_text(text, name="<csv>", offsets=None):
     """Parse a flight ELUT CSV given as text; returns
     rows[(subcol, pix)] = [e0..e30] (adc edges).
 
@@ -94,7 +99,9 @@ def parse_csv_text(text, name="<csv>"):
     text. Columns are read by position: offset, gain, Pixel (pix),
     Detector (subcol, 0-based), 31 ADC edges. Exactly 384 data rows,
     each (subcol, pix) once, integer edges strictly increasing in
-    1..4095. Raises CsvError naming the CSV line and the index space."""
+    1..4095. Raises CsvError naming the CSV line and the index space.
+    With @offsets (a dict), also fills offsets[(subcol, pix)] with the
+    row's offset column (float; the derived --b0 case, A2/D6)."""
     reader = csv.reader(io.StringIO(text, newline=""))
     header_line = None
     rows = {}
@@ -153,6 +160,8 @@ def parse_csv_text(text, name="<csv>"):
             raise CsvError("%s: duplicate (subcol %d, pix %d)"
                            % (where, subcol, pix))
         rows[(subcol, pix)] = edges
+        if offsets is not None:
+            offsets[(subcol, pix)] = float(cells[0])
         n_data += 1
     if header_line is None:
         raise CsvError("%s: no header row (first cell 'Offset ...')" % name)
@@ -162,17 +171,51 @@ def parse_csv_text(text, name="<csv>"):
     return rows
 
 
-def parse_csv_file(path):
+def parse_csv_file(path, offsets=None):
     with open(path, newline="") as f:
-        return parse_csv_text(f.read(), path)
+        return parse_csv_text(f.read(), path, offsets=offsets)
 
 
-def boundaries(edges):
-    """B[0..32] for one (subcol, pix) row: B0 = 0, B[1..31] = e[0..30],
-    B32 = 0 (D-Eb)."""
+def boundaries(edges, b0=0):
+    """B[0..32] for one (subcol, pix) row: B0 = @b0 (0, D-Eb; the
+    derived --b0 case, A2/D6), B[1..31] = e[0..30], B32 = 0. b0 above
+    the first edge is refused: the FSW loop would never write ebin 0."""
     if len(edges) != N_EDGES:
         raise ValueError("want %d edges, got %d" % (N_EDGES, len(edges)))
-    return [0] + list(edges) + [0]
+    if not 0 <= b0 < N_ADC:
+        raise ValueError("b0 %d outside 0..%d" % (b0, N_ADC - 1))
+    if b0 > edges[0]:
+        raise ValueError("b0 %d above the first edge %d: the FSW loop "
+                         "would never write ebin 0" % (b0, edges[0]))
+    return [b0] + list(edges) + [0]
+
+
+def b0_of_offsets(offsets):
+    """B[0] per (subcol, pix) from the CSV's offset column (A2/D6): a
+    non-zero *integral* offset is honoured (a derived --b0 CSV writes
+    integers); the flight files carry a fractional scale offset there
+    (e.g. 900.5), which stays ignored so D-Eb stands for them. Returns
+    None (no B0 anywhere) or a dict; raises CsvError for an integral
+    offset outside 0..4095."""
+    if not offsets:
+        return None
+    out = {}
+    for key, off in offsets.items():
+        if off == 0 or not float(off).is_integer():
+            continue
+        b0 = int(off)
+        if not 0 <= b0 < N_ADC:
+            raise CsvError("subcol %d pix %d: the offset column %s is "
+                           "outside 0..%d for B[0]"
+                           % (key[0], key[1], off, N_ADC - 1))
+        out[key] = b0
+    return out or None
+
+
+def b0_lookup(b0s):
+    """The b0_of(key) callable for a b0_of_offsets() dict (rows with no
+    honoured offset get 0), or None."""
+    return (lambda key: b0s.get(key, 0)) if b0s else None
 
 
 # ---------------------------------------------------------- TC encoding
@@ -216,9 +259,10 @@ def elut_struct(det_id_1based, pix, b):
     return bytes(out)
 
 
-def elut_units(rows, first_seq, rows_per_tc=ROWS_PER_TC):
+def elut_units(rows, first_seq, rows_per_tc=ROWS_PER_TC, b0_of=None):
     """The 96 TC(237,7) units, rows in (subcol, pix) order, seq
-    first_seq + k for unit k."""
+    first_seq + k for unit k. b0_of(key) gives the row's B[0]
+    (default 0, D-Eb; the derived --b0 case, A2/D6)."""
     if not 1 <= rows_per_tc <= ROWS_PER_TC:
         raise ValueError("N = %d rows per TC(237,7); the FSW takes 1..%d"
                          % (rows_per_tc, ROWS_PER_TC))
@@ -228,7 +272,9 @@ def elut_units(rows, first_seq, rows_per_tc=ROWS_PER_TC):
         chunk = keys[k:k + rows_per_tc]
         app = bytes([LUT_TYPE_ELUT, len(chunk)])
         for (subcol, pix) in chunk:
-            app += elut_struct(subcol + 1, pix, boundaries(rows[(subcol, pix)]))
+            b0 = b0_of((subcol, pix)) if b0_of else 0
+            app += elut_struct(subcol + 1, pix,
+                               boundaries(rows[(subcol, pix)], b0=b0))
         units.append(tc_unit(first_seq + len(units), 237, 7, app))
     return units
 
@@ -300,12 +346,14 @@ def apply_row(b, prior=0):
     return bytes(val)
 
 
-def fpga_elut(rows, subcol_from_fpga_det, b_of=None, layout="pix_fpga"):
+def fpga_elut(rows, subcol_from_fpga_det, b_of=None, layout="pix_fpga",
+              b0_of=None):
     """The FPGA ELUT bytes val[pix][fpga_det][adc] the FSW writes for
     CSV rows[(subcol, pix)], reading RAM row subcol_from_fpga_det
     [fpga_det] for FPGA detector fpga_det. b_of(edges) builds B[] (the
     shared-builder trap swaps it); layout "fpga_pix" lays the table out
-    [fpga_det][pix][adc] instead (the axis trap)."""
+    [fpga_det][pix][adc] instead (the axis trap). b0_of(key) gives the
+    row's B[0] with the default builder (A2/D6)."""
     b_of = b_of or boundaries
     cache = {}
     val = bytearray(DUMP_SIZE)
@@ -314,7 +362,11 @@ def fpga_elut(rows, subcol_from_fpga_det, b_of=None, layout="pix_fpga"):
         for pix in range(N_PIX):
             key = (subcol, pix)
             if key not in cache:
-                cache[key] = apply_row(b_of(rows[key]))
+                if b_of is boundaries:
+                    b0 = b0_of(key) if b0_of else 0
+                    cache[key] = apply_row(boundaries(rows[key], b0=b0))
+                else:
+                    cache[key] = apply_row(b_of(rows[key]))
             if layout == "pix_fpga":
                 off = (pix * N_SUBCOL + fpga_det) * N_ADC
             else:
@@ -323,20 +375,24 @@ def fpga_elut(rows, subcol_from_fpga_det, b_of=None, layout="pix_fpga"):
     return bytes(val)
 
 
-def oracle_failures(rows, dump):
+def oracle_failures(rows, dump, b0_of=None):
     """D-Ef's independent oracle, from the CSV edges directly (no B[],
     no loop replay): for each (pix, fpga_det), e = the CSV row of
-    subcol = SUBCOL_FROM_FPGA_DET[fpga_det]: val[0] == 0,
-    val[e[k]-1] == k and val[e[k]] == k+1 for k = 0..30, and
-    val[4095] == 31. Returns a list of (pix, fpga_det, subcol, adc,
-    want_ebin, got_ebin)."""
+    subcol = SUBCOL_FROM_FPGA_DET[fpga_det]: val[0] == b0 (or 0; with a
+    B0 the adc below it is unassigned and val[b0] == 0), val[e[k]-1] == k
+    and val[e[k]] == k+1 for k = 0..30, and val[4095] == 31. Returns a
+    list of (pix, fpga_det, subcol, adc, want_ebin, got_ebin)."""
     bad = []
     for pix in range(N_PIX):
         for fpga_det in range(N_SUBCOL):
             subcol = SUBCOL_FROM_FPGA_DET[fpga_det]
             e = rows[(subcol, pix)]
             off = (pix * N_SUBCOL + fpga_det) * N_ADC
-            probes = [(0, 0), (N_ADC - 1, N_EBIN - 1)]
+            b0 = b0_of((subcol, pix)) if b0_of else 0
+            probes = [(0, b0 if b0 == 0 else N_EBIN)]
+            if b0:
+                probes += [(b0 - 1, N_EBIN), (b0, 0)]
+            probes += [(N_ADC - 1, N_EBIN - 1)]
             for k in range(N_EDGES):
                 probes += [(e[k] - 1, k), (e[k], k + 1)]
             for adc, want in probes:
@@ -347,36 +403,46 @@ def oracle_failures(rows, dump):
 
 
 def check_dump_bytes(rows, dump, expect_constant=None, out=print,
-                     b_of=None):
+                     b_of=None, b0_of=None, skip_sensitivity=False):
     """check-dump on bytes; returns the exit code (0, 1 or 2).
 
     D-Eg first: the checker must be able to tell the true mapping from
     the identity and the wrong-direction table on THIS CSV, with exactly
     12 x #{fpga_det : table differs} differing rows each; else exit 2.
+    skip_sensitivity (A2/D7) skips that self-check for uniform-baseline
+    CSVs and says so: identical rows make D-Eg exit 2 by design, and a
+    real uniform-baseline run must still be dump-checkable.
     Then the dump: a constant dump is named as such (exit 0 only under a
     matching expect_constant); otherwise the loop replay (D-Ef, all
     1 572 864 bytes) and the independent oracle must both pass.
     b_of is a self-test hook: the B[] builder of the replay (never of
     the oracle), to prove that the oracle catches a builder bug the
-    replay shares."""
+    replay shares. b0_of(key) gives the row's B[0] (A2/D6)."""
     if len(dump) != DUMP_SIZE:
         out("check-dump: ERROR: dump is %d bytes, want %d (12 pix x 32 "
             "fpga_det x 4096 adc)" % (len(dump), DUMP_SIZE))
         return 2
-    want = fpga_elut(rows, SUBCOL_FROM_FPGA_DET, b_of=b_of)
-    counts = []
-    for name, table in (("identity", IDENTITY),
-                        ("wrong-direction", FPGA_DET_FROM_SUBCOL)):
-        predicted = {(p, f) for p in range(N_PIX) for f in range(N_SUBCOL)
-                     if table[f] != SUBCOL_FROM_FPGA_DET[f]}
-        got = rows_differing(fpga_elut(rows, table, b_of=b_of), want)
-        if got != predicted:
-            out("check-dump: ERROR: sensitivity: the %s mapping differs "
-                "in %d rows, predicted %d: checker cannot detect a "
-                "mapping bug on this CSV" % (name, len(got), len(predicted)))
-            return 2
-        counts.append("%s %d rows" % (name, len(got)))
-    out("sensitivity: " + ", ".join(counts) + " (as predicted)")
+    want = fpga_elut(rows, SUBCOL_FROM_FPGA_DET, b_of=b_of, b0_of=b0_of)
+    if skip_sensitivity:
+        out("sensitivity: skipped (--skip-sensitivity: this CSV cannot "
+            "detect a mapping bug; D7)")
+    else:
+        counts = []
+        for name, table in (("identity", IDENTITY),
+                            ("wrong-direction", FPGA_DET_FROM_SUBCOL)):
+            predicted = {(p, f) for p in range(N_PIX)
+                         for f in range(N_SUBCOL)
+                         if table[f] != SUBCOL_FROM_FPGA_DET[f]}
+            got = rows_differing(fpga_elut(rows, table, b_of=b_of,
+                                           b0_of=b0_of), want)
+            if got != predicted:
+                out("check-dump: ERROR: sensitivity: the %s mapping "
+                    "differs in %d rows, predicted %d: checker cannot "
+                    "detect a mapping bug on this CSV"
+                    % (name, len(got), len(predicted)))
+                return 2
+            counts.append("%s %d rows" % (name, len(got)))
+        out("sensitivity: " + ", ".join(counts) + " (as predicted)")
 
     first = dump[0]
     if dump.count(first) == DUMP_SIZE:
@@ -412,7 +478,7 @@ def check_dump_bytes(rows, dump, expect_constant=None, out=print,
                         if len(shown) < 20:
                             shown.append((pix, fpga_det, subcol, adc,
                                           b[adc], a[adc]))
-    oracle = oracle_failures(rows, dump)
+    oracle = oracle_failures(rows, dump, b0_of=b0_of)
     if not per_row and not oracle:
         out("replay: PASS (all %d bytes)" % DUMP_SIZE)
         out("oracle: PASS (%d rows x %d probes)"
@@ -661,6 +727,56 @@ def self_test():
             check("csv parse %r" % eol, got == rows)
     run("csv parse", t_parse)
 
+    # 11. the offset column (A2/D6): parsed when asked; a non-zero
+    # integral offset becomes B[0] in the encode and in the replay and
+    # the oracle; a fractional one (the flight scale offset) is ignored
+    def t11():
+        text = synth_csv_text(rows)
+        got = parse_csv_text(text)
+        offs = {}
+        got = parse_csv_text(text, offsets=offs)
+        check("11 offsets parsed", offs == {k: 900.5 for k in rows} and
+              got == rows)
+        check("11 a fractional offset is ignored (D-Eb stands)",
+              b0_of_offsets(offs) is None)
+        # B0 below every row's first edge (100 + ...)
+        int_offs = {k: 50.0 for k in rows}
+        b0 = b0_of_offsets(int_offs)
+        check("11 an integral offset is honoured", b0 == {k: 50
+                                                          for k in rows})
+        b0f = b0_lookup(b0)
+        ram = {}
+        for u in elut_units(rows, 0x010, b0_of=b0f):
+            fsw_process_elut(u[4:][10:-2], ram)
+        check("11 the encode carries B[0] = 50",
+              all(ram[k][0] == 50 for k in ram))
+        edges_hi = [1900 + 60 * k for k in range(N_EDGES)]  # e0 > B0
+        val = apply_row(boundaries(edges_hi, b0=1800))
+        check("11 adc < B0 unassigned, adc == B0 in ebin 0",
+              val[1799] == N_EBIN and val[1800] == 0)
+        try:
+            boundaries([100 + 60 * k for k in range(N_EDGES)], b0=1800)
+            check("11 a B0 above the first edge is refused", False)
+        except ValueError:
+            check("11 a B0 above the first edge is refused", True)
+        try:
+            b0_of_offsets({(0, 0): 4096.0})
+            check("11 an out-of-range offset is refused", False)
+        except CsvError:
+            check("11 an out-of-range offset is refused", True)
+        good_b0 = fpga_elut(rows, SUBCOL_FROM_FPGA_DET, b0_of=b0f)
+        del quiet[:]
+        rc = check_dump_bytes(rows, good_b0, out=capture, b0_of=b0f)
+        check("11 a B0 dump passes the replay and the oracle",
+              rc == 0 and any(s.startswith("oracle: PASS") for s in quiet),
+              " | ".join(quiet[-2:]))
+        del quiet[:]
+        rc = check_dump_bytes(rows, good_b0, out=capture, b0_of=b0f,
+                              skip_sensitivity=True)
+        check("11 --skip-sensitivity says so and still passes",
+              rc == 0 and any("skipped" in s for s in quiet))
+    run("11 offset column", t11)
+
     if failures:
         print("SELF-TEST: FAIL (%d: %s)" % (len(failures),
                                             ", ".join(failures)))
@@ -678,15 +794,17 @@ def csv_path(args):
     return p
 
 
-def record_line(path, rows, lut_id):
+def record_line(path, rows, lut_id, b0_of=None):
     with open(path, "rb") as f:
         digest = hashlib.sha256(f.read()).hexdigest()
     e0 = [e[0] for e in rows.values()]
     e30 = [e[30] for e in rows.values()]
+    b0 = ("B0=offset-column (derived --b0, D6) B32=0" if b0_of else
+          "B0=0 B32=0 (user decision 2026-11-11)")
     return ("ELUT CSV %s sha256 %s rows %d edges %d..%d (e0 %d..%d, "
-            "e30 %d..%d) lut_id %d B0=0 B32=0 (user decision 2026-11-11)"
+            "e30 %d..%d) lut_id %d %s"
             % (path, digest, len(rows), min(e0), max(e30), min(e0),
-               max(e0), min(e30), max(e30), lut_id))
+               max(e0), min(e30), max(e30), lut_id, b0))
 
 
 def main(argv=None):
@@ -708,6 +826,10 @@ def main(argv=None):
     chk.add_argument("--csv")
     chk.add_argument("--dump", required=True)
     chk.add_argument("--expect-constant", type=int, choices=(0, 31))
+    chk.add_argument("--skip-sensitivity", action="store_true",
+                     help="skip the D-Eg mapping-sensitivity self-check "
+                          "(A2/D7): identical rows make it exit 2 by "
+                          "design; the skip is said on the record")
     sub.add_parser("self-test")
     args = ap.parse_args(argv)
 
@@ -715,7 +837,9 @@ def main(argv=None):
         return self_test()
     try:
         path = csv_path(args)
-        rows = parse_csv_file(path)
+        offsets = {}
+        rows = parse_csv_file(path, offsets=offsets)
+        b0_of = b0_lookup(b0_of_offsets(offsets))
     except (OSError, CsvError) as e:
         print("elut-upload: %s" % e, file=sys.stderr)
         return 2
@@ -726,7 +850,9 @@ def main(argv=None):
         except OSError as e:
             print("elut-upload: %s" % e, file=sys.stderr)
             return 2
-        return check_dump_bytes(rows, dump, args.expect_constant)
+        return check_dump_bytes(rows, dump, args.expect_constant,
+                                b0_of=b0_of,
+                                skip_sensitivity=args.skip_sensitivity)
 
     if not 0 <= args.lut_id <= 0xFFFF:
         print("elut-upload: --lut-id %d outside 0..65535" % args.lut_id,
@@ -741,8 +867,8 @@ def main(argv=None):
         print("elut-upload: --t0 must be >= 0 and --pace > 0",
               file=sys.stderr)
         return 2
-    print(record_line(path, rows, args.lut_id), file=sys.stderr)
-    units = elut_units(rows, args.first_seq)
+    print(record_line(path, rows, args.lut_id, b0_of=b0_of), file=sys.stderr)
+    units = elut_units(rows, args.first_seq, b0_of=b0_of)
     seq_apply = args.first_seq + N_ELUT_TCS
     apply = apply_unit(args.lut_id, seq_apply)
     if args.no_apply:

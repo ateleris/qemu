@@ -229,6 +229,61 @@ grep -q 'sensitivity: identity 348 rows, wrong-direction 276 rows' <<< "$out" &&
     report "check-dump prints the sensitivity line" ok ||
     report "check-dump prints the sensitivity line" "$out"
 
+# 6b. the derived --b0 case (A2/D6): an integral offset column becomes
+# B[0] in the encode, the replay and the oracle; --skip-sensitivity
+# skips the D-Eg self-check and says so
+python3 - "$TOOL" "$T/lf.csv" "$T/good.bin" <<'EOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("elut_upload", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+rows = m.parse_csv_file(sys.argv[2])
+b0 = {k: 50 for k in rows}
+dump = bytearray(m.fpga_elut(rows, m.SUBCOL_FROM_FPGA_DET,
+                             b0_of=m.b0_lookup(b0)))
+with open(sys.argv[3] + ".b0", "wb") as f:
+    f.write(bytes(dump))
+EOF
+out="$(python3 "$TOOL" check-dump --csv "$T/lf.csv" \
+    --dump "$T/good.bin.b0" 2>&1)"
+[ $? -eq 1 ] && grep -q 'oracle: FAIL' <<< "$out" &&
+    report "a B0 dump fails the B0=0 oracle" ok ||
+    report "a B0 dump fails the B0=0 oracle" "$out"
+python3 - "$TOOL" "$T/lf.csv" <<'EOF' > "$T/b0csv" 2>&1
+import sys
+text = open(sys.argv[2], newline="").read()
+eol = "\r\n" if "\r\n" in text else "\n"      # lf.csv: LF endings
+lines = text.split(eol)
+out = []
+for i, line in enumerate(lines):
+    # lines 0-1: the preamble, 2: the header, 3+: the data rows
+    if i >= 3 and line:
+        cells = line.split(",")
+        cells[0] = "50"
+        line = ",".join(cells)
+    out.append(line)
+open(sys.argv[2] + ".b0", "w", newline="").write(eol.join(out))
+print("OK")
+EOF
+[ "$(cat "$T/b0csv")" = OK ] &&
+    report "the B0 CSV variant built" ok ||
+    report "the B0 CSV variant built" "$(cat "$T/b0csv")"
+out="$(python3 "$TOOL" check-dump --csv "$T/lf.csv.b0" \
+    --dump "$T/good.bin.b0" 2>&1)"
+[ $? -eq 0 ] && grep -q 'oracle: PASS' <<< "$out" &&
+    report "the B0 CSV re-checks its B0 dump (replay and oracle)" ok ||
+    report "the B0 CSV re-checks its B0 dump" "$out"
+out="$(python3 "$TOOL" encode --csv "$T/lf.csv.b0" --emit hex \
+    2>&1 >/dev/null)"
+grep -q 'B0=offset-column (derived --b0, D6)' <<< "$out" &&
+    report "the record line names the offset-column B0" ok ||
+    report "the record line names the offset-column B0" "$out"
+out="$(python3 "$TOOL" check-dump --csv "$T/lf.csv" \
+    --dump "$T/good.bin" --skip-sensitivity 2>&1)"
+[ $? -eq 0 ] && grep -q 'skipped (--skip-sensitivity' <<< "$out" &&
+    report "--skip-sensitivity skips the D-Eg check and says so" ok ||
+    report "--skip-sensitivity skips the D-Eg check" "$out"
+
 # 7. the FSW-source cross-check (read-only, optional)
 if [ -z "${STIX_FSW_SRC:-}" ]; then
     echo "SKIP (fsw-src): STIX_FSW_SRC unset (point it at STIX-FSW/ASW/ASW/src)"

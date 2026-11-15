@@ -16,7 +16,11 @@
  * stix_det_add_counts. D-7 (D-Dk): the DSS .dssevs replay — the file
  * pre-scanned at realize into an event table, the ELUT lookup with the
  * linear fallback for degenerate rows, and the trigger/offset clock;
- * its ticks feed stix_det_add_counts like det-inject.
+ * its ticks feed stix_det_add_counts like det-inject. S1: the mix tape
+ * (det-tape-load/-play, JSON steps on guest time over a background
+ * layer, per-pair rates on the 100 ms tick). A1: det-align, the ELUT
+ * row classification and its report. C1: the ADC-faithful sky
+ * (det-adc-mode): the cached per-row bin-mass map and the draw fold.
  *
  * FSW references are to STIX-FSW 600a7a72, the ASW tree (BSW =
  * BSW_ASW/src/BSW/...; utils.c, utils.h = ASW/src/utils.*; Detectors.c
@@ -42,6 +46,12 @@
 #include "qapi/error.h"
 #include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
+#include "qobject/qlist.h"
+#include "qobject/qbool.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
+#include "qobject/qnum.h"
+#include "qobject/qstring.h"
 #include "hw/core/qdev.h"
 #include "stix_det.h"
 #include "trace.h"
@@ -115,6 +125,24 @@ static void stix_det_replay_tick(StixDetState *d);
 static void stix_det_nominal_tick(StixDetState *d);
 static void stix_det_nom_fresh(StixDetState *d);
 static void stix_det_nom_latch(StixDetState *d);
+/* S1 mix tape (defined after the scene properties it shares) */
+static void stix_det_tape_tick(StixDetState *d);
+static void stix_det_tape_stop(StixDetState *d, const char *why);
+/* S1 per-pair rate: the tape step's cps or the background's */
+static uint32_t stix_det_tape_pair_cps(const StixDetState *d,
+                                       uint32_t fpga_det, uint32_t pix);
+/* A1: the ELUT row classification gate (the pass itself is
+ * stix_det_replay_classify, extended with the summary and the C1 map) */
+static bool stix_det_classify_wanted(const StixDetState *d);
+/* C1: the ADC-faithful sky */
+static bool stix_det_adc_mode_on(const StixDetState *d);
+static void stix_det_adc_map_rebuild(StixDetState *d);
+static double stix_det_adc_fold_share(const StixDetState *d, uint32_t fpga_det,
+                                      uint32_t pix, uint32_t profile,
+                                      uint32_t ebin_mask);
+/* the scene properties' offset helper, shared by the tape/align/adc
+ * accessors (defined with the scene properties below) */
+static StixDetState *stix_det_of(Object *obj, void *opaque);
 
 static uint32_t *stix_det_regp(StixDetState *d, hwaddr addr)
 {
@@ -197,6 +225,18 @@ static void stix_det_ql_swap(StixDetState *d)
     bool irq = (d->reg->fsmCmd >> STIXCTRL_FSMCMD_QLIRQEN) &
                STIXCTRL_FSMCMD_QLIRQEN_MASK;
 
+    /*
+     * D-Dk/S1-A1/C1: re-classify the ELUT rows for the coming period —
+     * so a TC(237,8) apply during NOMINAL takes effect within one
+     * period, and so the ADC bin-mass map (when the mode is on) is
+     * rebuilt BEFORE the swap materializes its banks: the bank closed
+     * by the first swap after a mid-period row rewrite already folds
+     * with the new map (deliberately unlike the replay's event-time
+     * lookup, which still shows the old binning in that bank).
+     */
+    if (stix_det_classify_wanted(d)) {
+        stix_det_replay_classify(d);
+    }
     stix_det_sky_materialize(d, done);
 
     d->active_ql_bank = next;
@@ -206,13 +246,6 @@ static void stix_det_ql_swap(StixDetState *d)
     stix_det_latch_ql_int_time(d);
     d->ql_ready = true;
     trace_stixdet_ql_swap(done, next, d->ql_int_time, irq);
-    /*
-     * D-Dk: re-classify the ELUT rows for the coming period, so a
-     * TC(237,8) apply during NOMINAL takes effect within one period
-     */
-    if (d->replay_loaded && d->source == STIX_DET_SOURCE_REPLAY_DSS) {
-        stix_det_replay_classify(d);
-    }
     if (irq) {
         qemu_irq_pulse(*d->irq);
     }
@@ -236,6 +269,13 @@ static void stix_det_tick(void *opaque)
 
     /* D-Dj: out-of-MMIO writes into guest-visible memory, see the top */
     guard->engaged_in_io = true;
+    /*
+     * S1: the tape first — the play/stop requests apply (D-Dj) and the
+     * running step advances, so the sky tick below reads this tick's
+     * per-pair rates from the tape state. The step clock only advances
+     * here, i.e. only while FSM Enable = 1 (D3: SAFE freezes playback).
+     */
+    stix_det_tape_tick(d);
     stix_det_sky_tick(d);
     stix_det_replay_tick(d);
     stix_det_inject_apply(d);
@@ -1149,47 +1189,73 @@ static double stix_det_ebin_share_masked(StixDetState *d, uint32_t profile,
  * masks, plan "Index spaces"). QLACC is not masked. The nominal
  * integration (D-5) gets the same exposure for the fpga_det in SUMDMASK
  * (EACC is gated by it [D, RP-0067]); the others count in ETRG only.
+ *
+ * S1: while a tape plays the per-pair rate is the active step's cps on
+ * its masks, else the background's (kind off contributes 0; an all-32
+ * off step silences the background too); the scene's det-flare and the
+ * two *-cps knobs are ignored and the quiet profile is used. The rate
+ * still flows through the exposure + template and the per-tick pix
+ * gate: a step rate on a gated-off pix produces nothing, like a real
+ * event. On stop/done the scene knobs resume.
+ *
+ * C1: with the ADC mode on the SUMEMASK/VAREMASK shares are the
+ * map-folded ones (per pair, from the cached bin-mass map); the
+ * exposure and the totals stay ebin-space.
  */
 static void stix_det_sky_tick(StixDetState *d)
 {
-    uint32_t profile = d->flare ? STIX_DET_PROFILE_FLARE :
-                                  STIX_DET_PROFILE_QUIET;
-    uint32_t cps = d->flare ? d->flare_cps : d->quiet_cps;
+    bool playing = d->tape_state == STIX_DET_TAPE_PLAYING;
+    uint32_t profile = !playing && d->flare ? STIX_DET_PROFILE_FLARE :
+                                              STIX_DET_PROFILE_QUIET;
+    uint32_t cps = !playing && d->flare ? d->flare_cps : d->quiet_cps;
     uint32_t sumd_fpga_det = d->reg->fsmSumDmask;
     uint32_t vard_fpga_det = d->reg->fsmQlVarDMask;
     uint32_t varp_pix = (d->reg->fsmQlConfig >>
                          STIXCTRL_FSMQLCONFIG_QLVARPMASK) &
                         STIXCTRL_FSMQLCONFIG_QLVARPMASK_MASK;
-    double tick_counts, sum_share, var_share, sum_lambda = 0, var_lambda = 0;
+    uint32_t sum_ebin_mask = d->reg->fsmSumEmask;
+    uint32_t var_ebin_mask = d->reg->fsmQlVarEMask;
+    double sum_share, var_share, sum_lambda = 0, var_lambda = 0;
+    bool folded = stix_det_adc_mode_on(d) && d->adc_map_valid;
     uint32_t fpga_det, pix;
     uint64_t n;
 
-    if (d->source != STIX_DET_SOURCE_SYNTHETIC || cps == 0) {
+    if (d->source != STIX_DET_SOURCE_SYNTHETIC ||
+        (!playing && cps == 0)) {
         return;
     }
-    tick_counts = cps * (STIX_DET_TICK_NS / 1e9);
-    sum_share = stix_det_ebin_share_masked(d, profile, d->reg->fsmSumEmask);
-    var_share = stix_det_ebin_share_masked(d, profile, d->reg->fsmQlVarEMask);
+    sum_share = stix_det_ebin_share_masked(d, profile, sum_ebin_mask);
+    var_share = stix_det_ebin_share_masked(d, profile, var_ebin_mask);
 
     for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
         uint32_t pix_mask = stix_det_pix_gate(d, fpga_det);
 
         for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
-            double c;
+            uint32_t pair_cps = playing ?
+                stix_det_tape_pair_cps(d, fpga_det, pix) : cps;
+            double tick_counts, c, pair_sum_share, pair_var_share;
 
             if (!((pix_mask >> pix) & 1)) {
                 continue;
             }
+            tick_counts = pair_cps * (STIX_DET_TICK_NS / 1e9);
             d->expo[fpga_det][pix][profile] += tick_counts;
             c = tick_counts * d->pix_share[pix];
+            pair_sum_share = folded ?
+                stix_det_adc_fold_share(d, fpga_det, pix, profile,
+                                        sum_ebin_mask) : sum_share;
+            pair_var_share = folded ?
+                stix_det_adc_fold_share(d, fpga_det, pix, profile,
+                                        var_ebin_mask) : var_share;
             if ((sumd_fpga_det >> fpga_det) & 1) {
                 d->nom_expo[fpga_det][pix][profile] += tick_counts;
-                sum_lambda += c * sum_share;
+                sum_lambda += c * pair_sum_share;
             } else {
                 d->nom_trg_extra_grp[stix_det_grp_of(fpga_det)] += c;
             }
-            if (((vard_fpga_det >> fpga_det) & 1) && ((varp_pix >> pix) & 1)) {
-                var_lambda += c * var_share;
+            if (((vard_fpga_det >> fpga_det) & 1) &&
+                ((varp_pix >> pix) & 1)) {
+                var_lambda += c * pair_var_share;
             }
         }
     }
@@ -1458,20 +1524,82 @@ static uint32_t stix_det_replay_fallback_ebin(StixDetState *d,
 }
 
 /*
+ * A1: is a classification pass wanted at this point? The established
+ * replay-dss case, plus det-align and the ADC-faithful sky (C1), which
+ * both need the row states (and, for the ADC mode, the map rebuild).
+ */
+static bool stix_det_classify_wanted(const StixDetState *d)
+{
+    return d->align || d->source == STIX_DET_SOURCE_REPLAY_DSS ||
+           stix_det_adc_mode_on(d);
+}
+
+/*
+ * The sim calibration baseline of one fpga_det (C1/D5): the dss_det's
+ * 0xE baseline from the realized replay table, or 0 without one (the
+ * status reports base_source=zero). Identical across pix by default.
+ */
+static uint32_t stix_det_cal_base(const StixDetState *d, uint32_t fpga_det)
+{
+    return d->replay_loaded ? d->replay_base_dss_det[fpga_det] : 0;
+}
+
+/*
+ * The sim calibration's ebin of one adc, the D-7 law (C1/D5): the
+ * grid the fallback bins on, E(e) = base + ceil(e*W/32); ebin e covers
+ * adc [E(e), E(e+1)), so the bin of adc a is (a - base)*32/W, floor,
+ * clamped to 0..31 (adc below the grid clamps into ebin 0: adc = base
+ * = E(0) sits inside sim ebin 0's interval; only the map build sees
+ * the clamped low edge, the replay fallback drops adc <= base before
+ * it would ever bin one).
+ */
+static uint32_t stix_det_cal_ebin(uint32_t base, uint32_t adc)
+{
+    int64_t diff = (int64_t)adc - (int64_t)base;
+    int64_t w = (int64_t)(STIX_DET_N_ADC - base);
+    int64_t ebin = diff * (int64_t)STIX_DET_N_EBIN / w;
+
+    return (uint32_t)MAX(0, MIN(ebin, (int64_t)STIX_DET_N_EBIN - 1));
+}
+
+/*
  * Classify every (fpga_det, pix) ELUT row (D-Dk): a constant row (all
  * 0 — the power-on/EDAC state — or all 31 — what applyELUT writes from
  * the all-zero boundary table of an empty flash, LUTMgmt.c:912 — or
  * any other constant) cannot be a calibration, so the row falls back
  * to the linear binning. Runs at each SetEnable 0->1 edge and at each
- * QL swap while det-source=replay-dss, so a TC(237,8) apply during
- * NOMINAL takes effect within one period. A row newly classified
- * degenerate traces stixdet_elut_fallback once.
+ * QL swap while the classification is wanted (D-Dk: replay-dss; A1:
+ * det-align; C1: the ADC mode), so a TC(237,8) apply during NOMINAL
+ * takes effect within one period. A row newly classified degenerate
+ * traces stixdet_elut_fallback once.
+ *
+ * A1: the pass also fills the det-align summary (rows, fallback,
+ * honoured, mismatch_cells, unassigned_cells) and traces one
+ * stixdet_align line per classification — the classification itself
+ * becomes visible (the E-4 vacuity gap). mismatch_cells compares the
+ * honoured rows' ELUT values against the sim calibration's linear bin
+ * (the D-7 law from the replay table's baselines); without a table
+ * there is no comparison and calibration reads "none" — that marks the
+ * comparison as not computed, not a zero-mismatch verdict.
+ *
+ * C1: while the ADC mode is on the pass rebuilds the per-row bin-mass
+ * map (stix_det_adc_map_rebuild) from the fresh row states.
  */
 static void stix_det_replay_classify(StixDetState *d)
 {
     uint32_t fpga_det, pix;
 
+    d->align_rows = STIX_DET_N_FPGA_DET * STIX_DET_N_PIX_ACC;
+    d->align_fallback = 0;
+    d->align_honoured = 0;
+    d->align_mismatch_cells = 0;
+    d->align_unassigned_cells = 0;
+    d->align_has_table = d->replay_loaded;
+
     for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
+        uint32_t base = stix_det_cal_base(d, fpga_det);
+        uint32_t mism = 0, unass = 0, honoured = 0;
+
         for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
             const uint8_t *row = memory_region_get_ram_ptr(d->sram) +
                                  (pix * STIX_DET_N_FPGA_DET + fpga_det) *
@@ -1489,8 +1617,189 @@ static void stix_det_replay_classify(StixDetState *d)
                 trace_stixdet_elut_fallback(fpga_det, pix, row[0]);
             }
             d->replay_row_fallback[fpga_det][pix] = degenerate;
+            if (degenerate) {
+                d->align_fallback++;
+                continue;
+            }
+            honoured++;
+            if (d->align_has_table) {
+                for (adc = 0; adc < STIX_DET_N_ADC; adc++) {
+                    if (row[adc] >= STIX_DET_N_EBIN) {
+                        unass++;
+                    } else if (row[adc] != stix_det_cal_ebin(base, adc)) {
+                        mism++;
+                    }
+                }
+            }
+        }
+        d->align_honoured += honoured;
+        d->align_mismatch_cells += mism;
+        d->align_unassigned_cells += unass;
+    }
+    trace_stixdet_align(d->align_rows, d->align_fallback, d->align_honoured,
+                        d->align_mismatch_cells,
+                        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (stix_det_adc_mode_on(d)) {
+        stix_det_adc_map_rebuild(d);
+    }
+}
+
+/*
+ * A1 (fixed for S2/S3): an adc whose loaded ELUT row (pix @pix,
+ * fpga_det @fpga_det) maps to @ebin — the midpoint of the longest run
+ * of adc holding that value. -1 when the row is degenerate (the caller
+ * uses the sim calibration) or no adc maps to @ebin (the caller counts
+ * a preimage_miss). Not called before S2.
+ */
+int stix_det_align_adc(StixDetState *d, uint32_t fpga_det, uint32_t pix,
+                       uint32_t ebin)
+{
+    const uint8_t *row;
+    uint32_t adc, best_len = 0, best_mid = 0, run_len = 0, run_start = 0;
+
+    if (fpga_det >= STIX_DET_N_FPGA_DET || pix >= STIX_DET_N_PIX_ACC ||
+        ebin >= STIX_DET_N_EBIN || d->replay_row_fallback[fpga_det][pix]) {
+        return -1;
+    }
+    row = memory_region_get_ram_ptr(d->sram) +
+          (pix * STIX_DET_N_FPGA_DET + fpga_det) * STIX_DET_N_ADC;
+    for (adc = 0; adc <= STIX_DET_N_ADC; adc++) {
+        if (adc < STIX_DET_N_ADC && row[adc] == ebin) {
+            if (run_len == 0) {
+                run_start = adc;
+            }
+            run_len++;
+            continue;
+        }
+        if (run_len > best_len) {
+            best_len = run_len;
+            best_mid = run_start + run_len / 2;
+        }
+        run_len = 0;
+    }
+    return best_len ? (int)best_mid : -1;
+}
+
+/*
+ * ---- C1: the ADC-faithful sky mode (decision D1) ----
+ *
+ * Effective while the synthetic sky draws (det-source=synthetic); a
+ * tape's adc_mode field overrides the knob while the tape plays and
+ * reverts on stop/done. Inert otherwise (replay-dss, zero).
+ */
+static bool stix_det_adc_mode_on(const StixDetState *d)
+{
+    bool mode = d->tape_state == STIX_DET_TAPE_PLAYING ? d->tape_adc_mode
+                                                       : d->adc_mode;
+
+    return mode && d->source == STIX_DET_SOURCE_SYNTHETIC;
+}
+
+/*
+ * The cached per-row bin-mass map (decision D1): map[s][t] is the
+ * fraction of sim-ebin s's mass the row (pix, fpga_det) puts in ebin
+ * t. Built by one walk over the row's 4096 ELUT bytes from the SRAM
+ * ram pointer (the stix_det_replay_classify pattern, under the tick's
+ * mem_reentrancy_guard), source ebin = the sim calibration grid (the
+ * D-7 law from the row's baseline):
+ * - honoured row: destination val[adc], 32 (unassigned) drops the adc;
+ * - degenerate row: destination = the fallback's (== the calibration)
+ *   bin, and the fallback's adc <= base drop loses the adc = base
+ *   sliver of ebin 0 (1/len0: 1/72 at base 1800, 1/128 at base 0).
+ * adc below the grid owns no sim ebin and is skipped. There is no
+ * write hook (a TC(237,8) apply is a plain RAM store): the rebuild
+ * runs at the classification points only — the SetEnable edge and the
+ * start of stix_det_ql_swap, before materialize — never per tick,
+ * never per event; one full 384 x 4096 walk, host ~ms, zero while the
+ * mode is off. Traces stixdet_adc_map once per rebuild.
+ */
+static void stix_det_adc_map_rebuild(StixDetState *d)
+{
+    uint32_t fpga_det, pix, s, t, nonidentity = 0;
+    const uint8_t *elut = memory_region_get_ram_ptr(d->sram);
+
+    for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
+        uint32_t base = stix_det_cal_base(d, fpga_det);
+
+        for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
+            const uint8_t *row = elut +
+                (pix * STIX_DET_N_FPGA_DET + fpga_det) * STIX_DET_N_ADC;
+            double (*map)[STIX_DET_N_EBIN] = d->adc_map[fpga_det][pix];
+            uint32_t counts[STIX_DET_N_EBIN][STIX_DET_N_EBIN];
+            uint32_t total[STIX_DET_N_EBIN];
+            uint32_t adc;
+            bool degenerate = d->replay_row_fallback[fpga_det][pix];
+            bool identity = true;
+
+            memset(counts, 0, sizeof(counts));
+            memset(total, 0, sizeof(total));
+            for (adc = base; adc < STIX_DET_N_ADC; adc++) {
+                uint32_t src = stix_det_cal_ebin(base, adc);
+                uint32_t dst;
+
+                if (degenerate) {
+                    if (adc == base) {
+                        continue;   /* the fallback drops adc <= base */
+                    }
+                    dst = src;
+                } else {
+                    dst = row[adc];
+                    if (dst >= STIX_DET_N_EBIN) {
+                        continue;   /* 32 = unassigned: the row drops it */
+                    }
+                }
+                counts[src][dst]++;
+                total[src]++;
+            }
+            for (s = 0; s < STIX_DET_N_EBIN; s++) {
+                for (t = 0; t < STIX_DET_N_EBIN; t++) {
+                    map[s][t] = total[s] ?
+                                (double)counts[s][t] / total[s] : 0.0;
+                }
+                if (total[s] && map[s][s] != 1.0) {
+                    identity = false;
+                }
+            }
+            if (!identity) {
+                nonidentity++;
+            }
         }
     }
+    d->adc_map_valid = true;
+    d->adc_map_armed = false;
+    trace_stixdet_adc_map(STIX_DET_N_FPGA_DET * STIX_DET_N_PIX_ACC,
+                          nonidentity,
+                          qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+/*
+ * The ebin-masked share of one profile's rate after the fold: instead
+ * of ebin_share[profile][s] summed over the mask, the mass of ebin s
+ * reaches the masked bins t as ebin_share[s] x map[s][t] — a 32x32 dot
+ * product over the cached map row (the masks still read live). Only
+ * called with the map valid (the mode on).
+ */
+static double stix_det_adc_fold_share(const StixDetState *d, uint32_t fpga_det,
+                                      uint32_t pix, uint32_t profile,
+                                      uint32_t ebin_mask)
+{
+    const double (*map)[STIX_DET_N_EBIN] = d->adc_map[fpga_det][pix];
+    double share = 0;
+    uint32_t s, t;
+
+    for (s = 0; s < STIX_DET_N_EBIN; s++) {
+        double es = d->ebin_share[profile][s];
+
+        if (es == 0.0) {
+            continue;
+        }
+        for (t = 0; t < STIX_DET_N_EBIN; t++) {
+            if ((ebin_mask >> t) & 1) {
+                share += es * map[s][t];
+            }
+        }
+    }
+    return share;
 }
 
 /* start (or restart) a loaded replay at det-replay-offset-ms */
@@ -1532,18 +1841,18 @@ static void stix_det_replay_start(StixDetState *d, const char *why)
 
 /*
  * The SetEnable 0->1 edge (D-Dk): the nominal trigger starts the replay
- * here (the first edge after a reset — or after realize — re-arms), and
- * the ELUT rows are classified for the coming period. Only with
- * det-source=replay-dss.
+ * here, and the ELUT rows are classified for the coming period (A1:
+ * whenever the classification is wanted — replay-dss, det-align or the
+ * ADC mode — with or without a replay table).
  */
 static void stix_det_replay_enable_edge(StixDetState *d)
 {
-    if (!d->replay_loaded || d->source != STIX_DET_SOURCE_REPLAY_DSS) {
-        return;
+    if (stix_det_classify_wanted(d)) {
+        stix_det_replay_classify(d);
     }
-    stix_det_replay_classify(d);
     d->replay_class_pending = false;
-    if (d->replay_armed && !d->replay_running &&
+    if (d->replay_loaded && d->source == STIX_DET_SOURCE_REPLAY_DSS &&
+        d->replay_armed && !d->replay_running &&
         d->replay_trigger == STIX_DET_REPLAY_TRIGGER_NOMINAL) {
         stix_det_replay_start(d, "nominal");
     }
@@ -1567,7 +1876,9 @@ static void stix_det_replay_tick(StixDetState *d)
     }
     if (d->replay_class_pending) {
         d->replay_class_pending = false;
-        stix_det_replay_classify(d);
+        if (stix_det_classify_wanted(d)) {
+            stix_det_replay_classify(d);
+        }
     }
     if (d->replay_start_req) {
         d->replay_start_req = false;
@@ -1616,6 +1927,63 @@ static void stix_det_replay_tick(StixDetState *d)
 }
 
 /*
+ * C1 largest-remainder split: @n units of source ebin @s go over the
+ * map row's destination fractions, integer, deterministic, no new RNG
+ * (same loop order, same PRNG calls — the split is pure arithmetic).
+ * The row's dropped fraction is a phantom 33rd slot whose counts
+ * vanish, so totals change only where the row itself drops (the
+ * unassigned cells, the degenerate fallback's adc = base sliver).
+ * Ties break by destination ebin, ascending.
+ */
+static void stix_det_adc_split_counts(const double (*map)[STIX_DET_N_EBIN],
+                                      uint32_t s, uint64_t n,
+                                      uint64_t dest[STIX_DET_N_EBIN])
+{
+    double frac[STIX_DET_N_EBIN], drop_frac, w_drop = 0.0;
+    uint64_t base_sum = 0, drop_base;
+    int64_t left;
+    uint32_t t;
+
+    memset(dest, 0, sizeof(*dest) * STIX_DET_N_EBIN);
+    for (t = 0; t < STIX_DET_N_EBIN; t++) {
+        double exact = (double)n * map[s][t];
+
+        dest[t] = (uint64_t)exact;          /* floor: weights are >= 0 */
+        frac[t] = exact - (double)dest[t];
+        base_sum += dest[t];
+        w_drop += map[s][t];
+    }
+    w_drop = 1.0 - w_drop;
+    if (w_drop < 0.0) {
+        w_drop = 0.0;                       /* float rounding guard */
+    }
+    /* the drop slot: what the row's fractions do not cover */
+    drop_base = (uint64_t)((double)n * w_drop);
+    drop_frac = (double)n * w_drop - (double)drop_base;
+    left = (int64_t)n - (int64_t)base_sum - (int64_t)drop_base;
+    while (left > 0) {
+        uint32_t best = STIX_DET_N_EBIN;
+        double best_frac = -1.0;
+
+        for (t = 0; t < STIX_DET_N_EBIN; t++) {
+            if (frac[t] > best_frac) {
+                best_frac = frac[t];
+                best = t;
+            }
+        }
+        if (drop_frac > best_frac) {
+            drop_frac = -1.0;   /* the drop slot wins: counts vanish */
+        } else if (best == STIX_DET_N_EBIN) {
+            break;              /* no slot left (cannot happen) */
+        } else {
+            dest[best]++;
+            frac[best] = -1.0;
+        }
+        left--;
+    }
+}
+
+/*
  * Draw one accumulator bank from an exposure set (D-Df): each cell
  * [pix][fpga_det][ebin] (u16 big-endian at byte ((pix * 32 + fpga_det)
  * * 32 + ebin) * 2, Detectors.h:68-79, the same layout for LACC and
@@ -1623,6 +1991,13 @@ static void stix_det_replay_tick(StixDetState *d)
  * any injected counts (D-6) at the cell, wrapping at 16 bits. Adds the
  * drawn events per grp to @grp_events; returns the total. The consumed
  * deposits are cleared here.
+ *
+ * C1: with the ADC mode on (the map valid) each drawn count is split
+ * over the row's bin-mass map by largest remainder, so the drawn ebin-s
+ * mass lands where the loaded ELUT puts it; the injected counts are
+ * added after the draw, at their own ebin, science-space. The Poisson
+ * loop order and the RNG stream are unchanged; with the mode off the
+ * writes are bit-identical to the plain path.
  */
 static uint64_t stix_det_draw_acc(StixDetState *d,
                                   double (*expo_set)[STIX_DET_N_PIX_ACC]
@@ -1633,28 +2008,50 @@ static uint64_t stix_det_draw_acc(StixDetState *d,
                                   uint64_t grp_events[STIX_DET_N_GRP])
 {
     uint64_t acc_events = 0;
+    bool folded = stix_det_adc_mode_on(d) && d->adc_map_valid;
     uint32_t pix, fpga_det, ebin;
 
     for (pix = 0; pix < STIX_DET_N_PIX_ACC; pix++) {
         for (fpga_det = 0; fpga_det < STIX_DET_N_FPGA_DET; fpga_det++) {
             const double *expo = expo_set[fpga_det][pix];
+            const double (*map)[STIX_DET_N_EBIN] = folded ?
+                d->adc_map[fpga_det][pix] : NULL;
+            uint64_t cell[STIX_DET_N_EBIN];
+            uint64_t pair_total = 0;
 
+            memset(cell, 0, sizeof(cell));
             for (ebin = 0; ebin < STIX_DET_N_EBIN; ebin++) {
                 double lambda = d->pix_share[pix] *
                     (expo[STIX_DET_PROFILE_QUIET] *
                      d->ebin_share[STIX_DET_PROFILE_QUIET][ebin] +
                      expo[STIX_DET_PROFILE_FLARE] *
                      d->ebin_share[STIX_DET_PROFILE_FLARE][ebin]);
-                uint64_t n = stix_det_poisson(d, lambda) +
-                             inj[fpga_det][pix][ebin];
+                uint64_t n_sky = stix_det_poisson(d, lambda);
+                uint64_t n_inj = inj[fpga_det][pix][ebin];
 
                 inj[fpga_det][pix][ebin] = 0;
+                if (map) {
+                    uint64_t dest[STIX_DET_N_EBIN];
+                    uint32_t t;
+
+                    stix_det_adc_split_counts(map, ebin, n_sky, dest);
+                    for (t = 0; t < STIX_DET_N_EBIN; t++) {
+                        cell[t] += dest[t];
+                    }
+                } else {
+                    cell[ebin] += n_sky;
+                }
+                /* the deposits stay science-space: added after the draw */
+                cell[ebin] += n_inj;
+                pair_total += n_sky + n_inj;
+            }
+            for (ebin = 0; ebin < STIX_DET_N_EBIN; ebin++) {
                 stw_be_p(acc + ((pix * STIX_DET_N_FPGA_DET + fpga_det) *
                                 STIX_DET_N_EBIN + ebin) * sizeof(uint16_t),
-                         (uint16_t)n);
-                grp_events[stix_det_grp_of(fpga_det)] += n;
-                acc_events += n;
+                         (uint16_t)cell[ebin]);
             }
+            grp_events[stix_det_grp_of(fpga_det)] += pair_total;
+            acc_events += pair_total;
         }
     }
     return acc_events;
@@ -1990,6 +2387,728 @@ static void stix_det_nominal_tick(StixDetState *d)
         d->nom_tick >= d->nom_int_time_min + 1) {
         stix_det_nominal_swap(d);
     }
+}
+
+/* ---- S1: the mix tape (steps on guest time, a background layer) ---- */
+
+static const char *const stix_det_tape_kind_name[STIX_DET_TAPE_KIND__MAX] = {
+    [STIX_DET_TAPE_RATE] = "rate",
+    [STIX_DET_TAPE_REPLAY] = "replay",
+    [STIX_DET_TAPE_OFF] = "off",
+    [STIX_DET_TAPE_SINGLE] = "single",
+};
+
+static const char *const stix_det_tape_state_name[STIX_DET_TAPE__MAX] = {
+    [STIX_DET_TAPE_IDLE] = "idle",
+    [STIX_DET_TAPE_READY] = "ready",
+    [STIX_DET_TAPE_PLAYING] = "playing",
+    [STIX_DET_TAPE_DONE] = "done",
+    [STIX_DET_TAPE_STOPPED] = "stopped",
+};
+
+/* for_s is tick-quantized: whole 100 ms ticks, 0.1..86400 s */
+static uint32_t stix_det_tape_step_ticks(double for_s)
+{
+    return (uint32_t)(for_s * 10.0 + 0.5);  /* 10 ticks per second */
+}
+
+/*
+ * The per-pair rate while a tape plays (T2): the active step's cps on
+ * its masks (kind off contributes 0), else the background's cps (the
+ * background is unmasked: it fills all 384 pairs). The scene knobs are
+ * ignored while playing and resume on stop/done.
+ */
+static uint32_t stix_det_tape_pair_cps(const StixDetState *d,
+                                       uint32_t fpga_det, uint32_t pix)
+{
+    const StixDetTapeStep *st = &d->tape_steps[d->tape_step];
+
+    if (((st->fpga_det_mask >> fpga_det) & 1) &&
+        ((st->pix_mask >> pix) & 1)) {
+        return st->kind == STIX_DET_TAPE_OFF ? 0 : st->cps;
+    }
+    return d->tape_bg_cps;
+}
+
+/* drop the loaded tape (steps and name); the caller sets the state */
+static void stix_det_tape_clear(StixDetState *d)
+{
+    uint32_t i;
+
+    for (i = 0; i < d->tape_n_steps; i++) {
+        g_free(d->tape_steps[i].label);
+    }
+    d->tape_n_steps = 0;
+    d->tape_step = 0;
+    d->tape_left_ticks = 0;
+    g_clear_pointer(&d->tape_name, g_free);
+    d->tape_loop = false;
+    d->tape_align = false;
+    d->tape_adc_mode = false;
+    d->tape_bg_cps = 0;
+    d->tape_in_replay = false;
+}
+
+/*
+ * Stop a playing tape: rates revert to the scene knobs at the next
+ * tick (the sky tick reads the state), a running replay step stops the
+ * replay the way det-replay-start=false does and reverts the source.
+ */
+static void stix_det_tape_stop(StixDetState *d, const char *why)
+{
+    if (d->tape_state != STIX_DET_TAPE_PLAYING) {
+        return;
+    }
+    if (d->tape_in_replay) {
+        d->tape_in_replay = false;
+        if (d->replay_running) {
+            d->replay_running = false;
+            d->replay_stopped = true;
+            trace_stixdet_replay_state("stop", why, d->replay_time_tick,
+                                       d->replay_cursor,
+                                       d->replay_events_done);
+        }
+        d->source = STIX_DET_SOURCE_SYNTHETIC;
+    }
+    d->tape_state = STIX_DET_TAPE_STOPPED;
+    d->tape_left_ticks = 0;
+}
+
+/* a step starts: trace it, and a replay step switches to replay-dss */
+static void stix_det_tape_apply_step(StixDetState *d, uint32_t idx)
+{
+    const StixDetTapeStep *st = &d->tape_steps[idx];
+
+    d->tape_step = idx;
+    d->tape_left_ticks = stix_det_tape_step_ticks(st->for_s);
+    trace_stixdet_tape_step(idx, stix_det_tape_kind_name[st->kind],
+                            st->label ? st->label : "",
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (st->kind != STIX_DET_TAPE_REPLAY) {
+        return;
+    }
+    d->tape_in_replay = true;
+    d->source = STIX_DET_SOURCE_REPLAY_DSS;
+    /* the rows were not classified for this source yet (D-Dj) */
+    d->replay_class_pending = true;
+    /* replay_tick applies the start later in this same tick */
+    d->replay_start_req = true;
+}
+
+/*
+ * One tick of the tape (D-Dj): the play/stop requests apply, then the
+ * running step counts its tick down. The step clock advances only
+ * here — i.e. only while the tick runs, FSM Enable = 1 (D3: SAFE
+ * freezes playback). A step owns the ticks its for_s quantizes to; at
+ * its end the next step (or the loop restart, or done) applies, and a
+ * replay step's end stops the replay engine and reverts the source.
+ */
+static void stix_det_tape_tick(StixDetState *d)
+{
+    if (d->tape_stop_req) {
+        d->tape_stop_req = false;
+        stix_det_tape_stop(d, "det-tape-play=false");
+    }
+    if (d->tape_play_req) {
+        d->tape_play_req = false;
+        if (d->tape_state == STIX_DET_TAPE_PLAYING || !d->tape_n_steps) {
+            return;     /* the setter refused these; belt and braces */
+        }
+        d->tape_state = STIX_DET_TAPE_PLAYING;
+        stix_det_tape_apply_step(d, 0);
+        return;
+    }
+    if (d->tape_state != STIX_DET_TAPE_PLAYING) {
+        return;
+    }
+    if (d->tape_left_ticks > 0) {
+        d->tape_left_ticks--;
+    }
+    if (d->tape_left_ticks == 0) {
+        const StixDetTapeStep *st = &d->tape_steps[d->tape_step];
+
+        if (st->kind == STIX_DET_TAPE_REPLAY) {
+            d->tape_in_replay = false;
+            if (d->replay_running) {
+                d->replay_running = false;
+                d->replay_stopped = true;
+                trace_stixdet_replay_state("stop", "tape step end",
+                                           d->replay_time_tick,
+                                           d->replay_cursor,
+                                           d->replay_events_done);
+            }
+            d->source = STIX_DET_SOURCE_SYNTHETIC;
+        }
+        if (d->tape_step + 1 < d->tape_n_steps) {
+            stix_det_tape_apply_step(d, d->tape_step + 1);
+        } else if (d->tape_loop) {
+            stix_det_tape_apply_step(d, 0);
+        } else {
+            d->tape_state = STIX_DET_TAPE_DONE;
+            d->tape_left_ticks = 0;
+        }
+    }
+}
+
+/* ---- det-tape-load: the JSON parser ---- */
+
+/* a status line must stay one line: names and labels hold no comma */
+static bool stix_det_tape_line_text(const char *s, uint32_t max,
+                                    Error **errp, const char *what)
+{
+    uint32_t i, len = strlen(s);
+
+    if (!len || len > max) {
+        error_setg(errp, "det-tape-load: %s is empty or past %u "
+                   "characters", what, max);
+        return false;
+    }
+    for (i = 0; i < len; i++) {
+        if (s[i] == ',' || (unsigned char)s[i] < 0x20 ||
+            (unsigned char)s[i] == 0x7F) {
+            error_setg(errp, "det-tape-load: %s holds a comma or a "
+                       "control character", what);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* a JSON number out of a dict member; false with errp when absent or
+ * not a number; @idx names the step (UINT32_MAX = the tape itself) */
+static bool stix_det_tape_num(QDict *obj, const char *key, double *out,
+                              Error **errp, uint32_t idx)
+{
+    QNum *n = qobject_to(QNum, qdict_get(obj, key));
+
+    if (n) {
+        *out = qnum_get_double(n);
+    }
+    if (!n) {
+        if (idx == UINT32_MAX) {
+            error_setg(errp, "det-tape-load: '%s' is missing or not a "
+                       "number", key);
+        } else {
+            error_setg(errp, "det-tape-load: step %u: '%s' is missing or "
+                       "not a number", idx, key);
+        }
+        return false;
+    }
+    return true;
+}
+
+/* a JSON integer in 0..hi */
+static bool stix_det_tape_uint(QDict *obj, const char *key, uint64_t hi,
+                               uint64_t *out, Error **errp, uint32_t idx)
+{
+    QNum *n = qobject_to(QNum, qdict_get(obj, key));
+    int64_t v;
+
+    if (!n || !qnum_get_try_int(n, &v) || v < 0 || (uint64_t)v > hi) {
+        if (idx == UINT32_MAX) {
+            error_setg(errp, "det-tape-load: '%s' is missing or not an "
+                       "integer in 0..%" PRIu64, key, hi);
+        } else {
+            error_setg(errp, "det-tape-load: step %u: '%s' is missing or "
+                       "not an integer in 0..%" PRIu64, idx, key, hi);
+        }
+        return false;
+    }
+    *out = (uint64_t)v;
+    return true;
+}
+
+/* an optional JSON bool with a default */
+static bool stix_det_tape_bool(QDict *obj, const char *key, bool def,
+                               bool *out, Error **errp, uint32_t idx)
+{
+    QBool *b = qobject_to(QBool, qdict_get(obj, key));
+
+    if (!b) {
+        *out = def;
+        return true;
+    }
+    if (qobject_type(QOBJECT(b)) != QTYPE_QBOOL) {
+        if (idx == UINT32_MAX) {
+            error_setg(errp, "det-tape-load: '%s' is not a boolean", key);
+        } else {
+            error_setg(errp, "det-tape-load: step %u: '%s' is not a "
+                       "boolean", idx, key);
+        }
+        return false;
+    }
+    *out = qbool_get_bool(b);
+    return true;
+}
+
+/*
+ * One step dict into @st. Every error names the step index @idx; masks
+ * are fpga_det/pix indexed and a subcol key is refused by name. Kinds
+ * and specs the later stages own (single: S3; non-flat spec: S2) are
+ * rejected here with their stage named, so S1 never half-implements
+ * them.
+ */
+static bool stix_det_tape_parse_step(StixDetState *d, QDict *obj,
+                                     StixDetTapeStep *st, uint32_t idx,
+                                     Error **errp)
+{
+    const char *kind;
+    char *label;
+    uint64_t u64;
+    double for_s;
+    QString *spec;
+    const QDictEntry *e;
+
+    memset(st, 0, sizeof(*st));
+    if (qdict_haskey(obj, "subcol_mask")) {
+        error_setg(errp, "det-tape-load: step %u: \"subcol_mask\" is not "
+                   "a tape field; use fpga_det_mask (dss_det = fpga_det)",
+                   idx);
+        return false;
+    }
+    kind = qdict_get_try_str(obj, "kind");
+    if (!kind) {
+        error_setg(errp, "det-tape-load: step %u: 'kind' is missing", idx);
+        return false;
+    }
+    if (!strcmp(kind, "rate")) {
+        st->kind = STIX_DET_TAPE_RATE;
+    } else if (!strcmp(kind, "replay")) {
+        st->kind = STIX_DET_TAPE_REPLAY;
+    } else if (!strcmp(kind, "off")) {
+        st->kind = STIX_DET_TAPE_OFF;
+    } else if (!strcmp(kind, "single")) {
+        error_setg(errp, "det-tape-load: step %u: kind \"single\" is "
+                   "unsupported in this build (S2/S3)", idx);
+        return false;
+    } else {
+        error_setg(errp, "det-tape-load: step %u: unknown kind '%s' "
+                   "(rate, replay, off)", idx, kind);
+        return false;
+    }
+    if (!stix_det_tape_num(obj, "for_s", &for_s, errp, idx)) {
+        return false;
+    }
+    if (for_s < 0.1 || for_s > 86400.0) {
+        error_setg(errp, "det-tape-load: step %u: for_s %g s is outside "
+                   "0.1..86400", idx, for_s);
+        return false;
+    }
+    st->for_s = for_s;
+    /* the label is optional: an empty string is no label */
+    label = g_strdup(qdict_get_try_str(obj, "label") ? : "");
+    if (label[0] && !stix_det_tape_line_text(label, 64, errp,
+                                             "a step label")) {
+        g_free(label);
+        return false;
+    }
+    if (st->kind == STIX_DET_TAPE_RATE || st->kind == STIX_DET_TAPE_OFF) {
+        if (!stix_det_tape_uint(obj, "fpga_det_mask", 0xFFFFFFFFu, &u64,
+                                errp, idx)) {
+            g_free(label);
+            return false;
+        }
+        st->fpga_det_mask = (uint32_t)u64;
+    }
+    if (qdict_get(obj, "pix_mask")) {
+        if (!stix_det_tape_uint(obj, "pix_mask", 0xFFFu, &u64, errp, idx)) {
+            g_free(label);
+            return false;
+        }
+        st->pix_mask = (uint32_t)u64;
+    } else {
+        st->pix_mask = 0xFFFu;
+    }
+    if (st->kind == STIX_DET_TAPE_RATE) {
+        if (!stix_det_tape_uint(obj, "cps", STIX_DET_CPS_MAX, &u64, errp,
+                                idx)) {
+            g_free(label);
+            return false;
+        }
+        st->cps = (uint32_t)u64;
+    }
+    spec = qobject_to(QString, qdict_get(obj, "spec"));
+    if (qdict_haskey(obj, "spec") &&
+        (!spec || strcmp(qstring_get_str(spec), "flat"))) {
+        g_free(label);
+        error_setg(errp, "det-tape-load: step %u: spec values other than "
+                   "\"flat\" are unsupported in this build (S2/S3)", idx);
+        return false;
+    }
+    if (st->kind == STIX_DET_TAPE_REPLAY) {
+        const char *file = qdict_get_try_str(obj, "file");
+        QNum *off = qobject_to(QNum, qdict_get(obj, "offset_ms"));
+
+        if (!d->replay_loaded) {
+            g_free(label);
+            error_setg(errp, "det-tape-load: step %u: a replay step "
+                       "needs a replay table scanned at realize (set "
+                       "det-replay-file at startup)", idx);
+            return false;
+        }
+        if (d->replay_trigger != STIX_DET_REPLAY_TRIGGER_QMP) {
+            g_free(label);
+            error_setg(errp, "det-tape-load: step %u: a replay step "
+                       "needs det-replay-trigger=qmp (the nominal "
+                       "trigger starts the replay at the SetEnable "
+                       "edge regardless of the tape)", idx);
+            return false;
+        }
+        if (file && strcmp(file, d->replay_file)) {
+            g_free(label);
+            error_setg(errp, "det-tape-load: step %u: 'file' must match "
+                       "the realized det-replay-file", idx);
+            return false;
+        }
+        if (off) {
+            int64_t v;
+
+            if (!qnum_get_try_int(off, &v) ||
+                (uint64_t)v != d->replay_offset_ms) {
+                g_free(label);
+                error_setg(errp, "det-tape-load: step %u: 'offset_ms' "
+                           "must match det-replay-offset-ms", idx);
+                return false;
+            }
+        }
+    }
+    /* no unknown fields past the ones parsed */
+    for (e = qdict_first(obj); e; e = qdict_next(obj, e)) {
+        const char *key = qdict_entry_key(e);
+        static const char *const known[] = {
+            "kind", "for_s", "label", "fpga_det_mask", "pix_mask", "cps",
+            "spec", "file", "offset_ms",
+        };
+        size_t k;
+
+        for (k = 0; k < ARRAY_SIZE(known); k++) {
+            if (!strcmp(key, known[k])) {
+                break;
+            }
+        }
+        if (k == ARRAY_SIZE(known)) {
+            g_free(label);
+            error_setg(errp, "det-tape-load: step %u: unknown tape step "
+                       "field '%s'", idx, key);
+            return false;
+        }
+    }
+    if (label[0]) {
+        st->label = g_steal_pointer(&label);
+    } else {
+        g_free(label);
+    }
+    return true;
+}
+
+static void stix_det_tape_load_set(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    StixDetTapeStep steps[STIX_DET_TAPE_MAX_STEPS];
+    g_autofree char *value = NULL;
+    QObject *root;
+    g_autoptr(QDict) top = NULL;
+    QDict *bg = NULL;
+    const char *tape_name;
+    uint64_t u64;
+    double bg_cps = 0;
+    bool loop = false, align = false, adc_mode;
+    size_t len;
+    uint32_t i, n_steps = 0;
+
+    if (!visit_type_str(v, name, &value, errp)) {
+        return;
+    }
+    len = strlen(value);
+    if (len > STIX_DET_TAPE_MAX_BYTES) {
+        error_setg(errp, "det-tape-load: the tape is %zu bytes, past "
+                   "the %u KiB cap", len, STIX_DET_TAPE_MAX_BYTES / 1024u);
+        return;
+    }
+    root = qobject_from_json(value, errp);
+    if (!root) {
+        error_prepend(errp, "det-tape-load: invalid JSON: ");
+        return;
+    }
+    top = qobject_to(QDict, root);
+    if (!top) {
+        qobject_unref(root);
+        error_setg(errp, "det-tape-load: the tape is not a JSON object");
+        return;
+    }
+    if (!stix_det_tape_uint(top, "api", 1, &u64, errp, UINT32_MAX)) {
+        return;
+    }
+    if (u64 != 1) {
+        error_setg(errp, "det-tape-load: \"api\" must be 1");
+        return;
+    }
+    tape_name = qdict_get_try_str(top, "name");
+    if (!tape_name ||
+        !stix_det_tape_line_text(tape_name, 64, errp, "the tape name")) {
+        return;
+    }
+    if (!stix_det_tape_bool(top, "loop", false, &loop, errp, UINT32_MAX) ||
+        !stix_det_tape_bool(top, "align", false, &align, errp,
+                            UINT32_MAX)) {
+        return;
+    }
+    /* C1: a tape's adc_mode overrides the knob while it plays */
+    if (!stix_det_tape_bool(top, "adc_mode", d->adc_mode, &adc_mode, errp,
+                            UINT32_MAX)) {
+        return;
+    }
+    if (qdict_get(top, "background")) {
+        bg = qobject_to(QDict, qdict_get(top, "background"));
+        if (!bg) {
+            error_setg(errp, "det-tape-load: 'background' is not an "
+                       "object");
+            return;
+        }
+        if (qdict_haskey(bg, "fpga_det_mask") ||
+            qdict_haskey(bg, "pix_mask") ||
+            qdict_haskey(bg, "subcol_mask") || qdict_haskey(bg, "for_s")) {
+            error_setg(errp, "det-tape-load: the background is unmasked "
+                       "by definition: no fpga_det_mask/pix_mask/subcol_"
+                       "mask/for_s on it");
+            return;
+        }
+        if (!stix_det_tape_num(bg, "cps", &bg_cps, errp, UINT32_MAX)) {
+            return;
+        }
+        if (bg_cps < 0 || bg_cps > STIX_DET_CPS_MAX) {
+            error_setg(errp, "det-tape-load: background cps %g is "
+                       "outside 0..%u", bg_cps, STIX_DET_CPS_MAX);
+            return;
+        }
+    }
+    if (qdict_haskey(top, "steps")) {
+        QList *list = qobject_to(QList, qdict_get(top, "steps"));
+        const QListEntry *e;
+
+        if (!list) {
+            error_setg(errp, "det-tape-load: 'steps' is not an array");
+            return;
+        }
+        QLIST_FOREACH_ENTRY(list, e) {
+            QDict *so = qobject_to(QDict, qlist_entry_obj(e));
+
+            if (n_steps == STIX_DET_TAPE_MAX_STEPS) {
+                error_setg(errp, "det-tape-load: more than %u steps",
+                           STIX_DET_TAPE_MAX_STEPS);
+                return;
+            }
+            if (!so) {
+                error_setg(errp, "det-tape-load: step %u is not an "
+                           "object", n_steps);
+                return;
+            }
+            if (!stix_det_tape_parse_step(d, so, &steps[n_steps], n_steps,
+                                          errp)) {
+                while (n_steps--) {     /* the parsed labels leak not */
+                    g_free(steps[n_steps].label);
+                }
+                return;
+            }
+            n_steps++;
+        }
+    }
+
+    /* commit: a load while playing stops first */
+    stix_det_tape_stop(d, "det-tape-load");
+    stix_det_tape_clear(d);
+    for (i = 0; i < n_steps; i++) {
+        d->tape_steps[i] = steps[i];
+    }
+    d->tape_n_steps = n_steps;
+    d->tape_name = g_strdup(tape_name);
+    d->tape_loop = loop;
+    d->tape_align = align;
+    d->tape_adc_mode = adc_mode;
+    d->tape_bg_cps = (uint32_t)bg_cps;
+    d->tape_state = STIX_DET_TAPE_READY;
+    /* the status previews the first step */
+    d->tape_step = 0;
+    d->tape_left_ticks = n_steps ?
+                         stix_det_tape_step_ticks(d->tape_steps[0].for_s) : 0;
+    trace_stixdet_tape_load(tape_name, n_steps, loop, align,
+                            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+static void stix_det_tape_play_set(Object *obj, Visitor *v, const char *name,
+                                   void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    bool value;
+
+    if (!visit_type_bool(v, name, &value, errp)) {
+        return;
+    }
+    if (value) {
+        if (d->tape_state == STIX_DET_TAPE_PLAYING) {
+            error_setg(errp, "%s: the tape is already playing", name);
+            return;
+        }
+        if (d->tape_state == STIX_DET_TAPE_IDLE) {
+            error_setg(errp, "%s: no tape loaded (det-tape-load first)",
+                       name);
+            return;
+        }
+        if (d->source != STIX_DET_SOURCE_SYNTHETIC) {
+            error_setg(errp, "%s: rate steps need det-source=synthetic "
+                       "(the source is %s)", name,
+                       stix_det_source_name[d->source]);
+            return;
+        }
+        d->tape_play_req = true;
+    } else {
+        /* accepted also when done/stopped/ready: a no-op stop keeps
+         * drivers simple (det.tape.stop after done reverts nothing) */
+        d->tape_stop_req = true;
+    }
+}
+
+static void stix_det_tape_status_get(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    const StixDetTapeStep *st = d->tape_n_steps ?
+        &d->tape_steps[d->tape_step] : NULL;
+    char *value;
+
+    value = g_strdup_printf("state=%s,name=%s,step=%u/%u,label=%s,"
+                            "step_left_ticks=%u,loop=%s,align=%s",
+                            stix_det_tape_state_name[d->tape_state],
+                            d->tape_name ? d->tape_name : "",
+                            d->tape_n_steps ? d->tape_step + 1 : 0,
+                            d->tape_n_steps,
+                            st && st->label ? st->label : "",
+                            d->tape_left_ticks,
+                            d->tape_loop ? "true" : "false",
+                            d->tape_align ? "true" : "false");
+    visit_type_str(v, name, &value, errp);
+    g_free(value);
+}
+
+/* ---- A1: det-align, the classification report ---- */
+
+static void stix_det_align_get(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    bool value = stix_det_of(obj, opaque)->align;
+
+    visit_type_bool(v, name, &value, errp);
+}
+
+static void stix_det_align_set(Object *obj, Visitor *v, const char *name,
+                               void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    bool value;
+
+    if (!visit_type_bool(v, name, &value, errp)) {
+        return;
+    }
+    d->align = value;
+}
+
+static void stix_det_align_status_get(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    char *value;
+
+    value = g_strdup_printf("mode=%s,rows=%u,fallback=%u,honoured=%u,"
+                            "mismatch_cells=%u,unassigned_cells=%u,"
+                            "calibration=%s",
+                            d->align ? "on" : "off", d->align_rows,
+                            d->align_fallback, d->align_honoured,
+                            d->align_mismatch_cells,
+                            d->align_unassigned_cells,
+                            d->align_has_table ? "dss-linear" : "none");
+    visit_type_str(v, name, &value, errp);
+    g_free(value);
+}
+
+/* ---- C1: det-adc-mode and det-cal-kev-full ---- */
+
+static void stix_det_adc_mode_get(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    bool value = stix_det_of(obj, opaque)->adc_mode;
+
+    visit_type_bool(v, name, &value, errp);
+}
+
+static void stix_det_adc_mode_set(Object *obj, Visitor *v, const char *name,
+                                  void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    bool value;
+
+    if (!visit_type_bool(v, name, &value, errp)) {
+        return;
+    }
+    if (value && !d->adc_mode) {
+        /* the mode turning on arms the map rebuild */
+        d->adc_map_armed = true;
+    }
+    if (!value) {
+        /* off folds nothing: the map is stale until the next rebuild */
+        d->adc_map_valid = false;
+    }
+    d->adc_mode = value;
+}
+
+static void stix_det_adc_cal_get(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    uint32_t value = stix_det_of(obj, opaque)->adc_kev_full;
+
+    visit_type_uint32(v, name, &value, errp);
+}
+
+static void stix_det_adc_cal_set(Object *obj, Visitor *v, const char *name,
+                                 void *opaque, Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    uint32_t value;
+
+    if (!visit_type_uint32(v, name, &value, errp)) {
+        return;
+    }
+    if (value < 1 || value > STIX_DET_N_ADC) {
+        error_setg(errp, "%s: %u keV is outside 1..%u (the full scale "
+                   "maps to adc 4096)", name, value, STIX_DET_N_ADC);
+        return;
+    }
+    if (value != d->adc_kev_full) {
+        /* a calibration change re-arms the map rebuild */
+        d->adc_map_armed = true;
+    }
+    d->adc_kev_full = value;
+}
+
+static void stix_det_adc_status_get(Object *obj, Visitor *v,
+                                    const char *name, void *opaque,
+                                    Error **errp)
+{
+    StixDetState *d = stix_det_of(obj, opaque);
+    bool mode = d->tape_state == STIX_DET_TAPE_PLAYING ?
+                d->tape_adc_mode : d->adc_mode;
+    char *value;
+
+    value = g_strdup_printf("mode=%s,kev_full=%u,base_source=%s,"
+                            "map_rows=%u",
+                            mode ? "on" : "off", d->adc_kev_full,
+                            d->replay_loaded ? "replay" : "zero",
+                            d->adc_map_valid ?
+                            STIX_DET_N_FPGA_DET * STIX_DET_N_PIX_ACC : 0);
+    visit_type_str(v, name, &value, errp);
+    g_free(value);
 }
 
 /* ---- the scene properties (D-Db), on /machine/stixctrl ---- */
@@ -2465,6 +3584,11 @@ void stix_det_instance_init(StixDetState *d)
     d->replay_trigger = STIX_DET_REPLAY_TRIGGER_NOMINAL;
     d->replay_offset_ms = 0;
     d->burst_stop = "none";
+    d->tape_state = STIX_DET_TAPE_IDLE;
+    d->align = false;
+    d->align_rows = STIX_DET_N_FPGA_DET * STIX_DET_N_PIX_ACC;
+    d->adc_mode = false;
+    d->adc_kev_full = 160;      /* the D5 default full scale */
 }
 
 void stix_det_class_init(ObjectClass *klass, size_t det_offset)
@@ -2565,6 +3689,85 @@ void stix_det_class_init(ObjectClass *klass, size_t det_offset)
         "read-only line of the last det-rotb-burst: requested=N,"
         "appended=M,stop=done|ring-full|rotb-disabled|rotb-testmode,"
         "rotb_count=C; requested=0,stop=none before any (runtime)");
+    /* S1: the mix tape */
+    object_class_property_add(klass, "det-tape-load", "str", &str_type_info,
+                              NULL, stix_det_tape_load_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-tape-load",
+        "load a mix tape, write-only JSON: {\"api\": 1, \"name\": <str "
+        "1..64>, \"align\": <bool, default false>, \"adc_mode\": <bool, "
+        "optional, default = det-adc-mode>, \"loop\": <bool, default "
+        "false>, \"background\": {\"cps\": <0..1000000, unmasked>}, "
+        "\"steps\": [<step>, ...]} with at most 64 steps and 64 KiB. A "
+        "step: {\"kind\": \"rate\"|\"replay\"|\"off\", \"for_s\": <s "
+        "0.1..86400>, \"label\": <str, optional>, \"fpga_det_mask\": "
+        "<u32, required for rate/off>, \"pix_mask\": <0..0xFFF, default "
+        "0xFFF>, \"cps\": <0..1000000, rate>}; replay steps add "
+        "\"file\"/\"offset_ms\" matching det-replay-file/"
+        "det-replay-offset-ms and need det-replay-trigger=qmp. Masks "
+        "are fpga_det/pix indexed; a rejected load keeps the previous "
+        "tape (runtime)");
+    object_class_property_add(klass, "det-tape-play", "bool",
+                              &bool_type_info, NULL,
+                              stix_det_tape_play_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-tape-play",
+        "true starts the loaded tape at step 0 on the next 100 ms tick "
+        "(needs det-source=synthetic; the step clock runs only while "
+        "FSM Enable = 1, so SAFE freezes playback); false stops it and "
+        "the scene knobs resume at the next tick, as on done (write-"
+        "only; refused while already playing or with no tape loaded) "
+        "(runtime)");
+    object_class_property_add(klass, "det-tape-status", "str",
+                              &str_type_info, stix_det_tape_status_get,
+                              NULL, NULL, opaque);
+    object_class_property_set_description(klass, "det-tape-status",
+        "read-only line of the tape: state=idle|ready|playing|done|"
+        "stopped,name=...,step=K/N,label=...,step_left_ticks=...,loop="
+        "...,align=...; a device reset stops playback and keeps the "
+        "tape (state ready) (runtime)");
+    /* A1: ELUT alignment */
+    object_class_property_add(klass, "det-align", "bool", &bool_type_info,
+                              stix_det_align_get, stix_det_align_set,
+                              NULL, opaque);
+    object_class_property_set_description(klass, "det-align",
+        "ELUT alignment reporting: the ELUT row classification runs at "
+        "every SetEnable edge and QL swap (not only for replay-dss) and "
+        "det-align-status carries its summary (runtime; survives a "
+        "device reset)");
+    object_class_property_add(klass, "det-align-status", "str",
+                              &str_type_info, stix_det_align_status_get,
+                              NULL, NULL, opaque);
+    object_class_property_set_description(klass, "det-align-status",
+        "read-only line of the last classification: mode=off|on,rows=384"
+        ",fallback=F,honoured=H,mismatch_cells=M,unassigned_cells=U,"
+        "calibration=none|dss-linear. mismatch_cells compares the "
+        "honoured rows against the sim calibration's linear bin (the D-7 "
+        "law from the replay table's baselines); calibration=none means "
+        "the comparison was not computed (no replay table), not that "
+        "there are no mismatches (runtime)");
+    /* C1: the ADC-faithful sky */
+    object_class_property_add(klass, "det-adc-mode", "bool",
+                              &bool_type_info, stix_det_adc_mode_get,
+                              stix_det_adc_mode_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-adc-mode",
+        "ADC-faithful sky: the synthetic sky and the ROTB chunk fill "
+        "draw through the loaded FPGA ELUT via a cached per-row "
+        "bin-mass map (default off; effective while det-source="
+        "synthetic; a tape's adc_mode overrides it while the tape "
+        "plays) (runtime; survives a device reset)");
+    object_class_property_add(klass, "det-cal-kev-full", "uint32",
+                              &uint32_type_info, stix_det_adc_cal_get,
+                              stix_det_adc_cal_set, NULL, opaque);
+    object_class_property_set_description(klass, "det-cal-kev-full",
+        "the keV full scale K of the sim calibration (adc = base + "
+        "gain*keV, gain = (4096 - base)/K; a documented sim anchor, not "
+        "instrument truth); 1..4096, default 160; a change re-arms the "
+        "bin-mass map rebuild (runtime; survives a device reset)");
+    object_class_property_add(klass, "det-adc-status", "str",
+                              &str_type_info, stix_det_adc_status_get,
+                              NULL, NULL, opaque);
+    object_class_property_set_description(klass, "det-adc-status",
+        "read-only line of the ADC sky: mode=off|on,kev_full=...,"
+        "base_source=replay|zero,map_rows=0|384 (runtime)");
 }
 
 bool stix_det_owns(StixDetState *d, hwaddr addr)
@@ -2652,6 +3855,9 @@ bool stix_det_write(StixDetState *d, hwaddr addr, uint32_t value)
 void stix_det_hw_state(StixDetState *d, QDict *det)
 {
     QDict *fsm = qdict_new(), *rep = qdict_new();
+    QDict *tape = qdict_new(), *align = qdict_new(), *adc = qdict_new();
+    const StixDetTapeStep *st = d->tape_n_steps ?
+                                &d->tape_steps[d->tape_step] : NULL;
 
     qdict_put_str(det, "source", stix_det_source_name[d->source]);
     qdict_put_bool(det, "flare", d->flare);
@@ -2671,6 +3877,40 @@ void stix_det_hw_state(StixDetState *d, QDict *det)
     qdict_put_int(rep, "count", d->replay_n_ev);
     qdict_put_int(rep, "duration_ns", stix_det_replay_duration_ns(d));
     qdict_put(det, "replay", rep);
+
+    /* S1: the tape; step is 1-based (the board's "step K of N") */
+    qdict_put_str(tape, "state", stix_det_tape_state_name[d->tape_state]);
+    qdict_put_str(tape, "name", d->tape_name ? d->tape_name : "");
+    qdict_put_int(tape, "step", d->tape_n_steps ? d->tape_step + 1 : 0);
+    qdict_put_int(tape, "n_steps", d->tape_n_steps);
+    qdict_put_str(tape, "label", st && st->label ? st->label : "");
+    qdict_put_str(tape, "kind",
+                  st ? stix_det_tape_kind_name[st->kind] : "");
+    qdict_put_bool(tape, "loop", d->tape_loop);
+    qdict_put_bool(tape, "align", d->tape_align);
+    qdict_put(det, "tape", tape);
+
+    /* A1: the classification report */
+    qdict_put_str(align, "mode", d->align ? "on" : "off");
+    qdict_put_int(align, "rows", d->align_rows);
+    qdict_put_int(align, "fallback", d->align_fallback);
+    qdict_put_int(align, "honoured", d->align_honoured);
+    qdict_put_int(align, "mismatch_cells", d->align_mismatch_cells);
+    qdict_put_int(align, "unassigned_cells", d->align_unassigned_cells);
+    qdict_put_str(align, "calibration",
+                  d->align_has_table ? "dss-linear" : "none");
+    qdict_put(det, "align", align);
+
+    /* C1: the ADC sky */
+    qdict_put_str(adc, "mode",
+                  (d->tape_state == STIX_DET_TAPE_PLAYING ?
+                   d->tape_adc_mode : d->adc_mode) ? "on" : "off");
+    qdict_put_int(adc, "kev_full", d->adc_kev_full);
+    qdict_put_str(adc, "base_source", d->replay_loaded ? "replay" : "zero");
+    qdict_put_int(adc, "map_rows",
+                  d->adc_map_valid ?
+                  STIX_DET_N_FPGA_DET * STIX_DET_N_PIX_ACC : 0);
+    qdict_put(det, "adc", adc);
 }
 
 /*
@@ -2748,6 +3988,16 @@ void stix_det_reset(StixDetState *d)
     d->replay_ended = false;
     d->replay_start_req = false;
     d->replay_class_pending = false;
+    /*
+     * S1: playback stops, the loaded tape is kept (state ready), like
+     * the scene. The align/adc-mode knobs are bench intent and stay.
+     */
+    stix_det_tape_stop(d, "device reset");
+    d->tape_state = d->tape_n_steps ? STIX_DET_TAPE_READY
+                                    : STIX_DET_TAPE_IDLE;
+    d->tape_play_req = false;
+    d->tape_stop_req = false;
+    d->tape_left_ticks = 0;
     stix_det_nom_clear_expo(d);
     stix_det_reseed(d);
 }
@@ -2798,4 +4048,6 @@ void stix_det_unrealize(StixDetState *d)
     d->replay_n_ev = 0;
     d->replay_alloc = 0;
     d->replay_loaded = false;
+    stix_det_tape_clear(d);
+    d->tape_state = STIX_DET_TAPE_IDLE;
 }

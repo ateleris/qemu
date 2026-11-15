@@ -140,6 +140,7 @@ The path prefix is `/api/v1`. Read endpoints:
 | `GET /runs` | the run bundles under `<retention.run_root>/runs` (plus the live dir): run_id, started/ended, verdict, ELF and QEMU identity, icount, length, input and decision counts; newest first, a broken manifest listed with its error |
 | `GET /runs/<run_id>` | one bundle's manifest plus its file sizes, the baseline mark and the retention marker |
 | `GET /runs/<run_id>/manifest` | the raw `manifest.json` bytes |
+| `GET /tapes`, `GET /tapes/<name>` | the saved mix tapes' names and dir, or one tape (the model's schema, validated) |
 
 `GET /` serves the web UI (below).
 
@@ -155,7 +156,7 @@ namespaces and where each comes from:
 | `platform.*` | the controller's own state (power, boot, SpW link, time codes, OBT, keep-alive, time sync) |
 | `idpu.scet.*`, `idpu.watchdog.*`, `idpu.spw.*` | the SpW device's hw-state |
 | `instrument.supplies.*`, `instrument.hk_adc.<ch>`, `instrument.hk_prot.*` | the stixctrl hw-state |
-| `instrument.detector.quarter.<q>`, `instrument.detector.{source, flare, quiet_cps, flare_cps, ql_bank}`, `instrument.detector.fsm.*`, `instrument.detector.replay.*` | the hw-state's `det` section (`quarter.<q>` since PL-2, the rest PL-11c): the scene (`source` zero \| synthetic \| replay-dss, `flare`, `quiet_cps`/`flare_cps` counts/s per fpga_det), the QL bank in use (`ql_bank`), `fsm.enable`, and the replay progress `replay.{state, pos_ns, events, dropped, unsupported, table, count, duration_ns}` (the det-replay-status line's data; `pos_ns` is volatile) |
+| `instrument.detector.quarter.<q>`, `instrument.detector.{source, flare, quiet_cps, flare_cps, ql_bank}`, `instrument.detector.fsm.*`, `instrument.detector.replay.*`, `instrument.detector.tape.*`, `instrument.detector.align.*`, `instrument.detector.adc.*` | the hw-state's `det` section (`quarter.<q>` since PL-2, the rest PL-11c, tape/align/adc the stimulus plan): the scene (`source` zero \| synthetic \| replay-dss, `flare`, `quiet_cps`/`flare_cps` counts/s per fpga_det), the QL bank in use (`ql_bank`), `fsm.enable`, the replay progress `replay.{state, pos_ns, events, dropped, unsupported, table, count, duration_ns}` (the det-replay-status line's data; `pos_ns` is volatile), the mix tape `tape.{state, name, step, n_steps, label, kind, loop, align}` (1-based `step`, moves only at a step boundary), the ELUT-alignment report `align.{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration}`, and the ADC-sky knob `adc.{mode, kev_full, base_source, map_rows}` |
 | `instrument.attenuator.*` | the hw-state's `attenuator` section (PL-11b): `truth.{position, position_ppm, sensor_ab, sensor_bc, motor1_driving, motor2_driving, att_c, moves, last_end, last_end_ns}`, `presented.{sensor_ab, sensor_bc, cmdsta, att_c}`, `fsw_accesses`, `faults_active` |
 | `instrument.memory.*` | the hw-state's `edac` section (PL-11b): per-memory `injected`/`corrected`/`detected` counters for `cache`, `sdram` and `rotbuf`, and `poisons` (the armed upsets as one leaf; a change record per arm and per clear). `instrument.memory.bram` maps no leaf: the bram has no EDAC counters and its upsets arm no poison |
 | `instrument.rotb.{count, full, enable, rd, wr, capacity}` | the hw-state's `rotb` section (PL-11c): the ROTB ring's FIFO state — the block count, the full flag, the rotbConfig ENABLE bit, the read/write block indices, and the rotb-blocks capacity. `count`/`rd`/`wr` are volatile (they move while the detector fills the ring) |
@@ -191,6 +192,12 @@ lists exactly these verbs and arguments.
 | `force.set` | `path`, `value` | force a presented value: `instrument.hk_adc.<ch>` (adc-inject) |
 | `force.clear` | `path` | clear a forcing |
 | `det.rotb.burst` | `frames` | append that many copies of the last live detector frame into the ROTB ring now; the answer is the parsed burst status `{requested, appended, stop, rotb_count}`; 409 while STIX is off or the device refuses (no live chunk since reset, 0 or over the ring's chunk count) |
+| `det.adc.set` | `enabled` | the ADC-faithful sky knob (`det-adc-mode` on `/machine/stixctrl`, default off) + the parsed `det-adc-status` `{mode, kev_full, base_source, map_rows}`; while on, the synthetic sky folds through the loaded FPGA ELUT (the stimulus plan C1/C2) |
+| `det.align.set` | `enabled` | the ELUT-alignment bench knob (`det-align`, default off) + the parsed `det-align-status` `{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration}`; the "the ELUT does not match the DSS" signal is a large `mismatch_cells` (the stimulus plan A1) |
+| `det.tape.save` | `name`, `tape` | save a mix tape as `<name>.json` in the tapes dir (next to the views); the model's schema, validated here first (400 with the step index); a tape without its own `name` field takes the file name |
+| `det.tape.delete` | `name` | delete a saved mix tape (404 unknown) |
+| `det.tape.play` | `name`, `loop` | load a saved tape into the model (`det-tape-load`) and start it on the guest-time tick (`det-tape-play`); `loop` overrides the tape's own; the answer is the parsed `det-tape-status` (`state`, `name`, `step`, `n_steps`, `label`, `step_left_ticks`, `loop`, `align`); 409 while STIX is off or the model refuses |
+| `det.tape.stop` | | stop the playing tape (`det-tape-play false`); the rates revert to the scene knobs; the answer is the parsed `det-tape-status` |
 | `fault.inject` | `id`, `params`, `trigger`, `seed` | a catalogue fault (`GET /faults`); logged as `fault` with its params and seed |
 | `fault.clear` | `id` | clear an active, reversible fault, or disarm an armed one |
 | `tc.platform.send` | `hex` | a raw platform TC space packet: source 14, services 9 and 20 only (403 otherwise); TC(9,129) gets 409 while a sync is pending |
@@ -229,7 +236,7 @@ self-test checks that it matches the table above.
 ```
 {"v":1,"seq":N,"sim_time":<ns>,"boot_id":B,"vclock_ns":<ns|null>,
  "wall_time":"...Z","source":"ctl|qemu|fsw|tm|tc|scn|api",
- "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|uart|log|debug|sample|param",
+ "kind":"cmd|result|state|power|tm|tc|fault|force|expect|mismatch|uart|log|debug|sample|param|stim",
  "path":"<state path or verb>","data":{...}}
 ```
 
@@ -253,6 +260,11 @@ self-test checks that it matches the table above.
 - A `param` record (its own topic) is one FSW parameter's value change
   — `path` `param.<index>`, `data` `{index, name, how: ram|readback,
   old, new}`; see FSW parameters below.
+- A `stim` record (the stimulus plan T4) marks a mix-tape event: one per
+  `instrument.detector.tape.step` change (a step start) and one per
+  `det.tape.play`/`det.tape.stop`, with
+  `data = {name, step, n_steps, label, kind}`. Every step start is a
+  Timeline marker (`stim`).
 - Topics: `cmd` and `result` map to `cmd`; `state` and `power` map to
   `state`; `fault` and `force` map to `fault`; `debug` maps to `log`.
   Every other kind is its own topic.
@@ -282,7 +294,7 @@ over the gate scenarios). The keys most often set:
 | `timesync.autostart` | `"first_tm"` | the automatic TC(9,129) once per boot |
 | `api.bind`, `.container` | `"127.0.0.1"`, false | loopback unless the container of PL-7 |
 | `clock.snapshot_s` | 10.0 | the full state record cadence (0 = off) |
-| `timeline.sample_s`, `.sample_paths`, `.idb_json`, `.views_dir` | -1, the volatile leaves, the GS's IDB JSON, `""` | the truth sampler's period (-1 = by mode: 1 s interactive, off in run mode; 0 = off; else 0.5..60), its globs, the HK decoder's `stix_idb_tlm.json` and the views dir (`""` = `<retention.run_root>/views`) |
+| `timeline.sample_s`, `.sample_paths`, `.idb_json`, `.views_dir`, `.tapes_dir` | -1, the volatile leaves, the GS's IDB JSON, `""`, `""` | the truth sampler's period (-1 = by mode: 1 s interactive, off in run mode; 0 = off; else 0.5..60), its globs, the HK decoder's `stix_idb_tlm.json`, the views dir and the mix tapes dir (`""` = `<retention.run_root>/views` and `<retention.run_root>/tapes`) |
 | `retention.*` | see `config.py` | run mode's run root and cleanup (D-PLl) |
 | `bundle.enabled`, `.hk_codes` | true, `["NIXD0501", "NIXD0023"]` | the run-bundle writer (manifest.json + decisions.jsonl in the run dir) and the HK fields that yield `hk_step` decisions |
 | `faults.catalogue` | `""` (the v1 catalogue) | a JSON catalogue path |
@@ -621,9 +633,10 @@ HK and markers on one bench clock, for the plots and for
   `tm` record without `hk_cal`, e.g. in a run logged before HKC,
   plots raw with `cal: raw`), and
   the marker kinds `fault`, `force`, `tc`, `event`, `mode`, `power`,
-  `scenario` (one
+  `scenario`, `stim` (one
   point per record, the hover text is the label, e.g.
-  `TC(237,18) param 312 = 0`). Bools plot as 0/1, enum strings (link
+  `TC(237,18) param 312 = 0`, `EID 0x0021 mode change`, `tape 'flare
+  on Q1+Q3' step 2/4: flare Q1+Q3`). Bools plot as 0/1, enum strings (link
   up/down, the timesync verdict) as labelled steps. Each series keeps
   at most 200k points (the oldest drop; the catalogue notes
   `truncated_before`); a window with more than `max_points` points is
@@ -741,6 +754,42 @@ stdlib only — the controller image has no binutils):
   unsupported form (never silently wrong names). `--view-run` replays
   the run's `param` records onto the run's own ELF (its
   `controller.start` record carries the path and the digest).
+
+## Tapes (the detector mix tape, stimulus plan T3–T5)
+
+The Detectors tab's Stimulus sub-view drives per-detector and per-pixel
+rate stimulus through JSON "mix tapes" the model plays on its 100 ms
+guest-time tick (the tape engine and the step semantics are the model's,
+`2026-11-15-stimulus-plan.md` stage S1; SAFE or a pause freezes
+playback, the scene knobs resume on stop/done).
+
+- **Files**: `[timeline] tapes_dir` (default
+  `<retention.run_root>/tapes`, next to the views dir, outside every
+  run dir), one `<name>.json` per tape. A name is 1..64 of
+  `A-Za-z0-9._-` not starting with a dot (the views' rule), checked
+  before any file access. The file is the model's schema: `{api: 1,
+  name, align, adc_mode, loop, background, steps}` with at most 64
+  steps and 64 KiB; steps are `{kind: rate|replay|off|single, for_s,
+  label?, fpga_det_mask, pix_mask, cps, ...}`. Masks are `fpga_det`-
+  and `pix`-indexed (Q1–Q4 are `fpga_det` 0-7/8-15/16-23/24-31, so
+  Q1+Q3 is `0x00FF00FF`); the background layer is unmasked — it fills
+  every (fpga_det, pix) pair a step does not.
+- **Validation**: `det.tape.save` validates the model's schema before
+  any QMP (a bad tape is a 400 naming the step index); the model stays
+  the authority at `det-tape-load`. Detector numbers here and in the
+  board are DSS (`fpga_det`); the TM's `subcol` numbering is the
+  FSW-sourced table (`elut-upload.py`'s `SUBCOL_FROM_FPGA_DET`, pinned
+  per language by the self-test, `tapes_numbering`).
+- **Play**: `det.tape.play {name, loop}` reads the file, writes
+  `det-tape-load` then `det-tape-play` on `/machine/stixctrl`, and
+  answers the parsed `det-tape-status`; `det.tape.stop {}` plays false.
+  The hw-state's `det.tape` section maps to the
+  `instrument.detector.tape.*` leaves (1-based `step`), the sampler
+  samples them, and every step start is one `stim` record — a Timeline
+  marker with the hover text `tape '<name>' step <k>/<N>: <label>`.
+  `det.align.set {enabled}` (A1) and `det.adc.set {enabled}` (C2) are
+  the bench knobs next to the tape panel; their reports map to
+  `instrument.detector.align.*` and `.adc.*`.
 
 ## Security
 
@@ -897,17 +946,24 @@ is the URL hash, default `#overview`): Overview, Platform, IDPU & FSW,
 Detectors, Faults & forcings, Scenarios, Logs, State, Runs, Setup,
 Timeline. Overview shows a health word per subsystem (power, link,
 mode, active faults, the ROTB fill) and the last TM(5,x) events.
-Detectors shows the ROTB fill as a bar, the `instrument.detector.*`
-and `instrument.rotb.*` leaves as a state table, and the burst
-control. The Runs board (S1) lists the run bundles from `GET /runs`
-every 5 s while visible, with a case-insensitive filter over name, ELF,
-QEMU and verdict, the columns bundle (name, live/open badges, baseline
-mark), recorded, FSW ELF (name + the first 8 hex of its sha256), QEMU
-(describe, "+ dirty"), icount, length and tags (verdict, scenario,
-error), a baseline and an open action per row (open serves the bundle
-read-only and the page opens it in a new tab) and one header-level
-close-viewer button while a viewer is open; a row with an error shows
-the error instead of actions. Setup is read-only:
+Detectors has the Status/Stimulus sub-view (stimulus plan T5): Status
+is the ROTB fill as a bar, the `instrument.detector.*` and
+`instrument.rotb.*` leaves as a state table and the burst control;
+Stimulus is the board — target chips (All 32, Q1–Q4, pick on the map;
+the mockup's DG1–DG4 are dropped, decision D2), the pixel select, the
+rate step (Send now / Add to tape), the Spectrum / Single-events /
+DSS-sequence controls rendered disabled (wired in S2/S3), the mix tape
+panel (saved tapes, loop, play/stop, the background and step rows with
+widths proportional to `for_s`, the step table with move up/down/remove)
+and the align + ADC-sky box. The Runs board (S1) lists the run bundles
+from `GET /runs` every 5 s while visible, with a case-insensitive filter
+over name, ELF, QEMU and verdict, the columns bundle (name, live/open
+badges, baseline mark), recorded, FSW ELF (name + the first 8 hex of its
+sha256), QEMU (describe, "+ dirty"), icount, length and tags (verdict,
+scenario, error), a baseline and an open action per row (open serves the
+bundle read-only and the page opens it in a new tab) and one
+header-level close-viewer button while a viewer is open; a row with an
+error shows the error instead of actions. Setup is read-only:
 the launch configuration from `status()["setup"]` (`binary`, `elf`,
 `elf_sha256`, `icount_shift`, `pace`, `memory`, `timecode_source`,
 `obt_continuity`, `on_guest_reset`, `sample_s`) in plain words, the
