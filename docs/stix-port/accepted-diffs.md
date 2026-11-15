@@ -6606,5 +6606,13 @@ move to a pix with R3 = 63. `--single` combines with none of `--flare`,
 `--tape`, `--no-rotb`, `--spectrum`; run-dir suffixes `-single` /
 `-singleneg`; `--dry-run --single` prints the QEMU and probe lines.
 
-**Gate record:** pending the first live run — both legs' measured
-byte and `eacc_events` land here.
+**Gate record** (sgl1 2026-11-15, the first live run): positive, the
+subcol 19 ebin 2 byte is 0x3F (exactly S0 of 1000; the only other
+non-zero ebin-2 byte outside subcols 18-20 is subcol 1's 0x01), the
+burst chunk's `eacc_events` = 1139 (the 1000 + ~140 of the 2 cps
+background), the status `dropped=0`. Negative (pix 1), the status
+reads `dropped=1000`, the trace still sums 1000 (`ebin -1`), the byte is
+0x00 and the burst chunk's `eacc_events` = 141 (the background alone):
+exactly `single-byte` and `single-chunk` fail. sgl1's negative first
+failed `single-trace` too (its pattern still named pix 0); fixed, then
+re-gated in sgl2.
