@@ -16,6 +16,7 @@ import time
 
 from . import faults as faults_mod
 from . import flashlib
+from . import fswmode as fswmode_mod
 from . import idb as idb_mod
 from . import params as params_mod
 from . import tcbuild
@@ -83,8 +84,12 @@ class Platform:
         self.faults = faults_mod.Faults(
             faults_mod.load(cfg["faults"]["catalogue"] or None),
             self.log, self.clock, self._fault_actions())
+        # U2: the FSW operating mode leaf (fsw.mode), from the same TM
+        # listeners as keepalive/timesync/params
+        self.fsw_mode = fswmode_mod.FswMode(ctl.state, self.clock,
+                                            ctl.state_platform)
         self.relay.listeners += [self.keepalive.on_tm, self.timesync.on_tm,
-                                 self.params.on_tm]
+                                 self.params.on_tm, self.fsw_mode.on_tm]
         ctl.trace_filters.append(self.keepalive.trace_filter)
         self.power.hooks.append(self._on_power)
 
@@ -230,14 +235,17 @@ class Platform:
             self.faults.reapply("warm guest reset")
             self.keepalive.on_boot()
             self.timesync.on_boot()
+            self.fsw_mode.reset()       # a new boot_id
         elif event == "boot":
             self.relay.drop_held("boot")
             self.keepalive.on_boot()
             self.timesync.on_boot()
+            self.fsw_mode.reset()
         elif event == "off":
             self.relay.drop_held("off")
             self.keepalive.on_off()
             self.timesync.on_off()
+            self.fsw_mode.reset()
 
     # -- verbs ----------------------------------------------------------------
     def register(self, d):

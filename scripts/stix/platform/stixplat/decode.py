@@ -28,6 +28,19 @@ EIDS = {
 TIMESYNC_FIDS = {48034: "sync already in progress",
                  48035: "no time code within 2 s",
                  48041: "fine != 0 or coarse = 0"}
+# the FSW operating mode (IDB text calibration CIXT0023TM) and the
+# EID 0x0021 mode-change reasons (CIXT0024TM)
+MODE_NAMES = {0: "LIKELY_BOOT", 1: "BOOT", 2: "SAFE", 3: "MAINTENANCE",
+              4: "CONFIGURATION", 5: "NOMINAL"}
+REASON_NAMES = {0: "TC_TRANSITION", 1: "AUTO_NOMINAL", 2: "AUTO_FAILURE"}
+
+
+def mode_name(n):
+    return MODE_NAMES.get(n, "MODE_%d" % n)
+
+
+def reason_name(n):
+    return REASON_NAMES.get(n, "REASON_%d" % n)
 
 
 def decode(unit):
@@ -54,6 +67,13 @@ def decode(unit):
         d["eid"] = struct.unpack(">H", app[:2])[0]
         d["eid_name"] = EIDS.get(d["eid"])
         d["params"] = app[2:].hex()
+        if d["eid"] == 0x21 and len(app) >= 5:
+            # the mode change's (previous, actual, reason) bytes
+            prev, act, why = app[2], app[3], app[4]
+            d["mode_change"] = {"from": prev, "to": act, "reason": why,
+                                "from_name": mode_name(prev),
+                                "to_name": mode_name(act),
+                                "reason_name": reason_name(why)}
     elif d["type"] == 3 and d["subtype"] == 25 and len(app) >= 1:
         d["sid"] = app[0]
         if d["apid"] == APID_HK and d["sid"] in (1, 2) and len(app) >= 2:
@@ -85,4 +105,8 @@ def describe(d):
         s += " FID %d" % d["fid"]
     if "mode" in d:
         s += " SID %d mode %d" % (d["sid"], d["mode"])
+    if "mode_change" in d:
+        s += " mode %d->%d (%s)" % (d["mode_change"]["from"],
+                                    d["mode_change"]["to"],
+                                    d["mode_change"]["reason_name"])
     return s

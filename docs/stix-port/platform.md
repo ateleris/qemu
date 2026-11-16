@@ -162,6 +162,7 @@ namespaces and where each comes from:
 | Namespace | From |
 |---|---|
 | `platform.*` | the controller's own state (power, boot, SpW link, time codes, OBT, keep-alive, time sync) |
+| `fsw.mode` | the FSW operating mode (U2), set from the TM the relay sees: the TM(5,1) EID 0x0021 mode change (`source: "event"`, with `reason`) and the TM(3,25) SID 1/2 mode nibble (`source: "hk"`, decode.py's `app[1] & 0x0F`). Truth is `{value, name, source, reason, obt, t}`: `obt` the packet's own CUC, `t` the bench time. A sample replaces the leaf only when its OBT is >= the leaf's OBT (an HK sampled before a mode change but delivered after its event does not revert it); with either OBT missing, arrival order. Null at power-off and at a new boot (a boot_id change) |
 | `idpu.scet.*`, `idpu.watchdog.*`, `idpu.spw.*` | the SpW device's hw-state |
 | `instrument.supplies.*`, `instrument.hk_adc.<ch>`, `instrument.hk_prot.*` | the stixctrl hw-state |
 | `instrument.detector.quarter.<q>`, `instrument.detector.{source, flare, quiet_cps, flare_cps, ql_bank}`, `instrument.detector.fsm.*`, `instrument.detector.replay.*`, `instrument.detector.tape.*`, `instrument.detector.align.*`, `instrument.detector.adc.*` | the hw-state's `det` section (`quarter.<q>` since PL-2, the rest PL-11c, tape/align/adc the stimulus plan): the scene (`source` zero \| synthetic \| replay-dss, `flare`, `quiet_cps`/`flare_cps` counts/s per fpga_det), the QL bank in use (`ql_bank`), `fsm.enable`, the replay progress `replay.{state, pos_ns, events, dropped, unsupported, table, count, duration_ns}` (the det-replay-status line's data; `pos_ns` is volatile), the mix tape `tape.{state, name, step, n_steps, label, kind, loop, align, spec, dropped}` (1-based `step`, moves only at a step boundary; `spec` the running step's spectrum text, e.g. `line_kev=62 align`, S2; `dropped` the running play's pix-gate drop count — it moves while a single step plays, so it is volatile, S3), the ELUT-alignment report `align.{mode, rows, fallback, honoured, mismatch_cells, unassigned_cells, calibration, preimage_miss}` (`preimage_miss`: the running aligned keV step's dropped (pair, ebin) count, S2), and the ADC-sky knob `adc.{mode, kev_full, base_source, map_rows}` |
@@ -1192,9 +1193,13 @@ no CDN. It is only an API client:
   log and UART tail: first
   `GET /log` (the last 2000 records), then the SSE stream from that seq.
   The header chips are power, boot, sim, OBT, SpW, time codes,
-  keep-alive, time sync, TM, scenario and `controller <mode>` (the
+  keep-alive, time sync, TM, scenario, `controller <mode>` (the
   controller's interactive/run/view mode, so it is not mistaken for the
-  FSW's mode); without `status.platform` (a view-run) the platform
+  FSW's mode) and `FSW <name>` (U2: the `fsw.mode` state leaf's name,
+  "FSW –" before the first mode TM, after a reset and always in a
+  view-run; the tooltip says the source `event`/`hk`, the age in
+  seconds and, for events, the change reason); without
+  `status.platform` (a view-run) the platform
   chips read "–".
   So a reload loses nothing, and nothing lives only in the page.
 

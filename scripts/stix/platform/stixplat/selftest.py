@@ -29,6 +29,7 @@ from . import compare as compare_mod
 from . import config as config_mod
 from . import decode
 from . import faults as faults_mod
+from . import fswmode as fswmode_mod
 from . import idb as idb_mod
 from . import keepalive as keepalive_mod
 from . import params as params_mod
@@ -930,6 +931,18 @@ def t_decode(env):
           not d["unsynced"], "heartbeat: %r" % d)
     d = decode.decode(ev)
     check(d["eid"] == 0x142E and "30 s" in d["eid_name"], "event %r" % d)
+    # U2: the 0x0021 mode change's (previous, actual, reason) bytes
+    mc = decode.decode(_tm_unit(0x5A7, 5, 1, bytes.fromhex("0021040500")))
+    check(mc["mode_change"] == {"from": 4, "to": 5, "reason": 0,
+                                "from_name": "CONFIGURATION", "to_name": "NOMINAL",
+                                "reason_name": "TC_TRANSITION"},
+          "the mode change decode: %r" % mc)
+    check("mode 4->5 (TC_TRANSITION)" in decode.describe(mc),
+          "the mode change text: %s" % decode.describe(mc))
+    check(decode.mode_name(5) == "NOMINAL" and
+          decode.mode_name(9) == "MODE_9", "mode_name")
+    check(decode.reason_name(1) == "AUTO_NOMINAL" and
+          decode.reason_name(7) == "REASON_7", "reason_name")
     sid2 = bytes.fromhex("490200000da4c001000a1003190e00000000000002"
                          "15")
     sid2 = sid2[:8] + (len(sid2) - 11).to_bytes(2, "big") + sid2[10:]
@@ -1806,6 +1819,106 @@ def t_platform_leaves(env):
         check(ctl.state.get("platform.timesync.verdict") is not None,
               "the verdict leaf exists")
     finally:
+        ctl.shutdown()
+
+
+def t_fsw_mode(env):
+    """U2: the fsw.mode leaf: the 0x0021 event and the HK nibble set it,
+    a sample only replaces the leaf at a >= packet OBT (an older HK
+    never reverts an event, missing OBTs go by arrival order), and
+    power-off and a new boot reset it to null."""
+    st = state_mod.StateTree()
+    t = [0.0]
+    clk = SimClock(mono_fn=lambda: t[0])
+    clk.process_started()
+    clk.resumed()
+    clk.sample(0)
+    changes = []
+    fm = fswmode_mod.FswMode(st, clk, lambda v: changes.append(
+        st.set_platform(v, clk.now()[0])))
+    ev = {"value": 5, "name": "NOMINAL", "source": "event",
+          "reason": "TC_TRANSITION", "obt": 100 << 16}
+    check(fm.update(ev) and
+          st.get("fsw.mode")["truth"] == dict(ev, t=0),
+          "the event sets the leaf: %r" % st.get("fsw.mode")["truth"])
+    clk.sample(NS)
+    hk = {"value": 4, "name": "CONFIGURATION", "source": "hk",
+          "obt": 99 << 16}
+    check(not fm.update(hk) and
+          st.get("fsw.mode")["truth"]["name"] == "NOMINAL",
+          "an HK sampled before the change but delivered after it does "
+          "not revert the leaf")
+    hk["obt"] = 101 << 16
+    check(fm.update(hk) and
+          st.get("fsw.mode")["truth"] == dict(hk, t=NS) and
+          "reason" not in st.get("fsw.mode")["truth"],
+          "a newer HK replaces the event: %r" % st.get("fsw.mode")["truth"])
+    # the OBT steps backwards (a time sync, an obt.jump): within the
+    # window the older sample is still dropped, past it arrival order wins
+    back = {"value": 5, "name": "NOMINAL", "source": "hk", "obt": 10 << 16}
+    clk.sample(3 * NS)
+    check(not fm.update(back), "an older OBT within the 5 s window: dropped")
+    clk.sample(7 * NS)
+    check(fm.update(back) and
+          st.get("fsw.mode")["truth"]["obt"] == 10 << 16,
+          "an OBT that stepped back cannot freeze the leaf past the window")
+    # a missing OBT on either side: arrival order
+    no_obt = {"value": 2, "name": "SAFE", "source": "hk", "obt": None}
+    check(fm.update(no_obt) and
+          st.get("fsw.mode")["truth"]["name"] == "SAFE",
+          "the sample's OBT is missing: arrival order, it replaces")
+    ev2 = {"value": 5, "name": "NOMINAL", "source": "event",
+           "reason": "AUTO_NOMINAL", "obt": None}
+    check(fm.update(ev2) and
+          st.get("fsw.mode")["truth"]["reason"] == "AUTO_NOMINAL",
+          "no OBT either side now: arrival order again")
+    old = {"value": 1, "name": "BOOT", "source": "hk", "obt": 50 << 16}
+    check(fm.update(old) and
+          st.get("fsw.mode")["truth"]["name"] == "BOOT",
+          "the leaf's OBT is missing: arrival order, not the rule")
+    fm.reset()
+    check(st.get("fsw.mode")["truth"] is None, "reset to null")
+    n = len(changes)
+    fm.reset()
+    check(len(changes) == n, "a second reset changes nothing")
+
+    # through the controller: the relay listener feeds the leaf, a boot
+    # and the power-off hook reset it
+    ctl = env.controller()
+    snd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ctl.command("platform.power.on", {})
+        unit = _tm_unit(0x5A7, 5, 1, bytes.fromhex("0021040500"),
+                        cuc=100 << 16)
+        dest = ("127.0.0.1", ctl.cfg["ports"]["qemu_tm"])
+        snd.sendto(unit, dest)
+        wait_for(lambda: (ctl.state.get("fsw.mode") or {}).get("truth"),
+                 what="the fsw.mode leaf")
+        lf = ctl.state.get("fsw.mode")["truth"]
+        check(lf["source"] == "event" and lf["name"] == "NOMINAL" and
+              lf["reason"] == "TC_TRANSITION" and lf["obt"] == 100 << 16,
+              "the event's leaf: %r" % lf)
+        rec = [r for r in ctl.log.since(0) if r.kind == "state" and
+               r.obj["path"] == "fsw.mode"][-1]
+        check(rec.obj["data"]["new"]["truth"]["name"] == "NOMINAL",
+              "the change record: %r" % rec.obj["data"])
+        ctl.command("platform.power.boot", {})
+        check(ctl.state.get("fsw.mode")["truth"] is None,
+              "a boot resets the leaf")
+        snd.sendto(unit, dest)          # the event again after the boot
+        wait_for(lambda: (ctl.state.get("fsw.mode") or {}).get("truth"),
+                 what="the leaf after the boot")
+        snd.sendto(_tm_unit(0x5A4, 3, 25, bytes((1, 4)), cuc=99 << 16),
+                   dest)
+        wait_for(lambda: sum(r.kind == "tm" for r in ctl.log.since(0)) == 3,
+                 what="the third tm record")
+        check(ctl.state.get("fsw.mode")["truth"]["source"] == "event",
+              "the older HK did not revert the event")
+        ctl.command("platform.power.off", {})
+        check(ctl.state.get("fsw.mode")["truth"] is None,
+              "power-off resets the leaf")
+    finally:
+        snd.close()
         ctl.shutdown()
 
 
@@ -3864,6 +3977,9 @@ UI_VERB_NOTE_IDS = {"verb-note-platform", "verb-note-idpu",
                     "verb-note-detectors", "verb-note-faults",
                     "verb-note-scenarios", "verb-note-runs",
                     "verb-note-setup"}
+# U2: the header chips' ids (the value <b> of each chip)
+UI_HEADER_IDS = {"s-power", "s-boot", "s-sim", "s-obt", "s-link", "s-tc",
+                 "s-ka", "s-ts", "s-tm", "s-scn", "s-mode", "s-fsw"}
 # run bundles (S1): the board's own verbs (built per row in JS, so the
 # parser only sees the static run.close button); S3 adds run.compare
 UI_RUNS_VERBS = {"run.baseline", "run.open", "run.close", "run.compare"}
@@ -4127,6 +4243,13 @@ def t_ui_page(env):
           "the loadState poll is skipped in view mode")
     check('controller <b id="s-mode">' in page,
           "the header chip says controller <mode>")
+    # U2: the FSW mode chip next to it, from the fsw.mode state leaf
+    check(UI_HEADER_IDS <= ids, "header chip ids missing %r"
+          % sorted(UI_HEADER_IDS - ids))
+    check('FSW <b id="s-fsw">–</b>' in page,
+          "the header chip says FSW <name>")
+    check('if (viewMode) chip("s-fsw"' in js and 'tree.fsw' in js,
+          "the FSW chip reads the state leaf, – in view mode")
 
 
 def t_ui_tabs(env):
@@ -4915,6 +5038,15 @@ def t_idb_real_json(env):
     check(all(f.raw == (f.cal is None) and
               f.cal in (None, "poly", "interp", "text")
               for f in f1 + f2), "raw iff no usable calibration")
+    # U2: the decoder's mode names are the IDB's CIXT0023TM texts
+    c23 = (raw.get("calibrations") or {}).get("CIXT0023TM")
+    if isinstance(c23, dict) and isinstance(c23.get("text_ranges"), list):
+        got = {r[0]: r[2] for r in c23["text_ranges"]
+               if isinstance(r, list) and len(r) == 3}
+        check(all(got.get(n) == m for n, m in decode.MODE_NAMES.items()),
+              "CIXT0023TM matches MODE_NAMES: %r" % got)
+    else:
+        print("     (no CIXT0023TM in the IDB JSON)")
     app = bytes(random.randrange(256) for _ in range(96))
     check(idb.decode_hk(1, app)["NIXD0023"] == app[1] & 0x0F,
           "the real mode field is the minimal decoder's")
@@ -8553,6 +8685,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("scenario: review fixes", t_scn_review),
          ("run mode: review fixes", t_runmode_review),
          ("platform state leaves", t_platform_leaves),
+         ("FSW mode leaf (U2)", t_fsw_mode),
          ("run mode", t_runmode),
          ("TM relay + TC proxy", t_relay),
          ("hold queue (SF5)", t_hold_queue),

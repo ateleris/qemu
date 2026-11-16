@@ -184,6 +184,7 @@ tr.cmp-first td { font-weight: 600; }
   <span class="chip">TM <b id="s-tm">?</b></span>
   <span class="chip">scenario <b id="s-scn">none</b></span>
   <span class="chip">controller <b id="s-mode">?</b></span>
+  <span class="chip">FSW <b id="s-fsw">–</b></span>
   <span id="hdr-run" class="ctl">
     <button data-verb="sim.pause">pause</button>
     <button data-verb="sim.resume" hidden>resume</button>
@@ -1411,6 +1412,7 @@ async function refresh() {
   text($("ts-last"), ts.last ? "last: " + JSON.stringify(ts.last) : "");
   chip("s-tm", p.tm_count == null ? "–" : p.tm_count, "");
   chip("s-mode", st.mode, "");
+  if (viewMode) chip("s-fsw", "–", "");   // a view-run has no state tree
   const scn = st.scenario;
   chip("s-scn", scn ? scn.name + "/" + scn.variant + " " + scn.phase +
        (scn.verdict ? " " + scn.verdict : "") : "none",
@@ -1723,6 +1725,14 @@ async function loadState() {
   stateRows = leaves(tree, "", []);
   renderState();
   renderDet();
+  // the FSW mode chip (U2): the state tree's fsw.mode leaf; "–" while
+  // the leaf is absent or reset (null)
+  const fm = tree.fsw && tree.fsw.mode ? tree.fsw.mode.truth : null;
+  chip("s-fsw", fm ? fm.name : "–", "");
+  $("s-fsw").title = fm ?
+    "source " + fm.source + ", " +
+    Math.max(0, Math.round(((TL.now || 0) - fm.t) / 1e9)) + " s ago" +
+    (fm.reason ? ", " + fm.reason : "") : "";
   const sel = $("force-path");
   const want = stateRows.map(([p]) => p).filter((p) => /^instrument\.hk_adc\.\d+$/.test(p));
   const have = [...sel.options].map((o) => o.value);
