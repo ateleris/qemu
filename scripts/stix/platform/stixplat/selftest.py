@@ -7665,7 +7665,7 @@ def t_compare_core(env):
     check(r["summary"]["verdict"] == "same" and
           all(x["result"] == "same" for x in r["rows"]),
           "identical bundles: %r" % r["summary"])
-    check(r["summary"]["counts"] == {"pairs": 3} and
+    check(r["summary"]["counts"]["pairs"] == 3 and
           r["summary"]["align"] == {"t_a": 5 * NS, "t_b": 5 * NS} and
           r["summary"]["first_divergence"] is None and
           not any(x["first"] for x in r["rows"]),
@@ -7755,7 +7755,7 @@ def t_compare_core(env):
         _cmp_ev(2, int(5.15 * NS), 0x21)])
     r = _cmp_ok(da, db)
     check(r["summary"]["verdict"] == "same" and
-          r["summary"]["counts"] == {"pairs": 2} and
+          r["summary"]["counts"]["pairs"] == 2 and
           all(x["result"] == "same" for x in _p1(r)),
           "the swapped near-simultaneous pair: %r" % r["summary"])
     # R1: a repeated ack key pairs in order (details would betray a
@@ -7832,7 +7832,7 @@ def t_compare_core(env):
     db = _cmp_bundle(env, "cmp-rd-b", None, records=recs)
     r = _cmp_ok(da, db)
     check(r["summary"]["verdict"] == "same" and
-          r["summary"]["counts"] == {"pairs": 3},
+          r["summary"]["counts"]["pairs"] == 3,
           "the re-derived list equals the writer's: %r" % r["summary"])
     with open(os.path.join(db, bundle_mod.MANIFEST)) as f:
         mb = json.load(f)
@@ -7860,13 +7860,13 @@ def t_compare_core(env):
     dd = _cmp_bundle(env, "cmp-two-d", produced2)
     r = _cmp_ok(dd, dc)
     check(r["summary"]["verdict"] == "same" and
-          r["summary"]["counts"] == {"pairs": 3},
+          r["summary"]["counts"]["pairs"] == 3,
           "the scoped re-derive compares same: %r" % r["summary"])
     # no manifest at all: the whole log is the slice, verdict unchanged
     dl = _cmp_bundle(env, "cmp-logonly", None, mf=False, records=recs)
     r = _cmp_ok(da, dl)
     check(r["summary"]["verdict"] == "same" and
-          r["summary"]["counts"] == {"pairs": 3},
+          r["summary"]["counts"]["pairs"] == 3,
           "the whole log is the slice: %r" % r["summary"])
     # the refusals name the side
     dr = _cmp_bundle(env, "cmp-rot", None, mf={"log_rotations": 9},
@@ -7978,7 +7978,7 @@ def t_compare_verb(env):
         st, _, body = post(a_id, b_id)
         res = json.loads(body)["result"]
         check(st == 200 and res["summary"]["verdict"] == "same" and
-              res["summary"]["counts"] == {"pairs": 2} and
+              res["summary"]["counts"]["pairs"] == 2 and
               len(res["rows"]) == 3 and res["artifact"].startswith(cmpdir),
               "the compare: %d %r" % (st, res))
         with open(res["artifact"]) as f:
@@ -8233,6 +8233,15 @@ def t_compare_series_rows(env):
     check(info["first_series_divergence"] ==
           {"check": ga, "index": 3, "t_a": 4, "v_a": 13, "v_b": 20},
           "the first divergence: %r" % info)
+    # wired into compare(): log-only dirs, no decisions -> the series
+    # row decides the verdict and first_series_divergence is summarised
+    r = compare_mod.compare(a, b, {"series": [ga]})
+    check(r["summary"]["verdict"] == "differs" and
+          [x["check"] for x in r["rows"]].count(ga) == 1 and
+          r["summary"]["first_series_divergence"]["index"] == 3 and
+          r["summary"]["counts"]["series"] == 1 and
+          "series_error" not in r["summary"],
+          "compare() carries pass 2: %r" % r["summary"])
     # counts within the slack -> same; beyond it -> differs, no index
     b = side("srows-cnt7", values(1, [10, 11, 12, 13, 14, 15, 16]))
     rows, info = rows_of(a, b, [ga])

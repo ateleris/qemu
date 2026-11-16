@@ -15,6 +15,7 @@ import copy
 from . import bundle as bundle_mod
 from . import config as config_mod
 from . import replay as replay_mod
+from . import runseries as runseries_mod
 from .dispatch import VerbError
 
 # tol=None: the [compare] defaults (the series ids are pass 2's, read
@@ -250,8 +251,8 @@ def compare(baseline_dir, other_dir, tol=None):
     dict; None uses the defaults. Both dirs are read-only. Raises
     CompareError (the message names the side): a dir with neither
     manifest nor log, a slice rotated away with no decisions to fall
-    back on, a manifest still open. Pass 2 (the series numbers) comes
-    with C3."""
+    back on, a manifest still open. Pass 2 (the series numbers) is
+    runseries.series_rows over tol["series"]."""
     t = dict(DEFAULT_TOL)
     if tol:
         t.update(tol)
@@ -272,14 +273,36 @@ def compare(baseline_dir, other_dir, tol=None):
         except CompareError as e:
             raise CompareError("%s: %s" % (side, e))
     rows, fd, align, pairs = _decisions(sides[0], sides[1], t)
+    # pass 2 (the series numbers, runseries.series_rows): a side with
+    # decisions but no readable log has no series; pass 2 is then
+    # left out and the summary says why (pass 1 still stands)
+    counts = {"pairs": pairs, "series": 0, "series_skipped": 0}
+    fsd, series_error = None, None
+    logs = [_has_log(baseline_dir), _has_log(other_dir)]
+    try:
+        if not any(logs):       # decisions-only bundles: nothing to do
+            raise replay_mod.ReplayError(None)
+        srows, info = runseries_mod.series_rows(baseline_dir, other_dir,
+                                                t)
+    except replay_mod.ReplayError as e:
+        if any(logs):
+            series_error = str(e)
+    else:
+        rows = rows + srows
+        counts["series"] = len(info["series"])
+        counts["series_skipped"] = info["series_skipped"]
+        fsd = info["first_series_divergence"]
     verdict = "same"
     for row in rows:                    # only-* counts too (owner 6)
         if row["result"] != "same":
             verdict = "differs"
             break
-    return {"summary": {"verdict": verdict, "first_divergence": fd,
-                        "align": align, "counts": {"pairs": pairs}},
-            "rows": rows}
+    summary = {"verdict": verdict, "first_divergence": fd,
+               "first_series_divergence": fsd, "align": align,
+               "counts": counts}
+    if series_error is not None:
+        summary["series_error"] = series_error
+    return {"summary": summary, "rows": rows}
 
 
 # -- the surfaces (C2) -------------------------------------------------------
