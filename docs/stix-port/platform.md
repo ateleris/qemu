@@ -147,6 +147,7 @@ The path prefix is `/api/v1`. Read endpoints:
 | `GET /runs` | the run bundles under `<retention.run_root>/runs` (plus the live dir): run_id, started/ended, verdict, ELF and QEMU identity, icount, length, input and decision counts; newest first, a broken manifest listed with its error |
 | `GET /runs/<run_id>` | one bundle's manifest plus its file sizes, the baseline mark and the retention marker |
 | `GET /runs/<run_id>/manifest` | the raw `manifest.json` bytes |
+| `GET /runs/<run_id>/series` | a finished bundle's series, same query and body as `GET /series` (S3; read-only, the Timeline overlay) |
 | `GET /tapes`, `GET /tapes/<name>` | the saved mix tapes' names and dir, or one tape (the model's schema, validated) |
 
 `GET /` serves the web UI (below).
@@ -614,7 +615,9 @@ bundle read-only in-process — exactly the `--view-run` objects
 verb is refused like any other non-`view.*` verb. `GET /runs`,
 `GET /runs/<run_id>` (also the live dir, `live: true`) and
 `GET /runs/<run_id>/manifest` feed the Runs board in the web UI
-(filter, per-row baseline/open, a header close-viewer button).
+(filter, per-row baseline/open, a header close-viewer button). Once a
+baseline is marked, each other finished row gets a `compare` button
+(S3, below). The buttons are hidden while either side is still open.
 
 ### Replaying a bundle (S2)
 
@@ -716,6 +719,90 @@ the same 7 decisions in the same (kind, key) order — events 0x0022,
 |sim_time delta| of 0.44 s; the fault seed and the TC bytes re-fed
 identically. The plan's ±2 s is thus measured at 0.44 s for this run
 (one run, not a bound).
+
+### Comparing two runs (S3)
+
+`run.compare {a, b}` (CLI `--compare A B`) compares two finished
+bundles by `run_id`, `a` being the baseline. Both are read-only
+throughout: a still-open bundle is a 409, an unknown id a 404. The
+result is written to `<run_root>/compares/<a>-vs-<b>.{jsonl,json}`
+(rows, then the summary), and the verb returns it along with the
+artifact path. `--compare` prints the verdict and one line per row and
+exits 0 whatever the verdict (2 for a refusal such as an unknown or
+open bundle, 3 for an I/O failure), so a script reads the verdict,
+not the exit code.
+
+**Pass 1: decisions.** Each side's `decisions.jsonl` rows (kinds
+`event`, `ack`, `hk_step`) are keyed `(kind, key)`. A bundle without
+the file has it re-derived from its manifest's log slice, using the
+default HK codes when the manifest records none. **Alignment:** the
+anchor is the earliest baseline decision whose `(kind, key)` also
+occurs in the other run, and every time is taken relative to its own
+side's anchor. This removes the replay's launch-latency offset, which
+the S2 live check's 0.44 s still contained on absolute times. A
+baseline row pairs with the next unused other-run row of the same key
+whose anchor-relative time is within `tol_event_s`. Rows before the
+anchor count too. The result is `same`, `only-baseline` or
+`only-other`, and the earliest non-`same` row is marked `first`
+(`summary.first_divergence`).
+
+**Pass 2: numbers.** For each id in `[compare] series` that both
+sides have, the series value arrays are compared index-wise: a pair
+matches iff `|va - vb| <= tol_number_abs + tol_number_rel *
+max(|va|, |vb|)`, and the point counts must agree within `2 + 5 %`
+of the larger count. Times are not compared. An id that has no points
+on either side, or is a marker or enum, is skipped and counted in
+`series_skipped`. The first mismatching index is
+`summary.first_series_divergence`. A bundle pair with no log on either
+side skips pass 2 silently. When only one side has a log and the
+series read fails, `summary.series_error` says why.
+
+**Derived rows**, from the `hk_step` rows where NIXD0501 steps to 7:
+"First overrun (hk level 7)" compares the first such step's
+anchor-relative time and is left out when neither side has one;
+"Overruns in the run" compares the step counts and is always present.
+Derived rows never carry `first`. The default `series` ids
+(`hk:2:NIXD0501`, `truth:instrument.rotb.count`,
+`truth:instrument.detector.tape.dropped`) give the pass-2 rows the
+mockup names.
+
+**Tolerances** are `[compare]` keys: `tol_event_s` (1.0),
+`tol_number_rel` (0.05), `tol_number_abs` (1.0) and `series` (the id
+list). `seq` and `boot_id` are never compared.
+
+**UI.** The Runs board's `compare` button renders the result under the
+table in the owner-fixed **Check | Baseline | Replay | Result** layout,
+with the caption naming both run ids, the counts and the first
+divergence. "show on Timeline" switches to the Timeline with the pair.
+The Timeline's `overlay` select draws another run's series dashed at
+`t + (align.t_a - align.t_b)`, plus a red "first divergence" line. It
+is offered only when the page shows the compare's baseline: a viewer
+(`run.open`/`--view-run`) on the baseline, or a live controller whose
+live run is the baseline. On any other page a note in the Timeline
+says why. Without a compare summary, a viewer overlays unshifted.
+
+**Live check** (2026-11-16, real QEMU, the EM baseline ELF, icount
+off, `pace = "wall"`, timeline `sample_s = 0.5`). The origin was the
+S2 recipe: power on/boot, `fault.inject {id: obt.jump, params:
+{delta_s: 4}}`, a `tc.gs.send` of TC(237,18), ~30 s, power off. Three
+replays were compared against it:
+
+- **Plain replay:** `same`, 7 decision rows, aligned deltas ≤ 0.032 s.
+  The overrun row and both series rows (97 points each) were also
+  `same`.
+- **A copy with `delta_s` 4 → 40:** still `same`. The longer OBT jump
+  moved events 0x0032/0x8030 by 0.43 s (0.03 s in the plain replay),
+  which is inside `tol_event_s = 1.0`. No compared series carries OBT,
+  so pass 2 cannot see it either. An OBT-only perturbation is
+  invisible to the default checks. `platform.obt` would need adding to
+  `[compare] series` to catch it.
+- **A copy with the `tc.gs.send` record removed:** `differs`, `first`
+  = the baseline's TC(1,x) ack 0x05AC/0 at +14.65 s with no partner
+  (`only-baseline`, twice). The other five decisions stayed `same`.
+
+The Runs board and the Timeline overlay were checked in a browser on
+these bundles. The overlay drew the replay over the baseline with a
+shift of -33.6 ms, and the divergence line at the ack.
 
 ## Timeline (sampler, series, views, view-run)
 
