@@ -731,3 +731,14 @@ be `first` (recommended — nothing is hidden; a replay that misses a
 leading decision really differs); (b) report them but exclude them from
 the verdict and from `first` (friendlier when the baseline started its
 bench earlier, but a real early divergence would then hide).
+
+## Owner decisions (2026-11-16)
+
+Questions 1-6 all answered with the recommended option: `--compare`
+exits 0 on "differs" (the verdict is data); one artifact pair per run
+pair, overwritten; pass 2 index-wise with the count slack, times
+ignored; the overrun rows ship with `detail.value == 7`, revisited if
+corrected; the panel keeps the "Replay" column header, the caption
+names both runs; pre-anchor one-sided decisions count toward the
+verdict and may be `first`. Implementation is on hold until the
+owner's go.
