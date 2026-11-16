@@ -761,7 +761,13 @@ series read fails, `summary.series_error` says why.
 "First overrun (hk level 7)" compares the first such step's
 anchor-relative time and is left out when neither side has one;
 "Overruns in the run" compares the step counts and is always present.
-Derived rows never carry `first`. The default `series` ids
+"OBT offset vs sim time (s)" is (last − first `truth:platform.obt`) −
+(last − first sample time), in seconds: the net jump the run applied
+to the OBT (an `obt.jump` fault, a time sync). It is compared with
+`tol_event_s` as an absolute bound, and left out when neither side has
+two OBT samples. The series value compare cannot catch this: OBT is a
+48-bit counter in 2^-16 s ticks (~1.8·10¹³), so its 5 % relative
+tolerance is months. Derived rows never carry `first`. The default `series` ids
 (`hk:2:NIXD0501`, `truth:instrument.rotb.count`,
 `truth:instrument.detector.tape.dropped`) give the pass-2 rows the
 mockup names.
@@ -790,12 +796,12 @@ replays were compared against it:
 - **Plain replay:** `same`, 7 decision rows, aligned deltas ≤ 0.032 s.
   The overrun row and both series rows (97 points each) were also
   `same`.
-- **A copy with `delta_s` 4 → 40:** still `same`. The longer OBT jump
-  moved events 0x0032/0x8030 by 0.43 s (0.03 s in the plain replay),
-  which is inside `tol_event_s = 1.0`. No compared series carries OBT,
-  so pass 2 cannot see it either. An OBT-only perturbation is
-  invisible to the default checks. `platform.obt` would need adding to
-  `[compare] series` to catch it.
+- **A copy with `delta_s` 4 → 40:** `differs`, on the OBT offset row
+  only (+4.0 s vs +40.0 s; the plain replay reads 3.998 vs 3.997 s).
+  The longer jump also moved events 0x0032/0x8030 by 0.43 s (0.03 s
+  in the plain replay), still inside `tol_event_s = 1.0`, so the
+  decision rows stay `same`. Before the OBT row was added this copy
+  compared `same`.
 - **A copy with the `tc.gs.send` record removed:** `differs`, `first`
   = the baseline's TC(1,x) ack 0x05AC/0 at +14.65 s with no partner
   (`only-baseline`, twice). The other five decisions stayed `same`.

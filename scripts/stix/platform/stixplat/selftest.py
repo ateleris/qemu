@@ -7938,7 +7938,7 @@ def t_compare_core(env):
 def _cmp_root(env, dirs):
     """Bundles moved under <root>/runs so bundle._resolve finds them by
     id; returns (root, the moved dirs)."""
-    root = os.path.join(env.tmp, "cmp-root%d" % env.n)
+    root = tempfile.mkdtemp(prefix="cmp-root", dir=env.tmp)  # unique
     runs = os.path.join(root, "runs")
     os.makedirs(runs)
     moved = []
@@ -8288,6 +8288,41 @@ def t_compare_series_rows(env):
           rows[0]["result"] == "same", "only the gauge row: %r" % rows)
     check(info["series"] == [ga] and info["series_skipped"] == 3,
           "marker, enum and empty ids skipped: %r" % info)
+
+    # the derived OBT row: net offset = OBT span - sample-time span, in
+    # s, compared with an absolute tol_event_s (the relative number tol
+    # cannot see a jump on a 2^44-sized counter)
+    def obt_side(name, jump_s, n=5):
+        recs = []
+        for i in range(n):
+            obt = (0x10000000 << 16) + int((i + (jump_s if i >= 2 else 0))
+                                           * 65536)
+            r = _rec("sample", 100 + i, "", {"platform.obt": obt})
+            r["sim_time"] = i * 1000000000
+            recs.append(r)
+        return side(name, recs)
+
+    def obt_of(a, b, tol_s=1.0):
+        tol = {"tol_number_rel": 0.05, "tol_number_abs": 1.0,
+               "tol_event_s": tol_s, "series": [ga]}
+        rows, info = runseries_mod.series_rows(a, b, tol)
+        o = [r for r in rows if r["check"] == runseries_mod.OBT_CHECK]
+        check("truth:platform.obt" not in info["series"],
+              "the OBT row is not a counted series: %r" % info)
+        return o
+    o4 = obt_side("srows-obt4", 4)
+    o = obt_of(o4, obt_side("srows-obt4b", 4.5))
+    check(o == [{"check": runseries_mod.OBT_CHECK, "a": 4.0, "b": 4.5,
+                 "result": "same", "tol": 1.0, "first": False}],
+          "OBT within tol_event_s -> same: %r" % o)
+    o = obt_of(o4, obt_side("srows-obt40", 40))
+    check(len(o) == 1 and o[0]["result"] == "differs" and
+          o[0]["b"] == 40.0, "a 40 s jump vs 4 s -> differs: %r" % o)
+    o = obt_of(o4, obt_side("srows-obt1", 0, n=1))
+    check(len(o) == 1 and o[0]["result"] == "only-baseline" and
+          o[0]["b"] is None, "one OBT sample -> only-baseline: %r" % o)
+    o = obt_of(a, b)
+    check(o == [], "no OBT samples on either side -> no row: %r" % o)
 
 
 def t_ui_runs(env):

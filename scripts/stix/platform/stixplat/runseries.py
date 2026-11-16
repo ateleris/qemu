@@ -15,6 +15,7 @@ import json
 import os
 
 from . import bundle as bundle_mod
+from . import config as config_mod
 from . import log as log_mod
 from . import replay as replay_mod
 from . import series as series_mod
@@ -76,6 +77,39 @@ def _num_match(va, vb, tol_abs, tol_rel):
     return abs(va - vb) <= tol_abs + tol_rel * max(abs(va), abs(vb))
 
 
+OBT_ID = "truth:platform.obt"      # coarse << 16 | fine, 2^-16 s ticks
+OBT_CHECK = "OBT offset vs sim time (s)"
+
+
+def _obt_offset(q):
+    """(last - first OBT) - (last - first sample time), in seconds:
+    the net jump the run applied to the OBT (an obt.jump fault, a time
+    sync). None with fewer than two samples."""
+    t, v = q["t"], q["v"]
+    if len(v) < 2:
+        return None
+    return (v[-1] - v[0]) / 65536.0 - (t[-1] - t[0]) / 1e9
+
+
+def obt_row(qa, qb, tol_s):
+    """The derived OBT row: the series value compare cannot see an OBT
+    jump (the relative tolerance on a 2^44-sized counter is days), so
+    the net offsets compare with an absolute tol_event_s. No row when
+    neither side has two OBT samples."""
+    oa, ob = _obt_offset(qa), _obt_offset(qb)
+    if oa is None and ob is None:
+        return None
+    if oa is None:
+        res = "only-other"
+    elif ob is None:
+        res = "only-baseline"
+    else:
+        res = "same" if abs(oa - ob) <= tol_s else "differs"
+    r3 = lambda x: None if x is None else round(x, 3)
+    return {"check": OBT_CHECK, "a": r3(oa), "b": r3(ob), "result": res,
+            "tol": tol_s, "first": False}
+
+
 def series_rows(a_dir, b_dir, tol):
     """Pass 2 (the series numbers): both sides' index from
     series_index(d, load_manifest(d)); one row per id in tol["series"]
@@ -89,14 +123,15 @@ def series_rows(a_dir, b_dir, tol):
     Returns (rows, info), info = {"series": <ids compared>,
     "series_skipped", "first_series_divergence": {check, index, t_a,
     v_a, v_b} or None}. Raises replay.ReplayError when a side has no
-    readable log."""
+    readable log. A derived OBT row (obt_row) is appended after the
+    series rows; it is not counted in "series"."""
     tol_rel = tol["tol_number_rel"]
     tol_abs = tol["tol_number_abs"]
     ids = list(tol["series"])
     idx_a = series_index(a_dir, load_manifest(a_dir))
     idx_b = series_index(b_dir, load_manifest(b_dir))
-    qa = idx_a.query(ids, None, None, _RAW_POINTS)
-    qb = idx_b.query(ids, None, None, _RAW_POINTS)
+    qa = idx_a.query(ids + [OBT_ID], None, None, _RAW_POINTS)
+    qb = idx_b.query(ids + [OBT_ID], None, None, _RAW_POINTS)
     kind_a = {e["id"]: e["kind"] for e in idx_a.catalogue()}
     kind_b = {e["id"]: e["kind"] for e in idx_b.catalogue()}
     rows, compared, skipped, first = [], [], 0, None
@@ -134,5 +169,9 @@ def series_rows(a_dir, b_dir, tol):
                      "first": False})
         if bad is not None and first is None:
             first = bad
+    orow = obt_row(qa[OBT_ID], qb[OBT_ID], tol.get(
+        "tol_event_s", config_mod.DEFAULTS["compare"]["tol_event_s"]))
+    if orow is not None:
+        rows.append(orow)
     return rows, {"series": compared, "series_skipped": skipped,
                   "first_series_divergence": first}
