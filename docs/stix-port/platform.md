@@ -13,6 +13,8 @@ serves one REST + SSE API. The plan and its decisions are in
 ```
 python3 scripts/stix/platform/stixplat.py --config my.toml
 python3 scripts/stix/platform/stixplat.py --self-test     # offline, no QEMU
+python3 scripts/stix/platform/stixplat.py --config my.toml --replay DIR \
+    [--elf PATH] [--qemu-binary PATH] [--port N] [--allow-wall] [--no-idb]
 ```
 
 A config is TOML; every key has a default and an unknown key or wrong
@@ -20,6 +22,11 @@ type is an error (exit 2). `stixplat/config.py` holds the full list;
 `scripts/stix/platform/interactive.toml` and `run-gates.toml` are
 worked samples (native copies usually override `qemu.binary` and
 `qemu.elf`).
+
+`--replay DIR` re-runs a finished run bundle on guest time into a
+bundle of its own (exit 0 done, 2 refused, 3 infra — 3 also when a
+power or pause verb fails during the replay); see "Replaying a bundle
+(S2)" under Run bundles.
 
 ### In the container (PL-7)
 
@@ -607,6 +614,107 @@ verb is refused like any other non-`view.*` verb. `GET /runs`,
 `GET /runs/<run_id>` (also the live dir, `live: true`) and
 `GET /runs/<run_id>/manifest` feed the Runs board in the web UI
 (filter, per-row baseline/open, a header close-viewer button).
+
+### Replaying a bundle (S2)
+
+`--replay DIR` takes a finished run bundle and runs it again on guest
+time, into a bundle of its own; the origin is read-only throughout.
+Its manifest's log slice (`start_offset`/`log_rotations` through
+`log.jsonl`) is re-classified into the recorded inputs, each tagged
+with the origin's power phase at its record, and re-fed at its
+recorded `sim_time` in record order:
+
+- **Verbs** through the real Dispatcher with their recorded args —
+  the self-contained ones, the stimulus four included
+  (`det.tape.play`/`stop` — a play re-reads its tape file at re-feed
+  time — `det.align.set`, `det.adc.set`). Excluded verbs never re-run
+  (`det.tape.save`, `det.tape.delete`, the five `param.*` — their
+  `tc` records are the inputs — and the rest); each is one
+  `replay.skipped {seq, why}` record.
+- **TCs** as the recorded bytes through the relay, path `tc.replay`,
+  so the recorded TC seq keeps the TM(1,x) ack matching working; the
+  null-hex TC(9,129) as `platform.timesync.send {coarse}` with the
+  recorded coarse. A TC that never reached the FSW is skipped. A
+  wall-paced real GS TC refuses the replay up front unless
+  `--allow-wall` is given, and is skipped either way (no wall TC is
+  ever converted).
+- **Faults** with the recorded params + seed + trigger verbatim;
+  `fault.clear` is re-fed, `reapply`/`error` records are not (the
+  power hooks re-apply by themselves).
+- **Forces**: `force.set` with the recorded value, `force.clear`
+  without one.
+
+**Scheduling** is phase-split. An off-phase input dispatches when its
+`sim_time` is due on the bench clock and the replay's power state is
+off (bench time runs on the wall clock while off). A frozen or paused
+input waits for the power state only — bench time stands still in
+both, so it may never reach the origin's `sim_time`. A running-phase
+input is armed exactly once on `clock.at`, which fires only while
+RUNNING, so a pause holds the schedule. Every fire is slightly past
+its `sim_time` (a vclock sample must pass it first); only a delay
+beyond 250 ms gets a `replay.late {seq, by_s}` record (`by_s` in
+seconds, rounded to ms) and dispatches anyway — nothing is dropped. A
+failed `platform.power.*`, `sim.pause` or `sim.resume` feed aborts
+the replay, because the held inputs after it would wait for a state
+that never comes: `replay.done` names it in `aborted`, exit 3.
+
+**The replay's bundle** lives in a fresh dir
+`<local run_root>/runs/<stamp>-replay-<origin run_id>/` with no
+retention marker — never auto-deleted, like an interactive dir. The
+name is capped so that `<dir>/qmp.sock` fits a Unix socket path (the
+manifest's `of` keeps the full origin id); a run root too long for
+even a short name is a refusal naming `[retention] run_root`. The
+manifest carries `kind "replay"`, `of`, `elf` and `qemu-binary` (the
+replay's own; `--elf`/`--qemu-binary` override the recorded ones) and
+`idb: "absent"` when `--no-idb` was needed. S3 compares the two
+`decisions.jsonl` files. Once the last input is dispatched or
+skipped, the replay runs on until bench time reaches the origin's
+`t0 + length_s` (decisions keep arriving after the last input, and
+bench time advances while off, so this cannot stall), then writes one
+`replay.done {inputs, dispatched, skipped, failed, late}` and shuts
+down. SIGTERM/SIGINT stop early (exit 0; the bundle still closes).
+
+**Recorded-config rules**: the replay's config is the origin's
+recorded config with the replay's own bench bits — the automatic
+TC(9,129) (`[timesync] autostart`) is forced off because it is itself
+a recorded input and would go out twice; the API takes `--port` or a
+free one; the three UDP ports are re-drawn free; the recorded `mode`
+and `gs.tm_dests` stay, so `[gs] emulation = "auto"` resolves as
+recorded. The views and tapes dirs are forced under the local run
+root, and the played tapes with their spectra are copied from the
+origin's recorded tapes dir into the replay's own, so the replay is
+self-contained.
+
+**Refusals** (exit 2, each naming the fix): no or broken manifest,
+still open, no boot record (`t0`), the log slice rotated away, wall
+TCs without `--allow-wall`, a recorded IDB missing on this host
+without `--no-idb` (the `hk_step` rows would not be comparable), a
+`carried` flash start (no library entry to load; the workaround is
+one `platform.flash.save` + re-record), a missing flash-library
+entry, a missing tape or spectrum file, and a run root too long for
+the replay dir. Controller construction/start failures and a failed
+flash load are exit 3.
+
+**Determinism limits**: the replay inherits the recorded icount/pace
+— a `pace = "fast"` origin is replayed fast and its time-sync inputs
+may `late_apply` (see Fast-forward), so record timing-sensitive
+bundles with icount off and `pace = "wall"`. Fault seeds are re-fed
+verbatim, so seeded fault noise reproduces. The model's sky RNG is
+guest-time driven; the live check below plays no tape, so the
+compared decisions are FSW reactions, not model draws (with a tape
+playing, `hk_step` values depend on it). Power-off times stay
+wall-paced (D-PLr) and are the main source of the decision-time
+jitter.
+
+**Live check** (2026-11-16, real QEMU, the EM baseline ELF, icount
+off, `pace = "wall"`): the origin ran power on/boot, a
+`fault.inject {id: obt.jump, params: {delta_s: 4}}`, a
+`tc.gs.send` of TC(237,18), ~30 s, power off. Its replay produced
+the same 7 decisions in the same (kind, key) order — events 0x0022,
+0x0021, 0x0032, 0x8030, two TC(1,x) acks, 0x14A3 — with a max
+|sim_time delta| of 0.44 s; the fault seed and the TC bytes re-fed
+identically. The plan's ±2 s is thus measured at 0.44 s for this run
+(one run, not a bound).
 
 ## Timeline (sampler, series, views, view-run)
 
