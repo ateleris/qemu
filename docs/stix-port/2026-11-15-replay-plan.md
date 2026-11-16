@@ -781,3 +781,12 @@ needed, unlike R2/R3). Nothing in S1's formats changes; the S3 task
   depend on the sky RNG when a tape plays, so the live check plays no
   tape. ±2 s stays UNVERIFIED until the first live run.
 
+
+## Owner decisions (2026-11-16)
+
+Questions 1, 2, 4 and 6 answered with the recommended option (late
+inputs dispatched with `replay.late`; stop after the last input + the
+origin's `length_s`; a carried flash is refused with guidance; a
+missing IDB refuses unless `--no-idb`, manifest `idb: "absent"`).
+Questions 3 and 5 take the recommended defaults (`det.tape.save`
+excluded; `gs.tm_dests` kept).
