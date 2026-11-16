@@ -796,6 +796,28 @@ needed, unlike R2/R3). Nothing in S1's formats changes; the S3 task
   samples) is late. `by_s` is in seconds (rounded to ms), matching its
   name; the "in ms" in the scheduler bullet is superseded.
 
+## P2b review (2026-11-16, reviewer)
+
+- **Frozen inputs are state-held only, too.** Bench time stands still
+  while frozen (QEMU at `-S`, no vclock), at a value set by the
+  replay's own launch latency; a replay QEMU that launched faster than
+  the origin's froze the bench just before the origin's boot
+  `sim_time`, and the held `power.boot` never came due (replay_run
+  hung). Only an off-phase input still waits for `clock.now()` to pass
+  its `sim_time` (bench time runs on the wall clock while off).
+- **The replay dir name fits the QMP socket.** `<dir>/qmp.sock` must
+  fit a Unix socket path (107 bytes); the stamp-plus-origin-id name
+  under `<run_root>/runs/` overflowed it (power.on: `AF_UNIX path too
+  long`). The name is capped to fit (the manifest's `of` keeps the
+  full origin id); a run root too long for even a short name is a
+  refusal (exit 2) naming `[retention] run_root`.
+- **A failed power/pause verb aborts.** The held inputs after a failed
+  `platform.power.*`/`sim.pause`/`sim.resume` wait for a state that
+  will not come: the scheduler sets `aborted`, `run()` writes
+  `replay.done` with `aborted` and returns exit 3.
+- Noted, not changed: `_copy_tapes` overwrites a same-named tape in the
+  replay's local tapes dir when it differs from the origin's.
+
 ## Owner decisions (2026-11-16)
 
 Questions 1, 2, 4 and 6 answered with the recommended option (late

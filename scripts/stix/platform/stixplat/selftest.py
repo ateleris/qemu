@@ -6792,6 +6792,84 @@ def t_bundle_run_open(env):
 
 
 # -- run bundles S2: the replay loader (P1) --------------------------------
+# the one-step tape the shared origin saves and plays
+_REPLAY_TAPE = {"api": 1, "name": "t",
+                "steps": [{"kind": "rate", "for_s": 1, "cps": 1,
+                           "fpga_det_mask": 1}]}
+
+
+def _replay_origin(env):
+    """The origin bundle shared by t_replay_loader and t_replay_run
+    (the t_bundle_writer_lifecycle pattern) with the stimulus, fault,
+    tc and link shapes the loader must tell apart. R7: the origin's
+    ack decision is ingested before its power-off, so the replay's
+    watcher can reproduce it from the re-fed bytes. Returns (root, rd,
+    m, tcs, sp): the run root, the origin dir, its manifest, the two
+    GS TC records and the wall packet."""
+    root = os.path.join(env.tmp, "replay-loader-root")
+    tape = _REPLAY_TAPE
+    # R3: a recorded IDB that exists on this host (empty but valid: no
+    # hk fields, so the decisions match a run without an IDB)
+    idb_path = os.path.join(env.tmp, "replay-idb.json")
+    with open(idb_path, "w") as f:
+        f.write('{"packets": []}')
+    cfg = env.cfg(timeline={"sample_s": 0.5, "idb_json": idb_path},
+                  gs={"emulation": "on"}, retention={"run_root": root})
+    rd = env.run_dir()
+    ctl = core_mod.Controller(cfg, run_dir=rd)
+    sp = None
+    tcs = []
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        cmd("det.tape.save", {"name": "t", "tape": tape})
+        cmd("det.tape.play", {"name": "t"})
+        cmd("fault.inject", {"id": "obt.jump", "params": {"delta_s": 4},
+                             "seed": 99})
+        cmd("tc.gs.send", {"service": 237, "subtype": 18,
+                           "data": "01383c00000000"})
+        # the automatic TC(9,129)'s record shape, no hex (timesync.py);
+        # emit, not ingest: ingest writes no log.jsonl line
+        ctl.log.emit("ctl", "tc", "platform.timesync",
+                     {"service": 9, "subtype": 129, "seq": 5,
+                      "coarse": 100, "raw": False})
+        # a real GS TC: the relay's default source "tc"
+        sp = tcbuild.tc_packet(tcbuild.APID_TC, 3, 17, 1, b"\x02", ack=9,
+                               source=121)
+        ctl.plat.relay.gs_tc(sp)
+        cmd("platform.spw.link", {"state": "down"})
+        cmd("tc.gs.send", {"service": 237, "subtype": 18,
+                           "data": "01383c00000000"})
+        cmd("platform.spw.link", {"state": "up"})
+        tcs = [x.obj for x in ctl.log.since(0)
+               if x.kind == "tc" and x.obj["path"] == "tc.gs.send"]
+        check(len(tcs) == 2 and tcs[0]["data"]["delivered"] and
+              not tcs[1]["data"]["delivered"],
+              "one delivered and one dropped GS TC: %r" %
+              [t["data"]["delivered"] for t in tcs])
+        # R7: the synthetic TM(1,7) whose (apid, seq) matches the
+        # delivered GS TC's (the fake QEMU never sends TM)
+        apid, seq = tcs[0]["data"]["apid"], tcs[0]["data"]["seq"]
+        sim, boot, _, _ = ctl.clock.now()
+        ctl.log.ingest({"v": 1, "seq": ctl.log.seq + 1,
+                        "sim_time": sim, "boot_id": boot,
+                        "vclock_ns": None,
+                        "wall_time": log_mod.wall_now(),
+                        "source": "tm", "kind": "tm", "path": "tm.0x5a1",
+                        "data": {"decoded": {
+                            "apid": 0x5A1, "type": 1, "subtype": 7,
+                            "dest": 14,
+                            "tc": {"packet_id": 0x1DAC, "apid": apid,
+                                   "seq": seq}}}})
+        cmd("platform.power.off", {})
+    finally:
+        ctl.shutdown()
+    with open(os.path.join(rd, "manifest.json")) as f:
+        m = json.load(f)
+    return root, rd, m, tcs, sp
+
+
 def t_replay_loader(env):
     """S2 P1: the classifier gap closed (the four stimulus verbs
     re-feed, the tape save/delete and the param verbs are excluded with
@@ -6827,52 +6905,9 @@ def t_replay_loader(env):
         d = bundle_mod.classify(cmd(verb, args), st)
         check(d["replay"] == "guest", "%s re-feeds: %r" % (verb, d))
 
-    # a real bundle (the t_bundle_writer_lifecycle pattern) with the
-    # stimulus, fault, tc and link shapes the loader must tell apart
-    root = os.path.join(env.tmp, "replay-loader-root")
-    tape = {"api": 1, "name": "t",
-            "steps": [{"kind": "rate", "for_s": 1, "cps": 1,
-                       "fpga_det_mask": 1}]}
-    cfg = env.cfg(timeline={"sample_s": 0.5}, gs={"emulation": "on"},
-                  retention={"run_root": root})
-    rd = env.run_dir()
-    ctl = core_mod.Controller(cfg, run_dir=rd)
-    sp = None
-    tcs = []
-    try:
-        cmd = ctl.command
-        cmd("platform.power.on", {})
-        cmd("platform.power.boot", {})
-        cmd("det.tape.save", {"name": "t", "tape": tape})
-        cmd("det.tape.play", {"name": "t"})
-        cmd("fault.inject", {"id": "obt.jump", "params": {"delta_s": 4},
-                             "seed": 99})
-        cmd("tc.gs.send", {"service": 237, "subtype": 18,
-                           "data": "01383c00000000"})
-        # the automatic TC(9,129)'s record shape, no hex (timesync.py);
-        # emit, not ingest: ingest writes no log.jsonl line
-        ctl.log.emit("ctl", "tc", "platform.timesync",
-                     {"service": 9, "subtype": 129, "seq": 5,
-                      "coarse": 100, "raw": False})
-        # a real GS TC: the relay's default source "tc"
-        sp = tcbuild.tc_packet(tcbuild.APID_TC, 3, 17, 1, b"\x02", ack=9,
-                               source=121)
-        ctl.plat.relay.gs_tc(sp)
-        cmd("platform.spw.link", {"state": "down"})
-        cmd("tc.gs.send", {"service": 237, "subtype": 18,
-                           "data": "01383c00000000"})
-        cmd("platform.spw.link", {"state": "up"})
-        cmd("platform.power.off", {})
-        tcs = [x.obj for x in ctl.log.since(0)
-               if x.kind == "tc" and x.obj["path"] == "tc.gs.send"]
-    finally:
-        ctl.shutdown()
-    check(len(tcs) == 2 and tcs[0]["data"]["delivered"] and
-          not tcs[1]["data"]["delivered"],
-          "one delivered and one dropped GS TC: %r" %
-          [t["data"]["delivered"] for t in tcs])
-    with open(os.path.join(rd, "manifest.json")) as f:
-        m = json.load(f)
+    # a real bundle with the stimulus, fault, tc and link shapes the
+    # loader must tell apart (shared with t_replay_run)
+    root, rd, m, tcs, sp = _replay_origin(env)
     before = _dir_state(rd)
     inputs = replay_mod.load_inputs(rd, m)
     check(_dir_state(rd) == before, "the origin is read-only")
@@ -6901,7 +6936,7 @@ def t_replay_loader(env):
     check(stripped[1]["verb"] == "platform.power.boot",
           "power.boot while frozen: %r" % stripped[1])
     check(stripped[2] == {"input": "verb", "verb": "det.tape.save",
-                          "args": {"name": "t", "tape": tape},
+                          "args": {"name": "t", "tape": _REPLAY_TAPE},
                           "replay": "no",
                           "why": "the tape file is by reference"},
           "the save: %r" % stripped[2])
@@ -7259,6 +7294,185 @@ def t_replay_sched(env):
                            "failed": 0, "late": 1},
           "the counts: %r" % (sched.counts,))
     sched.stop()
+    # a failed power verb aborts: the frozen input after it would hold
+    # for a state that never comes (P2b review)
+    ctl2 = StubCtl()
+
+    def refuse(verb, args, source="scn"):
+        raise replay_mod.VerbError(500, "QEMU QMP: cannot connect")
+    ctl2.command = refuse
+    ctl2.clock.advance(300 * ms)    # the power.on is due
+    sched2 = replay_mod.Scheduler(ctl2, [dict(x) for x in inputs[2:4]])
+    sched2.start()
+    wait_for(lambda: sched2.aborted is not None, 2.0, "the abort")
+    check(sched2.aborted == "platform.power.on (seq 3) failed",
+          "the abort names the verb: %r" % (sched2.aborted,))
+    time.sleep(0.1)
+    check(not sched2.done.is_set() and sched2.counts["failed"] == 1 and
+          sched2.counts["dispatched"] == 0,
+          "aborted, not done: %r" % (sched2.counts,))
+    check(not sched2._cursor.is_alive() and not sched2._worker.is_alive(),
+          "both threads ended")
+
+
+def t_replay_run(env):
+    """S2 P2: replay.run re-feeds the t_replay_loader origin on guest
+    time: the wall refusal without allow_wall, the replay's own bundle
+    (kind "replay", of/elf/qemu-binary), key-scoped input counts (R2),
+    the re-fed records in order with the skips between them, the ack
+    parity via the origin's ingest (R7) plus the on_controller
+    watcher, and the origin dir untouched."""
+    root, rd, m, tcs, sp = _replay_origin(env)
+    origin_id = m["run_id"]
+    before = _dir_state(rd)
+    # the replay bench lives under its own run root (R5: the recorded
+    # views/tapes dirs are never written; the played tape is copied)
+    local = os.path.join(env.tmp, "replay-run-root")
+    cfg = env.cfg(retention={"run_root": local})
+    msgs = []
+    rc = replay_mod.run(cfg, rd, out=msgs.append)
+    check(rc == replay_mod.EXIT["refused"] and
+          any("--allow-wall" in x and "wall-paced" in x for x in msgs),
+          "the wall TC refuses without allow_wall: %d %r" % (rc, msgs))
+
+    def hook(ctl):
+        # R7: the watcher waits for the replay's tc.replay record and
+        # ingests the matching ack, the origin-side pattern mirrored
+        def watch():
+            while not ctl.stopping.is_set():
+                hits = [x.obj for x in ctl.log.since(0)
+                        if x.kind == "tc" and
+                        x.obj["path"] == "tc.replay"]
+                if hits:
+                    d = hits[0]["data"]
+                    sim, boot, _, _ = ctl.clock.now()
+                    ctl.log.ingest(
+                        {"v": 1, "seq": ctl.log.seq + 1,
+                         "sim_time": sim, "boot_id": boot,
+                         "vclock_ns": None,
+                         "wall_time": log_mod.wall_now(),
+                         "source": "tm", "kind": "tm",
+                         "path": "tm.0x5a1",
+                         "data": {"decoded": {
+                             "apid": 0x5A1, "type": 1, "subtype": 7,
+                             "dest": 14,
+                             "tc": {"packet_id": 0x1DAC,
+                                    "apid": d["apid"],
+                                    "seq": d["seq"]}}}})
+                    return
+                time.sleep(0.005)
+        threading.Thread(target=watch, daemon=True).start()
+
+    msgs = []
+    rc = replay_mod.run(cfg, rd, allow_wall=True, on_controller=hook,
+                        out=msgs.append)
+    check(rc == replay_mod.EXIT["ok"], "the replay ran: %d %r"
+          % (rc, msgs))
+    check(_dir_state(rd) == before, "the origin is read-only")
+    runs = os.path.join(local, "runs")
+    # the name may truncate the origin id (the QMP socket path cap);
+    # the manifest's "of" carries it whole
+    rdirs = [os.path.join(runs, n) for n in os.listdir(runs)
+             if "-replay-" in n]
+    check(len(rdirs) == 1, "one replay dir: %r" % (rdirs,))
+    check(all(len(os.path.join(d, "qmp.sock")) <= 107 for d in rdirs),
+          "the QMP socket path fits a Unix socket: %r" % (rdirs,))
+    rdir = rdirs[0]
+    with open(os.path.join(rdir, "manifest.json")) as f:
+        rm = json.load(f)
+    check(rm["kind"] == "replay" and rm["of"] == origin_id and
+          rm["open"] is False, "a closed replay manifest: %r"
+          % {k: rm[k] for k in ("kind", "of", "open")})
+    check(rm["elf"] == "/dev/null" and
+          rm["qemu-binary"].endswith("qemu-new"),
+          "the recorded elf/binary: %r %r"
+          % (rm["elf"], rm["qemu-binary"]))
+    check(rm["flash"]["start"]["source"] == "fresh", "a fresh flash")
+    counts = rm["inputs"]["counts"]
+    check(counts["fault"] == 1 and counts["tc"] == 2 and
+          counts["force"] == 0, "the key-scoped counts: %r" % counts)
+    # R2: the re-fed commands (fault.inject, platform.timesync.send)
+    # count as excluded verb inputs, the origin's skipped ones are
+    # absent
+    check(counts["verb"] == {
+        "platform.power.on": 1, "platform.power.boot": 1,
+        "det.tape.play": 1, "fault.inject": 1,
+        "platform.timesync.send": 1, "platform.spw.link": 2,
+        "platform.power.off": 1},
+          "the re-fed and excluded verbs: %r" % counts["verb"])
+    check(rm["decisions"]["counts"] == {"ack": 1, "event": 0,
+                                        "hk_step": 0},
+          "the replay's decisions: %r" % rm["decisions"])
+    with open(os.path.join(rdir, "log.jsonl")) as f:
+        recs = [json.loads(x) for x in f if x.strip()]
+
+    def shape(r):
+        k, p = r["kind"], r["path"]
+        if k == "cmd":
+            return ("cmd", p)
+        if k == "tc" and p == "tc.replay":
+            return ("tc.replay",)
+        if k == "fault" and r["data"].get("action") == "inject":
+            return ("fault",)
+        if k == "log" and p == "replay.skipped":
+            return ("skip", r["data"]["why"])
+        return None
+
+    shapes = [x for x in (shape(r) for r in recs) if x]
+    skips = [x for x in shapes if x[0] == "skip"]
+    check(skips == [("skip", "the tape file is by reference"),
+                    ("skip", "the fault record is the input"),
+                    ("skip", "the tc record is the input"),
+                    ("skip", "a real GS TC: wall-paced, not replayable"),
+                    ("skip", "the tc record is the input"),
+                    ("skip", "never reached the FSW")],
+          "the six skips in cursor order: %r" % (skips,))
+    feed = [x for x in shapes if x[0] != "skip"]
+    check(feed == [("cmd", "platform.power.on"),
+                   ("cmd", "platform.power.boot"),
+                   ("cmd", "det.tape.play"),
+                   ("cmd", "fault.inject"), ("fault",),
+                   ("tc.replay",),
+                   ("cmd", "platform.timesync.send"),
+                   ("cmd", "platform.spw.link"),
+                   ("cmd", "platform.spw.link"),
+                   ("cmd", "platform.power.off")],
+          "the re-fed records in dispatch order: %r" % (feed,))
+    play = [r for r in recs if r["kind"] == "cmd" and
+            r["path"] == "det.tape.play"]
+    check(play[0]["data"]["args"] == {"name": "t"},
+          "the play's recorded args: %r" % (play,))
+    fr = [r for r in recs if r["kind"] == "fault" and
+          r["data"].get("action") == "inject"]
+    check(len(fr) == 1 and fr[0]["data"]["params"] == {"delta_s": 4} and
+          fr[0]["data"]["seed"] == 99, "the re-fed fault: %r" % (fr,))
+    tr = [r for r in recs if r["kind"] == "tc" and
+          r["path"] == "tc.replay"]
+    check(len(tr) == 1 and tr[0]["data"]["hex"] == tcs[0]["data"]["hex"],
+          "the re-fed TC bytes: %r" % (tr,))
+    dn = [r for r in recs if r["kind"] == "log" and
+          r["path"] == "replay.done"]
+    check(len(dn) == 1, "one replay.done: %r" % (dn,))
+    d = dn[0]["data"]
+    check(d["inputs"] == 15 and d["dispatched"] == 9 and
+          d["skipped"] == 6 and d["failed"] == 0 and d["late"] >= 0,
+          "the replay.done counts: %r" % (d,))
+    check(os.path.isfile(os.path.join(local, "tapes", "t.json")),
+          "the played tape copied into the replay's tapes dir")
+
+    def acks(dd):
+        out = []
+        with open(os.path.join(dd, "decisions.jsonl")) as f:
+            for x in f:
+                if x.strip():
+                    r = json.loads(x)
+                    if r["kind"] == "ack":
+                        out.append(r)
+        return out
+    oa, ra = acks(rd), acks(rdir)
+    check(len(oa) == 1 and len(ra) == 1 and
+          oa[0]["key"] == ra[0]["key"],
+          "the ack parity (R7): %r vs %r" % (oa, ra))
 
 
 def t_ui_runs(env):
@@ -7393,6 +7607,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("replay: loader rotated (S2)", t_replay_loader_rotated),
          ("replay: dispatch (S2)", t_replay_dispatch),
          ("replay: scheduler (S2)", t_replay_sched),
+         ("replay: run (S2)", t_replay_run),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("faults: since_sim (D1)", t_faults_since_sim),

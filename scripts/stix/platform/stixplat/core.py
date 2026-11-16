@@ -32,7 +32,8 @@ DEBUG_PATHS = ("/machine/stixspw", "/machine/stixctrl")
 
 class Controller:
     def __init__(self, cfg, run_dir=None, launcher=None, mono_fn=None,
-                 sleep=time.sleep, scenario=None):
+                 sleep=time.sleep, scenario=None, bundle_kind=None,
+                 bundle_extra=None):
         self.cfg = cfg
         self.elf_sha256 = self._elf_sha256()
         self.run_dir = rundir.guard(run_dir or cfg["run_dir"]["path"])
@@ -106,9 +107,12 @@ class Controller:
         # from it). Created before anything else can emit a record the
         # writer would miss.
         if cfg["bundle"]["enabled"]:
+            # S2: the replay passes bundle_kind/bundle_extra for its
+            # manifest (kind "replay", of/elf/qemu-binary)
             self.bundle = bundle_mod.Writer(
                 cfg, self.run_dir, self.log, cfg["mode"],
-                scenario=scenario, start_seq=start_rec.seq)
+                scenario=scenario, start_seq=start_rec.seq,
+                kind=bundle_kind or "run", extra=bundle_extra)
             self.log.listeners.append(self.bundle.on_record)
         self._power_changed()
 

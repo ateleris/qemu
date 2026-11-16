@@ -4,7 +4,7 @@ plan). P1 is the input loader: the origin's log slice, in record
 order, through bundle.classify, every classified input tagged with its
 seq, sim_time, boot_id and the origin's power phase. The origin is
 read-only: the loader opens its files, never writes. P2 adds the
-scheduler and the re-feed table around it, P3 the CLI.
+scheduler, the re-feed table and run() around it, P3 the CLI.
 """
 
 import gzip
@@ -12,10 +12,18 @@ import json
 import os
 import queue
 import re
+import shutil
+import signal
+import socket
 import threading
+import time
 
 from . import bundle as bundle_mod
+from . import config as config_mod
+from . import core as core_mod
+from . import flashlib as flashlib_mod
 from . import log as log_mod
+from . import tapes as tapes_mod
 from .dispatch import VerbError
 
 EXIT = {"ok": 0, "refused": 2, "infra": 3}
@@ -156,6 +164,13 @@ _WALL_WHY = "a real GS TC: wall-paced, not replayable"
 # this is a replay.late (5 sample periods)
 _LATE_TOL_NS = 250 * 10**6
 
+# the verbs that move the power state the held inputs wait for
+_STATE_VERBS = ("platform.power.", "sim.pause", "sim.resume")
+
+# a Unix socket path holds at most 107 bytes (sun_path is 108 with the
+# NUL); QEMU's QMP socket lives at <run dir>/qmp.sock
+_SUN_PATH_MAX = 107
+
 
 def _note(ctl, path, data):
     """One replay marker: a kind "log" record, source "ctl" (the
@@ -249,18 +264,23 @@ class Scheduler:
     dispatch-queue thread running _FEED, so a slow verb never blocks
     the poller that fires the clock.at deadlines.
 
-    Off/frozen/paused-phase inputs dispatch when due (clock.now() past
-    sim_time) and the replay's power state matches the phase, else they
-    hold at the head in order. Paused joins off/frozen (a plan
-    deviation): clock.at never fires while paused, so an armed
-    sim.resume would never fire; guest time is frozen in a pause, so
-    the state match alone places it. Running-phase inputs are armed
+    Off/frozen/paused-phase inputs are held at the head, in order,
+    until the replay's power state matches the phase; an off-phase
+    input also waits for clock.now() to pass its sim_time (bench time
+    runs on the wall clock while off). Frozen and paused inputs wait
+    for the state only (a plan deviation): bench time stands still in
+    both, at a value set by the replay's own launch or pause latency,
+    so it may never reach the origin's sim_time; and clock.at never
+    fires while paused, so an armed sim.resume would never fire.
+    Running-phase inputs are armed
     exactly once on clock.at; a deadline fired more than _LATE_TOL_NS
     past its sim_time gets one replay.late record first (owner
     question 1a). Inputs
     with replay != "guest" never dispatch: one replay.skipped as the
     cursor passes them. done is set once every input was dispatched or
-    skipped and every armed one has fired.
+    skipped and every armed one has fired. A failed power or pause
+    verb sets aborted and stops the scheduler: the held inputs after it
+    wait for a state that will not come.
     """
 
     def __init__(self, ctl, inputs):
@@ -274,6 +294,7 @@ class Scheduler:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._walked = False    # the cursor passed every input
+        self.aborted = None     # why a failed state verb ended the replay
         self._cursor = threading.Thread(target=self._walk,
                                         name="replay-cursor", daemon=True)
         self._worker = threading.Thread(target=self._work,
@@ -310,12 +331,13 @@ class Scheduler:
         self._maybe_done()
 
     def _hold(self, inp):
-        """Dispatch when due and the power state matches the phase;
-        hold at the head otherwise (order kept: the power verb queued
-        just before changes the state)."""
+        """Dispatch once the power state matches the phase (and, while
+        off, once due); hold at the head otherwise (order kept: the
+        power verb queued just before changes the state)."""
         while not self._stop.is_set():
-            if self.ctl.clock.now()[0] >= inp["sim_time"] and \
-                    self.ctl.power.state == inp["phase"]:
+            due = inp["phase"] != "off" or \
+                self.ctl.clock.now()[0] >= inp["sim_time"]
+            if due and self.ctl.power.state == inp["phase"]:
                 self._queue.put(inp)
                 return True
             self._stop.wait(self.ctl.clock.wake_in(0.05))
@@ -368,6 +390,12 @@ class Scheduler:
             ok = False
         with self._lock:
             self.counts["dispatched" if ok else "failed"] += 1
+        if not ok and inp.get("input") == "verb" and \
+                inp.get("verb", "").startswith(_STATE_VERBS):
+            # every later held input waits for the state this verb
+            # should have set: abort instead of holding forever
+            self.aborted = "%s (seq %d) failed" % (inp["verb"], inp["seq"])
+            self.stop()
 
     def _maybe_done(self):
         with self._lock:
@@ -375,3 +403,307 @@ class Scheduler:
                     or self._queue.unfinished_tasks:
                 return
             self.done.set()
+
+
+# -- run(): the whole replay (P2) ------------------------------------------
+
+def _free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _free_tcp_port():
+    """R6: the API port when none was given (a 0 is refused by
+    config._check, so the replay probes one)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _read_manifest(bundle_dir):
+    path = os.path.join(bundle_dir, bundle_mod.MANIFEST)
+    try:
+        with open(path, encoding="utf-8") as f:
+            m = json.load(f)
+    except (OSError, ValueError):
+        raise ReplayError("no run bundle at %r" % (bundle_dir,))
+    if not isinstance(m, dict):
+        raise ReplayError("no run bundle at %r" % (bundle_dir,))
+    return m
+
+
+def _check_wall(inputs, allow_wall):
+    """No wall TC is ever converted: the refusal only lifts."""
+    walls = [i for i in inputs if i.get("replay") == "wall"]
+    if walls and not allow_wall:
+        raise ReplayError("%d wall-paced GS TC(s) (first seq %d): "
+                          "replaying omits them — pass --allow-wall to "
+                          "accept that"
+                          % (len(walls), walls[0]["seq"]))
+
+
+def _check_idb(origin_cfg, no_idb):
+    """R3: the IDB is a by-reference input; a missing file refuses
+    unless @no_idb (the manifest then records idb "absent")."""
+    if no_idb:
+        return
+    tl = origin_cfg.get("timeline") or {}
+    for key in ("idb_json", "idb_sqlite"):
+        v = tl.get(key)
+        if not v:
+            continue
+        path = os.path.expanduser(v)
+        if not os.path.isfile(path):
+            raise ReplayError("the recorded %s %s is missing on this "
+                              "host: pass --no-idb to run without it "
+                              "(the replay manifest then records idb "
+                              "\"absent\")" % (key, path))
+
+
+def _check_flash(manifest, cfg):
+    """The origin's flash start by reference: 'carried' refuses (owner
+    question 4a); a 'library' entry must exist under the local run
+    root's flash-library."""
+    start = ((manifest.get("flash") or {}).get("start")) or {}
+    src = start.get("source")
+    if src == "carried":
+        raise ReplayError("flash start is 'carried': no library entry "
+                          "to load (see platform.md)")
+    if src == "library":
+        name = start.get("name")
+        lib = flashlib_mod.library_dir(cfg)
+        rec = start.get("record") or {}
+        if not os.path.isfile(os.path.join(lib, "%s.bin" % name)) or \
+                not os.path.isfile(os.path.join(lib, "%s.json" % name)):
+            raise ReplayError("no flash library entry %r under %s (the "
+                              "origin recorded it from %s)"
+                              % (name, lib, rec.get("source_run_dir")))
+
+
+def _check_tapes(inputs, origin_cfg):
+    """R4/R5: every det.tape.play input's tape file must exist in the
+    origin's recorded tapes dir, its spec.file CSVs included; returns
+    [(name, tape)] for the copy into the replay's tapes dir."""
+    d = tapes_mod.tapes_dir(origin_cfg)
+    played = []
+    seen = set()
+    for inp in inputs:
+        if inp.get("input") != "verb" or \
+                inp.get("verb") != "det.tape.play":
+            continue
+        name = (inp.get("args") or {}).get("name")
+        if not isinstance(name, str) or name in seen:
+            continue
+        seen.add(name)
+        path = os.path.join(d, "%s.json" % name)
+        if not os.path.isfile(path):
+            raise ReplayError("tape file %r is missing from %s"
+                              % (os.path.basename(path), d))
+        try:
+            with open(path, encoding="utf-8") as f:
+                tape = json.load(f)
+            tape = tapes_mod.validate(tape)
+            # R4: the spectrum CSVs resolve at pre-flight, not at
+            # re-feed time (a missing one is a refusal, not a
+            # replay.failed)
+            tapes_mod.resolve(origin_cfg, tape,
+                              tapes_mod.KEV_FULL_DEFAULT)
+        except (VerbError, ValueError, OSError) as e:
+            raise ReplayError("tape %s: %s" % (name, e))
+        played.append((name, tape))
+    return played
+
+
+def _copy_tapes(played, origin_cfg, rcfg):
+    """R5: the played tapes and their spectra copied from the origin's
+    recorded tapes dir into the replay's, so the replay is
+    self-contained and the origin's dirs stay read-only."""
+    if not played:
+        return
+    src_dir = tapes_mod.tapes_dir(origin_cfg)
+    dst_dir = tapes_mod.tapes_dir(rcfg)
+    os.makedirs(dst_dir, exist_ok=True)
+    for name, tape in played:
+        pairs = [(os.path.join(src_dir, "%s.json" % name),
+                  os.path.join(dst_dir, "%s.json" % name))]
+        for step in tape.get("steps") or []:
+            spec = step.get("spec") if isinstance(step, dict) else None
+            if isinstance(spec, dict) and isinstance(spec.get("file"),
+                                                     str):
+                pairs.append((os.path.join(tapes_mod.spectra_dir(
+                                              origin_cfg),
+                                            spec["file"]),
+                              os.path.join(tapes_mod.spectra_dir(rcfg),
+                                           spec["file"])))
+        os.makedirs(tapes_mod.spectra_dir(rcfg), exist_ok=True)
+        for src, dst in pairs:
+            if os.path.realpath(src) == os.path.realpath(dst):
+                continue
+            shutil.copyfile(src, dst)
+
+
+def run(cfg, bundle_dir, elf=None, qemu_binary=None, port=None,
+        allow_wall=False, no_idb=False, on_controller=None, out=print,
+        now=time.time):
+    """One replay of the finished bundle at @bundle_dir, on guest time;
+    returns EXIT["ok"|"refused"|"infra"], never raises. Refusals
+    (ReplayError inside, exit 2): no or broken manifest, still open, no
+    t0, the log slice rotated away, a wall input without allow_wall, a
+    missing recorded IDB without no_idb, a carried flash start, a
+    missing flash-library entry, a missing tape or spectrum file.
+    Controller construction or start failures are exit 3. SIGTERM and
+    SIGINT stop early (exit 0; the Writer's close still runs); the
+    handlers are installed only from the main thread and restored on
+    return."""
+    stop = threading.Event()
+
+    def on_signal(signum, frame):
+        stop.set()
+
+    main = threading.current_thread() is threading.main_thread()
+    old = None
+    if main:
+        old = (signal.signal(signal.SIGTERM, on_signal),
+               signal.signal(signal.SIGINT, on_signal))
+    try:
+        return _run(cfg, bundle_dir, elf, qemu_binary, port, allow_wall,
+                    no_idb, on_controller, out, now, stop)
+    except ReplayError as e:
+        out("stixplat: %s" % e)
+        return EXIT["refused"]
+    except Exception as e:
+        out("stixplat: %s: %s" % (type(e).__name__, e))
+        return EXIT["infra"]
+    finally:
+        if main:
+            signal.signal(signal.SIGTERM, old[0])
+            signal.signal(signal.SIGINT, old[1])
+
+
+def _run(cfg, bundle_dir, elf, qemu_binary, port, allow_wall, no_idb,
+         on_controller, out, now, stop):
+    # 1. the origin: its manifest, its inputs, its by-reference files
+    #    (nothing created yet)
+    m = _read_manifest(bundle_dir)
+    origin_cfg = m.get("config")
+    if not isinstance(origin_cfg, dict):
+        raise ReplayError("no run bundle at %r (no recorded config)"
+                          % (bundle_dir,))
+    inputs = load_inputs(bundle_dir, m)
+    _check_wall(inputs, allow_wall)
+    _check_idb(origin_cfg, no_idb)
+    _check_flash(m, cfg)
+    played = _check_tapes(inputs, origin_cfg)
+    # 2. the replay config: the recorded config with the replay's own
+    #    bench bits; the recorded mode and gs.tm_dests stay
+    root = cfg["retention"]["run_root"]
+    over = {"timesync": {"autostart": "off"},   # D-e: the automatic
+            # TC(9,129) is itself a recorded input
+            "ports": {"api": port if port is not None
+                      else _free_tcp_port(),
+                      "qemu_tm": _free_udp_port(),
+                      "qemu_tc": _free_udp_port(),
+                      "gs_tc": _free_udp_port()},
+            "retention": {"run_root": root},
+            "timeline": {"views_dir": os.path.join(root, "views"),
+                         "tapes_dir": os.path.join(root, "tapes")}}
+    if elf:
+        over["qemu"] = {"elf": elf}
+    if qemu_binary:
+        over.setdefault("qemu", {})["binary"] = qemu_binary
+    # 3. the replay dir <run_root>/runs/<stamp>-replay-<origin id>,
+    #    capped to RUN_ID_RE's 128 characters and so that
+    #    <dir>/qmp.sock fits a Unix socket path (the manifest's "of"
+    #    keeps the full origin id)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now()))
+    head = "%s-replay-" % stamp
+    parent = os.path.join(os.path.abspath(root), "runs")
+    # <parent>/<name>/qmp.sock
+    room = min(128, _SUN_PATH_MAX - len(parent) - len("/") -
+               len("/qmp.sock"))
+    if room < len(head) + 8:
+        raise ReplayError("run_root %r is too long for the replay dir's "
+                          "QMP socket (Unix socket paths hold %d bytes): "
+                          "use a shorter [retention] run_root"
+                          % (root, _SUN_PATH_MAX))
+    name = (head + (m.get("run_id") or
+                    os.path.basename(bundle_dir)))[:room]
+    over["run_dir"] = {"path": os.path.join(parent, name),
+                       "fresh": True}
+    rcfg = config_mod.merged(origin_cfg, over)
+    _copy_tapes(played, origin_cfg, rcfg)
+    # the replay manifest's of/elf/qemu-binary (D-b); R3's no_idb marks
+    # the absent IDB so S3 knows the hk_step rows are not comparable
+    extra = {"of": m.get("run_id"), "elf": rcfg["qemu"]["elf"],
+             "qemu-binary": rcfg["qemu"]["binary"]}
+    if no_idb:
+        extra["idb"] = "absent"
+    # 4. the controller; its Writer writes kind "replay" and the extra
+    ctl = None
+    try:
+        try:
+            ctl = core_mod.Controller(rcfg, run_dir=over["run_dir"]["path"],
+                                      bundle_kind="replay",
+                                      bundle_extra=extra)
+        except Exception as e:
+            out("stixplat: controller: %s: %s" % (type(e).__name__, e))
+            return EXIT["infra"]
+        # 5. the flash start, power off (the pre-check passed, so a
+        #    failure here is a real error, exit 3)
+        start = ((m.get("flash") or {}).get("start")) or {}
+        if start.get("source") == "library":
+            try:
+                ctl.command("platform.flash.load",
+                            {"name": start.get("name")}, source="scn")
+            except Exception as e:
+                out("stixplat: flash load: %s: %s"
+                    % (type(e).__name__, e))
+                ctl.shutdown("replay flash load failed")
+                return EXIT["infra"]
+        # 6. serve, the caller's hook, then the scheduler
+        try:
+            ctl.start(serve=True)
+        except Exception as e:
+            out("stixplat: start: %s: %s" % (type(e).__name__, e))
+            ctl.shutdown("replay start failed")
+            return EXIT["infra"]
+        if on_controller is not None:
+            on_controller(ctl)
+        sched = Scheduler(ctl, inputs)
+        sched.start()
+        # 7. the end rule: every input dispatched, then the origin's
+        #    length_s of bench time (bench time advances while off), one
+        #    replay.done with the scheduler's counts, the shutdown
+        while not sched.done.wait(0.2):
+            if sched.aborted:
+                out("stixplat: replay aborted: %s" % sched.aborted)
+                _note(ctl, "replay.done",
+                      dict(sched.counts, aborted=sched.aborted))
+                ctl.shutdown("replay aborted")
+                return EXIT["infra"]
+            if stop.is_set():
+                sched.stop()
+                ctl.shutdown("replay stopped")
+                return EXIT["ok"]
+        end = (m.get("t0") or 0) + (m.get("length_s") or 0.0) * 1e9
+        while ctl.clock.now()[0] < end and not stop.is_set():
+            time.sleep(ctl.clock.wake_in(0.05))
+        _note(ctl, "replay.done", dict(sched.counts))
+        ctl.shutdown("replay stopped" if stop.is_set() else "replay done")
+        return EXIT["ok"]
+    except Exception as e:
+        out("stixplat: %s: %s" % (type(e).__name__, e))
+        return EXIT["infra"]
+    finally:
+        if ctl is not None and not ctl.stopping.is_set():
+            try:
+                ctl.shutdown("replay error")
+            except Exception:
+                pass
