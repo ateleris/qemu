@@ -5,11 +5,15 @@
   stixplat.py --config FILE [--run-dir DIR] [--api-port N]
   stixplat.py --config FILE --scenario NAME [--scenario ..] [--variant G]
   stixplat.py --view-run DIR [--port N]
+  stixplat.py --config FILE --replay DIR [--elf PATH]
+              [--qemu-binary PATH] [--port N] [--allow-wall] [--no-idb]
   stixplat.py --self-test [CASE]
 
 mode = "run" (or --scenario, which implies it) runs the scenarios each
 in its own QEMU and exits; --run-dir then sets retention.run_root.
 --view-run serves a finished run's log read-only (view.* verbs only).
+--replay re-feeds a finished run bundle's recorded inputs on guest
+time and writes its own bundle (run bundles S2).
 See docs/stix-port/platform.md. Stdlib only (Python >= 3.11).
 Exit codes: 0 ok (run mode: all passed), 1 a scenario failed, 2 a
 config or scenario error, 3 an infrastructure failure.
@@ -40,8 +44,28 @@ def main():
     ap.add_argument("--view-run", metavar="DIR",
                     help="serve a finished run dir's log read-only: the "
                          "same API and page, view.* verbs only")
+    ap.add_argument("--replay", metavar="DIR",
+                    help="replay a finished run bundle on guest time: "
+                         "every recorded input re-fed at its recorded "
+                         "sim_time, into its own new bundle (exit 0 "
+                         "done, 2 refused, 3 infra)")
+    ap.add_argument("--elf", metavar="PATH",
+                    help="with --replay: the ELF instead of the "
+                         "recorded one")
+    ap.add_argument("--qemu-binary", metavar="PATH",
+                    help="with --replay: the QEMU binary instead of the "
+                         "recorded one")
     ap.add_argument("--port", type=int,
-                    help="with --view-run: the API port (default 8081)")
+                    help="with --view-run or --replay: the API port "
+                         "(default 8081 with --view-run, a free one "
+                         "with --replay)")
+    ap.add_argument("--allow-wall", action="store_true",
+                    help="with --replay: accept that wall-paced GS TCs "
+                         "are omitted from the replay")
+    ap.add_argument("--no-idb", action="store_true",
+                    help="with --replay: run without a recorded IDB "
+                         "missing on this host (the replay manifest "
+                         "records idb \"absent\")")
     ap.add_argument("--self-test", nargs="?", const="", metavar="CASE",
                     help="run the offline self-test (optionally one case)")
     ap.add_argument("--check-ui", metavar="URL",
@@ -49,11 +73,19 @@ def main():
                     "(http://127.0.0.1:PORT) against its verbs; exit 1 on "
                     "a mismatch")
     args = ap.parse_args()
+    if args.replay and (args.scenario or args.variant or args.view_run or
+                        args.self_test is not None or args.check_ui):
+        ap.error("--replay cannot be combined with --scenario, --variant, "
+                 "--view-run, --self-test or --check-ui")
     if args.view_run and (args.self_test is not None or args.check_ui):
         ap.error("--view-run cannot be combined with --self-test or "
                  "--check-ui")
-    if args.port is not None and not args.view_run:
-        ap.error("--port needs --view-run")
+    if args.port is not None and not args.view_run and not args.replay:
+        ap.error("--port needs --view-run or --replay")
+    if (args.elf or args.qemu_binary or args.allow_wall or
+            args.no_idb) and not args.replay:
+        ap.error("--elf, --qemu-binary, --allow-wall and --no-idb need "
+                 "--replay")
     if args.view_run:
         from stixplat import viewrun
         return viewrun.main(args.view_run,
@@ -81,6 +113,12 @@ def main():
     except (config_mod.ConfigError, OSError) as e:
         print("stixplat: %s" % e, file=sys.stderr)
         return 2
+    if args.replay:
+        from stixplat import replay as replay_mod
+        return replay_mod.run(cfg, args.replay, elf=args.elf,
+                              qemu_binary=args.qemu_binary, port=args.port,
+                              allow_wall=args.allow_wall,
+                              no_idb=args.no_idb)
     if cfg["mode"] == "run":
         from stixplat import runmode
         return runmode.run_all(cfg, out=lambda t: print(t, flush=True))

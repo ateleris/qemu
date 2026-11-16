@@ -7475,6 +7475,114 @@ def t_replay_run(env):
           "the ack parity (R7): %r vs %r" % (oa, ra))
 
 
+def t_replay_cli(env):
+    """S2 P3: every --replay refusal reachable before the controller
+    returns EXIT["refused"] with its fix named (crafted bundles: a
+    manifest + a tiny log.jsonl, no controller); a healthy bundle whose
+    controller construction fails is EXIT["infra"] (the 2/3 split), and
+    the argparse combination rules exit 2."""
+    root = os.path.join(env.tmp, "replay-cli-root")
+    bench = env.cfg(retention={"run_root": root})
+    # a recorded config that passes every pre-flight check: an empty
+    # IDB (no hk fields) and the Env's ELF/binary
+    cfg = env.cfg(timeline={"sample_s": 0.5, "idb_json": "",
+                            "idb_sqlite": ""},
+                  qemu={"binary": env.bins["new"], "elf": "/dev/null"})
+    wall = _rec("tc", 3, "tc.gs", {"hex": "1dacc0070002", "apid": 0x5AC,
+                                   "seq": 7, "service": 17, "subtype": 1,
+                                   "source": 121, "delivered": True},
+                source="tc")
+    mark = _rec("cmd", 1, "log.mark", {"args": {"text": "x"}}, source="api")
+    play = _rec("cmd", 2, "det.tape.play", {"args": {"name": "t"}},
+                source="api")
+    base = {"v": 1, "kind": "run", "open": False, "t0": 1000.0,
+            "length_s": 1.0, "start_offset": 0, "log_rotations": 0,
+            "run_id": "cli-bundle", "config": cfg}
+
+    def craft(name, m, lines):
+        d = os.path.join(env.tmp, name)
+        os.makedirs(d)
+        with open(os.path.join(d, bundle_mod.MANIFEST), "w") as f:
+            json.dump(m, f)
+        with open(os.path.join(d, "log.jsonl"), "w") as f:
+            for r in lines:
+                f.write(json.dumps(r) + "\n")
+        return d
+
+    def refused(d, what, *subs):
+        msgs = []
+        rc = replay_mod.run(bench, d, out=msgs.append)
+        check(rc == replay_mod.EXIT["refused"], "%s: exit %d, %r"
+              % (what, rc, msgs))
+        check(any(all(s in x for s in subs) for x in msgs),
+              "%s: the message names the fix: %r" % (what, msgs))
+
+    d = os.path.join(env.tmp, "replay-cli-nomf")
+    os.makedirs(d)
+    refused(d, "no manifest", "no run bundle")
+    refused(craft("replay-cli-open", dict(base, open=True), (mark,)),
+            "still open", "still open")
+    refused(craft("replay-cli-t0", dict(base, t0=None), (mark,)),
+            "no t0", "no boot record")
+    refused(craft("replay-cli-rot", dict(base, log_rotations=2), (mark,)),
+            "rotated slice", "rotated away")
+    refused(craft("replay-cli-wall", base, (wall,)),
+            "wall without allow_wall", "--allow-wall", "wall-paced")
+    refused(craft("replay-cli-carried",
+                  dict(base, flash={"start": {"source": "carried"}}),
+                  (mark,)),
+            "carried flash", "carried")
+    refused(craft("replay-cli-library",
+                  dict(base, flash={"start": {
+                      "source": "library", "name": "no-such-flash",
+                      "record": {"source_run_dir": "/old/run"}}}),
+                  (mark,)),
+            "missing library entry", "no flash library entry",
+            "no-such-flash")
+    tapes = os.path.join(env.tmp, "replay-cli-tapes")
+    os.makedirs(tapes)
+    refused(craft("replay-cli-tape",
+                  dict(base, config=dict(cfg, timeline=dict(
+                      cfg["timeline"], tapes_dir=tapes))), (play,)),
+            "missing tape file", "tape file", "missing")
+    refused(craft("replay-cli-idb",
+                  dict(base, config=dict(cfg, timeline=dict(
+                      cfg["timeline"],
+                      idb_json=os.path.join(env.tmp,
+                                            "no-such-idb.json")))),
+                  (mark,)),
+            "missing IDB", "--no-idb", "missing on this host")
+
+    # the 2/3 split: past every pre-flight refusal, a controller
+    # construction failure is exit 3, not a refusal. rundir.guard's
+    # gate-dir rule (a run root like the gates', refused by the guard
+    # before anything is created; a comma would already be refused by
+    # config._check, which checks run_dir.path)
+    gate_root = "/tmp/stix-replay-cli-run"
+    gbench = env.cfg(retention={"run_root": gate_root})
+    msgs = []
+    rc = replay_mod.run(gbench, craft("replay-cli-healthy", base, (wall,)),
+                        allow_wall=True, out=msgs.append)
+    check(rc == replay_mod.EXIT["infra"], "the healthy bundle passes the "
+          "pre-flight and fails at the controller: %d %r" % (rc, msgs))
+    check(any("controller" in x and "RunDirError" in x for x in msgs),
+          "the controller construction failed: %r" % (msgs,))
+    check(not os.path.exists(os.path.join(gate_root, "runs")),
+          "the guard refused before anything was created")
+
+    # the argparse combination rules: ap.error exits 2
+    import subprocess
+    cli = os.path.normpath(os.path.join(HERE, "..", "stixplat.py"))
+    for argv, sub in ((["--replay", d, "--scenario", "s"], "--replay"),
+                      (["--allow-wall"], "--allow-wall")):
+        r = subprocess.run([sys.executable, cli] + argv,
+                           capture_output=True, text=True, timeout=30)
+        check(r.returncode == 2, "%s exits 2: %d %s"
+              % (argv, r.returncode, r.stderr[-200:]))
+        check(sub in r.stderr, "the error names the flag: %s"
+              % r.stderr.strip()[-120:])
+
+
 def t_ui_runs(env):
     """R4 (no browser): the Runs tab with its filter and table, the
     board's verbs used and served, the page rules still holding."""
@@ -7608,6 +7716,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("replay: dispatch (S2)", t_replay_dispatch),
          ("replay: scheduler (S2)", t_replay_sched),
          ("replay: run (S2)", t_replay_run),
+         ("replay: cli (S2)", t_replay_cli),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("faults: since_sim (D1)", t_faults_since_sim),
