@@ -842,6 +842,10 @@ tr.cmp-first td { font-weight: 600; }
       <option value="60m">60 min</option>
       <option value="run">whole run</option>
     </select>
+    <span class="lbl">overlay</span>
+    <select id="tl-overlay" title="another run's series, dashed">
+      <option value="">none</option>
+    </select>
     <button type="button" id="tl-reload">reload</button>
     <button type="button" id="tl-add-panel">add panel</button>
   </div>
@@ -1342,6 +1346,7 @@ $("runs-compare-tl").addEventListener("click", () => {
   if (!cmpPend) return;
   TL.overlayPend = { a: cmpPend.a, b: cmpPend.b,
                      summary: cmpPend.summary };
+  tlOverlayRefresh();     // R6: re-gate the select on the new compare
   location.hash = "timeline" +
     (TL.view ? "/v=" + encodeURIComponent(TL.view) : "");
 });
@@ -2526,6 +2531,9 @@ const TL = {
   active: -1, now: null, queryTo: null, unknown: [], catErr: null,
   view: null, viewNames: [],
   hoverX: null, drag: null, dirty: false,
+  overlayPend: null,              // the compare the board showed (C4)
+  overlay: null,                  // {runId, idsKey, data, shift, divergence}
+  overlayNote: null,              // the R6 gate / the unshifted note
 };
 
 function tlVar(n) {
@@ -2551,6 +2559,13 @@ function tlPlotIds() {          // the drawn ids: the panels' series plus
   return tlIds()                // the chosen markers; a marker kind that
     .filter((id) => TL.markers.includes(id) || !tlIsMarker(id));
 }                               // only a panel lists is skipped, not drawn
+function tlSeriesIds() {        // the panels' series ids, no markers:
+  const ids = [];               // the overlay fetches only these
+  for (const p of TL.panels)
+    for (const s of p.series)
+      if (!tlIsMarker(s) && !ids.includes(s)) ids.push(s);
+  return ids;
+}
 function tlNote() {
   const msgs = [];
   if (TL.unknown.length)
@@ -2559,6 +2574,7 @@ function tlNote() {
     msgs.push("catalogue unavailable: " + TL.catErr);
   else if (!TL.cat.some((e) => e.id.startsWith("hk")))
     msgs.push("HK series need the IDB JSON");
+  if (TL.overlayNote) msgs.push(TL.overlayNote);
   text($("tl-note"), msgs.join(" · "));
 }
 
@@ -2665,6 +2681,7 @@ async function tlQuery() {
     TL.unknown = skipped;
     tlNote();
     tlDraw();
+    if (TL.overlay) tlOverlayClear();
     return;
   }
   const r = tlRange();
@@ -2687,12 +2704,107 @@ async function tlQuery() {
     .concat(skipped);   // marker kinds a saved view lists as series
   tlNote();
   tlDraw();
+  if (TL.overlay && TL.overlay.idsKey !== tlSeriesIds().join(","))
+    tlOverlayQuery();             // the panels changed: refetch the overlay
 }
 
 function tlRange() {
   if (TL.zoom) return { from: TL.zoom[0], to: TL.zoom[1] };
   if (TL.window === "run") return { from: null, to: null };
   return { from: Math.max(0, tlNow() - tlWinNs()), to: tlNow() };
+}
+
+/* ---- the two-run overlay (S3 C5): another run's series drawn dashed
+   over the panels, shifted so the compare's anchors coincide ---- */
+async function tlOverlayRefresh() {
+  // R6: offered only when the page shows the compare's baseline — the
+  // live run that is it, or a --view-run server viewing it. Which run
+  // the page shows: GET /runs' live row (the viewed run on a
+  // --view-run server, the recorded run on a live controller).
+  TL.overlayNote = null;
+  const opts = [new Option("none", "")];
+  try {
+    const [st, q] = await Promise.all([getJSON("status"),
+                                       getJSON("runs")]);
+    const shown = (q.runs || []).find((e) => e.live) || null;
+    const pend = TL.overlayPend;
+    if (shown && (pend ? pend.a === shown.run_id
+                       : st.mode === "view")) {
+      for (const e of q.runs || []) {
+        if (e.run_id === shown.run_id || e.error) continue;
+        opts.push(new Option((e.kind === "replay" ? "↻ " : "") +
+                             (e.name || e.run_id), e.run_id));
+      }
+      if (opts.length === 1)
+        TL.overlayNote = "overlay: no other finished bundle";
+    } else if (pend) {
+      TL.overlayNote = "overlay: this page shows " +
+        (shown ? shown.run_id : "no run") + ", not the compared " +
+        "baseline " + pend.a;
+    } else {
+      TL.overlayNote = "overlay: compare two runs on the Runs board " +
+        "first (the panel's show on Timeline)";
+    }
+  } catch (e) {
+    TL.overlayNote = "overlay unavailable: " + (e.message || e);
+  }
+  const sel = $("tl-overlay");
+  const keep = sel.value;
+  sel.replaceChildren(...opts);
+  if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+  else if (keep) tlOverlayQuery();
+  tlNote();
+}
+
+let TL_OQUERY = 0;
+async function tlOverlayQuery() {
+  // the tlQuery discipline: a request counter supersedes stale answers
+  const q = ++TL_OQUERY;
+  const runId = $("tl-overlay").value;
+  const ids = tlSeriesIds();
+  if (!runId || !ids.length) { tlOverlayClear(); return; }
+  let res;
+  try {
+    res = await getJSON("runs/" + encodeURIComponent(runId) +
+                        "/series?" +
+                        ids.map((s) => "ids=" + encodeURIComponent(s))
+                        .join("&") + "&max_points=" + TL_MAX_POINTS);
+  } catch (e) {
+    if (q === TL_OQUERY) {
+      toast("overlay: " + (e.message || e), true);
+      tlOverlayClear();
+    }
+    return;
+  }
+  if (q !== TL_OQUERY) return;    // a newer query superseded this one
+  const data = new Map();
+  for (const id of ids) {
+    const d = res[id];
+    if (d && d.v && d.t.length) data.set(id, d);
+  }
+  const s = (TL.overlayPend || {}).summary || null;
+  const al = (s || {}).align || null;
+  const shift = al && al.t_a != null && al.t_b != null
+    ? al.t_a - al.t_b : 0;        // no summary: unshifted, with a note
+  const div = s && s.first_divergence &&
+    s.first_divergence.t_a != null ? s.first_divergence.t_a :
+    s && s.first_series_divergence &&
+    s.first_series_divergence.t_a != null
+    ? s.first_series_divergence.t_a : null;
+  TL.overlay = { runId, idsKey: ids.join(","), data, shift,
+                 divergence: div };
+  TL.overlayNote = s ? null
+    : "overlay: no compare summary — drawn unshifted";
+  tlNote();
+  tlDraw();
+}
+
+function tlOverlayClear() {
+  if (!TL.overlay) return;
+  TL.overlay = null;
+  TL.overlayNote = null;
+  tlNote();
+  tlDraw();
 }
 
 /* ---- live appends: the client side of series.py's feed rules ---- */
@@ -3015,7 +3127,7 @@ function tlAxis(ctx, sc, top, bot, plotW, right) {
     ctx.globalAlpha = 1;
   }
 }
-function tlSeries(ctx, en, x, t0, t1, top, bot, L, R, col) {
+function tlSeries(ctx, en, x, t0, t1, top, bot, L, R, col, ov) {
   const sc = en.axis === "R" ? R : L;
   if (!sc) return;
   const y = (v) => bot - ((v - sc.lo) / (sc.hi - sc.lo)) * (bot - top);
@@ -3052,6 +3164,23 @@ function tlSeries(ctx, en, x, t0, t1, top, bot, L, R, col) {
     ctx.lineTo(x(t1), y(lastV));
   ctx.stroke();
   ctx.lineWidth = 1;
+  const od = ov && ov.data.get(en.id);
+  if (od && od.t.length) {      // the overlay run: dashed, shifted (S3
+    ctx.setLineDash([4, 3]);    // C5); the hover ignores it (tlAt reads
+    ctx.lineWidth = 1.5;        // TL.data/TL.buf only)
+    ctx.beginPath();
+    started = false;
+    for (let i = 0; i < od.t.length; i++) {
+      const t = od.t[i] + ov.shift;
+      if (t < t0 || t > t1) continue;   // the domain spans the page's run
+      const vy = y(od.v[i]);
+      if (vy < top || vy > bot) continue;  // off the panel's own scale
+      point(t, od.v[i]);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1;
+  }
 }
 function tlLegend(ctx, p, plotW, pal) {
   // the swatch + label rows at the top of a panel, wrapped at plotW
@@ -3140,8 +3269,18 @@ function tlDraw() {
     if (R) tlAxis(ctx, R, o.plotTop, o.plotBot, plotW, true);
     entries.forEach((en, si) =>
       tlSeries(ctx, en, x, t0, t1, o.plotTop, o.plotBot, L, R,
-               pal[si % pal.length]));
+               pal[si % pal.length], TL.overlay));
   });
+  const dv = TL.overlay && TL.overlay.divergence;
+  if (dv != null && dv >= t0 && dv <= t1) {    // the compare's first
+    ctx.strokeStyle = tlVar("--bad");          // divergence, all panels
+    ctx.globalAlpha = 0.55;
+    ctx.beginPath();
+    ctx.moveTo(x(dv), first);
+    ctx.lineTo(x(dv), last);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
   for (const [mt, mk] of tlMarks(t0, t1)) {    // across all panels
     ctx.strokeStyle = tlVar(TL_KIND_VAR[mk] || "--muted");
     ctx.globalAlpha = 0.55;
@@ -3187,6 +3326,15 @@ function tlDraw() {
     ctx.fillStyle = tlVar("--muted");
     ctx.fillText(m, mx + 7, ay + 13);
     mx += 13 + ctx.measureText(m).width + 14;
+  }
+  if (dv != null && dv >= t0 && dv <= t1 && mx <= w - 40) {
+    ctx.strokeStyle = tlVar("--bad");       // the divergence joins the
+    ctx.beginPath();                        // marker legend line
+    ctx.moveTo(mx + 1, ay + 13);
+    ctx.lineTo(mx + 1, ay + 25);
+    ctx.stroke();
+    ctx.fillStyle = tlVar("--muted");
+    ctx.fillText("first divergence", mx + 7, ay + 13);
   }
   if (TL.hoverX != null && TL.hoverX >= TL_PAD_L &&
       TL.hoverX <= TL_PAD_L + plotW) {
@@ -3360,8 +3508,10 @@ async function loadTimeline() {
     TL.zoom = null;
     tlApply();
   });
+  $("tl-overlay").addEventListener("change", tlOverlayQuery);
   $("tl-reload").addEventListener("click", async () => {
     await tlCatalogue();
+    tlOverlayRefresh();
     tlQuery();
   });
   $("tl-add-panel").addEventListener("click", () => {
@@ -3382,7 +3532,8 @@ async function loadTimeline() {
       tlDraw();
     }
   }, 250);
-  await Promise.allSettled([tlCatalogue(), tlViews()]);
+  await Promise.allSettled([tlCatalogue(), tlViews(),
+                            tlOverlayRefresh()]);
   try {
     const t = await getJSON("time");
     if (TL.now == null) TL.now = t.sim_time;

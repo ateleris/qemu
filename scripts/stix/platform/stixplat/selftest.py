@@ -3855,7 +3855,9 @@ UI_ENDPOINTS = {"status", "time", "faults", "params", "verbs", "state",
 UI_TIMELINE_IDS = {"tl-view", "tl-window", "tl-search", "tl-hits",
                    "tl-add", "tl-save", "tl-save-name", "tl-delete",
                    "tl-note", "tl-panels", "tl-hover", "tl-plot",
-                   "tl-canvas", "tl-reload", "tl-add-panel"}
+                   "tl-canvas", "tl-reload", "tl-add-panel",
+                   # compare plan C5: the two-run overlay select
+                   "tl-overlay"}
 # UI plan D: the faults catalogue + its category chips and active list,
 # the Platform tab's faults-here box, the header pause, the log search
 # and the State tab's filters
@@ -8385,6 +8387,49 @@ def t_ui_compare(env):
     check(paths <= UI_ENDPOINTS, "API paths %r" % (paths - UI_ENDPOINTS))
 
 
+def t_ui_timeline_overlay(env):
+    """S3 C5 (no browser): the Timeline gains the two-run overlay — the
+    select is there, the script fetches the other run's series from the
+    runs/<id>/series path, the R6 gate keys on the compare the board
+    showed (TL.overlayPend) and the page's live row, the drawing names
+    the dashed style and the first-divergence mark, and the page rules
+    still hold (no style attribute, no inline handler, no innerHTML)."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    page = body.decode()
+    p = _UiParser()
+    p.feed(page)
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check("tl-overlay" in ids, "the overlay select is missing")
+    sel = re.search(r'<select id="tl-overlay"[^>]*>(.*?)</select>',
+                    page, re.S)
+    check(sel is not None and '<option value="">' in sel.group(1),
+          "the overlay select starts at none: %r" % (sel,))
+    js = "\n".join(p.scripts)
+    check('"runs/"' in js and '"/series' in js,
+          "the script fetches runs/<id>/series")
+    check("TL.overlayPend" in js and "e.live" in js,
+          "the R6 gate: the compare's baseline vs the page's live row")
+    check("setLineDash" in js and "first divergence" in js,
+          "dashed overlay points and the divergence mark")
+    for tag, a in p.attrs:
+        check("style" not in a and
+              not [k for k in a if k.startswith("on")],
+              "<%s %r>: style attribute or inline handler" % (tag, a))
+    for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
+        check(bad not in page.lower(), "the page uses %s" % bad)
+    paths = set(re.findall(r"""(?:getJSON\(|API \+ )["']([a-z]+)""", js))
+    check(paths <= UI_ENDPOINTS, "API paths %r" % (paths - UI_ENDPOINTS))
+
+
 CASES = [("config", t_config), ("argv golden", t_argv),
          ("run-dir guard + sparse preflight", t_rundir),
          ("binary guard", t_binary_guard), ("retention", t_retention),
@@ -8515,6 +8560,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: timeline (C1)", t_ui_timeline),
          ("UI: runs board (S1)", t_ui_runs),
          ("UI: compare panel (S3)", t_ui_compare),
+         ("UI: timeline overlay (S3)", t_ui_timeline_overlay),
          ("UI: mockup port (D)", t_ui_mockup_d),
          ("UI: stimulus board (T5)", t_ui_stimulus),
          ("setup status (timeline B2)", t_setup_status),
