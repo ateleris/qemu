@@ -217,6 +217,11 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith(PREFIX + "/runs/"):
             from . import bundle as bundle_mod
             rest = path[len(PREFIX + "/runs/"):]
+            if rest.endswith("/series"):
+                return self._runs_series(
+                    urllib.parse.parse_qs(url.query,
+                                          keep_blank_values=True),
+                    urllib.parse.unquote(rest[:-len("/series")]))
             if rest.endswith("/manifest"):
                 rid = urllib.parse.unquote(rest[:-len("/manifest")])
                 return self._send(200, bundle_mod.manifest_bytes(
@@ -264,6 +269,11 @@ class Handler(BaseHTTPRequestHandler):
         ids are repeated query parameters (not comma-joined), an empty
         ids= value is a 400, the window is in ns, max_points 10..5000
         (default 1000)."""
+        return self._series_query(self.ctl.series, q)
+
+    def _series_query(self, index, q):
+        """The param rules both /series routes share (S3: the second
+        answers a run's rebuilt index, same body shape)."""
         ids = q.get("ids")
         if not ids or not all(ids):
             return self._err(400, "ids required: repeat the ids= parameter")
@@ -276,8 +286,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(400, "from, to and max_points are integers")
         if not 10 <= max_points <= 5000:
             return self._err(400, "max_points is 10..5000")
-        return self._send(200, self.ctl.series.query(ids, t_from, t_to,
-                                                     max_points))
+        return self._send(200, index.query(ids, t_from, t_to, max_points))
+
+    def _runs_series(self, q, rid):
+        """GET /api/v1/runs/<run_id>/series: a finished run's series
+        (S3), the /series params and body shape; the index is rebuilt
+        from the run's log slice per request (no cache, R11), so a
+        changed log answers from the new bytes. Works on a --view-run
+        server too (GET is read-only; the viewed run resolves via its
+        own dir)."""
+        from . import bundle as bundle_mod
+        from . import replay as replay_mod
+        from . import runseries as runseries_mod
+        bundle_mod.check_run_id(rid)
+        d = bundle_mod._resolve(self.ctl.cfg, rid,
+                                getattr(self.ctl, "run_dir", None))
+        try:
+            idx = runseries_mod.series_index(d,
+                                             runseries_mod.load_manifest(d))
+        except replay_mod.ReplayError as e:     # no readable log slice
+            raise VerbError(404, str(e))
+        return self._series_query(idx, q)
 
     def _stream(self, q):
         topics = _csv(q.get("topics"))
