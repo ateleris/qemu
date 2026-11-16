@@ -8176,6 +8176,105 @@ def t_compare_series_api(env):
     check(_dir_state(rd) == grown, "still nothing written")
 
 
+def t_compare_series_rows(env):
+    """S3 pass 2 (R10, R4; owner decision 3): series_rows compares the
+    value arrays index-wise with the count slack of 2 + 5 %, times
+    ignored; a marker or enum id, and an id with no points anywhere,
+    are skipped; both run dirs stay read-only."""
+    ga = "truth:instrument.rotb.count"
+    ge = "truth:platform.timesync.verdict"
+    gd = "truth:instrument.detector.tape.dropped"
+
+    def values(seq0, vs, extra=None):
+        recs = []
+        for i, v in enumerate(vs):
+            data = {"instrument.rotb.count": v}
+            if extra:
+                data.update(extra(i))
+            recs.append(_rec("sample", seq0 + i, "", data))
+        return recs
+
+    def side(name, recs):
+        d = os.path.join(env.tmp, name)
+        os.makedirs(d)
+        with open(os.path.join(d, "log.jsonl"), "w") as f:
+            for r in recs:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+        return d
+
+    def rows_of(a, b, series):
+        tol = {"tol_number_rel": 0.05, "tol_number_abs": 1.0,
+               "series": series}
+        before = _dir_state(a) + _dir_state(b)
+        rows, info = runseries_mod.series_rows(a, b, tol)
+        check(_dir_state(a) + _dir_state(b) == before,
+              "the compared dirs are read-only")
+        return rows, info
+
+    a = side("srows-a", values(1, [10, 11, 12, 13, 14]))
+    b = side("srows-b", values(1, [10, 11, 12, 13, 14]))
+    rows, info = rows_of(a, b, [ga])
+    check(rows == [{"check": ga, "a": 5, "b": 5, "result": "same",
+                    "tol": {"rel": 0.05, "abs": 1.0}, "first": False}] and
+          set(rows[0]) == {"check", "a", "b", "result", "tol", "first"},
+          "identical: %r" % rows)
+    check(info == {"series": [ga], "series_skipped": 0,
+                   "first_series_divergence": None}, "the info: %r" % info)
+    # one point perturbed within tol -> same
+    b = side("srows-near", values(1, [10, 11, 12, 12.6, 14]))
+    rows, info = rows_of(a, b, [ga])
+    check(rows[0]["result"] == "same" and
+          info["first_series_divergence"] is None, "within tol: %r" % rows)
+    # one point beyond tol -> differs + the first divergence index
+    b = side("srows-pert", values(1, [10, 11, 12, 20, 14]))
+    rows, info = rows_of(a, b, [ga])
+    check(rows[0]["result"] == "differs" and rows[0]["a"] == 5 and
+          rows[0]["b"] == 5, "perturbed: %r" % rows)
+    check(info["first_series_divergence"] ==
+          {"check": ga, "index": 3, "t_a": 4, "v_a": 13, "v_b": 20},
+          "the first divergence: %r" % info)
+    # counts within the slack -> same; beyond it -> differs, no index
+    b = side("srows-cnt7", values(1, [10, 11, 12, 13, 14, 15, 16]))
+    rows, info = rows_of(a, b, [ga])
+    check(rows[0]["result"] == "same" and rows[0]["a"] == 5 and
+          rows[0]["b"] == 7, "counts within the slack: %r" % rows)
+    b = side("srows-cnt9", values(1, list(range(10, 19))))
+    rows, info = rows_of(a, b, [ga])
+    check(rows[0]["result"] == "differs" and
+          info["first_series_divergence"] is None,
+          "counts beyond the slack: %r %r" % (rows, info))
+    # points on one side only -> only-*
+    da = side("srows-only-a",
+              values(1, [10, 11, 12, 13, 14],
+                     lambda i: {"instrument.detector.tape.dropped": i}))
+    db = side("srows-only-b", values(1, [10, 11, 12, 13, 14]))
+    rows, info = rows_of(da, db, [ga, gd])
+    check(rows[1] == {"check": gd, "a": 5, "b": 0,
+                      "result": "only-baseline",
+                      "tol": {"rel": 0.05, "abs": 1.0}, "first": False},
+          "only-baseline: %r" % rows)
+    check(info["series"] == [ga, gd], "the only-* id is compared: %r"
+          % info)
+    rows, info = rows_of(db, da, [ga, gd])
+    check(rows[1]["result"] == "only-other" and rows[1]["a"] == 0 and
+          rows[1]["b"] == 5, "only-other: %r" % rows)
+    # a marker, an enum and an id with no points anywhere: skipped
+    def skip_side(name):
+        recs = values(1, [10, 11],
+                      lambda i: {"platform.timesync.verdict": "ok"})
+        recs.append(_rec("fault", 9, "fault.spw.link.disconnect",
+                         {"action": "inject", "params": {}}))
+        return side(name, recs)
+
+    da = skip_side("srows-skip-a")
+    db = skip_side("srows-skip-b")
+    rows, info = rows_of(da, db, [ga, "fault", ge, "truth:instrument.nope"])
+    check(len(rows) == 1 and rows[0]["check"] == ga and
+          rows[0]["result"] == "same", "only the gauge row: %r" % rows)
+    check(info["series"] == [ga] and info["series_skipped"] == 3,
+          "marker, enum and empty ids skipped: %r" % info)
+
+
 def t_ui_runs(env):
     """R4 (no browser): the Runs tab with its filter and table, the
     board's verbs used and served, the page rules still holding."""
@@ -8348,7 +8447,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: stimulus board (T5)", t_ui_stimulus),
          ("setup status (timeline B2)", t_setup_status),
          ("UI: the live check (smokes)", t_ui_check),
-         ("compare: series api (S3)", t_compare_series_api)]
+         ("compare: series api (S3)", t_compare_series_api),
+         ("compare: series rows (S3)", t_compare_series_rows)]
 
 
 def main(only=None):
