@@ -43,6 +43,7 @@ from . import log as log_mod
 from . import probe_lib
 from . import qemu as qemu_mod
 from . import relay as relay_mod
+from . import replay as replay_mod
 from . import retention
 from . import scenario
 from . import rundir
@@ -6227,8 +6228,10 @@ def t_bundle_inputs(env):
     check(d["replay"] == "no", "flash verbs are by reference: %r" % d)
 
     def tc(**over):
+        # data["source"] is the PUS source id, as _tc_info logs it; the
+        # wall rule keys on the record's source, not on this
         data = {"hex": "1dacc0070002", "apid": 0x5AC, "seq": 2,
-                "service": 17, "subtype": 1, "source": "tc",
+                "service": 17, "subtype": 1, "source": 121,
                 "delivered": True}
         data.update(over)
         return _rec("tc", 3, "tc.gs", data, source="tc")
@@ -6788,6 +6791,205 @@ def t_bundle_run_open(env):
     check(_dir_state(d) == before, "nothing written into the run dir")
 
 
+# -- run bundles S2: the replay loader (P1) --------------------------------
+def t_replay_loader(env):
+    """S2 P1: the classifier gap closed (the four stimulus verbs
+    re-feed, the tape save/delete and the param verbs are excluded with
+    a reason) and the loader: the origin's log slice through classify
+    in seq order, every input tagged with seq, sim_time, boot_id and
+    the origin's power phase."""
+    st = bundle_mod.new_state()
+
+    def cmd(verb, args=None, seq=1):
+        return _rec("cmd", seq, verb, {"args": args or {}}, source="api")
+    d = bundle_mod.classify(cmd("det.tape.play", {"name": "t"}), st)
+    check(d == {"input": "verb", "verb": "det.tape.play",
+                "args": {"name": "t"}, "replay": "guest"},
+          "det.tape.play re-feeds: %r" % d)
+    d = bundle_mod.classify(cmd("det.tape.save",
+                                {"name": "t", "tape": {}}), st)
+    check(d["replay"] == "no" and
+          d["why"] == "the tape file is by reference",
+          "the tape file is by reference: %r" % d)
+    d = bundle_mod.classify(cmd("det.tape.delete", {"name": "t"}), st)
+    check(d["why"] == "would delete a file a play needs",
+          "a delete would break a play: %r" % d)
+    d = bundle_mod.classify(cmd("param.set", {"index": 1, "value": 2}),
+                            st)
+    check(d["replay"] == "no" and
+          d["why"] == "the tc record is the input",
+          "param.set's tc record is the input: %r" % d)
+    d = bundle_mod.classify(cmd("param.refresh"), st)
+    check(d["why"] == "a read-only RAM snapshot",
+          "param.refresh is a snapshot: %r" % d)
+    for verb, args in (("det.adc.set", {"enabled": True}),
+                       ("det.align.set", {"enabled": False})):
+        d = bundle_mod.classify(cmd(verb, args), st)
+        check(d["replay"] == "guest", "%s re-feeds: %r" % (verb, d))
+
+    # a real bundle (the t_bundle_writer_lifecycle pattern) with the
+    # stimulus, fault, tc and link shapes the loader must tell apart
+    root = os.path.join(env.tmp, "replay-loader-root")
+    tape = {"api": 1, "name": "t",
+            "steps": [{"kind": "rate", "for_s": 1, "cps": 1,
+                       "fpga_det_mask": 1}]}
+    cfg = env.cfg(timeline={"sample_s": 0.5}, gs={"emulation": "on"},
+                  retention={"run_root": root})
+    rd = env.run_dir()
+    ctl = core_mod.Controller(cfg, run_dir=rd)
+    sp = None
+    tcs = []
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        cmd("det.tape.save", {"name": "t", "tape": tape})
+        cmd("det.tape.play", {"name": "t"})
+        cmd("fault.inject", {"id": "obt.jump", "params": {"delta_s": 4},
+                             "seed": 99})
+        cmd("tc.gs.send", {"service": 237, "subtype": 18,
+                           "data": "01383c00000000"})
+        # the automatic TC(9,129)'s record shape, no hex (timesync.py);
+        # emit, not ingest: ingest writes no log.jsonl line
+        ctl.log.emit("ctl", "tc", "platform.timesync",
+                     {"service": 9, "subtype": 129, "seq": 5,
+                      "coarse": 100, "raw": False})
+        # a real GS TC: the relay's default source "tc"
+        sp = tcbuild.tc_packet(tcbuild.APID_TC, 3, 17, 1, b"\x02", ack=9,
+                               source=121)
+        ctl.plat.relay.gs_tc(sp)
+        cmd("platform.spw.link", {"state": "down"})
+        cmd("tc.gs.send", {"service": 237, "subtype": 18,
+                           "data": "01383c00000000"})
+        cmd("platform.spw.link", {"state": "up"})
+        cmd("platform.power.off", {})
+        tcs = [x.obj for x in ctl.log.since(0)
+               if x.kind == "tc" and x.obj["path"] == "tc.gs.send"]
+    finally:
+        ctl.shutdown()
+    check(len(tcs) == 2 and tcs[0]["data"]["delivered"] and
+          not tcs[1]["data"]["delivered"],
+          "one delivered and one dropped GS TC: %r" %
+          [t["data"]["delivered"] for t in tcs])
+    with open(os.path.join(rd, "manifest.json")) as f:
+        m = json.load(f)
+    before = _dir_state(rd)
+    inputs = replay_mod.load_inputs(rd, m)
+    check(_dir_state(rd) == before, "the origin is read-only")
+    stripped = [{k: v for k, v in i.items()
+                 if k not in ("seq", "sim_time", "boot_id", "phase")}
+                for i in inputs]
+    check([(i["input"], i["phase"]) for i in inputs] ==
+          [("verb", "off"), ("verb", "frozen"), ("verb", "running"),
+           ("verb", "running"), ("verb", "running"), ("fault", "running"),
+           ("verb", "running"), ("tc", "running"), ("tc", "running"),
+           ("tc", "running"), ("verb", "running"), ("verb", "running"),
+           ("tc", "running"), ("verb", "running"), ("verb", "running")],
+          "the kinds with their phases: %r"
+          % [(i["input"], i["phase"]) for i in inputs])
+    seqs = [i["seq"] for i in inputs]
+    check(all(b > a for a, b in zip(seqs, seqs[1:])),
+          "strictly in seq order: %r" % seqs)
+    check(inputs[0]["boot_id"] == 0 and inputs[3]["boot_id"] == 1 and
+          inputs[3]["sim_time"] > 0,
+          "seq, sim_time and boot_id from the record: %r" %
+          [inputs[0]["boot_id"], inputs[3]["boot_id"],
+           inputs[3]["sim_time"] > 0])
+    check(stripped[0] == {"input": "verb", "verb": "platform.power.on",
+                          "args": {}, "replay": "guest"},
+          "power.on while off: %r" % stripped[0])
+    check(stripped[1]["verb"] == "platform.power.boot",
+          "power.boot while frozen: %r" % stripped[1])
+    check(stripped[2] == {"input": "verb", "verb": "det.tape.save",
+                          "args": {"name": "t", "tape": tape},
+                          "replay": "no",
+                          "why": "the tape file is by reference"},
+          "the save: %r" % stripped[2])
+    check(stripped[3] == {"input": "verb", "verb": "det.tape.play",
+                          "args": {"name": "t"}, "replay": "guest"},
+          "the play: %r" % stripped[3])
+    check(stripped[4]["verb"] == "fault.inject" and
+          stripped[4]["replay"] == "no" and
+          stripped[4]["why"] == "the fault record is the input",
+          "the inject cmd: %r" % stripped[4])
+    check(stripped[5] == {"input": "fault", "id": "obt.jump",
+                          "params": {"delta_s": 4}, "seed": 99,
+                          "trigger": {"at": "now"}, "replay": "guest"},
+          "the orphan inject keeps params/seed: %r" % stripped[5])
+    check(stripped[6]["verb"] == "tc.gs.send" and
+          stripped[6]["replay"] == "no",
+          "the send cmd: %r" % stripped[6])
+    check(stripped[7] == {"input": "tc", "hex": tcs[0]["data"]["hex"],
+                          "replay": "guest"},
+          "the delivered tc: %r" % stripped[7])
+    check(stripped[8] == {"input": "tc", "hex": None, "service": 9,
+                          "subtype": 129, "tc_seq": 5, "coarse": 100,
+                          "replay": "guest"},
+          "the null-hex tc(9,129): %r" % stripped[8])
+    check(stripped[9] == {"input": "tc", "hex": sp.hex(),
+                          "replay": "wall"},
+          "the wall tc: %r" % stripped[9])
+    check(stripped[10] == {"input": "verb",
+                           "verb": "platform.spw.link",
+                           "args": {"state": "down"},
+                           "replay": "guest"},
+          "the link down: %r" % stripped[10])
+    check(stripped[11]["verb"] == "tc.gs.send",
+          "the dropped send cmd: %r" % stripped[11])
+    check(stripped[12] == {"input": "tc", "hex": tcs[1]["data"]["hex"],
+                           "replay": "no",
+                           "why": "never reached the FSW"},
+          "the dropped tc: %r" % stripped[12])
+    check(stripped[13] == {"input": "verb",
+                           "verb": "platform.spw.link",
+                           "args": {"state": "up"},
+                           "replay": "guest"},
+          "the link up: %r" % stripped[13])
+    check(stripped[14]["verb"] == "platform.power.off" and
+          inputs[14]["phase"] == "running",
+          "power.off while running: %r" % stripped[14])
+
+
+def t_replay_loader_rotated(env):
+    """S2 P1: the slice survives a rotation (it starts inside the gz
+    part); a manifest whose slice rotated away, is still open or has no
+    t0 is a ReplayError."""
+    cfg = env.cfg(timeline={"sample_s": 0},
+                  log={"max_log_mb": 1, "max_log_files": 5})
+    d = env.run_dir()
+    ctl = core_mod.Controller(cfg, run_dir=d)
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        for i in range(9000):
+            ctl.log.emit("ctl", "log", "spin", {"i": i, "pad": "x" * 80})
+        ctl.command("platform.power.off", {})
+    finally:
+        ctl.shutdown()
+    check(os.path.exists(os.path.join(d, "log.jsonl.1.gz")),
+          "the log rotated")
+    with open(os.path.join(d, "manifest.json")) as f:
+        m = json.load(f)
+    check(m["log_rotations"] >= 1 and m["start_offset"] == 0,
+          "the session began before the rotation: %r" % m["log_rotations"])
+    inputs = replay_mod.load_inputs(d, m)
+    check([(i["input"], i["verb"], i["phase"]) for i in inputs] ==
+          [("verb", "platform.power.on", "off"),
+           ("verb", "platform.power.boot", "frozen"),
+           ("verb", "platform.power.off", "running")],
+          "the session's inputs across the rotation: %r"
+          % [(i["verb"], i["phase"]) for i in inputs])
+    e = raises(replay_mod.ReplayError, replay_mod.load_inputs, d,
+               dict(m, log_rotations=9))
+    check("rotated" in str(e), "the slice rotated away: %s" % e)
+    e = raises(replay_mod.ReplayError, replay_mod.load_inputs, d,
+               dict(m, open=True))
+    check("open" in str(e), "still open: %s" % e)
+    e = raises(replay_mod.ReplayError, replay_mod.load_inputs, d,
+               dict(m, t0=None))
+    check("t0" in str(e), "no boot record: %s" % e)
+
+
 def t_ui_runs(env):
     """R4 (no browser): the Runs tab with its filter and table, the
     board's verbs used and served, the page rules still holding."""
@@ -6916,6 +7118,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("bundle: runs API (S1)", t_bundle_api),
          ("bundle: baseline (S1)", t_bundle_baseline),
          ("bundle: run.open/close (S1)", t_bundle_run_open),
+         ("replay: loader (S2)", t_replay_loader),
+         ("replay: loader rotated (S2)", t_replay_loader_rotated),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("faults: since_sim (D1)", t_faults_since_sim),

@@ -41,7 +41,10 @@ REPLAY_VERBS = frozenset({
     "platform.timecode.enable", "platform.timecode.once",
     "platform.timecode.inject", "platform.obt.set",
     "platform.keepalive.set", "det.rotb.burst", "platform.power.on",
-    "platform.power.boot", "platform.power.off", "platform.power.cycle"})
+    "platform.power.boot", "platform.power.off", "platform.power.cycle",
+    # self-contained, guest-time verbs (S2): the play re-reads its tape
+    # file at re-feed time
+    "det.tape.play", "det.tape.stop", "det.align.set", "det.adc.set"})
 
 _EXCLUDED_VERB_WHY = {
     "fault.inject": "the fault record is the input",
@@ -51,6 +54,13 @@ _EXCLUDED_VERB_WHY = {
     "tc.platform.send": "the tc record is the input",
     "tc.gs.send": "the tc record is the input",
     "platform.timesync.send": "the tc record is the input",
+    "param.read": "the tc record is the input",
+    "param.read_all": "the tc record is the input",
+    "param.set": "the tc record is the input",
+    "param.reset_all": "the tc record is the input",
+    "param.refresh": "a read-only RAM snapshot",
+    "det.tape.save": "the tape file is by reference",
+    "det.tape.delete": "would delete a file a play needs",
     "scenario.run": "already expanded into its own records",
     "scenario.abort": "already expanded into its own records",
     "platform.flash.list": "a read-only listing",
@@ -184,8 +194,10 @@ def classify(obj, state):
         if not data.get("delivered"):
             out["replay"] = "no"
             out["why"] = "never reached the FSW"
-        elif data.get("source") == "tc":
-            out["replay"] = "wall"      # a real GS TC: wall-paced
+        elif obj.get("source") == "tc":
+            # a real GS TC (the relay's record source "tc"): wall-paced.
+            # Not data["source"]: that is the PUS source id (_tc_info).
+            out["replay"] = "wall"
         else:
             out["replay"] = "guest"
         return out
@@ -327,13 +339,14 @@ class Writer:
     """
 
     def __init__(self, cfg, run_dir, log, mode, scenario=None,
-                 start_seq=0, kind="run"):
+                 start_seq=0, kind="run", extra=None):
         self.cfg = cfg
         self.run_dir = run_dir
         self.log = log
         self.mode = mode
         self.scenario = scenario
         self.kind = kind
+        self._extra = extra
         self.lock = threading.Lock()
         self.state = new_state(cfg["bundle"]["hk_codes"])
         self._start_seq = start_seq
@@ -440,7 +453,10 @@ class Writer:
         length = None
         if not open_ and self._t0 is not None:
             length = (self._last_sim - self._t0) / 1e9
-        return {
+        # S2: the replay's of/elf/qemu-binary ride extra; merged first,
+        # so the fixed keys always win
+        out = dict(self._extra or {})
+        out.update({
             "v": BUNDLE_VERSION, "kind": self.kind, "run_id": self.run_id,
             "dir": self.run_dir, "mode": self.mode,
             "scenario": self.scenario, "started_utc": self.started_utc,
@@ -464,7 +480,8 @@ class Writer:
             "inputs": {"counts": self._counts,
                        "not_replayable": self._not_replayable},
             "decisions": {"counts": self._dec_counts},
-        }
+        })
+        return out
 
     def _flash_start(self):
         if self._flash_load is not None:
