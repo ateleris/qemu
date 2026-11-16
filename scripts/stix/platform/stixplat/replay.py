@@ -107,6 +107,29 @@ def _phase_next(phase, obj):
     return phase
 
 
+def iter_records(run_dir, manifest=None):
+    """The session's records — the manifest's log slice (_slice) — or,
+    when @manifest is None, the whole log in the viewrun.parts order
+    from offset 0 (S3 C1: the compare's re-derive reader). Every record
+    is parsed and check_record-validated; broken lines are skipped
+    (the viewrun._stream rule). Raises ReplayError when the slice's
+    first part has rotated away."""
+    if manifest is None:
+        paths, offset = _parts(run_dir), 0
+    else:
+        paths, offset = _slice(run_dir, manifest)
+    for line in _lines(paths, offset):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            log_mod.check_record(obj)
+        except ValueError:
+            continue
+        yield obj
+
+
 def load_inputs(run_dir, manifest):
     """[(input dict)] in seq order: the manifest's log slice
     (log.jsonl.<log_rotations>.gz from start_offset, then the newer
@@ -133,15 +156,7 @@ def load_inputs(run_dir, manifest):
     state = bundle_mod.new_state(bun.get("hk_codes") or ())
     out = []
     phase = "off"
-    for line in _lines(*_slice(run_dir, manifest)):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-            log_mod.check_record(obj)
-        except ValueError:
-            continue
+    for obj in iter_records(run_dir, manifest):
         inp = bundle_mod.classify(obj, state)
         if inp is not None:
             if "seq" in inp:    # the null-hex TC(9,129)'s own TC seq

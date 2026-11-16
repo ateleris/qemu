@@ -25,6 +25,7 @@ import types
 
 from . import api as api_mod
 from . import bundle as bundle_mod
+from . import compare as compare_mod
 from . import config as config_mod
 from . import decode
 from . import faults as faults_mod
@@ -7583,6 +7584,349 @@ def t_replay_cli(env):
               % r.stderr.strip()[-120:])
 
 
+# -- run bundles S3 C1: the pure decision compare ---------------------------
+_CMP_MF = {"v": 1, "kind": "run", "open": False, "t0": 1000.0,
+           "length_s": 100.0, "start_offset": 0, "log_rotations": 0}
+
+
+def _cmp_dec(kind, seq, t, key, detail, cls=None):
+    """A decision dict in the Writer's shape."""
+    return {"v": 1, "seq": seq, "sim_time": t, "boot_id": 1,
+            "kind": kind, "key": key, "class": cls, "detail": detail}
+
+
+def _cmp_ev(seq, t, eid, params="02", cls="mode"):
+    return _cmp_dec("event", seq, t, "0x%04X" % eid,
+                    {"name": "ev", "params": params}, cls)
+
+
+def _cmp_bundle(env, name, decisions, mf=None, records=None):
+    """A hand-written bundle under env.tmp: manifest + decisions.jsonl
+    (+ log.jsonl with the deciding records for the re-derive paths);
+    mf = manifest overrides, mf = False for no manifest at all,
+    decisions = None for no decisions.jsonl."""
+    d = os.path.join(env.tmp, name)
+    os.makedirs(d)
+    if mf is not False:
+        m = dict(_CMP_MF, run_id=name,
+                 config={"bundle": {"hk_codes": ["NIXD0501"]}})
+        m.update(mf or {})
+        with open(os.path.join(d, bundle_mod.MANIFEST), "w") as f:
+            json.dump(m, f)
+    if decisions is not None:
+        with open(os.path.join(d, bundle_mod.DECISIONS), "w") as f:
+            for x in decisions:
+                f.write(json.dumps(x, separators=(",", ":")) + "\n")
+    if records is not None:
+        with open(os.path.join(d, "log.jsonl"), "w") as f:
+            for r in records:
+                f.write(json.dumps(r, separators=(",", ":")) + "\n")
+    return d
+
+
+def _cmp_ok(a, b, **kw):
+    """compare() with the read-only pin: both dirs byte-identical."""
+    before = _dir_state(a) + _dir_state(b)
+    r = compare_mod.compare(a, b, **kw)
+    check(_dir_state(a) + _dir_state(b) == before,
+          "the compared dirs are read-only")
+    return r
+
+
+def _p1(r):
+    """The pass-1 rows (the derived overrun rows are last)."""
+    return [x for x in r["rows"]
+            if x["check"] not in ("First overrun (hk level 7)",
+                                  "Overruns in the run")]
+
+
+def _derived(r):
+    return {x["check"]: x for x in r["rows"]
+            if x["check"] in ("First overrun (hk level 7)",
+                              "Overruns in the run")}
+
+
+def t_compare_core(env):
+    """S3 C1 (the plan review's R1 pairing): identical bundles same;
+    a moved event, the hex rule and an exact hk_step value differ; the
+    pre-anchor and key-disjoint one-sided rows; the R1 swaps and the
+    repeated ack; the re-derive and slice scoping; the overrun rows;
+    the refusals. Both dirs stay read-only."""
+    a = [_cmp_ev(1, 5 * NS, 0x21),
+         _cmp_dec("hk_step", 2, 6 * NS, "hk:2:NIXD0501",
+                  {"value": 5, "previous": 3}),
+         _cmp_dec("ack", 3, 7 * NS, "0x05AC/7",
+                  {"subtype": 7, "fid": None})]
+    # identical bundles
+    da = _cmp_bundle(env, "cmp-same-a", a)
+    db = _cmp_bundle(env, "cmp-same-b", [dict(x) for x in a])
+    r = _cmp_ok(da, db)
+    check(r["summary"]["verdict"] == "same" and
+          all(x["result"] == "same" for x in r["rows"]),
+          "identical bundles: %r" % r["summary"])
+    check(r["summary"]["counts"] == {"pairs": 3} and
+          r["summary"]["align"] == {"t_a": 5 * NS, "t_b": 5 * NS} and
+          r["summary"]["first_divergence"] is None and
+          not any(x["first"] for x in r["rows"]),
+          "three pairs, no divergence: %r" % r["summary"])
+    check(set(r["rows"][0]) == {"check", "a", "b", "result", "tol",
+                                "first"}, "the frozen row shape")
+    # one event's sim_time moved 2 s: only-* rows around the anchor
+    db = _cmp_bundle(env, "cmp-move-b", [
+        _cmp_ev(1, 1 * NS, 0x142E, cls="keepalive"),
+        _cmp_ev(2, 7 * NS, 0x21)])
+    da = _cmp_bundle(env, "cmp-move-a", [
+        _cmp_ev(1, 1 * NS, 0x142E, cls="keepalive"),
+        _cmp_ev(2, 5 * NS, 0x21)])
+    r = _cmp_ok(da, db)
+    check(r["summary"]["verdict"] == "differs" and
+          r["summary"]["align"] == {"t_a": 1 * NS, "t_b": 1 * NS},
+          "the moved event: %r" % r["summary"])
+    check(r["summary"]["first_divergence"] ==
+          {"kind": "event", "key": "0x0021", "t_a": 5 * NS,
+           "t_b": None}, "the first divergence: %r"
+          % r["summary"]["first_divergence"])
+    fr = [x for x in r["rows"] if x["first"]]
+    check(len(fr) == 1 and fr[0]["check"] == "mode 0x0021" and
+          fr[0]["result"] == "only-baseline" and fr[0]["a"] == 4.0,
+          "the first row: %r" % fr)
+    check([x["result"] for x in _p1(r)] ==
+          ["same", "only-baseline", "only-other"], "the rows: %r"
+          % [x["result"] for x in _p1(r)])
+
+    # the hex rule: same times, different params
+    da = _cmp_bundle(env, "cmp-hex-a", [_cmp_ev(1, 5 * NS, 0x21)])
+    db = _cmp_bundle(env, "cmp-hex-b",
+                     [_cmp_ev(1, 5 * NS, 0x21, params="03")])
+    r = _cmp_ok(da, db)
+    check([x["result"] for x in _p1(r)] == ["differs"], "the hex rule")
+    check(r["rows"][0]["first"] is True and r["rows"][0]["a"] == 0.0
+          and r["rows"][0]["b"] == 0.0, "the hex row: %r" % r["rows"][0])
+    # an hk_step value 5 vs 6 differs even within tol_event_s
+    da = _cmp_bundle(env, "cmp-hk-a", [_cmp_dec(
+        "hk_step", 1, 5 * NS, "hk:2:NIXD0501", {"value": 5,
+                                                "previous": 3})])
+    db = _cmp_bundle(env, "cmp-hk-b", [_cmp_dec(
+        "hk_step", 1, int(5.2 * NS), "hk:2:NIXD0501",
+        {"value": 6, "previous": 3})])
+    r = _cmp_ok(da, db)
+    check([x["result"] for x in _p1(r)] == ["differs"],
+          "the exact hk value: %r" % _p1(r))
+    # a leading decision only on the baseline: pairing starts at the
+    # next common key, align is that anchor, the row may be first
+    da = _cmp_bundle(env, "cmp-lead-a", [
+        _cmp_ev(1, 1 * NS, 0x142E, cls="keepalive"),
+        _cmp_ev(2, 5 * NS, 0x21)])
+    db = _cmp_bundle(env, "cmp-lead-b", [_cmp_ev(2, 5 * NS, 0x21)])
+    r = _cmp_ok(da, db)
+    check(r["summary"]["verdict"] == "differs" and
+          r["summary"]["align"] == {"t_a": 5 * NS, "t_b": 5 * NS},
+          "the leading one-sided decision: %r" % r["summary"])
+    check([x["result"] for x in _p1(r)] == ["only-baseline", "same"],
+          "pairing starts at the anchor: %r" % _p1(r))
+    check(r["rows"][0]["a"] == -4.0 and r["rows"][0]["first"] is True,
+          "the pre-anchor row is first: %r" % r["rows"][0])
+    check(r["summary"]["first_divergence"] ==
+          {"kind": "event", "key": "0x142E", "t_a": 1 * NS,
+           "t_b": None}, "the leading divergence: %r"
+          % r["summary"]["first_divergence"])
+    # heads that never match: all one-sided, one first row
+    da = _cmp_bundle(env, "cmp-dis-a", [_cmp_ev(1, 5 * NS, 0x21)])
+    db = _cmp_bundle(env, "cmp-dis-b",
+                     [_cmp_ev(1, 6 * NS, 0x9999, cls="other")])
+    r = _cmp_ok(da, db)
+    check(r["summary"]["verdict"] == "differs" and
+          r["summary"]["align"] == {"t_a": None, "t_b": None},
+          "no common key: %r" % r["summary"])
+    check([x["result"] for x in _p1(r)] == ["only-baseline",
+                                            "only-other"],
+          "both sides one-sided: %r" % _p1(r))
+    check(sum(1 for x in r["rows"] if x["first"]) == 1 and
+          r["summary"]["first_divergence"]["key"] == "0x0021",
+          "exactly one first row: %r" % r["summary"])
+
+    # R1: a swapped near-simultaneous pair still pairs -> same
+    da = _cmp_bundle(env, "cmp-swp-a", [
+        _cmp_ev(1, 5 * NS, 0x21),
+        _cmp_ev(2, int(5.1 * NS), 0x142E, cls="keepalive")])
+    db = _cmp_bundle(env, "cmp-swp-b", [
+        _cmp_ev(1, int(5.05 * NS), 0x142E, cls="keepalive"),
+        _cmp_ev(2, int(5.15 * NS), 0x21)])
+    r = _cmp_ok(da, db)
+    check(r["summary"]["verdict"] == "same" and
+          r["summary"]["counts"] == {"pairs": 2} and
+          all(x["result"] == "same" for x in _p1(r)),
+          "the swapped near-simultaneous pair: %r" % r["summary"])
+    # R1: a repeated ack key pairs in order (details would betray a
+    # cross pairing)
+    da = _cmp_bundle(env, "cmp-ack-a", [
+        _cmp_dec("ack", 1, 5 * NS, "0x05AC/7", {"subtype": 7,
+                                                "fid": None}),
+        _cmp_dec("ack", 2, 6 * NS, "0x05AC/7", {"subtype": 7,
+                                                "fid": None})])
+    db = _cmp_bundle(env, "cmp-ack-b", [
+        _cmp_dec("ack", 1, int(5.1 * NS), "0x05AC/7",
+                 {"subtype": 7, "fid": None}),
+        _cmp_dec("ack", 2, int(6.1 * NS), "0x05AC/7",
+                 {"subtype": 8, "fid": None})])
+    r = _cmp_ok(da, db)
+    check([x["result"] for x in _p1(r)] == ["same", "differs"],
+          "the repeated ack pairs in order: %r" % _p1(r))
+    check([x["a"] for x in _p1(r)] == [0.0, 1.0] and
+          [x["b"] for x in _p1(r)] == [0.0, 1.0], "in-order times")
+    # R1: a=[A,B] vs b=[B,A] beyond tol -> the defined one-sided rows
+    da = _cmp_bundle(env, "cmp-swp2-a", [
+        _cmp_ev(1, 5 * NS, 0x21),
+        _cmp_ev(2, 15 * NS, 0x142E, cls="keepalive")])
+    db = _cmp_bundle(env, "cmp-swp2-b", [
+        _cmp_ev(1, 5 * NS, 0x142E, cls="keepalive"),
+        _cmp_ev(2, 15 * NS, 0x21)])
+    r = _cmp_ok(da, db)
+    check(r["summary"]["verdict"] == "differs" and
+          [x["result"] for x in _p1(r)] ==
+          ["only-other", "same", "only-baseline"],
+          "the beyond-tol swap: %r" % _p1(r))
+    check(_p1(r)[0]["b"] == -10.0 and _p1(r)[2]["a"] == 10.0,
+          "the relative times: %r" % _p1(r))
+    check(r["summary"]["first_divergence"] ==
+          {"kind": "event", "key": "0x142E", "t_a": None,
+           "t_b": 5 * NS}, "the swap divergence: %r"
+          % r["summary"]["first_divergence"])
+
+    # a missing decisions.jsonl: the re-derived list equals the
+    # Writer-produced one (decide() over the same records)
+    tc = _rec("tc", 1, "tc.gs.send", {
+        "hex": "1dacc0070002", "apid": 0x5AC, "seq": 7, "service": 17,
+        "subtype": 1, "source": 121, "delivered": True}, source="tc")
+
+    def tm_ev(seq, params):
+        return _rec("tm", seq, "tm.0x5a7", {"decoded": {
+            "apid": 0x5A7, "type": 5, "subtype": 1, "eid": 0x21,
+            "eid_name": "mode change", "params": params}}, source="tm")
+
+    def tm_hk(seq, v):
+        return _rec("tm", seq, "tm.0x5a4", {
+            "hk": {"NIXD0501": v},
+            "decoded": {"apid": 0x5A4, "type": 3, "subtype": 25,
+                        "sid": 2}}, source="tm")
+
+    def tm_ack(seq, tc_seq):
+        return _rec("tm", seq, "tm.0x5a1", {"decoded": {
+            "apid": 0x5A1, "type": 1, "subtype": 7, "dest": 14,
+            "tc": {"packet_id": 0x1DAC, "apid": 0x5AC,
+                   "seq": tc_seq}}}, source="tm")
+
+    def produced_of(recs):
+        st = bundle_mod.new_state(["NIXD0501"])
+        out = []
+        for x in recs:
+            out += bundle_mod.decide(x, st)
+        return out
+
+    recs = [tc, tm_ev(2, "02"), tm_hk(3, 3), tm_hk(4, 5), tm_ack(5, 7)]
+    produced = produced_of(recs)
+    check([d["kind"] for d in produced] == ["event", "hk_step", "ack"],
+          "the writer-shaped decisions: %r" % produced)
+    da = _cmp_bundle(env, "cmp-rd-a", produced, records=recs)
+    db = _cmp_bundle(env, "cmp-rd-b", None, records=recs)
+    r = _cmp_ok(da, db)
+    check(r["summary"]["verdict"] == "same" and
+          r["summary"]["counts"] == {"pairs": 3},
+          "the re-derived list equals the writer's: %r" % r["summary"])
+    with open(os.path.join(db, bundle_mod.MANIFEST)) as f:
+        mb = json.load(f)
+    check(compare_mod.load_decisions(db, mb) == produced,
+          "load_decisions re-derives: %r" % produced)
+    # a two-session log, the manifest scoped by start_offset: only this
+    # session's decisions
+    recs2 = [tc, tm_ev(2, "02"), tm_hk(3, 3), tm_hk(4, 5), tm_ack(5, 7),
+             _rec("tc", 11, "tc.gs.send", {
+                 "hex": "1dacc0070008", "apid": 0x5AC, "seq": 8,
+                 "service": 17, "subtype": 1, "source": 121,
+                 "delivered": True}, source="tc"),
+             tm_ev(12, "03"), tm_hk(13, 5), tm_hk(14, 7), tm_ack(15, 8)]
+    produced2 = produced_of(recs2[5:])
+    check([d["kind"] for d in produced2] == ["event", "hk_step", "ack"],
+          "the second session's decisions: %r" % produced2)
+    offset = sum(len(json.dumps(x, separators=(",", ":"))) + 1
+                 for x in recs2[:5])
+    dc = _cmp_bundle(env, "cmp-two-c", None, records=recs2,
+                     mf={"start_offset": offset})
+    with open(os.path.join(dc, bundle_mod.MANIFEST)) as f:
+        mc = json.load(f)
+    check(compare_mod.load_decisions(dc, mc) == produced2,
+          "only this session's decisions: %r" % produced2)
+    dd = _cmp_bundle(env, "cmp-two-d", produced2)
+    r = _cmp_ok(dd, dc)
+    check(r["summary"]["verdict"] == "same" and
+          r["summary"]["counts"] == {"pairs": 3},
+          "the scoped re-derive compares same: %r" % r["summary"])
+    # no manifest at all: the whole log is the slice, verdict unchanged
+    dl = _cmp_bundle(env, "cmp-logonly", None, mf=False, records=recs)
+    r = _cmp_ok(da, dl)
+    check(r["summary"]["verdict"] == "same" and
+          r["summary"]["counts"] == {"pairs": 3},
+          "the whole log is the slice: %r" % r["summary"])
+    # the refusals name the side
+    dr = _cmp_bundle(env, "cmp-rot", None, mf={"log_rotations": 9},
+                     records=[tc])
+    e = raises(compare_mod.CompareError, compare_mod.compare, da, dr)
+    check("other" in str(e) and "rotated" in str(e),
+          "the rotated slice refuses: %s" % e)
+    e = raises(compare_mod.CompareError, compare_mod.compare, dr, da)
+    check("baseline" in str(e), "the side is named: %s" % e)
+    empty = os.path.join(env.tmp, "cmp-empty")
+    os.makedirs(empty)
+    e = raises(compare_mod.CompareError, compare_mod.compare, empty, da)
+    check("baseline" in str(e) and "no run bundle" in str(e),
+          "no bundle: %s" % e)
+    do = _cmp_bundle(env, "cmp-open", [_cmp_ev(1, 5 * NS, 0x21)],
+                     mf={"open": True})
+    e = raises(compare_mod.CompareError, compare_mod.compare, da, do)
+    check("other" in str(e) and "open" in str(e), "still open: %s" % e)
+    e = raises(compare_mod.CompareError, compare_mod.compare, do, da)
+    check("baseline" in str(e), "still open, the side named: %s" % e)
+    # the derived overrun rows: an NIXD0501 step to 7 on one side only
+    da = _cmp_bundle(env, "cmp-ovr-a", [
+        _cmp_ev(1, 5 * NS, 0x21),
+        _cmp_dec("hk_step", 2, 6 * NS, "hk:2:NIXD0501",
+                 {"value": 7, "previous": 5})])
+    db = _cmp_bundle(env, "cmp-ovr-b", [_cmp_ev(1, 5 * NS, 0x21)])
+    r = _cmp_ok(da, db)
+    d = _derived(r)
+    check(d["First overrun (hk level 7)"]["result"] == "only-baseline"
+          and d["First overrun (hk level 7)"]["a"] == 1.0 and
+          d["First overrun (hk level 7)"]["b"] is None,
+          "the one-sided overrun: %r" % d)
+    check(d["Overruns in the run"] == {"check": "Overruns in the run",
+                                       "a": 1, "b": 0,
+                                       "result": "differs", "tol": None,
+                                       "first": False},
+          "the overrun counts: %r" % d)
+    check(r["summary"]["verdict"] == "differs", "the overrun differs")
+    # steps on both sides at aligned times
+    da = _cmp_bundle(env, "cmp-ovr2-a", [
+        _cmp_dec("hk_step", 1, 5 * NS, "hk:2:NIXD0501",
+                 {"value": 5, "previous": 3}),
+        _cmp_dec("hk_step", 2, 6 * NS, "hk:2:NIXD0501",
+                 {"value": 7, "previous": 5})])
+    db = _cmp_bundle(env, "cmp-ovr2-b", [
+        _cmp_dec("hk_step", 1, 5 * NS, "hk:2:NIXD0501",
+                 {"value": 5, "previous": 3}),
+        _cmp_dec("hk_step", 2, int(6.2 * NS), "hk:2:NIXD0501",
+                 {"value": 7, "previous": 5})])
+    r = _cmp_ok(da, db)
+    d = _derived(r)
+    check(d["First overrun (hk level 7)"]["result"] == "same" and
+          d["First overrun (hk level 7)"]["a"] == 1.0 and
+          d["First overrun (hk level 7)"]["b"] == 1.2,
+          "the aligned overruns: %r" % d)
+    check(d["Overruns in the run"]["result"] == "same" and
+          d["Overruns in the run"]["a"] == 1, "the equal counts")
+    check(r["summary"]["verdict"] == "same",
+          "aligned overruns stay same: %r" % r["summary"])
+
+
 def t_ui_runs(env):
     """R4 (no browser): the Runs tab with its filter and table, the
     board's verbs used and served, the page rules still holding."""
@@ -7717,6 +8061,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("replay: scheduler (S2)", t_replay_sched),
          ("replay: run (S2)", t_replay_run),
          ("replay: cli (S2)", t_replay_cli),
+         ("compare: core (S3)", t_compare_core),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("faults: since_sim (D1)", t_faults_since_sim),

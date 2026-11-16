@@ -101,6 +101,13 @@ DEFAULTS = {
     # run bundles (2026-11-15 run-bundles plan): the manifest +
     # decisions writer, and the HK fields that yield hk_step decisions
     "bundle": {"enabled": True, "hk_codes": ["NIXD0501", "NIXD0023"]},
+    # S3: comparing two run bundles (2026-11-16 compare plan); the
+    # series list is pass 2's (C3)
+    "compare": {"tol_event_s": 1.0, "tol_number_rel": 0.05,
+                "tol_number_abs": 1.0,
+                "series": ["hk:2:NIXD0501",
+                           "truth:instrument.rotb.count",
+                           "truth:instrument.detector.tape.dropped"]},
     "retention": {"run_root": "/tmp/stix-plat/runs-root", "keep_runs": 10,
                   "keep_failed_days": 7, "max_total_mb": 2048,
                   "min_free_mb": 1024, "keep_flash": "failed"},
@@ -240,6 +247,15 @@ def _check(cfg):
         raise ConfigError("bundle.enabled is true or false")
     if not all(isinstance(x, str) for x in cfg["bundle"]["hk_codes"]):
         raise ConfigError("bundle.hk_codes is a list of strings")
+    c = cfg["compare"]
+    if not 0 < c["tol_event_s"] <= 3600:
+        raise ConfigError("compare.tol_event_s is 0 < x <= 3600")
+    if not 0 <= c["tol_number_rel"] < 1:
+        raise ConfigError("compare.tol_number_rel is 0 <= x < 1")
+    if c["tol_number_abs"] < 0:
+        raise ConfigError("compare.tol_number_abs is >= 0")
+    if not all(isinstance(x, str) for x in c["series"]):
+        raise ConfigError("compare.series is a list of strings")
 
 
 def merged(cfg, *overs):
