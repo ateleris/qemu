@@ -349,7 +349,7 @@ class Platform:
                             "default": 9}},
               doc="GS emulation: an operator TC from source 121 "
                   "(allow_gs_emulation)",
-              enabled=self._gs_enabled)
+              enabled=self._gs_enabled("tc.gs.send"))
         # the FSW parameters (fsw-params plan T3-T5): the TC-carrying
         # verbs sit behind the same operator-TC gate as tc.gs.send
         d.add("param.refresh", self.params.refresh,
@@ -364,14 +364,14 @@ class Platform:
               doc="read one parameter back with TC(237,19) and wait up "
                   "to 2 s for its TM(237,20); sub 0 = value, 1 = min, "
                   "2 = max",
-              enabled=self._gs_enabled)
+              enabled=self._gs_enabled("param.read"))
         d.add("param.read_all", self.params.read_all,
               args={"only_changed": {"type": "boolean",
                                      "default": True}},
               doc="read rows back one by one: only the rows whose "
                   "value differs from the ELF default unless "
                   "only_changed is false; progress every 32",
-              enabled=self._gs_enabled, locked=False)
+              enabled=self._gs_enabled("param.read_all"), locked=False)
         d.add("param.set", self.params.set,
               args={"index": {"type": "integer", "required": True,
                               "min": 0, "max": 65535},
@@ -381,14 +381,14 @@ class Platform:
                             "default": 0}},
               doc="set a parameter with TC(237,18); delivered false "
                   "with the reason when the TC cannot go out",
-              enabled=self._gs_enabled)
+              enabled=self._gs_enabled("param.set"))
         d.add("param.reset_all", self.params.reset_all,
               args={"only_changed": {"type": "boolean",
                                      "default": True}},
               doc="TC(237,18) the ELF default of every row whose known "
                   "value differs (all known rows when only_changed is "
                   "false)",
-              enabled=self._gs_enabled, locked=False)
+              enabled=self._gs_enabled("param.reset_all"), locked=False)
 
     def v_link(self, state):
         down = state == "down"
@@ -662,12 +662,16 @@ class Platform:
                        "source": src, "crc_ok": p[6] if p else False})
         return {"service": svc, "subtype": sub, "len": len(sp)}
 
-    def _gs_enabled(self):
-        mode = self.cfg["gs"]["emulation"]
-        if mode == "on" or (mode == "auto" and self.cfg["mode"] == "run"):
-            return None
-        return ("tc.gs.send needs [gs] emulation = \"on\" (default: on in "
-                "run mode only)")
+    def _gs_enabled(self, verb):
+        """The enabled() gate of the operator-TC verbs: the refusal
+        reason names the verb being refused."""
+        def check():
+            mode = self.cfg["gs"]["emulation"]
+            if mode == "on" or (mode == "auto" and self.cfg["mode"] == "run"):
+                return None
+            return ('%s needs [gs] emulation = "on" (default: on in run '
+                    "mode only)" % verb)
+        return check
 
     def v_tc_gs(self, service, subtype, data="", ack=9):
         try:

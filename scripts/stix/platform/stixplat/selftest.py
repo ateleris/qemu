@@ -3808,6 +3808,28 @@ def t_verbs_doc(env):
           "doc %r" % (api, doc))
 
 
+def t_verbs_why(env):
+    """U1: describe() marks a disabled verb with `why` (the same text
+    run() refuses with, so the UI can show it), an enabled verb has no
+    why key, and the reason names the verb being refused."""
+    ctl = env.controller()      # interactive: the operator-TC gate is off
+    try:
+        vs = {v["verb"]: v for v in ctl.dispatcher.describe()}
+        check(vs["sim.pause"]["enabled"] and "why" not in vs["sim.pause"],
+              "an enabled verb has no why: %r" % vs["sim.pause"])
+        for verb in ("tc.gs.send", "param.set"):
+            check(not vs[verb]["enabled"] and
+                  vs[verb]["why"].startswith(verb + " needs [gs]"),
+                  "%s's why names the verb: %r" % (verb, vs[verb]["why"]))
+        e = raises(VerbError, ctl.command, "param.set",
+                   {"index": 1, "value": 1})
+        check(e.status == 403 and str(e) == vs["param.set"]["why"],
+              "describe's why is run()'s 403 text: %s vs %r"
+              % (e, vs["param.set"]["why"]))
+    finally:
+        ctl.shutdown()
+
+
 def t_gate_slots(env):
     """§41: the platform gates' ports come from the slot band (their
     --dry-run, a temp lock dir and a fake df; nothing boots)."""
@@ -3837,6 +3859,11 @@ UI_PARAMS_VERBS = {"param.refresh", "param.set", "param.read_all",
 # fsw-params plan T8: the ids the FSW parameters panel must have
 UI_PARAMS_IDS = {"params", "params-find", "params-nondef",
                  "params-readall", "params-reset", "params-body"}
+# U1: one shared why-note element per verb panel (all its verbs disabled)
+UI_VERB_NOTE_IDS = {"verb-note-platform", "verb-note-idpu",
+                    "verb-note-detectors", "verb-note-faults",
+                    "verb-note-scenarios", "verb-note-runs",
+                    "verb-note-setup"}
 # run bundles (S1): the board's own verbs (built per row in JS, so the
 # parser only sees the static run.close button); S3 adds run.compare
 UI_RUNS_VERBS = {"run.baseline", "run.open", "run.close", "run.compare"}
@@ -4082,6 +4109,24 @@ def t_ui_page(env):
     ids = {a["id"] for _, a in p.attrs if "id" in a}
     check(refs and refs <= ids, "$() ids %r, page ids %r"
           % (sorted(refs), sorted(ids)))
+    # U1: disabled verbs say why — one shared note element per verb
+    # panel, the why in the disabled buttons' tooltips and the params
+    # table's Set/Reset, and the /state poll skipped in view mode
+    check("sec-note" in page and ':scope > h2' in page,
+          "the per-section verb note (a section whose verbs are all "
+          "refused says why)")
+    check(UI_VERB_NOTE_IDS <= ids, "verb-note ids missing %r"
+          % sorted(UI_VERB_NOTE_IDS - ids))
+    check(page.count('class="verb-note"') == len(UI_VERB_NOTE_IDS),
+          "one why-note element per verb panel")
+    check("function verbWhy(" in js and
+          'verbWhy(verbBy["param.set"])' in js and
+          "v.why ||" in js, "the why in tooltips and table rows")
+    check("if (!viewMode) loadState()" in js and
+          "setInterval(loadState" not in js,
+          "the loadState poll is skipped in view mode")
+    check('controller <b id="s-mode">' in page,
+          "the header chip says controller <mode>")
 
 
 def t_ui_tabs(env):
@@ -8587,7 +8632,9 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("flash library (FF)", t_flashlib),
          ("guest-reset policies", t_guest_reset),
          ("D-PLj filter", t_filter), ("SSE + Last-Event-ID", t_sse),
-         ("verbs == docs table", t_verbs_doc), ("probe_lib", t_probe_lib),
+         ("verbs == docs table", t_verbs_doc),
+         ("verbs: disabled say why (U1)", t_verbs_why),
+         ("probe_lib", t_probe_lib),
          ("gate ports from the slot band", t_gate_slots),
          ("UI: served at /, CSP, scenarios", t_ui_server),
          ("UI: the page (no browser)", t_ui_page),

@@ -142,7 +142,7 @@ The path prefix is `/api/v1`. Read endpoints:
 | `GET /stream?topics=a,b` | SSE: `id` = seq, `event` = topic, `data` = the record line; resume with `Last-Event-ID` |
 | `GET /faults` | the fault catalogue and the active faults |
 | `GET /params` | the FSW parameters table: symbol, count, differ, warnings, and the rows (index, name, default, min, max, current, read-back, applies) |
-| `GET /verbs` | the command vocabulary with argument schemas |
+| `GET /verbs` | the command vocabulary with argument schemas; a disabled verb carries `why` (the same text its 403 refuses with) |
 | `GET /scenarios` | the scenario dir's files: name, variants, description, or the load error |
 | `GET /runs` | the run bundles under `<retention.run_root>/runs` (plus the live dir): run_id, started/ended, verdict, ELF and QEMU identity, icount, length, input and decision counts; newest first, a broken manifest listed with its error |
 | `GET /runs/<run_id>` | one bundle's manifest plus its file sizes, the baseline mark and the retention marker |
@@ -1184,10 +1184,18 @@ no CDN. It is only an API client:
   `GET /faults`, the forcings from the state tree's `instrument.hk_adc.*`
   leaves, the scenario list from `GET /scenarios`, and an "any verb"
   form and the buttons' tooltips from `GET /verbs` (a verb the server
-  does not enable is greyed out);
+  does not enable is greyed out and its tooltip is that verb's `why`;
+  a panel whose verbs are all disabled says why in one shared note);
 - everything shown comes from `/status` (polled each second),
-  `/state` (every 2 s), and the event log and UART tail: first
+  `/state` (every 2 s; the poll is skipped while the last `/status`
+  said mode `view`, a `--view-run` has no state tree), and the event
+  log and UART tail: first
   `GET /log` (the last 2000 records), then the SSE stream from that seq.
+  The header chips are power, boot, sim, OBT, SpW, time codes,
+  keep-alive, time sync, TM, scenario and `controller <mode>` (the
+  controller's interactive/run/view mode, so it is not mistaken for the
+  FSW's mode); without `status.platform` (a view-run) the platform
+  chips read "–".
   So a reload loses nothing, and nothing lives only in the page.
 
 **Web UI tabs** (timeline plan B1/B2): the page is a tab bar (the state

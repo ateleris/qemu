@@ -124,6 +124,9 @@ tbody th { position: static; }   /* group headers scroll, thead sticks */
 .diff { color: var(--warn); font-weight: 600; }
 #toast { min-height: 1.4em; font: 12px var(--mono); }
 .desc { color: var(--muted); font-size: 12px; margin: 2px 0 6px; }
+/* one shared note per panel: why all of its verbs are disabled */
+.verb-note { grid-column: 1 / -1; margin: 0; color: var(--warn);
+  font: 12px var(--mono); }
 .row { border-top: 1px solid var(--line); padding: 6px 0; }
 .row:first-child { border-top: 0; }
 #tl-plot { border: 1px solid var(--line); background: var(--panel); }
@@ -180,7 +183,7 @@ tr.cmp-first td { font-weight: 600; }
   <span class="chip">time sync <b id="s-ts">?</b></span>
   <span class="chip">TM <b id="s-tm">?</b></span>
   <span class="chip">scenario <b id="s-scn">none</b></span>
-  <span class="chip">mode <b id="s-mode">?</b></span>
+  <span class="chip">controller <b id="s-mode">?</b></span>
   <span id="hdr-run" class="ctl">
     <button data-verb="sim.pause">pause</button>
     <button data-verb="sim.resume" hidden>resume</button>
@@ -233,6 +236,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="platform" hidden>
+<p class="verb-note" id="verb-note-platform" hidden></p>
 <section>
   <h2>Power and simulation</h2>
   <div class="ctl">
@@ -323,6 +327,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="idpu" hidden>
+<p class="verb-note" id="verb-note-idpu" hidden></p>
 <section id="params" class="wide">
   <h2>FSW parameters
     <input id="params-find" class="wide"
@@ -406,6 +411,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="detectors" hidden>
+<p class="verb-note" id="verb-note-detectors" hidden></p>
 <section class="wide">
   <h2>Detectors
     <span class="ctl">
@@ -626,6 +632,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="faults" hidden>
+<p class="verb-note" id="verb-note-faults" hidden></p>
 <section>
   <h2>Faults <span id="fault-cats" class="ctl"></span></h2>
   <div class="scroll tall">
@@ -675,6 +682,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="scenarios" hidden>
+<p class="verb-note" id="verb-note-scenarios" hidden></p>
 <section>
   <h2>Scenarios</h2>
   <div class="ctl">
@@ -737,6 +745,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="runs" hidden>
+<p class="verb-note" id="verb-note-runs" hidden></p>
 <section class="wide">
   <h2>Run bundles
     <input id="runs-filter" placeholder="filter, e.g. gate" class="wide">
@@ -770,6 +779,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="setup" hidden>
+<p class="verb-note" id="verb-note-setup" hidden></p>
 <section class="wide">
   <h2>Launch configuration</h2>
   <div class="scroll">
@@ -1180,6 +1190,13 @@ function paramsRow(row, diff) {
   btns[1].dataset.idx = row.index;         // Reset sends the ELF default
   btns[1].dataset.value = row.default;
   btns[1].disabled = !diff;                // grey when the row does not differ
+  const setWhy = verbWhy(verbBy["param.set"]);   // the operator-TC gate
+  if (setWhy) {                            // the same why as the panel verbs
+    btns[0].disabled = true;
+    btns[1].disabled = true;
+    btns[0].title = "param.set: " + setWhy;
+    btns[1].title = btns[0].title;
+  }
   return tr;
 }
 $("params-find").addEventListener("input", renderParams);
@@ -1360,30 +1377,39 @@ function fmtObt(cuc) {
 }
 function chip(id, value, c) { text($(id), value); cls($(id), c || String(value)); }
 
+let viewMode = false;    // the last /status said mode "view" (a view-run)
+
 async function refresh() {
   let st;
   try { st = await getJSON("status"); } catch (e) { toast(String(e), true); return; }
   const p = st.platform || {};
+  viewMode = st.mode === "view";   // the loadState poll skips /state here
   TL.now = st.time ? st.time.sim_time : TL.now;
   chip("s-power", st.power);
   chip("s-boot", st.boot_id, "");
   chip("s-sim", fmtS(st.time && st.time.sim_time), "");
   chip("s-obt", fmtObt(st.time && st.time.obt) +
        (st.time && st.time.obt_kind ? " (" + st.time.obt_kind + ")" : ""), "");
-  chip("s-link", p.link);
+  // no platform in the status (a view-run): the chips say "–", never
+  // "undefined"
+  chip("s-link", p.link == null ? "–" : p.link,
+       p.link == null ? "" : p.link);
   // null = QEMU's default (on) until a verb or fault sets it
-  chip("s-tc", p.timecodes === false ? "off" :
+  chip("s-tc", !st.platform ? "–" :
+       p.timecodes === false ? "off" :
        p.timecodes == null ? "on (default)" : "on",
-       p.timecodes === false ? "off" : "on");
+       !st.platform ? "" : p.timecodes === false ? "off" : "on");
   const ka = p.keepalive || {};
-  chip("s-ka", (ka.enabled ? "on" : "off") + " " + ka.period_s + " s, " +
-       ka.sent + " sent", ka.enabled ? "on" : "off");
+  chip("s-ka", p.keepalive == null ? "–" :
+       (ka.enabled ? "on" : "off") + " " + ka.period_s + " s, " +
+       ka.sent + " sent",
+       p.keepalive == null ? "" : ka.enabled ? "on" : "off");
   const ts = p.timesync || {};
   const last = ts.last || {};
   chip("s-ts", ts.pending ? "pending" : (last.verdict || "none"),
        ts.pending ? "pending" : (last.verdict || "muted"));
   text($("ts-last"), ts.last ? "last: " + JSON.stringify(ts.last) : "");
-  chip("s-tm", p.tm_count, "");
+  chip("s-tm", p.tm_count == null ? "–" : p.tm_count, "");
   chip("s-mode", st.mode, "");
   const scn = st.scenario;
   chip("s-scn", scn ? scn.name + "/" + scn.variant + " " + scn.phase +
@@ -2420,14 +2446,58 @@ function stimReadout() {
 
 /* ---- the vocabulary: tooltips, disabled verbs, the any-verb form ---- */
 let vocab = [];
+let verbBy = {};        // verb -> its /verbs entry (the table rows read it)
+function verbWhy(v) {
+  if (!v) return "not offered by this server";
+  return v.enabled ? null : (v.why || "disabled");
+}
 async function loadVerbs() {
   vocab = (await getJSON("verbs")).verbs || [];
-  const by = Object.fromEntries(vocab.map((v) => [v.verb, v]));
+  verbBy = Object.fromEntries(vocab.map((v) => [v.verb, v]));
+  if (paramsRows.length) renderParams();  // the Set/Reset buttons' why
   for (const b of document.querySelectorAll("button[data-verb]")) {
-    const v = by[b.dataset.verb];
-    b.title = v ? b.dataset.verb + ": " + v.doc : b.dataset.verb + ": unknown";
-    b.dataset.off = !v || !v.enabled ? "1" : "";
+    const why = verbWhy(verbBy[b.dataset.verb]);
+    const v = verbBy[b.dataset.verb];
+    b.title = b.dataset.verb + ": " +
+      (why || (v && v.doc) || "unknown");
+    b.dataset.off = why ? "1" : "";
     b.disabled = !!b.dataset.off;
+  }
+  // one shared note per panel: when none of its verbs is enabled, say why
+  for (const panel of document.querySelectorAll(".tab[data-tab-panel]")) {
+    const note = panel.querySelector(":scope > .verb-note");
+    if (!note) continue;
+    const btns = [...panel.querySelectorAll("button[data-verb]")];
+    const whys = btns.map((b) => verbWhy(verbBy[b.dataset.verb]));
+    const all = btns.length > 0 && whys.every((w) => w);
+    note.hidden = !all;
+    if (all) {
+      const why = whys.find((w) => !w.startsWith("not offered"));
+      text(note, why || (viewMode ?
+        "view-run is read-only: every verb but view.* is refused" :
+        "this panel's verbs are not offered by this server"));
+    }
+  }
+  // and per section, when the tab as a whole is still usable: a section
+  // whose own verbs are all refused says why under its heading (the
+  // IDPU tab's GS-emulation TC panel next to an enabled param.refresh)
+  for (const sec of document.querySelectorAll(".tab section")) {
+    const btns = [...sec.querySelectorAll("button[data-verb]")];
+    if (!btns.length) continue;
+    const whys = btns.map((b) => verbWhy(verbBy[b.dataset.verb]));
+    const tabNote = sec.closest(".tab").querySelector(".verb-note");
+    const all = whys.every((w) => w) && !(tabNote && !tabNote.hidden);
+    let note = sec.querySelector(":scope > .sec-note");
+    if (!note && !all) continue;
+    if (!note) {
+      note = document.createElement("p");
+      note.className = "verb-note sec-note";
+      const h = sec.querySelector(":scope > h2");
+      if (h) h.after(note); else sec.prepend(note);
+    }
+    note.hidden = !all;
+    if (all) text(note, whys.find((w) => !w.startsWith("not offered")) ||
+                        whys[0]);
   }
   const sel = $("any-verb");
   sel.replaceChildren(...vocab.filter((v) => v.enabled)
@@ -3713,12 +3783,17 @@ function stream() {
 async function main() {
   let st = { seq: 0 };
   try { st = await getJSON("status"); } catch (e) { toast(String(e), true); }
+  viewMode = st.mode === "view";
   try { await backfill(st.seq || 0); } catch (e) { toast(String(e), true); }
   stream();
-  await Promise.allSettled([refresh(), loadVerbs(), loadFaults(),
-                            loadScenarios(), loadState(), loadTimeline()]);
+  const first = [refresh(), loadVerbs(), loadFaults(),
+                 loadScenarios(), loadTimeline()];
+  if (!viewMode) first.push(loadState());   // /state is 404 on a view-run
+  await Promise.allSettled(first);
   setInterval(refresh, 1000);
-  setInterval(loadState, 2000);
+  setInterval(() => {          // ditto: no /state poll in view mode
+    if (!viewMode) loadState();
+  }, 2000);
   setInterval(loadScenarios, 10000);
   setInterval(() => {   // the FSW parameters' RAM snapshot, but only
     if (!document.querySelector('[data-tab-panel="idpu"]').hidden)

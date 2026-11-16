@@ -77,10 +77,20 @@ class Dispatcher:
                             "locked": locked}
 
     def describe(self):
-        """GET /api/v1/verbs: the vocabulary with arg schemas."""
-        return [{"verb": n, "doc": v["doc"], "args": v["args"],
-                 "enabled": v["enabled"] is None or v["enabled"]() is None}
-                for n, v in sorted(self.verbs.items())]
+        """GET /api/v1/verbs: the vocabulary with arg schemas; a disabled
+        verb carries `why` (the enabled() reason, the same text run()
+        refuses with)."""
+        out = []
+        for n, v in sorted(self.verbs.items()):
+            d = {"verb": n, "doc": v["doc"], "args": v["args"],
+                 "enabled": True}
+            if v["enabled"] is not None:
+                why = v["enabled"]()
+                if why is not None:
+                    d["enabled"] = False
+                    d["why"] = why
+            out.append(d)
+        return out
 
     def run(self, verb, args, source="api"):
         """Validate, log `cmd`, run, log `result`. Returns the result
