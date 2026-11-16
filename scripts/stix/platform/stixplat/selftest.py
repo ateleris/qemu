@@ -7928,6 +7928,145 @@ def t_compare_core(env):
           "aligned overruns stay same: %r" % r["summary"])
 
 
+# -- S3 (compare plan C2): the verb, the artifact, the CLI ------------------
+def _cmp_root(env, dirs):
+    """Bundles moved under <root>/runs so bundle._resolve finds them by
+    id; returns (root, the moved dirs)."""
+    root = os.path.join(env.tmp, "cmp-root%d" % env.n)
+    runs = os.path.join(root, "runs")
+    os.makedirs(runs)
+    moved = []
+    for d in dirs:
+        nd = os.path.join(runs, os.path.basename(d))
+        os.rename(d, nd)
+        moved.append(nd)
+    return root, moved
+
+
+def t_compare_verb(env):
+    """S3 C2: run.compare by run id (R8) — 200 with the pair's summary
+    and rows, the artifact pair under <run_root>/compares (one per run
+    pair, overwritten), both run dirs read-only; an unknown id 404, a
+    bad id 400, a still-open bundle 409; registered in verbs.VERBS and
+    its cmd record classifies replay "no" with the new why."""
+    from . import verbs as verbs_mod
+    dec = [_cmp_ev(1, 5 * NS, 0x21),
+           _cmp_dec("hk_step", 2, 6 * NS, "hk:2:NIXD0501",
+                    {"value": 5, "previous": 3})]
+    da = _cmp_bundle(env, "20261116T101112Z-cmp-a", [dict(x) for x in dec])
+    db = _cmp_bundle(env, "20261116T101113Z-cmp-b", [dict(x) for x in dec])
+    do_ = _cmp_bundle(env, "20261116T101114Z-cmp-open",
+                      [_cmp_ev(1, 5 * NS, 0x21)], mf={"open": True})
+    root, (da, db, do_) = _cmp_root(env, (da, db, do_))
+    a_id, b_id = "20261116T101112Z-cmp-a", "20261116T101113Z-cmp-b"
+    ctl = env.controller(retention={"run_root": root})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    cmpdir = os.path.join(root, "compares")
+    before = _dir_state(da) + _dir_state(db) + _dir_state(do_)
+    try:
+        st, _, body = _http(port, "GET", "/api/v1/verbs")
+        check("run.compare" in
+              {v["verb"] for v in json.loads(body)["verbs"]} and
+              "run.compare" in verbs_mod.VERBS, "registered and served")
+
+        def post(a, b):
+            return _http(port, "POST", "/api/v1/cmd/run.compare",
+                         body=json.dumps({"a": a, "b": b}).encode(),
+                         headers=_post())
+
+        st, _, body = post(a_id, b_id)
+        res = json.loads(body)["result"]
+        check(st == 200 and res["summary"]["verdict"] == "same" and
+              res["summary"]["counts"] == {"pairs": 2} and
+              len(res["rows"]) == 3 and res["artifact"].startswith(cmpdir),
+              "the compare: %d %r" % (st, res))
+        with open(res["artifact"]) as f:
+            art = json.load(f)
+        check(art["summary"] == res["summary"] and
+              art["rows"] == res["rows"], "the .json artifact")
+        with open(res["artifact"][:-5] + ".jsonl") as f:
+            check([json.loads(x) for x in f if x.strip()] == res["rows"],
+                  "the .jsonl artifact")
+        check(_dir_state(da) + _dir_state(db) + _dir_state(do_) == before,
+              "the run dirs are read-only")
+        st, _, _ = post(a_id, b_id)     # again: latest wins, no growth
+        check(st == 200 and sorted(os.listdir(cmpdir)) ==
+              sorted(["%s-vs-%s.json" % (a_id, b_id),
+                      "%s-vs-%s.jsonl" % (a_id, b_id)]),
+              "one artifact pair per run pair: %r" % os.listdir(cmpdir))
+        st, _, body = post("no-such-run", b_id)
+        check(st == 404, "an unknown id: %d %r" % (st, body[:80]))
+        st, _, _ = post("a/b", b_id)
+        check(st == 400, "a bad id: %d" % st)
+        st, _, body = post(a_id, "20261116T101114Z-cmp-open")
+        check(st == 409 and "open" in body.decode(), "still open: %d %r"
+              % (st, body[:80]))
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    inp = bundle_mod.classify(_rec("cmd", 1, "run.compare",
+                                   {"args": {"a": a_id, "b": b_id}}),
+                              bundle_mod.new_state())
+    check(inp["replay"] == "no" and
+          inp["why"] == "controller management, not a run input",
+          "the cmd record classifies excluded: %r" % inp)
+
+
+def t_compare_cli(env):
+    """S3 C2: --compare's engine, compare.cli over run_compare (no
+    controller): a healthy pair exits 0 with the printed verdict and
+    the artifact path; a differing pair still exits 0 (owner question
+    1a); an unknown id and a still-open bundle exit 2 with the message;
+    the argparse combination rules exit 2."""
+    da = _cmp_bundle(env, "20261116T101112Z-cli-a",
+                     [_cmp_ev(1, 5 * NS, 0x21)])
+    db = _cmp_bundle(env, "20261116T101113Z-cli-b",
+                     [_cmp_ev(1, 5 * NS, 0x21)])
+    dc = _cmp_bundle(env, "20261116T101114Z-cli-c",
+                     [_cmp_ev(1, 5 * NS, 0x21, params="03")])
+    do_ = _cmp_bundle(env, "20261116T101115Z-cli-open",
+                      [_cmp_ev(1, 5 * NS, 0x21)], mf={"open": True})
+    root, (da, db, dc, do_) = _cmp_root(env, (da, db, dc, do_))
+    cfg = env.cfg(retention={"run_root": root})
+
+    def run(a, b):
+        msgs = []
+        return compare_mod.cli(cfg, [a, b], out=msgs.append), msgs
+
+    a_id, b_id = "20261116T101112Z-cli-a", "20261116T101113Z-cli-b"
+    rc, msgs = run(a_id, b_id)
+    check(rc == 0 and any("same" in x for x in msgs) and
+          any("artifact" in x for x in msgs),
+          "the healthy pair: %d %r" % (rc, msgs))
+    check(os.path.isfile(os.path.join(
+        root, "compares", "%s-vs-%s.json" % (a_id, b_id))),
+        "the artifact landed")
+    rc, msgs = run(a_id, "20261116T101114Z-cli-c")
+    check(rc == 0 and any("differs" in x for x in msgs),
+          "a differing verdict is still 0 (owner 1a): %d %r" % (rc, msgs))
+    rc, msgs = run("no-such-run", b_id)
+    check(rc == 2 and any("no-such-run" in x for x in msgs),
+          "an unknown id: %d %r" % (rc, msgs))
+    rc, msgs = run(a_id, "20261116T101115Z-cli-open")
+    check(rc == 2 and any("open" in x for x in msgs),
+          "still open: %d %r" % (rc, msgs))
+    # the argparse combination rules: ap.error exits 2
+    import subprocess
+    cli = os.path.normpath(os.path.join(HERE, "..", "stixplat.py"))
+    for argv, sub in ((["--compare", "a", "b", "--scenario", "s"],
+                       "--compare"),
+                      (["--replay", da, "--compare", "a", "b"],
+                       "--compare")):
+        r = subprocess.run([sys.executable, cli] + argv,
+                           capture_output=True, text=True, timeout=30)
+        check(r.returncode == 2, "%s exits 2: %d %s"
+              % (argv, r.returncode, r.stderr[-200:]))
+        check(sub in r.stderr, "the error names the flag: %s"
+              % r.stderr.strip()[-120:])
+
+
 # -- S3 (compare plan C3): a run bundle's series data path ----------------
 def t_compare_series_api(env):
     """C3 (R11): GET /runs/<id>/series answers a finished run's series
@@ -8172,6 +8311,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("replay: run (S2)", t_replay_run),
          ("replay: cli (S2)", t_replay_cli),
          ("compare: core (S3)", t_compare_core),
+         ("compare: verb (S3)", t_compare_verb),
+         ("compare: cli (S3)", t_compare_cli),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("faults: since_sim (D1)", t_faults_since_sim),

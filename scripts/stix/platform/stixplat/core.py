@@ -166,6 +166,15 @@ class Controller:
         d.add("run.close", self._run_close,
               args={"port": {"type": "integer", "min": 1024, "max": 65535}},
               doc="close the open run viewer (409 when none)")
+        d.add("run.compare", self._run_compare,
+              args={"a": {"type": "string", "required": True},
+                    "b": {"type": "string", "required": True}},
+              doc="compare two finished run bundles by run id (R8): the "
+                  "decisions aligned at the first common (kind, key) "
+                  "plus the derived rows; the answer is {summary, rows, "
+                  "artifact} with the artifact under "
+                  "<retention.run_root>/compares (404 unknown, 409 a "
+                  "bundle still open)")
         d.add("debug.qmp", self._debug_qmp,
               args={"command": {"type": "string", "required": True,
                                 "enum": list(DEBUG_QMP)},
@@ -241,6 +250,11 @@ class Controller:
 
     def _run_close(self, port=None):
         return self.viewers.close(port)
+
+    def _run_compare(self, a, b):
+        from . import compare as compare_mod   # lazy: compare -> replay
+        return compare_mod.run_compare(self.cfg, a, b,
+                                       live_dir=self.run_dir, out=None)
 
     def command(self, verb, args, source="api"):
         res = self.dispatcher.run(verb, args, source=source)

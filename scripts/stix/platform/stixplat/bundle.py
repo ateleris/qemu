@@ -72,6 +72,7 @@ _EXCLUDED_VERB_WHY = {
     "run.close": "controller management, not a run input",
     "run.baseline": "controller management, not a run input",
     "run.baseline.clear": "controller management, not a run input",
+    "run.compare": "controller management, not a run input",
     "view.delete": "views are not run inputs",
 }
 

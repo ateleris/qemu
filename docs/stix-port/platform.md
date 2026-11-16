@@ -222,6 +222,7 @@ lists exactly these verbs and arguments.
 | `run.baseline.clear` | | remove the baseline mark |
 | `run.open` | `name`, `port` | serve a finished run bundle read-only (the `--view-run` pair) on 127.0.0.1 in-process; one slot (409 while one is open); the answer is `{url, port}`, `port` 1024..65535 or a free one |
 | `run.close` | `port` | close the open run viewer (409 when none, or when `port` is not the open one) |
+| `run.compare` | `a`, `b` | compare two finished run bundles by run id: the decisions aligned at the first common (kind, key) pair plus the derived rows; the answer is `{summary, rows, artifact}` and the artifact pair is (re)written under `<retention.run_root>/compares/` — both run dirs stay read-only; 404 unknown id, 409 a bundle still open |
 | `debug.qmp` | `command`, `arguments` | one raw `qom-get` or `qom-set` on `/machine/stixspw` or `/machine/stixctrl`, or `query-status`; refused (403) unless `[debug] raw_qmp = true`, and in run mode also `[debug] allow_in_run = true`; every call is a `debug` record and sets the sticky `status.debug_used` taint (dev and gate use only) |
 <!-- verbs:end -->
 

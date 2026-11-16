@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Run bundles S3: compare two finished run bundles (2026-11-16
-compare plan, C1): the decisions — the plan review's R1 pairing —
-plus the derived overrun rows from the hk_step decisions. Both bundles
-are read-only and compare() is pure. Pass 2 (the series numbers, R10)
-and the surfaces come with C2/C3.
+compare plan): the decisions — the plan review's R1 pairing — plus the
+derived overrun rows from the hk_step decisions, and the surfaces (C2):
+the run.compare verb, the artifact pair and the --compare CLI. Both
+bundles are read-only and compare() is pure. Pass 2 (the series
+numbers, R10) comes with C3.
 """
 
 import json
@@ -14,6 +15,7 @@ import copy
 from . import bundle as bundle_mod
 from . import config as config_mod
 from . import replay as replay_mod
+from .dispatch import VerbError
 
 # tol=None: the [compare] defaults (the series ids are pass 2's, read
 # by C3)
@@ -261,9 +263,10 @@ def compare(baseline_dir, other_dir, tol=None):
             raise CompareError("%s: no run bundle at %r" % (side, d))
         if m is not None and m.get("open"):
             # a growing decisions file would make the verdict a moving
-            # snapshot; the replay refuses the same way
-            raise CompareError("%s: the run bundle at %r is still open"
-                               % (side, d))
+            # snapshot; the replay refuses the same way (CompareOpen:
+            # 409 on the verb, R8)
+            raise CompareOpen("%s: the run bundle at %r is still open"
+                              % (side, d))
         try:
             sides.append(load_decisions(d, m))
         except CompareError as e:
@@ -277,3 +280,82 @@ def compare(baseline_dir, other_dir, tol=None):
     return {"summary": {"verdict": verdict, "first_divergence": fd,
                         "align": align, "counts": {"pairs": pairs}},
             "rows": rows}
+
+
+# -- the surfaces (C2) -------------------------------------------------------
+class CompareOpen(CompareError):
+    """The refusal for a manifest still open: 409 on the verb (wrong
+    state, R8), exit 2 on the CLI like every other refusal."""
+
+
+EXIT = {"ok": 0, "refused": 2, "infra": 3}   # the runmode convention
+
+
+def _write_artifact(root, a_id, b_id, res):
+    """The artifact pair (owner question 2: one pair per run pair,
+    latest wins): <root>/compares/<a>-vs-<b>.jsonl (one row per line)
+    and .json ({"summary", "rows"} — what a human or the board reads
+    back). Both tmp + os.replace (the bundle._write_json pattern);
+    never into either run dir. Returns the .json path."""
+    d = os.path.join(root, "compares")
+    os.makedirs(d, exist_ok=True)
+    base = os.path.join(d, "%s-vs-%s" % (a_id, b_id))
+    tmp = base + ".jsonl.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in res["rows"]:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
+    os.replace(tmp, base + ".jsonl")
+    tmp = base + ".json.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"summary": res["summary"], "rows": res["rows"]},
+                  f, indent=1, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, base + ".json")
+    return base + ".json"
+
+
+def run_compare(cfg, a_id, b_id, live_dir=None, out=print):
+    """The compare of two finished run bundles, by run id (R8): the name
+    rule and the resolve first (400/404, before any filesystem access),
+    then compare() with cfg["compare"] — a CompareError is a 404 (no
+    bundle at the dir, or its slice rotated away with no decisions to
+    fall back on), a CompareOpen a 409 (the verb's wrong-state refusal;
+    the CLI maps both to exit 2) — then the artifact pair. Returns
+    {summary, rows, artifact} (the .json path)."""
+    for rid in (a_id, b_id):
+        bundle_mod.check_run_id(rid)
+    da = bundle_mod._resolve(cfg, a_id, live_dir)
+    db = bundle_mod._resolve(cfg, b_id, live_dir)
+    try:
+        res = compare(da, db, cfg["compare"])
+    except CompareError as e:
+        raise VerbError(409 if isinstance(e, CompareOpen) else 404,
+                        str(e))
+    artifact = _write_artifact(cfg["retention"]["run_root"], a_id, b_id,
+                               res)
+    if out:
+        out("stixplat: compare %s vs %s: %s"
+            % (a_id, b_id, res["summary"]["verdict"]))
+    return {"summary": res["summary"], "rows": res["rows"],
+            "artifact": artifact}
+
+
+def cli(cfg, ids, out=print):
+    """--compare BASELINE OTHER (the two run ids): exit 0 on a completed
+    compare whichever the verdict (the verdict is data, owner question
+    1), 2 refused (an unknown id, a bundle still open or unusable), 3
+    infra. Prints the verdict, the rows and the artifact path."""
+    try:
+        res = run_compare(cfg, ids[0], ids[1], out=out)
+    except VerbError as e:
+        out("stixplat: %s" % e)
+        return EXIT["refused"]
+    except Exception as e:
+        out("stixplat: %s: %s" % (type(e).__name__, e))
+        return EXIT["infra"]
+    for row in res["rows"]:
+        out("  %s: a=%s b=%s -> %s%s"
+            % (row["check"], row["a"], row["b"], row["result"],
+               " (first)" if row["first"] else ""))
+    out("stixplat: artifact %s" % res["artifact"])
+    return EXIT["ok"]

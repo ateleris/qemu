@@ -7,13 +7,16 @@
   stixplat.py --view-run DIR [--port N]
   stixplat.py --config FILE --replay DIR [--elf PATH]
               [--qemu-binary PATH] [--port N] [--allow-wall] [--no-idb]
+  stixplat.py --config FILE --compare BASELINE OTHER
   stixplat.py --self-test [CASE]
 
 mode = "run" (or --scenario, which implies it) runs the scenarios each
 in its own QEMU and exits; --run-dir then sets retention.run_root.
 --view-run serves a finished run's log read-only (view.* verbs only).
 --replay re-feeds a finished run bundle's recorded inputs on guest
-time and writes its own bundle (run bundles S2).
+time and writes its own bundle (run bundles S2). --compare compares
+two finished run bundles by run id and writes the artifact pair under
+<retention.run_root>/compares (run bundles S3).
 See docs/stix-port/platform.md. Stdlib only (Python >= 3.11).
 Exit codes: 0 ok (run mode: all passed), 1 a scenario failed, 2 a
 config or scenario error, 3 an infrastructure failure.
@@ -59,6 +62,12 @@ def main():
                     help="with --view-run or --replay: the API port "
                          "(default 8081 with --view-run, a free one "
                          "with --replay)")
+    ap.add_argument("--compare", nargs=2, metavar=("BASELINE", "OTHER"),
+                    help="compare two finished run bundles by run id: "
+                         "the decisions and the derived rows, the "
+                         "artifact pair under <run_root>/compares "
+                         "(exit 0 done whichever the verdict, 2 "
+                         "refused, 3 infra)")
     ap.add_argument("--allow-wall", action="store_true",
                     help="with --replay: accept that wall-paced GS TCs "
                          "are omitted from the replay")
@@ -74,9 +83,15 @@ def main():
                     "a mismatch")
     args = ap.parse_args()
     if args.replay and (args.scenario or args.variant or args.view_run or
-                        args.self_test is not None or args.check_ui):
+                        args.compare or args.self_test is not None or
+                        args.check_ui):
         ap.error("--replay cannot be combined with --scenario, --variant, "
-                 "--view-run, --self-test or --check-ui")
+                 "--view-run, --compare, --self-test or --check-ui")
+    if args.compare and (args.scenario or args.variant or args.view_run or
+                         args.replay or args.self_test is not None or
+                         args.check_ui):
+        ap.error("--compare cannot be combined with --scenario, --variant, "
+                 "--view-run, --replay, --self-test or --check-ui")
     if args.view_run and (args.self_test is not None or args.check_ui):
         ap.error("--view-run cannot be combined with --self-test or "
                  "--check-ui")
@@ -119,6 +134,9 @@ def main():
                               qemu_binary=args.qemu_binary, port=args.port,
                               allow_wall=args.allow_wall,
                               no_idb=args.no_idb)
+    if args.compare:
+        from stixplat import compare as compare_mod
+        return compare_mod.cli(cfg, args.compare)
     if cfg["mode"] == "run":
         from stixplat import runmode
         return runmode.run_all(cfg, out=lambda t: print(t, flush=True))
