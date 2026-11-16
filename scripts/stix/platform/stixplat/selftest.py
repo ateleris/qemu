@@ -4096,6 +4096,9 @@ class _UiParser(__import__("html.parser").parser.HTMLParser):
         self.rows = []          # (verb, input names) of each ctl button
         self._ctl = []          # [depth, names, buttons] of open .ctl
         self._depth = 0
+        self.sections = []      # (panel, classes) of each tab section
+        self._panel = None      # the open data-tab-panel div
+        self._panel_depth = 0
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -4106,10 +4109,15 @@ class _UiParser(__import__("html.parser").parser.HTMLParser):
             self.tabs.append(a["data-tab"])
         if "data-tab-panel" in a:
             self.panels.append(a["data-tab-panel"])
+            self._panel = a["data-tab-panel"]
+            self._panel_depth = self._depth + 1
         if tag == "div":
             self._depth += 1
             if "ctl" in (a.get("class") or "").split():
                 self._ctl.append([self._depth, [], []])
+        if tag == "section" and self._panel is not None:
+            self.sections.append((self._panel,
+                                  (a.get("class") or "").split()))
         if self._ctl and a.get("name") and tag in ("input", "select"):
             self._ctl[-1][1].append(a["name"])
         if self._ctl and "data-verb" in a and "data-args" not in a:
@@ -4124,6 +4132,8 @@ class _UiParser(__import__("html.parser").parser.HTMLParser):
         if tag == "nav":
             self._bar = False
         if tag == "div":
+            if self._panel is not None and self._depth == self._panel_depth:
+                self._panel = None
             if self._ctl and self._ctl[-1][0] == self._depth:
                 _, names, buttons = self._ctl.pop()
                 for verb, only in buttons:
@@ -4445,6 +4455,56 @@ def t_ui_stimulus(env):
         check(r.returncode == 0 and
               r.stdout.strip() == "det(22, 0, 2200) x 1000 · 20 us",
               "stimSettings renders: %r %r" % (r.stdout, r.stderr))
+
+
+def t_ui_layout(env):
+    """U3 (no browser): the layout model — every section in a tab
+    carries exactly one width class (narrow, wide or full), the only
+    scroll box is the viewport-sized log box of the live-appending
+    logs (no fixed max-height anywhere else, the params table has no
+    min-width), the header chips are grouped, and the page rules still
+    hold (no style attribute, no inline handler, no innerHTML)."""
+    ctl = env.controller()
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    page = body.decode()
+    p = _UiParser()
+    p.feed(page)
+    check(p.sections, "the tabs have sections")
+    for tab, classes in p.sections:
+        check(len({"narrow", "wide", "full"} & set(classes)) == 1,
+              "%s: section %r carries one width class" % (tab, classes))
+    css = re.search(r"<style>(.*?)</style>", page, re.S).group(1)
+    rules = re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+    check(any(".logbox" in sel for sel, b in rules if "max-height" in b),
+          "the log-box rule is there")
+    for sel, b in rules:
+        if "max-height" in b:
+            check(".logbox" in sel and "max-height: calc(" in b,
+                  "%s: a fixed max-height outside the log box"
+                  % " ".join(sel.split()))
+        if "#params table" in sel:
+            check("min-width" not in b,
+                  "the params table has no min-width")
+    for i in ("ov-events", "uart", "events", "tl-hover"):
+        m = re.search(r'<div id="%s" class="([^"]+)"' % i, page)
+        check(m and "logbox" in m.group(1).split(),
+              "%s keeps the log box" % i)
+    check('<span class="hgrp" id="hdr-platform">' in page and
+          '<span class="hgrp" id="hdr-fsw">' in page,
+          "the header chips are grouped")
+    for tag, a in p.attrs:
+        check("style" not in a and not [k for k in a if k.startswith("on")],
+              "<%s %r>: style attribute or inline handler" % (tag, a))
+    for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
+        check(bad not in page.lower(), "the page uses %s" % bad)
 
 
 SETUP_KEYS = {"binary", "elf", "elf_sha256", "icount_shift", "pace",
@@ -8778,6 +8838,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: timeline overlay (S3)", t_ui_timeline_overlay),
          ("UI: mockup port (D)", t_ui_mockup_d),
          ("UI: stimulus board (T5)", t_ui_stimulus),
+         ("UI: layout model (U3)", t_ui_layout),
          ("setup status (timeline B2)", t_setup_status),
          ("UI: the live check (smokes)", t_ui_check),
          ("compare: series api (S3)", t_compare_series_api),

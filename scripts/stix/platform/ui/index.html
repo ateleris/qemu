@@ -24,6 +24,7 @@
   "Cascadia Mono", Menlo, Consolas, monospace;
   --tl1: #2457c5; --tl2: #1d7a46; --tl3: #a86400; --tl4: #b3261e;
   --tl5: #6a3fa0; --tl6: #0f7c8c; --tl7: #8a5a44; --tl8: #5d6677;
+  --p-group: #f8fafc; --p-diff: #fff7ed; --p-diff-ink: #9a3412;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -32,10 +33,8 @@
     --bad: #ff6b60; --chip: #232936;
     --tl1: #7aa2ff; --tl2: #4cc47f; --tl3: #e0a339; --tl4: #ff6b60;
     --tl5: #c9a6ff; --tl6: #62d0e0; --tl7: #d9a184; --tl8: #98a1b3;
+    --p-group: #232936; --p-diff: #3a2c1f; --p-diff-ink: #ffab91;
   }
-  tr.p-group th { background: #232936; }
-  tr.p-diff td { background: #3a2c1f; }
-  tr.p-diff .p-cur { color: #ffab91; }
 }
 * { box-sizing: border-box; }
 body {
@@ -53,6 +52,7 @@ header h1 { font-size: 15px; margin: 0 8px 0 0; }
   padding: 2px 7px; white-space: nowrap;
 }
 .chip b { font-weight: 600; }
+.hgrp { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .on, .up, .ok, .running { color: var(--ok); }
 .off, .down, .fail, .halted { color: var(--bad); }
 .frozen, .paused, .pending, .warn { color: var(--warn); }
@@ -75,7 +75,12 @@ section {
   background: var(--panel); border: 1px solid var(--line);
   border-radius: 6px; padding: 10px 12px; min-width: 0;
 }
-section.wide { grid-column: 1 / -1; }
+/* U3: one width class per section — narrow (one track), wide (two,
+   one track when the grid has only one), full (all tracks). Two 320px
+   tracks need 684px of grid; the margin covers the scrollbar. */
+section.wide { grid-column: span 2; }
+section.full { grid-column: 1 / -1; }
+@media (max-width: 719px) { section.wide { grid-column: auto; } }
 h2 {
   font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
   color: var(--muted); margin: 0 0 8px;
@@ -105,11 +110,13 @@ textarea.wide { flex: 1 1 20em; width: 20em; }
 table { border-collapse: collapse; width: 100%; font: 12px var(--mono); }
 th, td { text-align: left; padding: 2px 6px; border-bottom:
          1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 500; position: sticky; top: 0;
-     background: var(--panel); }
-tbody th { position: static; }   /* group headers scroll, thead sticks */
-.scroll { max-height: 340px; overflow: auto; }
-.tall { max-height: 520px; }
+th { color: var(--muted); font-weight: 500; background: var(--panel); }
+/* thead sticks only inside a scroll box; page-flow tables would slide
+   under the sticky page header */
+.logbox thead th { position: sticky; top: 0; }
+/* only the live-appending logs scroll, to the viewport height (U3);
+   tables grow with the page */
+.logbox { max-height: calc(100vh - 72px); overflow: auto; }
 .log { font: 12px/1.35 var(--mono); white-space: pre-wrap;
        word-break: break-all; }
 .log div { border-bottom: 1px dotted var(--line); padding: 1px 0; }
@@ -122,7 +129,8 @@ tbody th { position: static; }   /* group headers scroll, thead sticks */
 .k-stim { color: var(--accent); font-weight: 600; }
 .muted { color: var(--muted); }
 .diff { color: var(--warn); font-weight: 600; }
-#toast { min-height: 1.4em; font: 12px var(--mono); }
+#toast { min-height: 1.4em; max-width: min(480px, 90vw);
+  overflow-wrap: anywhere; font: 12px var(--mono); }
 .desc { color: var(--muted); font-size: 12px; margin: 2px 0 6px; }
 /* one shared note per panel: why all of its verbs are disabled */
 .verb-note { grid-column: 1 / -1; margin: 0; color: var(--warn);
@@ -146,18 +154,19 @@ tbody th { position: static; }   /* group headers scroll, thead sticks */
 .tl-sw5 { background: var(--tl6); }
 .tl-sw6 { background: var(--tl7); }
 .tl-sw7 { background: var(--tl8); }
-#tl-hover { min-height: 1.4em; max-height: 7em; overflow: auto; }
+#tl-hover { min-height: 1.4em; }
 /* FSW parameters (fsw-params plan T8): the mockup's grid as a fixed
    table, the differing rows highlighted */
-#params table { min-width: 900px; table-layout: fixed; }
+#params table { table-layout: fixed; }
 #params .p-ix { width: 70px; }
 #params .p-def, #params .p-cur { width: 110px; }
 #params .p-new { width: 130px; }
 #params .p-app { width: 150px; }
 #params .p-act { width: 130px; }
-tr.p-group th { background: #f8fafc; font-weight: 600; }
-tr.p-diff td { background: #fff7ed; }
-tr.p-diff .p-cur { color: #9a3412; font-weight: 600; }
+#params .p-name { word-break: break-all; }
+tr.p-group th { background: var(--p-group); font-weight: 600; }
+tr.p-diff td { background: var(--p-diff); }
+tr.p-diff .p-cur { color: var(--p-diff-ink); font-weight: 600; }
 .k-param { color: var(--warn); }
 section.bluebox { border-color: var(--accent); }
 .stim-tape { display: flex; width: 100%; gap: 2px; }
@@ -173,18 +182,22 @@ tr.cmp-first td { font-weight: 600; }
 <body>
 <header>
   <h1>STIX platform</h1>
-  <span class="chip">power <b id="s-power">?</b></span>
-  <span class="chip">boot <b id="s-boot">?</b></span>
-  <span class="chip">sim <b id="s-sim">?</b></span>
-  <span class="chip">OBT <b id="s-obt">?</b></span>
-  <span class="chip">SpW <b id="s-link">?</b></span>
-  <span class="chip">time codes <b id="s-tc">?</b></span>
-  <span class="chip">keep-alive <b id="s-ka">?</b></span>
-  <span class="chip">time sync <b id="s-ts">?</b></span>
-  <span class="chip">TM <b id="s-tm">?</b></span>
-  <span class="chip">scenario <b id="s-scn">none</b></span>
-  <span class="chip">controller <b id="s-mode">?</b></span>
-  <span class="chip">FSW <b id="s-fsw">–</b></span>
+  <span class="hgrp" id="hdr-platform">
+    <span class="chip">power <b id="s-power">?</b></span>
+    <span class="chip">boot <b id="s-boot">?</b></span>
+    <span class="chip">sim <b id="s-sim">?</b></span>
+    <span class="chip">OBT <b id="s-obt">?</b></span>
+    <span class="chip">SpW <b id="s-link">?</b></span>
+    <span class="chip">time codes <b id="s-tc">?</b></span>
+    <span class="chip">keep-alive <b id="s-ka">?</b></span>
+    <span class="chip">time sync <b id="s-ts">?</b></span>
+    <span class="chip">TM <b id="s-tm">?</b></span>
+  </span>
+  <span class="hgrp" id="hdr-fsw">
+    <span class="chip">scenario <b id="s-scn">none</b></span>
+    <span class="chip">controller <b id="s-mode">?</b></span>
+    <span class="chip">FSW <b id="s-fsw">–</b></span>
+  </span>
   <span id="hdr-run" class="ctl">
     <button data-verb="sim.pause">pause</button>
     <button data-verb="sim.resume" hidden>resume</button>
@@ -206,39 +219,39 @@ tr.cmp-first td { font-weight: 600; }
 </nav>
 <main>
 <div class="tab" data-tab-panel="overview">
-<section>
+<section class="narrow">
   <h2>Platform</h2>
   <div class="desc" id="ov-platform">?</div>
   <div class="ctl"><button data-tab="platform">open</button></div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>IDPU &amp; FSW</h2>
   <div class="desc" id="ov-idpu">?</div>
   <div class="ctl"><button data-tab="idpu">open</button></div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Detectors</h2>
   <div class="desc" id="ov-detectors">?</div>
   <div class="ctl"><button data-tab="detectors">open</button></div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Faults</h2>
   <div class="desc" id="ov-faults">?</div>
   <div class="ctl"><button data-tab="faults">open</button></div>
 </section>
 
-<section class="wide">
+<section class="full">
   <h2>Events (TM(5,x))</h2>
-  <div id="ov-events" class="log scroll"></div>
+  <div id="ov-events" class="log logbox"></div>
 </section>
 </div>
 
 <div class="tab" data-tab-panel="platform" hidden>
 <p class="verb-note" id="verb-note-platform" hidden></p>
-<section>
+<section class="narrow">
   <h2>Power and simulation</h2>
   <div class="ctl">
     <button data-verb="platform.power.on">on</button>
@@ -262,14 +275,14 @@ tr.cmp-first td { font-weight: 600; }
   </div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Faults here</h2>
   <div class="desc">The link, supply and HK faults of this tab's
     subsystems; the full catalogue is on the Faults tab.</div>
   <div id="plat-faults"></div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>SpW link and time codes</h2>
   <div class="ctl">
     <span class="lbl">SpW link</span>
@@ -293,7 +306,7 @@ tr.cmp-first td { font-weight: 600; }
   </div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Time sync, keep-alive, OBT</h2>
   <div class="ctl">
     <span class="lbl">TC(9,129)</span>
@@ -329,7 +342,7 @@ tr.cmp-first td { font-weight: 600; }
 
 <div class="tab" data-tab-panel="idpu" hidden>
 <p class="verb-note" id="verb-note-idpu" hidden></p>
-<section id="params" class="wide">
+<section id="params" class="full">
   <h2>FSW parameters
     <input id="params-find" class="wide"
            placeholder="Find by index or name…">
@@ -348,18 +361,16 @@ tr.cmp-first td { font-weight: 600; }
   <div class="desc">Set sends TC(237,18) and reads back with
     TC(237,19). Highlighted rows differ from the ELF default. Applies
     says when the FSW picks the value up.</div>
-  <div class="scroll tall">
-    <table id="params-table">
-      <colgroup>
-        <col class="p-ix"><col><col class="p-def"><col class="p-cur">
-        <col class="p-new"><col class="p-app"><col class="p-act">
-      </colgroup>
-      <thead><tr><th>Index</th><th>Name</th><th>Default</th>
-        <th>Current</th><th>New value</th><th>Applies</th>
-        <th>Set/Reset</th></tr></thead>
-      <tbody id="params-body"></tbody>
-    </table>
-  </div>
+  <table id="params-table">
+    <colgroup>
+      <col class="p-ix"><col><col class="p-def"><col class="p-cur">
+      <col class="p-new"><col class="p-app"><col class="p-act">
+    </colgroup>
+    <thead><tr><th>Index</th><th>Name</th><th>Default</th>
+      <th>Current</th><th>New value</th><th>Applies</th>
+      <th>Set/Reset</th></tr></thead>
+    <tbody id="params-body"></tbody>
+  </table>
   <template id="t-param-row">
     <tr>
       <td class="p-ix"></td>
@@ -376,7 +387,7 @@ tr.cmp-first td { font-weight: 600; }
   </template>
 </section>
 
-<section>
+<section class="narrow">
   <h2>TC send (GS emulation)</h2>
   <div class="desc">tc.gs.send: an operator TC from source 121; needs
     [gs] emulation = "on" (on in run mode by default). The any-verb form
@@ -392,7 +403,7 @@ tr.cmp-first td { font-weight: 600; }
   </div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Any verb</h2>
   <div class="desc">Generated from GET /api/v1/verbs (the same
     vocabulary and checks as the panels and scenarios).</div>
@@ -404,16 +415,16 @@ tr.cmp-first td { font-weight: 600; }
   <div class="ctl" id="any-args"></div>
 </section>
 
-<section class="wide">
+<section class="full">
   <h2>UART <label class="muted"><input type="checkbox" id="uart-follow"
     checked> follow</label></h2>
-  <div id="uart" class="log scroll"></div>
+  <div id="uart" class="log logbox"></div>
 </section>
 </div>
 
 <div class="tab" data-tab-panel="detectors" hidden>
 <p class="verb-note" id="verb-note-detectors" hidden></p>
-<section class="wide">
+<section class="full">
   <h2>Detectors
     <span class="ctl">
       <button type="button" id="det-sub-status" class="chip on">Status
@@ -424,8 +435,7 @@ tr.cmp-first td { font-weight: 600; }
   </h2>
 </section>
 
-<div class="det-status-view">
-<section>
+<section class="narrow det-status-view">
   <h2>ROTB ring</h2>
   <div class="ctl">
     <span class="lbl">fill</span>
@@ -439,23 +449,19 @@ tr.cmp-first td { font-weight: 600; }
     <button data-verb="det.rotb.burst">append</button>
   </div>
 </section>
-</div>
 
-<section class="wide det-status-view">
+<section class="full det-status-view">
   <h2>Detector state</h2>
   <div class="desc">instrument.detector.* and instrument.rotb.* from
     /state and the state stream.</div>
-  <div class="scroll tall">
-    <table>
-      <thead><tr><th>path</th><th>truth</th><th>presented</th>
-        <th>unit</th><th>status</th></tr></thead>
-      <tbody id="det-state"></tbody>
-    </table>
-  </div>
+  <table>
+    <thead><tr><th>path</th><th>truth</th><th>presented</th>
+      <th>unit</th><th>status</th></tr></thead>
+    <tbody id="det-state"></tbody>
+  </table>
 </section>
 
-<div class="det-stim-view" hidden>
-<section>
+<section class="wide det-stim-view" hidden>
   <h2>Target</h2>
   <div class="desc">Rates per detector and pixel on the guest-time
     tick. Detector numbers are DSS (fpga_det = dss_det); the TM shows
@@ -485,7 +491,7 @@ tr.cmp-first td { font-weight: 600; }
   </div>
 </section>
 
-<section>
+<section class="wide det-stim-view" hidden>
   <h2>Stimulus</h2>
   <div class="ctl">
     <span class="lbl">kind</span>
@@ -560,7 +566,7 @@ tr.cmp-first td { font-weight: 600; }
     W optional (default 20 us).</div>
 </section>
 
-<section class="bluebox">
+<section class="bluebox narrow det-stim-view" hidden>
   <h2>Emulator support today vs needed</h2>
   <div class="desc">Today: per-detector and per-pixel rates, spectra (a
     line or flat band at ADC or keV, or a CSV from the spectra dir,
@@ -570,7 +576,7 @@ tr.cmp-first td { font-weight: 600; }
     through the preimage). The stimulus board is complete.</div>
 </section>
 
-<section>
+<section class="full det-stim-view" hidden>
   <h2>Mix tape</h2>
   <div class="desc" id="stim-now">idle</div>
   <div class="ctl">
@@ -595,20 +601,18 @@ tr.cmp-first td { font-weight: 600; }
     <button type="button" id="stim-delete" class="danger">delete</button>
   </div>
   <div class="ctl" id="stim-tape-row"></div>
-  <div class="scroll">
-    <table>
-      <thead><tr><th>#</th><th>kind</th><th>target</th><th>settings</th>
-        <th>for</th><th></th></tr></thead>
-      <tbody id="stim-steps"></tbody>
-    </table>
-  </div>
+  <table>
+    <thead><tr><th>#</th><th>kind</th><th>target</th><th>settings</th>
+      <th>for</th><th></th></tr></thead>
+    <tbody id="stim-steps"></tbody>
+  </table>
   <div class="desc">Steps run one after another; the background layer
     runs under all of them. Every step start is a marker on the
     Timeline. A tape is a JSON file next to the saved views; edits live
     in the page until saved.</div>
 </section>
 
-<section>
+<section class="narrow det-stim-view" hidden>
   <h2>ELUT alignment and ADC sky</h2>
   <div class="ctl">
     <span class="lbl">align</span>
@@ -630,19 +634,16 @@ tr.cmp-first td { font-weight: 600; }
     save, the readout is the det-adc knob's.</div>
 </section>
 </div>
-</div>
 
 <div class="tab" data-tab-panel="faults" hidden>
 <p class="verb-note" id="verb-note-faults" hidden></p>
-<section>
+<section class="full">
   <h2>Faults <span id="fault-cats" class="ctl"></span></h2>
-  <div class="scroll tall">
-    <table>
-      <thead><tr><th>fault</th><th>what it does</th><th>parameters</th>
-        <th>state</th><th>inject</th></tr></thead>
-      <tbody id="faults"></tbody>
-    </table>
-  </div>
+  <table>
+    <thead><tr><th>fault</th><th>what it does</th><th>parameters</th>
+      <th>state</th><th>inject</th></tr></thead>
+    <tbody id="faults"></tbody>
+  </table>
   <div id="faults-empty" class="desc"></div>
   <template id="t-fault">
     <tr>
@@ -661,7 +662,7 @@ tr.cmp-first td { font-weight: 600; }
   </template>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Active now
     <button type="button" id="faults-clear-all" class="danger">clear
       all</button>
@@ -669,7 +670,7 @@ tr.cmp-first td { font-weight: 600; }
   <div id="faults-active"></div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Forcings</h2>
   <div class="ctl">
     <select name="path" id="force-path" class="wide"
@@ -684,7 +685,7 @@ tr.cmp-first td { font-weight: 600; }
 
 <div class="tab" data-tab-panel="scenarios" hidden>
 <p class="verb-note" id="verb-note-scenarios" hidden></p>
-<section>
+<section class="narrow">
   <h2>Scenarios</h2>
   <div class="ctl">
     <select name="file" id="scn-file" class="wide"></select>
@@ -698,7 +699,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="logs" hidden>
-<section class="wide">
+<section class="full">
   <h2>Events
     <input id="log-search" class="wide" placeholder="search the lines">
     <span class="muted">
@@ -718,12 +719,12 @@ tr.cmp-first td { font-weight: 600; }
       <label><input type="checkbox" id="follow" checked> follow</label>
     </span>
   </h2>
-  <div id="events" class="log scroll tall"></div>
+  <div id="events" class="log logbox"></div>
 </section>
 </div>
 
 <div class="tab" data-tab-panel="state" hidden>
-<section class="wide">
+<section class="full">
   <h2>State
     <input id="state-filter" placeholder="filter, e.g. idpu.spw"
                    class="wide">
@@ -732,14 +733,12 @@ tr.cmp-first td { font-weight: 600; }
     <label class="muted"><input type="checkbox" id="state-faulted">
       only faulted</label>
   </h2>
-  <div class="scroll tall">
-    <table>
-      <thead><tr><th>leaf</th><th>truth</th>
-        <th>presented to FSW</th><th>reported in TM</th><th>status</th>
-        <th>changed</th></tr></thead>
-      <tbody id="state"></tbody>
-    </table>
-  </div>
+  <table>
+    <thead><tr><th>leaf</th><th>truth</th>
+      <th>presented to FSW</th><th>reported in TM</th><th>status</th>
+      <th>changed</th></tr></thead>
+    <tbody id="state"></tbody>
+  </table>
   <div class="desc">Click a leaf row to plot its truth series on the
     Timeline.</div>
 </section>
@@ -747,31 +746,27 @@ tr.cmp-first td { font-weight: 600; }
 
 <div class="tab" data-tab-panel="runs" hidden>
 <p class="verb-note" id="verb-note-runs" hidden></p>
-<section class="wide">
+<section class="full">
   <h2>Run bundles
     <input id="runs-filter" placeholder="filter, e.g. gate" class="wide">
     <button type="button" id="runs-refresh">refresh</button>
     <button type="button" id="runs-close-viewer" data-verb="run.close"
             hidden>close viewer</button>
   </h2>
-  <div class="scroll tall">
-    <table>
-      <thead><tr><th>bundle</th><th>recorded</th><th>FSW ELF</th>
-        <th>QEMU</th><th>icount</th><th>length</th><th>tags</th>
-        <th>actions</th></tr></thead>
-      <tbody id="runs-table"></tbody>
-    </table>
-  </div>
+  <table>
+    <thead><tr><th>bundle</th><th>recorded</th><th>FSW ELF</th>
+      <th>QEMU</th><th>icount</th><th>length</th><th>tags</th>
+      <th>actions</th></tr></thead>
+    <tbody id="runs-table"></tbody>
+  </table>
   <div id="runs-compare" hidden>
     <div class="desc" id="runs-compare-caption"></div>
     <div class="desc" id="runs-compare-counts"></div>
-    <div class="scroll">
-      <table>
-        <thead><tr><th>Check</th><th>Baseline</th><th>Replay</th>
-          <th>Result</th></tr></thead>
-        <tbody id="runs-compare-table"></tbody>
-      </table>
-    </div>
+    <table>
+      <thead><tr><th>Check</th><th>Baseline</th><th>Replay</th>
+        <th>Result</th></tr></thead>
+      <tbody id="runs-compare-table"></tbody>
+    </table>
     <div class="desc" id="runs-compare-note"></div>
     <button type="button" id="runs-compare-tl">show on Timeline</button>
   </div>
@@ -781,19 +776,17 @@ tr.cmp-first td { font-weight: 600; }
 
 <div class="tab" data-tab-panel="setup" hidden>
 <p class="verb-note" id="verb-note-setup" hidden></p>
-<section class="wide">
+<section class="full">
   <h2>Launch configuration</h2>
-  <div class="scroll">
-    <table>
-      <thead><tr><th>key</th><th>value</th><th>what it means</th></tr></thead>
-      <tbody id="setup"></tbody>
-    </table>
-  </div>
+  <table>
+    <thead><tr><th>key</th><th>value</th><th>what it means</th></tr></thead>
+    <tbody id="setup"></tbody>
+  </table>
   <div class="desc">Read-only: changing these is a restart (next
     launch) — edit the config file, not this page.</div>
 </section>
 
-<section>
+<section class="full">
   <h2>Speed (measured, this host)</h2>
   <table>
     <thead><tr><th>profile (icount shift)</th><th>wall s / guest s</th></tr></thead>
@@ -812,7 +805,7 @@ tr.cmp-first td { font-weight: 600; }
     link faults) run with pace = wall.</div>
 </section>
 
-<section>
+<section class="narrow">
   <h2>Skip ahead</h2>
   <div class="ctl">
     <span class="lbl">ROTB burst</span>
@@ -840,7 +833,7 @@ tr.cmp-first td { font-weight: 600; }
 </div>
 
 <div class="tab" data-tab-panel="timeline" hidden>
-<section class="wide">
+<section class="full">
   <h2>Timeline</h2>
   <div class="ctl">
     <span class="lbl">view</span>
@@ -874,7 +867,7 @@ tr.cmp-first td { font-weight: 600; }
   </div>
   <div id="tl-note" class="desc"></div>
   <div id="tl-panels"></div>
-  <div id="tl-hover" class="log"></div>
+  <div id="tl-hover" class="log logbox"></div>
   <div id="tl-plot"><canvas id="tl-canvas"></canvas></div>
   <div class="desc">Drag on the plot to zoom, double-click to reset.
     Windows live, 1/10/60 min trail the newest records; "whole run" is
