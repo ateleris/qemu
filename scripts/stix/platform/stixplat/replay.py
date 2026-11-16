@@ -10,10 +10,13 @@ scheduler and the re-feed table around it, P3 the CLI.
 import gzip
 import json
 import os
+import queue
 import re
+import threading
 
 from . import bundle as bundle_mod
 from . import log as log_mod
+from .dispatch import VerbError
 
 EXIT = {"ok": 0, "refused": 2, "infra": 3}
 
@@ -142,3 +145,233 @@ def load_inputs(run_dir, manifest):
             out.append(inp)
         phase = _phase_next(phase, obj)
     return out
+
+
+# -- the re-feed table (P2): one function per input kind -----------------
+
+_WALL_WHY = "a real GS TC: wall-paced, not replayable"
+
+# a clock.at deadline fires only once a vclock sample (20 Hz) has passed
+# it, so every fire is a little past its sim_time; only a delay beyond
+# this is a replay.late (5 sample periods)
+_LATE_TOL_NS = 250 * 10**6
+
+
+def _note(ctl, path, data):
+    """One replay marker: a kind "log" record, source "ctl" (the
+    controller's own records; classify returns None for kind "log", so
+    a marker is never an input or a decision)."""
+    ctl.log.emit("ctl", "log", path, data)
+
+
+def _failed(ctl, inp, e):
+    """One replay.failed record for a refused re-feed; never raises."""
+    _note(ctl, "replay.failed",
+          {"seq": inp["seq"], "status": e.status, "error": str(e)})
+    return False
+
+
+def _feed_verb(ctl, inp):
+    """The recorded verb with its recorded args, through the real
+    Dispatcher (the path a scenario step takes)."""
+    try:
+        ctl.command(inp["verb"], inp["args"], source="scn")
+    except VerbError as e:
+        return _failed(ctl, inp, e)
+    return True
+
+
+def _feed_tc(ctl, inp):
+    """The recorded TC bytes via the relay (source "scn", never "tc" —
+    that is the real-GS marker classify keys on), or the null-hex
+    TC(9,129) as platform.timesync.send with the recorded coarse."""
+    try:
+        if inp["hex"] is None:
+            ctl.command("platform.timesync.send",
+                        {"coarse": inp["coarse"]}, source="scn")
+        else:
+            # delivered false (the link-down policy re-applied) is the
+            # origin's own outcome: not a failure
+            ctl.plat.relay.gs_tc(bytes.fromhex(inp["hex"]),
+                                 source="scn", path="tc.replay")
+    except VerbError as e:
+        return _failed(ctl, inp, e)
+    return True
+
+
+def _feed_fault(ctl, inp):
+    """The recorded params + seed + trigger verbatim; a clear input
+    re-runs fault.clear."""
+    try:
+        if inp.get("action") == "clear":
+            ctl.command("fault.clear", {"id": inp["id"]}, source="scn")
+        else:
+            ctl.command("fault.inject",
+                        {"id": inp["id"], "params": inp["params"],
+                         "seed": inp["seed"], "trigger": inp["trigger"]},
+                        source="scn")
+    except VerbError as e:
+        return _failed(ctl, inp, e)
+    return True
+
+
+def _feed_force(ctl, inp):
+    """A value present is force.set, absent force.clear."""
+    try:
+        if "value" in inp:
+            ctl.command("force.set", {"path": inp["path"],
+                                      "value": inp["value"]},
+                        source="scn")
+        else:
+            ctl.command("force.clear", {"path": inp["path"]},
+                        source="scn")
+    except VerbError as e:
+        return _failed(ctl, inp, e)
+    return True
+
+
+_FEED = {"verb": _feed_verb, "tc": _feed_tc, "fault": _feed_fault,
+         "force": _feed_force}
+
+
+# -- the scheduler (P2) ---------------------------------------------------
+
+def _skip_why(inp):
+    """replay.skipped's why: the input's own, or the wall rule's."""
+    if inp.get("why"):
+        return inp["why"]
+    return _WALL_WHY if inp.get("replay") == "wall" else "no replay rule"
+
+
+class Scheduler:
+    """Re-feeds the inputs on guest time, in seq order: a daemon cursor
+    thread (waking at most every 50 ms, the clock.wake_in cap) and one
+    dispatch-queue thread running _FEED, so a slow verb never blocks
+    the poller that fires the clock.at deadlines.
+
+    Off/frozen/paused-phase inputs dispatch when due (clock.now() past
+    sim_time) and the replay's power state matches the phase, else they
+    hold at the head in order. Paused joins off/frozen (a plan
+    deviation): clock.at never fires while paused, so an armed
+    sim.resume would never fire; guest time is frozen in a pause, so
+    the state match alone places it. Running-phase inputs are armed
+    exactly once on clock.at; a deadline fired more than _LATE_TOL_NS
+    past its sim_time gets one replay.late record first (owner
+    question 1a). Inputs
+    with replay != "guest" never dispatch: one replay.skipped as the
+    cursor passes them. done is set once every input was dispatched or
+    skipped and every armed one has fired.
+    """
+
+    def __init__(self, ctl, inputs):
+        self.ctl = ctl
+        self.inputs = inputs
+        self.counts = {"inputs": len(inputs), "dispatched": 0,
+                       "skipped": 0, "failed": 0, "late": 0}
+        self.done = threading.Event()
+        self._queue = queue.Queue()
+        self._armed = set()     # seqs armed, not yet released
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._walked = False    # the cursor passed every input
+        self._cursor = threading.Thread(target=self._walk,
+                                        name="replay-cursor", daemon=True)
+        self._worker = threading.Thread(target=self._work,
+                                        name="replay-dispatch",
+                                        daemon=True)
+
+    def start(self):
+        self._cursor.start()
+        self._worker.start()
+
+    def stop(self):
+        """Stop both threads; done stays unset (the replay is ending)."""
+        self._stop.set()
+        self._queue.put(None)
+
+    # -- the cursor thread -------------------------------------------------
+    def _walk(self):
+        for inp in self.inputs:
+            if self._stop.is_set():
+                return
+            if inp.get("replay") != "guest":
+                _note(self.ctl, "replay.skipped",
+                      {"seq": inp["seq"], "why": _skip_why(inp)})
+                with self._lock:
+                    self.counts["skipped"] += 1
+                self._maybe_done()
+            elif inp["phase"] in ("off", "frozen", "paused"):
+                if not self._hold(inp):
+                    return
+            else:
+                self._arm(inp)
+        with self._lock:
+            self._walked = True
+        self._maybe_done()
+
+    def _hold(self, inp):
+        """Dispatch when due and the power state matches the phase;
+        hold at the head otherwise (order kept: the power verb queued
+        just before changes the state)."""
+        while not self._stop.is_set():
+            if self.ctl.clock.now()[0] >= inp["sim_time"] and \
+                    self.ctl.power.state == inp["phase"]:
+                self._queue.put(inp)
+                return True
+            self._stop.wait(self.ctl.clock.wake_in(0.05))
+        return False
+
+    def _arm(self, inp):
+        with self._lock:
+            self._armed.add(inp["seq"])
+        self.ctl.clock.at(inp["sim_time"],
+                          lambda: self._release(inp))
+
+    def _release(self, inp):
+        """The clock.at callback (the poller thread): queue the feed; a
+        deadline the bench reached only later notes the delay first."""
+        try:
+            now = self.ctl.clock.now()[0]
+            if now - inp["sim_time"] > _LATE_TOL_NS:
+                _note(self.ctl, "replay.late",
+                      {"seq": inp["seq"],
+                       "by_s": round((now - inp["sim_time"]) / 1e9, 3)})
+                with self._lock:
+                    self.counts["late"] += 1
+            self._queue.put(inp)
+        except Exception:       # never into the clock callback
+            pass
+        finally:
+            with self._lock:
+                self._armed.discard(inp["seq"])
+            self._maybe_done()
+
+    # -- the dispatch-queue thread -----------------------------------------
+    def _work(self):
+        while True:
+            inp = self._queue.get()
+            try:
+                if inp is None:     # the stop sentinel
+                    return
+                self._feed_one(inp)
+            finally:
+                self._queue.task_done()
+                self._maybe_done()
+
+    def _feed_one(self, inp):
+        try:
+            ok = _FEED[inp["input"]](self.ctl, inp)
+        except Exception as e:  # not a VerbError: still one record,
+            _note(self.ctl, "replay.failed",   # never a dead queue
+                  {"seq": inp["seq"], "status": 0,
+                   "error": "%s: %s" % (type(e).__name__, e)})
+            ok = False
+        with self._lock:
+            self.counts["dispatched" if ok else "failed"] += 1
+
+    def _maybe_done(self):
+        with self._lock:
+            if self._stop.is_set() or not self._walked or self._armed \
+                    or self._queue.unfinished_tasks:
+                return
+            self.done.set()

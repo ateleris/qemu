@@ -6990,6 +6990,277 @@ def t_replay_loader_rotated(env):
     check("t0" in str(e), "no boot record: %s" % e)
 
 
+def t_replay_dispatch(env):
+    """S2 P2: the re-feed table, offline: the recorded TC bytes through
+    the relay (source "scn", path "tc.replay"), the null-hex TC(9,129)
+    as platform.timesync.send, the fault params/seed/trigger verbatim
+    (a clear as fault.clear), forces, verbs with source "scn"; a
+    VerbError is exactly one replay.failed record and False."""
+    class StubLog:
+        def __init__(self):
+            self.records = []
+
+        def emit(self, source, kind, path, data=None):
+            self.records.append((source, kind, path, data))
+
+    class StubRelay:
+        def __init__(self):
+            self.calls = []
+            self.delivered = True
+
+        def gs_tc(self, sp, source="tc", path="tc.gs"):
+            self.calls.append((sp, source, path))
+            return self.delivered
+
+    class StubCtl:
+        def __init__(self):
+            self.log = StubLog()
+            self.plat = types.SimpleNamespace(relay=StubRelay())
+            self.calls = []
+            self.refuse = ()
+
+        def command(self, verb, args, source="api"):
+            if verb in self.refuse:
+                raise VerbError(409, "power is off")
+            self.calls.append((verb, args, source))
+            return {}
+
+    ctl = StubCtl()
+    sp = tcbuild.tc_packet(tcbuild.APID_TC, 3, 17, 1, b"\x02", ack=9,
+                           source=121)
+    check(replay_mod._feed_tc(ctl, {"input": "tc", "hex": sp.hex(),
+                                    "replay": "guest", "seq": 7}) is True,
+          "a tc feed succeeds")
+    check(ctl.plat.relay.calls == [(sp, "scn", "tc.replay")],
+          "the recorded bytes, source scn, path tc.replay: %r"
+          % (ctl.plat.relay.calls,))
+    check(ctl.log.records == [], "a clean feed logs no record")
+    ctl.plat.relay.delivered = False
+    check(replay_mod._feed_tc(ctl, {"input": "tc", "hex": sp.hex(),
+                                    "seq": 8}) is True,
+          "delivered false is the origin's own policy outcome")
+    check(len(ctl.plat.relay.calls) == 2 and ctl.log.records == [],
+          "no replay.failed for the link-down policy")
+    check(replay_mod._feed_tc(ctl, {"input": "tc", "hex": None,
+                                    "coarse": 100, "seq": 9}) is True,
+          "the null-hex TC(9,129) re-runs timesync.send")
+    check(ctl.calls == [("platform.timesync.send", {"coarse": 100},
+                         "scn")], "timesync.send with the recorded "
+          "coarse, source scn: %r" % (ctl.calls,))
+    check(replay_mod._feed_fault(ctl, {"input": "fault",
+                                       "id": "obt.jump",
+                                       "params": {"delta_s": 4},
+                                       "seed": 99,
+                                       "trigger": {"at": "now"},
+                                       "seq": 10}) is True,
+          "a fault inject feed succeeds")
+    check(ctl.calls[-1] == ("fault.inject",
+                            {"id": "obt.jump", "params": {"delta_s": 4},
+                             "seed": 99, "trigger": {"at": "now"}},
+                            "scn"), "the params/seed/trigger verbatim: %r"
+          % (ctl.calls[-1],))
+    check(replay_mod._feed_fault(ctl, {"input": "fault",
+                                       "id": "obt.jump",
+                                       "action": "clear",
+                                       "seq": 11}) is True,
+          "a fault clear feed succeeds")
+    check(ctl.calls[-1] == ("fault.clear", {"id": "obt.jump"}, "scn"),
+          "a clear re-runs fault.clear: %r" % (ctl.calls[-1],))
+    check(replay_mod._feed_force(ctl, {"input": "force",
+                                       "path": "instrument.hk_adc.3",
+                                       "value": 123, "seq": 12}) is True,
+          "a force set feed succeeds")
+    check(ctl.calls[-1] == ("force.set",
+                            {"path": "instrument.hk_adc.3",
+                             "value": 123}, "scn"),
+          "value present is force.set: %r" % (ctl.calls[-1],))
+    check(replay_mod._feed_force(ctl, {"input": "force",
+                                       "path": "instrument.hk_adc.3",
+                                       "seq": 13}) is True,
+          "a force clear feed succeeds")
+    check(ctl.calls[-1] == ("force.clear",
+                            {"path": "instrument.hk_adc.3"}, "scn"),
+          "no value is force.clear: %r" % (ctl.calls[-1],))
+    check(replay_mod._feed_verb(ctl, {"input": "verb",
+                                      "verb": "det.tape.play",
+                                      "args": {"name": "t"},
+                                      "seq": 14}) is True,
+          "a verb feed succeeds")
+    check(ctl.calls[-1] == ("det.tape.play", {"name": "t"}, "scn"),
+          "the recorded args, source scn: %r" % (ctl.calls[-1],))
+    ctl.refuse = ("det.tape.play",)
+    check(replay_mod._feed_verb(ctl, {"input": "verb",
+                                      "verb": "det.tape.play",
+                                      "args": {"name": "t"},
+                                      "seq": 15}) is False,
+          "a VerbError fails the feed, no raise")
+    check(ctl.log.records == [("ctl", "log", "replay.failed",
+                               {"seq": 15, "status": 409,
+                                "error": "power is off"})],
+          "exactly one replay.failed with status and error: %r"
+          % (ctl.log.records,))
+
+
+def t_replay_sched(env):
+    """S2 P2: the scheduler offline (a fake clock, a stub power state):
+    the skips pass as the cursor reaches them, the off input waits for
+    now >= sim_time, the frozen input also waits for the power state,
+    the running inputs arm exactly once on clock.at, a deadline fired
+    late is one replay.late before its dispatch, the counts and done."""
+    class StubLog:
+        def __init__(self, events):
+            self.events = events
+
+        def emit(self, source, kind, path, data=None):
+            self.events.append(("log", path, data))
+
+    class FakeClock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self._now = 0
+            self.arms = []      # every at() deadline, in call order
+            self.pending = []   # (sim_ns, cb) not fired yet
+
+        def now(self):
+            with self._lock:
+                return (self._now, 1, None, False)
+
+        def at(self, sim_ns, cb):
+            with self._lock:
+                self.arms.append(sim_ns)
+                self.pending.append((sim_ns, cb))
+
+        def wake_in(self, cap_s=0.05):
+            return cap_s
+
+        def advance(self, ns):
+            with self._lock:
+                self._now = ns
+
+        def fire_due(self):
+            """The test helper: fire what the bench time passed."""
+            with self._lock:
+                due = [d for d in self.pending if d[0] <= self._now]
+                self.pending = [d for d in self.pending
+                                if d[0] > self._now]
+            for _, cb in due:
+                cb()
+
+    class StubCtl:
+        def __init__(self):
+            self.events = []
+            self.log = StubLog(self.events)
+            self.clock = FakeClock()
+            self.power = types.SimpleNamespace(state="off")
+
+        def command(self, verb, args, source="scn"):
+            # like the real verbs: power.on leaves the state frozen,
+            # power.boot running; the state on entry is recorded
+            state = self.power.state
+            self.events.append(("cmd", verb, self.clock.now()[0], state))
+            if verb == "platform.power.on":
+                time.sleep(0.2)     # a slow verb: the queue holds it
+                self.power.state = "frozen"
+            elif verb in ("platform.power.boot", "sim.resume"):
+                self.power.state = "running"
+            elif verb == "sim.pause":
+                self.power.state = "paused"
+            return {}
+
+    ctl = StubCtl()
+    ms = 10**6
+    inputs = [
+        {"input": "verb", "verb": "det.tape.save", "args": {},
+         "replay": "no", "why": "the tape file is by reference",
+         "seq": 1, "sim_time": 0, "phase": "off"},
+        {"input": "tc", "hex": "1dacc0070002", "replay": "wall",
+         "seq": 2, "sim_time": 0, "phase": "off"},
+        {"input": "verb", "verb": "platform.power.on", "args": {},
+         "replay": "guest", "seq": 3, "sim_time": 300 * ms,
+         "phase": "off"},
+        {"input": "verb", "verb": "platform.power.boot", "args": {},
+         "replay": "guest", "seq": 4, "sim_time": 0, "phase": "frozen"},
+        {"input": "verb", "verb": "sim.pause", "args": {},
+         "replay": "guest", "seq": 5, "sim_time": 500 * ms,
+         "phase": "running"},
+        # recorded while paused: guest time frozen at the pause
+        {"input": "verb", "verb": "sim.resume", "args": {},
+         "replay": "guest", "seq": 6, "sim_time": 500 * ms,
+         "phase": "paused"},
+        {"input": "verb", "verb": "log.mark", "args": {},
+         "replay": "guest", "seq": 7, "sim_time": 600 * ms,
+         "phase": "running"},
+    ]
+    sched = replay_mod.Scheduler(ctl, inputs)
+
+    def logs(path):
+        return [e for e in ctl.events if e[:2] == ("log", path)]
+
+    def cmds():
+        return [e[1:] for e in ctl.events if e[0] == "cmd"]
+    sched.start()
+    wait_for(lambda: len(logs("replay.skipped")) == 2, 2.0, "the skips")
+    check([e[2] for e in logs("replay.skipped")] ==
+          [{"seq": 1, "why": "the tape file is by reference"},
+           {"seq": 2,
+            "why": "a real GS TC: wall-paced, not replayable"}],
+          "the skip records with their whys: %r"
+          % [e[2] for e in logs("replay.skipped")])
+    check(cmds() == [], "nothing dispatched yet")
+    ctl.clock.advance(200 * ms)
+    time.sleep(0.1)             # two cursor wakes: the head still holds
+    check(cmds() == [], "the off input waits for now >= its sim_time")
+    ctl.clock.advance(300 * ms)
+    wait_for(lambda: len(cmds()) == 1, 2.0, "the off-phase dispatch")
+    check(cmds()[0] == ("platform.power.on", 300 * ms, "off"),
+          "dispatched once due, while the power is off: %r" % (cmds(),))
+    ctl.clock.advance(400 * ms)
+    time.sleep(0.1)             # the slow power.on still holds the state
+    check(len(cmds()) == 1,
+          "the frozen input held while the state is still off")
+    wait_for(lambda: len(cmds()) == 2, 2.0, "the frozen-phase dispatch")
+    check(cmds()[1] == ("platform.power.boot", 400 * ms, "frozen"),
+          "dispatched once the state is frozen: %r" % (cmds(),))
+    wait_for(lambda: len(ctl.clock.pending) == 1, 2.0, "the first arm")
+    time.sleep(0.1)             # the cursor holds at the paused input
+    check(ctl.clock.arms == [500 * ms],
+          "the running input armed; the paused one is not: %r"
+          % (ctl.clock.arms,))
+    ctl.clock.advance(550 * ms)     # one sample past: within tolerance
+    ctl.clock.fire_due()
+    wait_for(lambda: len(cmds()) == 3, 2.0, "the on-time fire")
+    check(cmds()[2] == ("sim.pause", 550 * ms, "running"),
+          "fired once the bench passed its sim_time: %r" % (cmds()[2],))
+    wait_for(lambda: len(cmds()) == 4, 2.0, "the paused-phase dispatch")
+    check(cmds()[3] == ("sim.resume", 550 * ms, "paused"),
+          "the paused input dispatched by state, not clock.at: %r"
+          % (cmds()[3],))
+    check(logs("replay.late") == [],
+          "a fire 50 ms past its sim_time is not late")
+    wait_for(lambda: len(ctl.clock.pending) == 1, 2.0, "the second arm")
+    check(ctl.clock.arms == [500 * ms, 600 * ms],
+          "each running input armed exactly once: %r" % (ctl.clock.arms,))
+    ctl.clock.advance(1600 * ms)
+    ctl.clock.fire_due()
+    wait_for(lambda: len(cmds()) == 5 and sched.done.is_set(), 2.0,
+             "the late fire and done")
+    late = logs("replay.late")
+    check(late == [("log", "replay.late", {"seq": 7, "by_s": 1.0})],
+          "one replay.late with the delay in s: %r" % (late,))
+    i_late = ctl.events.index(late[0])
+    i_cmd = [i for i, e in enumerate(ctl.events)
+             if e[0] == "cmd" and e[1] == "log.mark"][0]
+    check(i_late < i_cmd, "replay.late before the dispatch")
+    check(cmds()[4] == ("log.mark", 1600 * ms, "running"),
+          "the late input still dispatches: %r" % (cmds()[4],))
+    check(ctl.clock.arms == [500 * ms, 600 * ms],
+          "no re-arm after the fires: %r" % (ctl.clock.arms,))
+    check(sched.counts == {"inputs": 7, "dispatched": 5, "skipped": 2,
+                           "failed": 0, "late": 1},
+          "the counts: %r" % (sched.counts,))
+    sched.stop()
+
+
 def t_ui_runs(env):
     """R4 (no browser): the Runs tab with its filter and table, the
     board's verbs used and served, the page rules still holding."""
@@ -7120,6 +7391,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("bundle: run.open/close (S1)", t_bundle_run_open),
          ("replay: loader (S2)", t_replay_loader),
          ("replay: loader rotated (S2)", t_replay_loader_rotated),
+         ("replay: dispatch (S2)", t_replay_dispatch),
+         ("replay: scheduler (S2)", t_replay_sched),
          ("fault lifecycle (SF4)", t_fault_lifecycle),
          ("fault catalogue + forcing", t_faults),
          ("faults: since_sim (D1)", t_faults_since_sim),

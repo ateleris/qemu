@@ -782,6 +782,20 @@ needed, unlike R2/R3). Nothing in S1's formats changes; the S3 task
   tape. ±2 s stays UNVERIFIED until the first live run.
 
 
+## P2a review (2026-11-16, reviewer, overrides the scheduler text above)
+
+- **Paused-phase inputs are state-held, not armed** (D-h). `run_due`
+  never fires while PAUSED (simclock.py `run_due`), so a `sim.resume`
+  (or any verb) recorded during a pause would stay armed forever and
+  the replay would never end. Guest time is frozen in a pause, so
+  paused inputs join the off/frozen group: dispatched when due and
+  `power.state == "paused"`. Only running-phase inputs use `clock.at`.
+- **`replay.late` has a tolerance.** A deadline fires only after a
+  vclock sample has passed it, so every fire is slightly past its
+  `sim_time`; only a delay above `_LATE_TOL_NS` (250 ms, five 20 Hz
+  samples) is late. `by_s` is in seconds (rounded to ms), matching its
+  name; the "in ms" in the scheduler bullet is superseded.
+
 ## Owner decisions (2026-11-16)
 
 Questions 1, 2, 4 and 6 answered with the recommended option (late
