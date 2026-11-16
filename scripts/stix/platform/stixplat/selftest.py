@@ -230,6 +230,20 @@ def t_argv(env):
     argv = qemu_mod.build_argv(c, "/r")
     check(argv == ARGV_GOLDEN, "argv differs from the golden:\n%s"
           % "\n".join(argv))
+    # relative paths (the default binary) resolve against the
+    # controller's cwd, not the run dir QEMU is spawned in
+    c = config_mod.load(overrides={"qemu": {"binary": "build/qs",
+                                            "elf": "e/asw.elf"}})
+    argv = qemu_mod.build_argv(c, "rd")
+    cwd = os.getcwd()
+    check(argv[0] == os.path.join(cwd, "build/qs"),
+          "relative binary made absolute: %r" % argv[0])
+    check(argv[argv.index("-kernel") + 1] == os.path.join(cwd, "e/asw.elf"),
+          "relative ELF made absolute")
+    check(os.path.join(cwd, "rd", "uart.raw") in
+          argv[argv.index("-chardev") + 1],
+          "relative run dir made absolute: %r"
+          % argv[argv.index("-chardev") + 1])
     check(qemu_mod.reset_args("cold") == ["-no-reboot"], "cold args")
     check(qemu_mod.reset_args("halt") ==
           ["-action", "reboot=shutdown,shutdown=pause"], "halt args")

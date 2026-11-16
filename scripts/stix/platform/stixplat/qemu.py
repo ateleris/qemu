@@ -34,11 +34,16 @@ def reset_args(policy):
 
 
 def build_argv(cfg, run_dir, binary=None):
-    """The QEMU command line. Always frozen (-S): power on is not boot."""
+    """The QEMU command line. Always frozen (-S): power on is not boot.
+    The binary, the ELF and the run dir are made absolute against the
+    controller's cwd (where the binary guard resolved them): QEMU is
+    spawned with cwd = the run dir, so a relative path (the default
+    build/qemu-system-sparc) would resolve there instead."""
     q = cfg["qemu"]
     p = cfg["ports"]
     spw = "grlib-stixspw."
-    argv = [binary or q["binary"],
+    run_dir = os.path.abspath(run_dir)
+    argv = [os.path.abspath(binary or q["binary"]),
             "-M", "leon3_generic", "-m", q["memory"], "-S",
             "-display", "none", "-monitor", "none",
             # append=on: QEMU's file chardev truncates otherwise
@@ -68,7 +73,7 @@ def build_argv(cfg, run_dir, binary=None):
         argv += ["-icount", icount]
     for t in q["traces"]:
         argv += ["-trace", t]
-    argv += ["-kernel", q["elf"]]
+    argv += ["-kernel", os.path.abspath(q["elf"])]
     argv += list(q["extra_args"])
     return argv
 
