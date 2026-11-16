@@ -61,3 +61,78 @@ def series_index(run_dir, manifest=None):
             continue
         idx.feed(obj)
     return idx
+
+
+# pass 2 (compare plan C1/R10; owner decision 3): the value-compare
+# rules — index-wise, counts within a slack of 2 + 5 % of the larger,
+# times ignored; R4: marker/enum ids and ids with no points anywhere
+# are skipped
+_SKIP_KINDS = ("marker", "enum")
+_COUNT_BASE, _COUNT_REL = 2, 0.05
+_RAW_POINTS = 1 << 30           # query() n: no decimation, raw arrays
+
+
+def _num_match(va, vb, tol_abs, tol_rel):
+    return abs(va - vb) <= tol_abs + tol_rel * max(abs(va), abs(vb))
+
+
+def series_rows(a_dir, b_dir, tol):
+    """Pass 2 (the series numbers): both sides' index from
+    series_index(d, load_manifest(d)); one row per id in tol["series"]
+    with points on at least one side — check the series id, a/b the
+    point counts, tol {"rel", "abs"}, first False. The value arrays
+    compare index-wise up to the shorter length, a pair matching within
+    tol_number_abs + tol_number_rel * max(|va|, |vb|); the counts must
+    match within 2 + 5 % of the larger count, else the row differs.
+    Times are not compared. A marker or enum id, and an id with no
+    points anywhere, produce no row and count in series_skipped (R4).
+    Returns (rows, info), info = {"series": <ids compared>,
+    "series_skipped", "first_series_divergence": {check, index, t_a,
+    v_a, v_b} or None}. Raises replay.ReplayError when a side has no
+    readable log."""
+    tol_rel = tol["tol_number_rel"]
+    tol_abs = tol["tol_number_abs"]
+    ids = list(tol["series"])
+    idx_a = series_index(a_dir, load_manifest(a_dir))
+    idx_b = series_index(b_dir, load_manifest(b_dir))
+    qa = idx_a.query(ids, None, None, _RAW_POINTS)
+    qb = idx_b.query(ids, None, None, _RAW_POINTS)
+    kind_a = {e["id"]: e["kind"] for e in idx_a.catalogue()}
+    kind_b = {e["id"]: e["kind"] for e in idx_b.catalogue()}
+    rows, compared, skipped, first = [], [], 0, None
+    for sid in ids:
+        if kind_a.get(sid) in _SKIP_KINDS or kind_b.get(sid) in _SKIP_KINDS:
+            skipped += 1
+            continue
+        ta, va = qa[sid]["t"], qa[sid]["v"]
+        vb = qb[sid]["v"]
+        na, nb = len(va), len(vb)
+        if na == 0 and nb == 0:
+            skipped += 1            # no points anywhere (R4)
+            continue
+        compared.append(sid)
+        if na == 0 or nb == 0:
+            rows.append({"check": sid, "a": na, "b": nb,
+                         "result": "only-baseline" if nb == 0
+                         else "only-other",
+                         "tol": {"rel": tol_rel, "abs": tol_abs},
+                         "first": False})
+            continue
+        res = "same"
+        bad = None
+        if abs(na - nb) > _COUNT_BASE + _COUNT_REL * max(na, nb):
+            res = "differs"
+        else:
+            for i in range(min(na, nb)):
+                if not _num_match(va[i], vb[i], tol_abs, tol_rel):
+                    res = "differs"
+                    bad = {"check": sid, "index": i, "t_a": ta[i],
+                           "v_a": va[i], "v_b": vb[i]}
+                    break
+        rows.append({"check": sid, "a": na, "b": nb, "result": res,
+                     "tol": {"rel": tol_rel, "abs": tol_abs},
+                     "first": False})
+        if bad is not None and first is None:
+            first = bad
+    return rows, {"series": compared, "series_skipped": skipped,
+                  "first_series_divergence": first}
