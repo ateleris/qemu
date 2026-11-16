@@ -44,6 +44,7 @@ from . import probe_lib
 from . import qemu as qemu_mod
 from . import relay as relay_mod
 from . import replay as replay_mod
+from . import runseries as runseries_mod
 from . import retention
 from . import scenario
 from . import rundir
@@ -7583,6 +7584,115 @@ def t_replay_cli(env):
               % r.stderr.strip()[-120:])
 
 
+# -- S3 (compare plan C3): a run bundle's series data path ----------------
+def t_compare_series_api(env):
+    """C3 (R11): GET /runs/<id>/series answers a finished run's series
+    from a per-request rebuild of its log slice — the /series params
+    and body shape; a manifest scoped by start_offset serves only that
+    session's points; the run dir stays read-only; a --view-run server
+    serves the route too."""
+    root = os.path.join(env.tmp, "runs-series%d" % env.n)
+    name = "20261116T101112Z-series-a"
+    rd = os.path.join(root, "runs", name)
+    os.makedirs(rd)
+
+    def dump(lines):
+        return "".join(json.dumps(r, separators=(",", ":")) + "\n"
+                       for r in lines).encode()
+
+    # a reused dir with two sessions: session 1's bytes open the gz
+    # part, the manifest slices from their end (the replay's scoping)
+    start = _rec("log", 1, "controller.start",
+                 {"run_dir": rd, "config": {
+                     "retention": {"run_root": env.tmp},
+                     "timeline": {"sample_s": 0}}})
+    s1 = [start] + [_rec("sample", 2 + i, "",
+                         {"instrument.rotb.count": i}) for i in range(3)]
+    s2 = [_rec("sample", 10 + i, "", {"instrument.rotb.count": 100 + i})
+          for i in range(5)]
+    with gzip.open(os.path.join(rd, "log.jsonl.1.gz"), "wb") as f:
+        f.write(dump(s1) + dump(s2[:2]))
+    with open(os.path.join(rd, "log.jsonl"), "wb") as f:
+        f.write(dump(s2[2:]))
+    m = {"v": 1, "kind": "run", "run_id": name, "open": False,
+         "t0": 2.0, "length_s": 30.0, "start_offset": len(dump(s1)),
+         "log_rotations": 1, "config": {}}
+    with open(os.path.join(rd, bundle_mod.MANIFEST), "w") as f:
+        json.dump(m, f)
+    check(runseries_mod.load_manifest(rd) == m, "the manifest loads")
+    check(runseries_mod.load_manifest(os.path.join(env.tmp, "gone"))
+          is None, "no manifest -> None")
+    one = runseries_mod.series_index(rd, m).query(
+        ["truth:instrument.rotb.count"], None, None, 10)
+    check(one["truth:instrument.rotb.count"]["v"] ==
+          [100, 101, 102, 103, 104] and
+          one["truth:instrument.rotb.count"]["t"] == [10, 11, 12, 13, 14],
+          "only this session's points: %r" % one)
+    whole = runseries_mod.series_index(rd).query(
+        ["truth:instrument.rotb.count"], None, None, 10)
+    check(whole["truth:instrument.rotb.count"]["v"] ==
+          [0, 1, 2, 100, 101, 102, 103, 104],
+          "no manifest: the whole log, oldest part first: %r" % whole)
+    raises(replay_mod.ReplayError, runseries_mod.series_index, rd,
+           dict(m, log_rotations=9))
+    ctl = env.controller(retention={"run_root": root})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    path = "/api/v1/runs/%s/series?ids=truth:instrument.rotb.count" % name
+    before = _dir_state(rd)
+    try:
+        st, _, body = _http(port, "GET", path)
+        q = json.loads(body)
+        srs = q["truth:instrument.rotb.count"]
+        check(st == 200 and q["unknown"] == [] and
+              srs["v"] == [100, 101, 102, 103, 104] and
+              srs["t"] == [10, 11, 12, 13, 14],
+              "the session's points, /series' body shape: %r" % srs)
+        st, _, _ = _http(port, "GET", "/api/v1/runs/%s/series?ids=" % name)
+        check(st == 400, "an empty ids= is 400: %d" % st)
+        st, _, _ = _http(port, "GET", path + "&max_points=9")
+        check(st == 400, "max_points is 10..5000: %d" % st)
+        st, _, _ = _http(port, "GET", "/api/v1/runs/no-such-run/series")
+        check(st == 404, "an unknown id: %d" % st)
+        st, _, _ = _http(port, "GET", "/api/v1/runs/a/b/series")
+        check(st == 400, "a bad id: %d" % st)
+        check(_dir_state(rd) == before, "the run dir is read-only")
+        # R11: no cache, so an appended record is served as it is
+        line = dump([_rec("sample", 20, "",
+                          {"instrument.rotb.count": 200})])
+        with open(os.path.join(rd, "log.jsonl"), "ab") as f:
+            f.write(line)
+        st, _, body = _http(port, "GET", path)
+        srs = json.loads(body)["truth:instrument.rotb.count"]
+        check(st == 200 and srs["v"] == [100, 101, 102, 103, 104, 200],
+              "the re-query sees the appended point: %r" % srs["v"])
+        grown = sorted((p, s + len(line) if p == "log.jsonl" else s)
+                       for p, s in before)
+        check(_dir_state(rd) == grown, "only the append changed the dir")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    vr = viewrun_mod.ViewRun(rd)
+    srv = api_mod.make_server(vr, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", path)
+        srs = json.loads(body)["truth:instrument.rotb.count"]
+        check(st == 200 and srs["v"] == [100, 101, 102, 103, 104, 200],
+              "the --view-run server serves the route: %r" % srs)
+        st, _, body = _http(port, "GET",
+                            "/api/v1/series?ids=truth:instrument.rotb.count")
+        srs = json.loads(body)["truth:instrument.rotb.count"]
+        check(srs["v"] == [0, 1, 2, 100, 101, 102, 103, 104, 200],
+              "the view-run's own index is still the whole log: %r"
+              % srs["v"])
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    check(_dir_state(rd) == grown, "still nothing written")
+
+
 def t_ui_runs(env):
     """R4 (no browser): the Runs tab with its filter and table, the
     board's verbs used and served, the page rules still holding."""
@@ -7751,7 +7861,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: mockup port (D)", t_ui_mockup_d),
          ("UI: stimulus board (T5)", t_ui_stimulus),
          ("setup status (timeline B2)", t_setup_status),
-         ("UI: the live check (smokes)", t_ui_check)]
+         ("UI: the live check (smokes)", t_ui_check),
+         ("compare: series api (S3)", t_compare_series_api)]
 
 
 def main(only=None):
