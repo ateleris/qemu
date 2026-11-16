@@ -163,6 +163,8 @@ section.bluebox { border-color: var(--accent); }
   white-space: nowrap; text-overflow: ellipsis; min-width: 2em; }
 .stim-bg { background: var(--chip); }
 .stim-step.active { border-color: var(--accent); color: var(--accent); }
+/* the Runs board's Compare panel (S3): the first-divergence row bold */
+tr.cmp-first td { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -750,6 +752,19 @@ section.bluebox { border-color: var(--accent); }
       <tbody id="runs-table"></tbody>
     </table>
   </div>
+  <div id="runs-compare" hidden>
+    <div class="desc" id="runs-compare-caption"></div>
+    <div class="desc" id="runs-compare-counts"></div>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Check</th><th>Baseline</th><th>Replay</th>
+          <th>Result</th></tr></thead>
+        <tbody id="runs-compare-table"></tbody>
+      </table>
+    </div>
+    <div class="desc" id="runs-compare-note"></div>
+    <button type="button" id="runs-compare-tl">show on Timeline</button>
+  </div>
   <div class="desc" id="runs-note"></div>
 </section>
 </div>
@@ -972,7 +987,9 @@ document.addEventListener("click", async (ev) => {
   try {
     const args = argsOf(btn);
     const res = await post(verb, args);
-    toast(verb + " ok " + JSON.stringify(res.result));
+    // run.compare's result renders in the board's panel, not the toast
+    toast(verb + " ok " + (verb === "run.compare" ?
+        (res.result.summary || {}).verdict : JSON.stringify(res.result)));
     showResult(btn, res);
     if (verb === "platform.flash.save" || verb === "platform.flash.load")
       loadFlash();  // the library table shows the new state
@@ -985,6 +1002,7 @@ document.addEventListener("click", async (ev) => {
     if (verb === "run.close") { runsViewerOpen = false; renderRuns(); }
     if (verb === "run.baseline" || verb === "run.baseline.clear")
       loadRuns();   // the baseline mark moved
+    if (verb === "run.compare") showCompare(args, res.result || {});
   } catch (e) {
     toast(String(e.message || e), true);
     // a 409 close means no viewer is open (closed elsewhere)
@@ -1164,13 +1182,13 @@ $("params-find").addEventListener("input", renderParams);
 $("params-nondef").addEventListener("change", renderParams);
 /* ---- the runs board (S1): the bundles of this run root ---- */
 let runsCache = [];
+let runsRoot = "";
 async function loadRuns() {
   try {
     const q = await getJSON("runs");
     runsCache = q.runs || [];
+    runsRoot = q.root || "";
     renderRuns();
-    text($("runs-note"), (q.root || "") + " · " + runsCache.length +
-         " bundle" + (runsCache.length === 1 ? "" : "s"));
   } catch (e) {
     toast(String(e.message || e), true);
   }
@@ -1182,7 +1200,7 @@ function runsHit(e, q) {
     .some((v) => String(v == null ? "" : v).toLowerCase().includes(q));
 }
 
-function runsRow(e) {
+function runsRow(e, base) {
   const tr = document.createElement("tr");
   const c1 = document.createElement("td");
   text(c1, e.name || e.run_id || "");
@@ -1215,7 +1233,9 @@ function runsRow(e) {
   const tags = document.createElement("td");
   const scn = e.scenario ? (e.scenario.name || "") +
     (e.scenario.variant ? "/" + e.scenario.variant : "") : null;
-  text(tags, [e.verdict, scn, e.error].filter((x) => x).join(" "));
+  text(tags, [e.verdict, scn,
+              e.kind === "replay" ? "replay of " + (e.of || "?") : null,
+              e.error].filter((x) => x).join(" "));
   tr.append(tags);
   const act = document.createElement("td");
   if (e.error) {
@@ -1229,6 +1249,16 @@ function runsRow(e) {
       text(b, label);
       act.append(b);
     }
+    // compare against the marked baseline (S3): never on the baseline
+    // row itself, never when either side is a still-open bundle (the
+    // live run: the verb would 409)
+    if (base && !base.open && !e.baseline && !e.open) {
+      const b = document.createElement("button");
+      b.dataset.verb = "run.compare";
+      b.dataset.args = JSON.stringify({ a: base.run_id, b: e.run_id });
+      text(b, "compare");
+      act.append(b);
+    }
   }
   tr.append(act);
   return tr;
@@ -1237,15 +1267,84 @@ function runsRow(e) {
 let runsViewerOpen = false;
 function renderRuns() {
   const q = $("runs-filter").value.trim().toLowerCase();
+  const base = runsCache.find((x) => x.baseline) || null;
   const rows = [];
-  for (const e of runsCache) if (runsHit(e, q)) rows.push(runsRow(e));
+  for (const e of runsCache) if (runsHit(e, q)) rows.push(runsRow(e, base));
   $("runs-table").replaceChildren(...rows);
   // the viewer this page opened (run.open/run.close), not a manifest's
   // open flag (the live run's manifest is always open)
   $("runs-close-viewer").hidden = !runsViewerOpen;
+  let note = (runsRoot || "") + " · " + runsCache.length +
+    " bundle" + (runsCache.length === 1 ? "" : "s");
+  if (!base) note += " · mark a baseline first (run.baseline)";
+  text($("runs-note"), note);
 }
 $("runs-filter").addEventListener("input", renderRuns);
 $("runs-refresh").addEventListener("click", loadRuns);
+
+/* ---- the Compare panel (S3 C4): the run.compare response under the
+   board; C5's overlay picks the pair up from TL.overlayPend ---- */
+let cmpPend = null;
+function cmpS(v) {              // a relative time in s, signed
+  return v == null ? "-" :
+    (v < 0 ? "-" : "+") + Math.abs(v).toFixed(2) + " s";
+}
+function showCompare(args, r) {
+  const s = r.summary || {};
+  const c = s.counts || {};
+  text($("runs-compare-caption"),
+       (args.a || "?") + " vs " + (args.b || "?") + " · " +
+       (s.verdict || "?"));
+  let counts = "pairs " + (c.pairs == null ? "?" : c.pairs) +
+    " · series " + (c.series == null ? "?" : c.series) +
+    " · series skipped " +
+    (c.series_skipped == null ? "?" : c.series_skipped);
+  if (s.series_error) counts += " · series error: " + s.series_error;
+  text($("runs-compare-counts"), counts);
+  const rows = [];
+  for (const row of r.rows || []) {
+    const tr = document.createElement("tr");
+    if (row.first) cls(tr, "cmp-first");
+    const c1 = document.createElement("td");
+    text(c1, row.check);
+    tr.append(c1);
+    for (const v of [row.a, row.b]) {
+      const td = document.createElement("td");
+      text(td, v == null ? "-" : String(v));
+      tr.append(td);
+    }
+    const c4 = document.createElement("td");
+    text(c4, row.result);
+    cls(c4, row.result === "same" ? "muted" :
+        row.result === "differs" ? "k-err" : "warn");
+    tr.append(c4);
+    rows.push(tr);
+  }
+  $("runs-compare-table").replaceChildren(...rows);
+  // the first divergence line: the decision pass, else the series one
+  let note = "";
+  const fr = (r.rows || []).find((x) => x.first);
+  if (s.first_divergence && fr)
+    note = s.first_divergence.kind + " " + s.first_divergence.key +
+      " at " + cmpS(fr.a) + " vs " + cmpS(fr.b);
+  else if (s.first_series_divergence) {
+    const f = s.first_series_divergence;
+    const al = (s.align || {}).t_a;
+    note = f.check + "[" + f.index + "] at " +
+      cmpS(al == null || f.t_a == null ? null : (f.t_a - al) / 1e9) +
+      ": " + f.v_a + " vs " + f.v_b;
+  }
+  text($("runs-compare-note"), note);
+  cmpPend = { a: args.a, b: args.b, summary: s };
+  $("runs-compare").hidden = false;
+}
+$("runs-compare-tl").addEventListener("click", () => {
+  if (!cmpPend) return;
+  TL.overlayPend = { a: cmpPend.a, b: cmpPend.b,
+                     summary: cmpPend.summary };
+  location.hash = "timeline" +
+    (TL.view ? "/v=" + encodeURIComponent(TL.view) : "");
+});
 
 /* ---- status strip and the per-panel status ---- */
 function fmtS(ns) { return ns == null ? "?" : (ns / 1e9).toFixed(3) + " s"; }

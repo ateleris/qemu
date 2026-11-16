@@ -621,6 +621,7 @@ def _entry(d, live):
             "qemu_dirty": q.get("dirty"),
             "icount_shift": qc.get("icount_shift"),
             "pace": qc.get("pace"), "length_s": m.get("length_s"),
+            "kind": m.get("kind"), "of": m.get("of"),
             "baseline": is_baseline(d), "inputs": m.get("inputs"),
             "decisions": m.get("decisions")}
 

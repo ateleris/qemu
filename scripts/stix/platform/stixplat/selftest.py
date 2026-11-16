@@ -3838,10 +3838,14 @@ UI_PARAMS_VERBS = {"param.refresh", "param.set", "param.read_all",
 UI_PARAMS_IDS = {"params", "params-find", "params-nondef",
                  "params-readall", "params-reset", "params-body"}
 # run bundles (S1): the board's own verbs (built per row in JS, so the
-# parser only sees the static run.close button)
-UI_RUNS_VERBS = {"run.baseline", "run.open", "run.close"}
+# parser only sees the static run.close button); S3 adds run.compare
+UI_RUNS_VERBS = {"run.baseline", "run.open", "run.close", "run.compare"}
 UI_RUNS_IDS = {"runs-filter", "runs-table", "runs-refresh", "runs-note",
                "runs-close-viewer"}
+# compare plan C4: the Runs board's Compare panel ids
+UI_COMPARE_IDS = {"runs-compare", "runs-compare-caption",
+                  "runs-compare-counts", "runs-compare-table",
+                  "runs-compare-note", "runs-compare-tl"}
 UI_TABS = ("overview", "platform", "idpu", "detectors", "faults",
            "scenarios", "logs", "state", "runs", "setup", "timeline")
 UI_ENDPOINTS = {"status", "time", "faults", "params", "verbs", "state",
@@ -8323,6 +8327,64 @@ def t_ui_runs(env):
         check(bad not in page.lower(), "the page uses %s" % bad)
 
 
+def t_ui_compare(env):
+    """S3 C4 (no browser): the Runs board's Compare panel — the board
+    builds run.compare rows, the panel ids are there, the page rules
+    still hold and no new GET is named; a /runs entry for a replay
+    bundle carries kind "replay" and its of."""
+    da = _cmp_bundle(env, "20261116T101112Z-ui-a",
+                     [_cmp_ev(1, 5 * NS, 0x21)])
+    db = _cmp_bundle(env, "20261116T101113Z-ui-replay",
+                     [_cmp_ev(1, 5 * NS, 0x21)],
+                     mf={"kind": "replay", "of": "20261116T101112Z-ui-a"})
+    root, (da, db) = _cmp_root(env, (da, db))
+    ctl = env.controller(retention={"run_root": root})
+    srv = api_mod.make_server(ctl, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    try:
+        st, _, body = _http(port, "GET", "/")
+        check(st == 200, "GET /: %d" % st)
+        st, _, rbody = _http(port, "GET", "/api/v1/verbs")
+        verbs = {v["verb"] for v in json.loads(rbody)["verbs"]}
+        st, _, qbody = _http(port, "GET", "/api/v1/runs")
+        check(st == 200, "GET /runs: %d" % st)
+        runs = json.loads(qbody)["runs"]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        ctl.shutdown()
+    by = {e["run_id"]: e for e in runs}
+    check(by["20261116T101113Z-ui-replay"]["kind"] == "replay" and
+          by["20261116T101113Z-ui-replay"]["of"] ==
+          "20261116T101112Z-ui-a",
+          "the replay entry carries kind and of: %r"
+          % by.get("20261116T101113Z-ui-replay"))
+    check(by["20261116T101112Z-ui-a"]["kind"] == "run",
+          "the plain entry's kind: %r"
+          % by.get("20261116T101112Z-ui-a"))
+    page = body.decode()
+    p = _UiParser()
+    p.feed(page)
+    ids = {a["id"] for _, a in p.attrs if "id" in a}
+    check(UI_COMPARE_IDS <= ids, "compare ids missing %r"
+          % sorted(UI_COMPARE_IDS - ids))
+    js = "\n".join(p.scripts)
+    check("run.compare" in verbs, "run.compare is a served verb")
+    check('"run.compare"' in js and '"runs-compare-table"' in js,
+          "the board builds compare rows into the panel")
+    check(UI_RUNS_VERBS <= verbs, "all board verbs served: %r"
+          % (UI_RUNS_VERBS - verbs))
+    for tag, a in p.attrs:
+        check("style" not in a and
+              not [k for k in a if k.startswith("on")],
+              "<%s %r>: style attribute or inline handler" % (tag, a))
+    for bad in ("innerhtml", "outerhtml", "insertadjacenthtml"):
+        check(bad not in page.lower(), "the page uses %s" % bad)
+    # the panel uses the verb response: no GET beyond the board's /runs
+    paths = set(re.findall(r"""(?:getJSON\(|API \+ )["']([a-z]+)""", js))
+    check(paths <= UI_ENDPOINTS, "API paths %r" % (paths - UI_ENDPOINTS))
+
+
 CASES = [("config", t_config), ("argv golden", t_argv),
          ("run-dir guard + sparse preflight", t_rundir),
          ("binary guard", t_binary_guard), ("retention", t_retention),
@@ -8452,6 +8514,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("UI: tabs (timeline B1)", t_ui_tabs),
          ("UI: timeline (C1)", t_ui_timeline),
          ("UI: runs board (S1)", t_ui_runs),
+         ("UI: compare panel (S3)", t_ui_compare),
          ("UI: mockup port (D)", t_ui_mockup_d),
          ("UI: stimulus board (T5)", t_ui_stimulus),
          ("setup status (timeline B2)", t_setup_status),
