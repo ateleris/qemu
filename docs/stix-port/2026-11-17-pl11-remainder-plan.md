@@ -489,3 +489,25 @@ equality) and fake support (SETTABLE, fake_qemu.py:43-46).
    typing, and the hknames table must cover exactly the servable
    channels (grlib_stixctrl.c:1637-1644) or the count self-test is
    vacuous.
+
+## 9. Plan review (2026-11-17) — resolutions (these override the task text above)
+
+Independent review; the four MAJORs were re-checked against the code by
+the integrator. No BLOCKER.
+
+| # | finding | resolution |
+|---|---|---|
+| R1 MAJOR | cmdsta bounds: the device refuses any bit outside 11:5 (`STIX_ATT_FORCE_MASK 0xFE0`, "has bits outside 11:5", stix_att.c:875, 902-903) | `att.cmdsta.set/.clear` validate `value & ~0xFE0 == 0` controller-side (400), not 0..0xFFF |
+| R2 MAJOR | stuck grammar: `value` (0/1) is required for every stuck; `bit` is a STRING `"byte.bit"` required for page scope and forbidden for block scope; erase-fail is block-only, program-fail page-only (grlib_stixflash.c:1094-1298, kind checks ~1259-1266, bit ~1277-1295) | the `flash_damage` validate branch mirrors exactly these rules (scope from block vs page key; stuck ⇒ value; page stuck ⇒ bit; block stuck ⇒ no bit; erase-fail ⇒ block; program-fail ⇒ page). The device's parser (stixflash_dmg_entry) is the truth, cite it |
+| R3 MAJOR | integer-only params cannot express `"byte.bit"` | the spec leaf `bit` takes `{"byte": <int or param>, "bit": <int or param>}`; apply composes the device string `"<byte>.<bit>"`; validate bounds byte < page size and bit 0..7 when fixed. Params stay integer-only (faults.py:112-115 unchanged). `flash.cell.stuck` is page scope with params page, byte, bit, value |
+| R4 MAJOR | PL-11d poll error rule contradicted its cite (core.py:351-352 returns silently on QmpError) | the flash gets run in their own block AFTER the hw-state update: each get catches QmpError/ValueError and calls `_poll_error("flash", e)` (deduped, core.py:370-374), then the poll continues; a flash error never skips the hw-state leaves. A missing QMP (`qmp_alive` false) still returns early as today |
+| R5 | snapshots copy only {truth, presented} (core.py:407-408) | claim corrected: `label` never rides snapshots; add platform.md:155-157 (leaf shape sentence) to PL-11h's edit list |
+| R6 | CSP cite | CSP hashes are uicheck.py:47-58 / api.py:52-64 and recompute at serve time; the gate that bites is the data-verb check |
+| R7 | flash knob cite | flash latency/timings/allow-reserved are grlib_stixflash.c:1709-1728 |
+| R8 | parser cites | spec grammar = stixflash_dmg_entry 1094-1298 (enum text 1140-1142); damage-list renderer 1450-1475 prints `bit` as `byte.bit` — the parsed `flash.damage` record carries `bit: "byte.bit"` (string) |
+| R9 | PL-11d 403 matrix wording | accepted (exact): the five paths. Refused: `/machine`, `/objects/x`, `/machine/stixspw/../stixflash`, any child such as `/machine/stixspw/sub` or `/machine/stixflash/x` |
+| R10 | hk names vs the fake's ch 5 | the names table covers the C table's named channels; the self-test checks (a) every channel the REAL table can serve (non-zero entries in grlib_stixctrl.c:650-694, parsed from the C file at test time) has a name, and (b) the fake serves only named channels — the fake's ch 5 moves to a named channel |
+| R11 | edac-enable is a string property | send `"all-on"`, `"1"`, `"2"`, `"4"` as strings |
+| R12 | `memory.*` verb prefix shares a word with fault IDs and leaves | verbs use `mem.*` (`mem.edac.enable`, `mem.upset.clear`, `mem.upset.burst`), see O-N1 |
+
+O-N1 updated recommendation: option A with `mem.*` for the memory verbs.
