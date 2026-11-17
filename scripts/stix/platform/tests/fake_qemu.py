@@ -39,6 +39,11 @@ import sys
 import threading
 import time
 
+# the attenuator 0x5C readback after reset: POSITIONAB (bit 10, out)
+# | OPERATIONSTATUS (bit 8, set by stix_att.c reset) = 0x500
+ATT_CMDSTA_RESET = 0x500
+
+
 PROPS_NEW = ["flash-file", "inverted-storage"]
 PROPS_OLD = ["flash-file"]
 # the attenuator fault properties (the catalogue's qom rows on
@@ -310,7 +315,8 @@ class Fake:
                               "moves": 0, "last_end": "none",
                               "last_end_ns": 0},
                     "presented": {"sensor_ab": True, "sensor_bc": False,
-                                  "cmdsta": (1024 | self.cmdsta_force["set"])
+                                  "cmdsta": (ATT_CMDSTA_RESET
+                                             | self.cmdsta_force["set"])
                                   & ~self.cmdsta_force["clear"] & 0xFFF,
                                   "att_c": 20},
                     "fsw_accesses": 0, "faults_active": ""},

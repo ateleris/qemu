@@ -2914,7 +2914,7 @@ def t_att_edac_leaves(env):
         p = ctl.state.get("instrument.attenuator.presented")
         check(p["sensor_ab"]["truth"] is True and
               p["sensor_bc"]["truth"] is False and
-              p["cmdsta"]["truth"] == 1024 and
+              p["cmdsta"]["truth"] == 0x500 and
               p["att_c"]["truth"] == 20,
               "the attenuator presented leaves: %r" % p)
         check(ctl.state.get("instrument.attenuator.fsw_accesses")
@@ -3427,18 +3427,19 @@ def t_att_mem_control(env):
         # set then clear: the presented cmdsta moves in the hw-state
         cmd("att.cmdsta.set", {"value": 0x20})
         wait_for(lambda: leaf("instrument.attenuator.presented.cmdsta")
-                 == (1024 | 0x20), what="the forced cmdsta")
+                 == (0x500 | 0x20), what="the forced cmdsta")
         cmd("att.cmdsta.clear", {"value": 0x420})
         check(sets()[-1] == ["/machine/stixctrl/attenuator",
                              "force.cmdsta-clear", 0x420],
               "the clear set: %r" % sets()[-1])
+        # 0x520 & ~0x420: bits 10 and 5 go, OPERATIONSTATUS (bit 8) stays
         wait_for(lambda: leaf("instrument.attenuator.presented.cmdsta")
-                 == 0, what="the cleared cmdsta (the clear wins)")
+                 == 0x100, what="the cleared cmdsta (the clear wins)")
         # both masks back to 0: the idle readback again
         cmd("att.cmdsta.set", {"value": 0})
         cmd("att.cmdsta.clear", {"value": 0})
         wait_for(lambda: leaf("instrument.attenuator.presented.cmdsta")
-                 == 1024, what="the idle cmdsta back")
+                 == 0x500, what="the idle cmdsta back")
         # edac-enable: the module -> the device's exact string
         n = len(sets())
         for module, s in (("all", "all-on"), ("sdram", "1"),
