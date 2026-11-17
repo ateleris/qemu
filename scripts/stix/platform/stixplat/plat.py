@@ -30,6 +30,8 @@ from .timesync import TimeSync
 
 STIXSPW = "/machine/stixspw"
 STIXCTRL = "/machine/stixctrl"
+STIXATT = STIXCTRL + "/attenuator"      # PL-11f: the cmdsta forcing
+STIXEDAC = STIXCTRL + "/edac"           # PL-11f: the EDAC knobs
 
 
 def split_kv(line):
@@ -382,6 +384,48 @@ class Platform:
                   "argument, only the given ones are written; both "
                   "survive a device reset, the offset is capped at "
                   "2^32 ticks of replay time")
+        d.add("att.cmdsta.set", self.v_att_cmdsta_set,
+              args={"value": {"type": "integer", "required": True,
+                              "min": 0}},
+              doc="force bits 11:5 of the attenuator's 0x5C readback to 1 "
+                  "(force.cmdsta-set on /machine/stixctrl/attenuator); "
+                  "the value is masked to 0xfe0 (400 naming the mask "
+                  "otherwise); the device clears the force on reset and "
+                  "the controller does not re-apply it across cycles")
+        d.add("att.cmdsta.clear", self.v_att_cmdsta_clear,
+              args={"value": {"type": "integer", "required": True,
+                              "min": 0}},
+              doc="force bits 11:5 of the attenuator's 0x5C readback to 0 "
+                  "(force.cmdsta-clear); a bit in both masks reads 0 (the "
+                  "clear wins); clears on reset, not re-applied")
+        d.add("mem.edac.enable", self.v_edac_enable,
+              args={"module": {"type": "string", "required": True,
+                               "enum": ["all", "sdram", "cache", "rotbuf"]},
+                    "on": {"type": "boolean", "default": True}},
+              doc="set the EdacOn bits at run time (edac-enable on "
+                  "/machine/stixctrl/edac): all sends the string "
+                  "\"all-on\", sdram/cache/rotbuf the masks \"1\"/\"2\"/"
+                  "\"4\"; the property only sets, never clears, so on is "
+                  "true (a false is a 400 that never reaches the device); "
+                  "the device's refusals are the 409; Edacon is not "
+                  "re-applied across cycles (the FSW or a reset owns the "
+                  "off path)")
+        d.add("mem.upset.clear", self.v_upset_clear,
+              args={"id": {"type": ["string", "integer"], "required": True,
+                           "min": 0}},
+              doc="clear armed upsets (upset-clear on the edac): \"all\" "
+                  "or an index into instrument.memory.poisons; 409 while "
+                  "STIX is off or the index is not armed")
+        d.add("mem.upset.burst", self.v_upset_burst,
+              args={"seed": {"type": "integer", "min": 0,
+                             "max": 0xFFFFFFFF},
+                    "count": {"type": "integer", "required": True,
+                              "min": 1, "max": 0xFFFFFFFF}},
+              doc="the seeded random upset burst (random-seed, then "
+                  "random-count, on the edac): count one-bit upsets drawn "
+                  "from the seed (0 = off, survives a reset); a burst "
+                  "without seed uses the device's stored seed and is a "
+                  "409 while it is 0")
         d.add("fault.inject", self.faults.inject,
               args={"id": {"type": "string", "required": True},
                     "params": {"type": "object"},
@@ -685,6 +729,60 @@ class Platform:
         if offset_ms is not None:
             out["offset_ms"] = offset_ms
         return out
+
+    # -- PL-11f: the attenuator cmdsta forcing and the EDAC knobs
+    # (validation before any QMP; the device's own refusals surface as
+    # the 409 from _qom_set)
+    @staticmethod
+    def _cmdsta_check(value):
+        """The device's rule (stix_att.c:874-905): bits 11:5 only, the
+        mask named in the 400."""
+        if value & ~0xFE0:
+            raise VerbError(400, "value 0x%x has bits outside 11:5 "
+                            "(the force mask is 0xfe0)" % value)
+        return value
+
+    def _att_cmdsta(self, value, prop):
+        self._qom_set(prop, self._cmdsta_check(value), STIXATT)
+        return {"value": value}
+
+    def v_att_cmdsta_set(self, value):
+        return self._att_cmdsta(value, "force.cmdsta-set")
+
+    def v_att_cmdsta_clear(self, value):
+        return self._att_cmdsta(value, "force.cmdsta-clear")
+
+    def v_edac_enable(self, module, on=True):
+        """O4 verbatim: edac-enable is a string property and its setter
+        only ORs the EdacOn bits in (stix_edac.c:1285-1352), so on must
+        be true and never reaches the device as false."""
+        if not on:
+            raise VerbError(400, "on must be true: edac-enable only "
+                            "sets, it never clears (the off path is the "
+                            "FSW's own TC(236) write or a reset)")
+        enable = {"all": "all-on", "sdram": "1", "cache": "2",
+                  "rotbuf": "4"}[module]
+        self._qom_set("edac-enable", enable, STIXEDAC)
+        return {"module": module, "on": True}
+
+    def v_upset_clear(self, id):
+        """upset-clear takes the device's string: "all" or the index
+        (stix_edac.c:1044-1091). Off, or an index that is not armed, is
+        the 409."""
+        if isinstance(id, str) and id != "all":
+            raise VerbError(400, "id is \"all\" or an index into "
+                            "instrument.memory.poisons")
+        self._qom_set("upset-clear", str(id), STIXEDAC)
+        return {"cleared": id}
+
+    def v_upset_burst(self, count, seed=None):
+        """The seeded burst (stix_edac.c:1133-1199): the seed is plain
+        state (0 = off), the count is the write-only verb that fires the
+        draw; seed first, then count."""
+        if seed is not None:
+            self._qom_set("random-seed", seed, STIXEDAC)
+        self._qom_set("random-count", count, STIXEDAC)
+        return {"count": count, "seed": seed}
 
     @staticmethod
     def _flash_name(name):

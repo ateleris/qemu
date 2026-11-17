@@ -730,6 +730,55 @@ tr.cmp-first td { font-weight: 600; }
   </div>
   <div id="forcings"></div>
 </section>
+
+<section class="narrow">
+  <h2>Attenuator forcing</h2>
+  <div class="ctl">
+    <span class="lbl">bits 11:5</span>
+    <input type="number" name="value" min="0" max="4064" data-type="int"
+           title="force.cmdsta value, bits 11:5 only (mask 0xfe0)">
+    <button data-verb="att.cmdsta.set" class="danger">set</button>
+    <button data-verb="att.cmdsta.clear">clear</button>
+  </div>
+  <div class="desc">Forces bits of the attenuator's 0x5C readback (the
+    presented.cmdsta leaf); the device clears the force on reset — not
+    re-applied across power cycles.</div>
+</section>
+
+<section class="narrow">
+  <h2>EDAC</h2>
+  <div class="ctl">
+    <span class="lbl">module</span>
+    <select name="module"
+            title="edac-enable: which EdacOn bits to set (all sends all-on)">
+      <option value="all">all</option>
+      <option value="sdram">sdram</option>
+      <option value="cache">cache</option>
+      <option value="rotbuf">rotbuf</option>
+    </select>
+    <button data-verb="mem.edac.enable">enable</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">upsets</span>
+    <input name="id" data-type="auto-int" placeholder="all"
+           title="upset-clear: all, or an index into memory.poisons">
+    <button data-verb="mem.upset.clear">clear</button>
+    <button data-verb="mem.upset.clear" data-args='{"id": "all"}'>clear
+      all</button>
+  </div>
+  <div class="ctl">
+    <span class="lbl">burst</span>
+    <input type="number" name="seed" min="0" data-type="int"
+           placeholder="seed" title="random-seed; empty = the device's stored seed">
+    <input type="number" name="count" min="1" value="1" data-type="int"
+           title="random-count: upsets to draw">
+    <button data-verb="mem.upset.burst">burst</button>
+  </div>
+  <div class="desc">edac-enable only sets Edacon (the off path is the
+    FSW's or a reset); the burst draws count one-bit upsets from the
+    seed into the poison table (the armed upsets are the
+    instrument.memory.poisons leaf).</div>
+</section>
 </div>
 
 <div class="tab" data-tab-panel="scenarios" hidden>

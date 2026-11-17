@@ -18,7 +18,10 @@ pairs (the stimulus plan T3/C2), the det scene/inject/replay knobs
 replay-dss source or a replay start is refused with the device's
 no-table text), the flash device at /machine/stixflash
 (the five watch props, the damage-add/remove verbs and the
-x-fake-flash-op counter bumps, PL-11d), memsave (the fsw-params RAM
+x-fake-flash-op counter bumps, PL-11d), the PL-11f knobs (the
+attenuator's force.cmdsta-set/-clear move the hw-state's presented
+cmdsta, upset-clear and random-count move the poisons, edac-enable and
+random-seed are stored like the device's), memsave (the fsw-params RAM
 snapshot: zeros into the asked file, in the cwd), and the test-only
 x-fake-guest-reset, x-fake-tape-state, x-fake-align-state and
 x-fake-adc-state, which behave per -no-reboot / -action like QEMU.
@@ -53,13 +56,18 @@ SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject",
             # knobs on /machine/stixctrl
             "det-source", "det-flare", "det-quiet-cps", "det-flare-cps",
             "det-inject", "det-replay-start", "det-replay-trigger",
-            "det-replay-offset-ms") + ATTENUATOR + \
+            "det-replay-offset-ms",
+            # PL-11f: the attenuator cmdsta forcing and the EDAC knobs
+            "force.cmdsta-set", "force.cmdsta-clear", "edac-enable",
+            "random-seed", "random-count") + ATTENUATOR + \
     tuple("adc-inject[%d]" % ch for ch in range(128))
 # read-back before the first set: the booleans are false, the offset 0
 ATT_DEFAULT = {"attenuator.current.offset": 0}
 # the EDAC device (the memory.* catalogue rows' target); its upset
 # verbs move the hw-state's edac section, like the device's
 EDAC = "/machine/stixctrl/edac"
+# the attenuator (PL-11f): the cmdsta forcing props live here
+ATT = "/machine/stixctrl/attenuator"
 # the controller device (the det.* scene knobs are on its class)
 CTRL = "/machine/stixctrl"
 # the flash device (PL-11d): the five watch props, the damage verbs
@@ -144,6 +152,13 @@ class Fake:
         self.edac_counters = {m: {"injected": 0, "corrected": 0,
                                   "detected": 0}
                               for m in ("sdram", "cache", "rotbuf")}
+        # PL-11f: the cmdsta forcing masks (stix_att.c:874-905, applied
+        # to the readback as (value | set) & ~clear) and the burst seed
+        # (0 = off, survives a reset like the device's). The real device
+        # clears the cmdsta force on reset; this fake keeps all props
+        # across a reset (see guest_reset)
+        self.cmdsta_force = {"set": 0, "clear": 0}
+        self.random_seed = 0
         # the flash device (PL-11d): the op counters move only through
         # x-fake-flash-op (D-F9); the damage list holds the parsed
         # runtime specs (damage-add/damage-remove) and survives a guest
@@ -279,7 +294,9 @@ class Fake:
                 # the attenuator section (stix_att.c:966-998), idle at
                 # "out": AB actuates at OUT (stix_att.c:291-293), so the
                 # presented cmdsta carries the AB bit (bit 10,
-                # StixIdpu.h:722); att_c is HK ch 8's idle adc
+                # StixIdpu.h:722); att_c is HK ch 8's idle adc. The
+                # cmdsta forcing applies to the readback as
+                # (value | set) & ~clear (stix_att.c:344-350)
                 "attenuator": {
                     "truth": {"position": "out", "position_ppm": 0,
                               "sensor_ab": True, "sensor_bc": False,
@@ -288,7 +305,9 @@ class Fake:
                               "moves": 0, "last_end": "none",
                               "last_end_ns": 0},
                     "presented": {"sensor_ab": True, "sensor_bc": False,
-                                  "cmdsta": 1024, "att_c": 20},
+                                  "cmdsta": (1024 | self.cmdsta_force["set"])
+                                  & ~self.cmdsta_force["clear"] & 0xFFF,
+                                  "att_c": 20},
                     "fsw_accesses": 0, "faults_active": ""},
                 "edac": self.hw_edac(),
                 # the aspect generator (AS-2), powered off
@@ -362,17 +381,72 @@ class Fake:
 
     def upset_clear(self, spec):
         """upset-clear (stix_edac.c:1044-1091): "all", or an index into
-        the poisons list."""
+        the poisons list; the refusals are the device's texts."""
         if spec == "all":
             self.poisons = []
             return
         try:
             i = int(spec, 0)
         except ValueError:
-            raise KeyError("expected \"all\" or an index, not %r" % spec)
+            raise KeyError("upset-clear: expected \"all\" or an index "
+                           "into upsets-active, not \"%s\"" % spec)
         if i < 0 or i >= len(self.poisons):
-            raise KeyError("no upset %d armed (%d)" % (i, len(self.poisons)))
+            raise KeyError("upset-clear: no upset %d armed (upsets-active "
+                           "holds %d)" % (i, len(self.poisons)))
         del self.poisons[i]
+
+    # the device's draw PRNG, xorshift32 13/17/5 (stix_edac.c:1122-1131)
+    @staticmethod
+    def _xorshift(state):
+        x = state
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= x >> 17
+        x ^= (x << 5) & 0xFFFFFFFF
+        return x
+
+    def upset_burst(self, count):
+        """random-count (stix_edac.c:1133-1199): count one-bit upsets
+        from self.random_seed, 0 injects nothing and a 0 seed is off
+        (the device's texts). The fake does NOT model the real draw —
+        the device picks the memory, word and bit uniformly among the
+        wired EDAC memories and skips already poisoned words (the qtest
+        edac-random pins it); it only needs count plausible poison
+        records, drawn deterministically from the seed over
+        sdram/cache/rotbuf so the leaves move the same way every run."""
+        if count == 0:
+            raise KeyError("random-count: 0 injects nothing")
+        if self.random_seed == 0:
+            raise KeyError("random-count: random-seed is 0 (off): set a "
+                           "nonzero seed first")
+        if count > 256 - len(self.poisons):
+            raise KeyError("random-count: %d upsets do not fit the poison "
+                           "table (%d free of %d)"
+                           % (count, 256 - len(self.poisons), 256))
+        # one-bit mask, so every record is a seu; the addresses are the
+        # modules' plausible window starts, the rotbuf one split into
+        # the block:offset pair the records carry
+        base = {"sdram": 0x40000000, "cache": 0xE0180000,
+                "rotbuf": 0x00000000}
+        state = self.random_seed
+        for _ in range(count):
+            state = self._xorshift(state)
+            mem = ("sdram", "cache", "rotbuf")[state % 3]
+            state = self._xorshift(state)
+            word = state % 4096
+            state = self._xorshift(state)
+            mask = 1 << (state % 32)
+            rec = {"memory": mem, "mask": mask, "mode": "seu",
+                   "persist": False}
+            if mem == "rotbuf":
+                # "<block>:<offset>": the block index into the ring and
+                # the 4-aligned byte offset in the block (M-4)
+                rec["block"] = word // 64
+                rec["offset"] = (word % 64) * 4
+                rec["address"] = rec["block"] * 0x200 + rec["offset"]
+            else:
+                rec["address"] = base[mem] + word * 4
+            self.poisons.append(rec)
+            self.edac_counters[mem]["injected"] += 1
 
     def flash_spec(self, value):
         """One damage spec string into a canonical record — the device's
@@ -560,6 +634,47 @@ class Fake:
                     self.upset_inject(a["value"])
                 elif a["path"] == EDAC and prop == "upset-clear":
                     self.upset_clear(a["value"])
+                elif a["path"] == ATT and prop in ("force.cmdsta-set",
+                                                   "force.cmdsta-clear"):
+                    # stix_att.c:886-908: a uint32, bits 11:5 only (the
+                    # device's text otherwise); the masks apply to the
+                    # readback as (value | set) & ~clear
+                    v = a["value"]
+                    if not isinstance(v, int) or isinstance(v, bool) or \
+                            not 0 <= v <= 0xFFFFFFFF:
+                        raise KeyError("%s: not a uint32: %r" % (prop, v))
+                    if v & ~0xFE0:
+                        raise KeyError("%s: 0x%x has bits outside 11:5"
+                                       % (prop, v))
+                    self.cmdsta_force["set" if prop.endswith("set")
+                                      else "clear"] = v
+                elif a["path"] == EDAC and prop == "edac-enable":
+                    # stix_edac.c:1302-1352: "all-on" or a 3-bit mask
+                    # string; only sets, never clears (the fake keeps no
+                    # Edacon state: no hw-state field shows it)
+                    s = a["value"]
+                    if s != "all-on":
+                        try:
+                            m = int(s, 0)
+                        except (TypeError, ValueError):
+                            m = -1
+                        if not 0 <= m <= 7:
+                            raise KeyError(
+                                "edac-enable: expected all-on or a 3-bit "
+                                "mask (1 = sdram, 2 = cache, 4 = rotb), "
+                                "not %s" % s)
+                        if m == 0:
+                            raise KeyError("edac-enable: an empty mask "
+                                           "enables nothing")
+                elif a["path"] == EDAC and prop == "random-seed":
+                    # plain state, 0 = off (stix_edac.c:1460-1464)
+                    v = a["value"]
+                    if not isinstance(v, int) or isinstance(v, bool) or \
+                            not 0 <= v <= 0xFFFFFFFF:
+                        raise KeyError("random-seed: not a uint32: %r" % v)
+                    self.random_seed = v
+                elif a["path"] == EDAC and prop == "random-count":
+                    self.upset_burst(a["value"])
                 elif prop == "det-tape-load":
                     try:
                         tape = json.loads(a["value"])

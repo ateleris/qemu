@@ -2730,8 +2730,8 @@ def t_att_edac_leaves(env):
               ch[1]["old"]["truth"] == [] and
               len(ch[1]["new"]["truth"]) == 1,
               "creation, then one change record on the arm: %r" % ch)
-        # the clear: the device's own upset-clear (no platform verb
-        # until PL-11f), driven straight on the fake's QMP
+        # the clear: the device's own upset-clear (the PL-11f verb has
+        # its own case), driven straight on the fake's QMP
         ctl.power.qmp.execute("qom-set", {
             "path": "/machine/stixctrl/edac",
             "property": "upset-clear", "value": "all"})
@@ -3117,6 +3117,131 @@ def t_det_control(env):
         check(r == {"started": False}, "%r" % r)
         check(sets()[-1] == ["/machine/stixctrl", "det-replay-start",
                              False], "the stop stored: %r" % sets()[-1])
+    finally:
+        ctl.shutdown()
+
+
+def t_att_mem_control(env):
+    """PL-11f: the attenuator cmdsta forcing and the EDAC verbs. The
+    mask 400s name bits 11:5 and stay client-side, presented.cmdsta
+    moves in the fake's hw-state, edac-enable sends the device's
+    strings, on=false never reaches it, upset.clear all/index/
+    out-of-range, the burst (seed first, then count) arms poisons, and
+    one verb of each family is a 409 while off."""
+    from . import verbs as verbs_mod
+    for v in ("att.cmdsta.set", "att.cmdsta.clear", "mem.edac.enable",
+              "mem.upset.clear", "mem.upset.burst"):
+        check(v in verbs_mod.VERBS, "%s in the registry" % v)
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+
+        def sets():
+            return [list(x) for x in
+                    ctl.power.qmp.execute("x-fake-set-log")]
+
+        def leaf(p):
+            lf = ctl.state.get(p)
+            return None if lf is None else lf["truth"]
+
+        # 409 while off, one verb of each family
+        for verb, args in (("att.cmdsta.set", {"value": 0x20}),
+                           ("mem.edac.enable",
+                            {"module": "sdram", "on": True}),
+                           ("mem.upset.clear", {"id": "all"}),
+                           ("mem.upset.burst", {"count": 2})):
+            e = raises(VerbError, cmd, verb, args)
+            check(e.status == 409 and "off" in str(e),
+                  "off %s: %s" % (verb, e))
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        # arg validation before any QMP: the cmdsta mask (bits 11:5
+        # only), a wrong type, on=false, a 0 count
+        n = len(sets())
+        for args in ({"value": 0x1F}, {"value": 0x1000}, {"value": -1},
+                     {"value": "0x20"}):
+            e = raises(VerbError, cmd, "att.cmdsta.set", args)
+            check(e.status == 400, "cmdsta %r: %s" % (args, e))
+        e = raises(VerbError, cmd, "att.cmdsta.set", {"value": 0x1000})
+        check("11:5" in str(e) and "0xfe0" in str(e),
+              "the mask is named: %s" % e)
+        e = raises(VerbError, cmd, "mem.edac.enable",
+                   {"module": "sdram", "on": False})
+        check(e.status == 400 and "only sets" in str(e), "on=false: %s" % e)
+        e = raises(VerbError, cmd, "mem.upset.clear", {"id": "none"})
+        check(e.status == 400, "clear id: %s" % e)
+        e = raises(VerbError, cmd, "mem.upset.clear", {"id": -1})
+        check(e.status == 400, "clear -1: %s" % e)
+        e = raises(VerbError, cmd, "mem.upset.burst", {"count": 0})
+        check(e.status == 400, "count 0: %s" % e)
+        check(len(sets()) == n, "the refusals stayed client-side")
+        # the mask boundary is the device's 0xfe0
+        cmd("att.cmdsta.set", {"value": 0xFE0})
+        check(sets()[-1] == ["/machine/stixctrl/attenuator",
+                             "force.cmdsta-set", 0xFE0],
+              "the 0xfe0 boundary set: %r" % sets()[-1])
+        cmd("att.cmdsta.set", {"value": 0})     # back to plain forcing
+        # set then clear: the presented cmdsta moves in the hw-state
+        cmd("att.cmdsta.set", {"value": 0x20})
+        wait_for(lambda: leaf("instrument.attenuator.presented.cmdsta")
+                 == (1024 | 0x20), what="the forced cmdsta")
+        cmd("att.cmdsta.clear", {"value": 0x420})
+        check(sets()[-1] == ["/machine/stixctrl/attenuator",
+                             "force.cmdsta-clear", 0x420],
+              "the clear set: %r" % sets()[-1])
+        wait_for(lambda: leaf("instrument.attenuator.presented.cmdsta")
+                 == 0, what="the cleared cmdsta (the clear wins)")
+        # both masks back to 0: the idle readback again
+        cmd("att.cmdsta.set", {"value": 0})
+        cmd("att.cmdsta.clear", {"value": 0})
+        wait_for(lambda: leaf("instrument.attenuator.presented.cmdsta")
+                 == 1024, what="the idle cmdsta back")
+        # edac-enable: the module -> the device's exact string
+        n = len(sets())
+        for module, s in (("all", "all-on"), ("sdram", "1"),
+                          ("cache", "2"), ("rotbuf", "4")):
+            r = cmd("mem.edac.enable", {"module": module})
+            check(r == {"module": module, "on": True}, "%r" % r)
+            check(sets()[-1] == ["/machine/stixctrl/edac", "edac-enable",
+                                 s],
+                  "edac-enable %s: %r" % (module, sets()[-1]))
+        # the burst: seed first, then count; the poisons move
+        n = len(sets())
+        r = cmd("mem.upset.burst", {"seed": 7, "count": 2})
+        check(r == {"count": 2, "seed": 7}, "%r" % r)
+        check(sets()[n:] == [["/machine/stixctrl/edac", "random-seed", 7],
+                             ["/machine/stixctrl/edac", "random-count",
+                              2]],
+              "seed then count: %r" % sets()[n:])
+        wait_for(lambda: len(leaf("instrument.memory.poisons") or []) == 2,
+                 what="the burst's poisons")
+        for rec in leaf("instrument.memory.poisons"):
+            check(rec["memory"] in ("sdram", "cache", "rotbuf") and
+                  bin(rec["mask"]).count("1") == 1 and
+                  rec["mode"] == "seu" and rec["persist"] is False,
+                  "a burst poison: %r" % rec)
+        # without a seed: the stored one is used, only the count is set
+        n = len(sets())
+        cmd("mem.upset.burst", {"count": 1})
+        check(sets()[n:] == [["/machine/stixctrl/edac", "random-count",
+                              1]],
+              "no seed set: %r" % sets()[n:])
+        wait_for(lambda: len(leaf("instrument.memory.poisons")) == 3,
+                 what="the second burst's poison")
+        # upset.clear: an index removes one, out of range is the 409
+        cmd("mem.upset.clear", {"id": 1})
+        check(sets()[-1] == ["/machine/stixctrl/edac", "upset-clear",
+                             "1"], "the index clear: %r" % sets()[-1])
+        wait_for(lambda: len(leaf("instrument.memory.poisons")) == 2,
+                 what="the index cleared")
+        e = raises(VerbError, cmd, "mem.upset.clear", {"id": 9})
+        check(e.status == 409 and "no upset 9 armed" in str(e),
+              "out of range: %s" % e)
+        cmd("mem.upset.clear", {"id": "all"})
+        check(sets()[-1] == ["/machine/stixctrl/edac", "upset-clear",
+                             "all"], "the all clear: %r" % sets()[-1])
+        wait_for(lambda: leaf("instrument.memory.poisons") == [],
+                 what="the poisons emptied")
     finally:
         ctl.shutdown()
 
@@ -9075,6 +9200,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("state: t_changed (D4)", t_state_t_changed),
          ("detector burst verb (FF)", t_det_burst),
          ("detector control verbs (PL-11e)", t_det_control),
+         ("attenuator + EDAC control verbs (PL-11f)", t_att_mem_control),
          ("detector tapes: files + schema (T3)", t_tapes_crud),
          ("detector tapes: play/stop verbs (T3)", t_tapes_play_stop),
          ("detector tapes: spec rules (S2 U3)", t_tapes_spec),

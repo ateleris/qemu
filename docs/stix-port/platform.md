@@ -213,6 +213,11 @@ lists exactly these verbs and arguments.
 | `det.replay.start` | | start a loaded `.dssevs` replay now (`det-replay-start` true); the device refuses without a table or without `det-source=replay-dss` (409 with its text); a start applies at the next 100 ms tick |
 | `det.replay.stop` | | stop a running replay now (`det-replay-start` false, applied at once) |
 | `det.replay.config` | `trigger`, `offset_ms` | the replay's scene knobs (`det-replay-trigger` nominal \| qmp, `det-replay-offset-ms`); at least one argument, only the given ones are written; both survive a device reset, and the device rejects an offset past 2^32 ticks of replay time |
+| `att.cmdsta.set` | `value` | force bits 11:5 of the attenuator's 0x5C readback to 1 (`force.cmdsta-set` on `/machine/stixctrl/attenuator`); the value is masked to 0xfe0 (400 naming the mask otherwise); the device clears the force on reset, and the controller does not re-apply it across power cycles |
+| `att.cmdsta.clear` | `value` | force bits 11:5 of the readback to 0 (`force.cmdsta-clear`); a bit in both masks reads 0 (the clear wins); clears on reset, not re-applied |
+| `mem.edac.enable` | `module`, `on` | set the EdacOn bits at run time (`edac-enable` on `/machine/stixctrl/edac`): `all` sends the string `all-on`, `sdram`/`cache`/`rotbuf` the mask strings `1`/`2`/`4`; the property only sets, never clears, so `on` is true (false is a 400 that never reaches the device); the device's refusals (an unwired module) are the 409; Edacon is not re-applied across cycles (the FSW's TC(236) write or a reset owns the off path) |
+| `mem.upset.clear` | `id` | clear armed upsets (`upset-clear` on the edac): `all` or an index into `instrument.memory.poisons`; 409 while STIX is off or the index is not armed |
+| `mem.upset.burst` | `seed`, `count` | the seeded random upset burst (`random-seed`, then `random-count`, on the edac): `count` one-bit upsets drawn from the seed (0 = off; the seed survives a reset); a burst without `seed` uses the device's stored seed and is a 409 while it is 0 |
 | `fault.inject` | `id`, `params`, `trigger`, `seed` | a catalogue fault (`GET /faults`); logged as `fault` with its params and seed |
 | `fault.clear` | `id` | clear an active, reversible fault, or disarm an armed one |
 | `tc.platform.send` | `hex` | a raw platform TC space packet: source 14, services 9 and 20 only (403 otherwise); TC(9,129) gets 409 while a sync is pending |
@@ -430,6 +435,10 @@ One-shots (`transient`/`permanent` — the `memory.*` rows) are never
 re-applied; the controller-side kinds (link, timecodes, keepalive) and
 `adc` keep their own re-apply paths. A re-apply that fails at the
 device is a `reapply-error` record and never fails the power-on.
+Deliberately outside the re-apply rule (PL-11f): the cmdsta forcing
+(`att.cmdsta.*`) — the device clears it on reset by design — and the
+EDAC's Edacon (`mem.edac.enable`) — the FSW's TC(236) write or a reset
+owns the off path.
 
 The v1 entries (all on existing model hooks): `spw.link.disconnect`,
 `timecode.missing`, `timecode.wrong_value`, `obt.jump`,
