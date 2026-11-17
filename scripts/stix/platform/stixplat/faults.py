@@ -113,6 +113,11 @@ def validate(cat):
               "string" % i)
         _need(fid not in seen, "duplicate fault id %r" % fid)
         seen.add(fid)
+        # PL-11h (D-PSf): optional title and one-sentence description
+        for k in ("label", "description"):
+            _need(k not in f or (isinstance(f[k], str) and f[k]),
+                  "%s: %s must be a non-empty string when present"
+                  % (fid, k))
         _need(f["class"] in CLASSES, "%s: class %r" % (fid, f["class"]))
         _need(f["changes"] in CHANGES, "%s: changes %r is not truth or "
               "presented" % (fid, f["changes"]))

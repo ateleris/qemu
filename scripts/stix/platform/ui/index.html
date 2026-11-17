@@ -132,6 +132,10 @@ th { color: var(--muted); font-weight: 500; background: var(--panel); }
 #toast { min-height: 1.4em; max-width: min(480px, 90vw);
   overflow-wrap: anywhere; font: 12px var(--mono); }
 .desc { color: var(--muted); font-size: 12px; margin: 2px 0 6px; }
+/* the fault row's preconditions and expected_detection (PL-11h) */
+.f-cap { font-size: 11px; margin-top: 2px; }
+.f-list { margin: 1px 0 0 14px; padding: 0; }
+.f-list li { color: var(--muted); font-size: 12px; }
 /* one shared note per panel: why all of its verbs are disabled */
 .verb-note { grid-column: 1 / -1; margin: 0; color: var(--warn);
   font: 12px var(--mono); }
@@ -1611,8 +1615,39 @@ async function loadFaults() {
     row.dataset.fault = f.id;
     row.dataset.cat = faultCat(f.id);
     text(row.querySelector(".f-id"), f.id);
-    text(row.querySelector(".f-desc"), f.class + ", " + f.mode + " on " +
-         f.target + " (" + f.changes + ", " + f.persistence + ")");
+    // the label as the row's title, the description under it (else
+    // today's class/mode line), then the two small lists (PL-11h)
+    const d = row.querySelector(".f-desc");
+    d.replaceChildren();
+    if (f.label) {
+      const b = document.createElement("b");
+      text(b, f.label);
+      d.append(b);
+    }
+    const what = document.createElement("div");
+    text(what, f.description ||
+         (f.class + ", " + f.mode + " on " + f.target +
+          " (" + f.changes + ", " + f.persistence + ")"));
+    d.append(what);
+    for (const [key, cap] of [["preconditions", "needs"],
+                              ["expected_detection", "detects"]]) {
+      const items = f[key] || [];
+      if (!items.length) continue;
+      const h = document.createElement("div");
+      cls(h, "f-cap");
+      text(h, cap);
+      d.append(h);
+      const ul = document.createElement("ul");
+      cls(ul, "f-list");
+      for (const item of items) {
+        const li = document.createElement("li");
+        text(li, typeof item === "string" ? item
+             : [item.tm, "within " + item.within_s + " s", item.note]
+               .filter(Boolean).join(" — "));
+        ul.append(li);
+      }
+      d.append(ul);
+    }
     const ps = row.querySelector(".f-params");
     for (const [name, spec] of Object.entries(f.params || {})) {
       const lbl = document.createElement("label");
@@ -1825,12 +1860,16 @@ async function loadState() {
     Math.max(0, Math.round(((TL.now || 0) - fm.t) / 1e9)) + " s ago" +
     (fm.reason ? ", " + fm.reason : "") : "";
   const sel = $("force-path");
-  const want = stateRows.map(([p]) => p).filter((p) => /^instrument\.hk_adc\.\d+$/.test(p));
+  const want = stateRows.filter(([p]) =>
+    /^instrument\.hk_adc\.\d+$/.test(p));
   const have = [...sel.options].map((o) => o.value);
-  if (want.join() !== have.join()) {
+  if (want.map(([p]) => p).join() !== have.join()) {
     const keep = sel.value;
-    sel.replaceChildren(...want.map((p) => new Option(p, p)));
-    if (want.includes(keep)) sel.value = keep;
+    // "ch 8 — ATT_C" where the leaf carries a name, else the raw path
+    sel.replaceChildren(...want.map(([p, lf]) =>
+      new Option(lf.label ? "ch " + leafName(p) + " — " + lf.label : p,
+                 p)));
+    if (want.some(([p]) => p === keep)) sel.value = keep;
   }
   // "Reported in TM" (D4): the latest point of the HK series a leaf is
   // mapped to; "–" without an IDB
@@ -1911,6 +1950,8 @@ function renderState() {
       cells.forEach((c, i) => {
         const td = document.createElement("td");
         text(td, c);
+        // the HK channel's name (PL-11h) as the leaf cell's title
+        if (i === 0 && lf.label) td.title = lf.label;
         if (i === 2 && show(lf.truth) !== show(lf.presented)) cls(td, "diff");
         if (i === 4) {
           cls(td, lf.status);

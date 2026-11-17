@@ -30,6 +30,7 @@ from . import config as config_mod
 from . import decode
 from . import faults as faults_mod
 from . import fswmode as fswmode_mod
+from . import hknames as hknames_mod
 from . import idb as idb_mod
 from . import keepalive as keepalive_mod
 from . import params as params_mod
@@ -583,7 +584,7 @@ def t_power(env):
         cmd("sim.resume", {})
         wait_for(lambda: ctl.state.get("platform.obt") is not None,
                  what="state poll")
-        check(ctl.state.get("instrument.hk_adc.5")["truth"] == 100,
+        check(ctl.state.get("instrument.hk_adc.64")["truth"] == 100,
               "state leaf")
         snaps = [x.obj["data"] for x in ctl.log.since(0)
                  if x.kind == "state" and x.obj["data"].get("snapshot")]
@@ -2815,6 +2816,71 @@ def t_flash_faults(env):
         check("at most 65536" in recs("reapply-error")[-1][1]["error"],
               "the error text: %r" % (recs("reapply-error")[-1],))
         ctl.plat.faults.actions["flash_damage"] = real
+    finally:
+        ctl.shutdown()
+
+
+def t_hk_names(env):
+    """PL-11h (O6, R10): the HK channel names match the C table parsed
+    at test time, the fake serves only named channels, the hk_adc
+    leaves carry the additive label, and the catalogue's optional
+    label/description validate as non-empty strings."""
+    cpath = os.path.normpath(os.path.join(HERE, "..", "..", "..", "..",
+                                          "hw", "sparc",
+                                          "grlib_stixctrl.c"))
+    with open(cpath) as f:
+        src = f.read()
+    m = re.search(r"stixctrl_hk_adc_table\[STIXCTRL_HK_CHANNELS\] = \{"
+                  r"(.*?)\n\};", src, re.S)
+    check(m, "the C hk_adc table is found in %s" % cpath)
+    parsed = {}
+    for ch, val, name in re.findall(
+            r"\[(\d+)\] = (\d+),\s*(?:/\*\s*([A-Za-z0-9_]+))?", m.group(1)):
+        parsed[int(ch)] = (int(val), name)
+    check(len(parsed) >= 38, "the parse saw the table: %d rows"
+          % len(parsed))
+    names = hknames_mod.HK_NAMES
+    # the names table covers exactly the channels the real table can
+    # serve (the non-zero entries, grlib_stixctrl.c:1637-1644), and
+    # every name the C comments give is transcribed verbatim
+    check(set(names) == {ch for ch, (v, _) in parsed.items() if v},
+          "the name table is exactly the C table's non-zero channels")
+    for ch in sorted(parsed):
+        if parsed[ch][1]:
+            check(names.get(ch) == parsed[ch][1],
+                  "ch %d is %r in C, %r in hknames"
+                  % (ch, parsed[ch][1], names.get(ch)))
+    # the catalogue: the shipped rows all carry both, and a non-string
+    # or empty label/description is refused (D-PSf)
+    cat = faults_mod.load()
+    check(len(cat["faults"]) == 28, "the catalogue has 28 rows")
+    for broken in ({"api": 1, "faults": [dict(cat["faults"][0], label=7)]},
+                   {"api": 1, "faults": [dict(cat["faults"][0], label="")]},
+                   {"api": 1, "faults": [dict(cat["faults"][0],
+                                              description=None)]},
+                   {"api": 1, "faults": [dict(cat["faults"][0],
+                                              description="")]}):
+        raises(faults_mod.CatalogueError, faults_mod.validate, broken)
+    for f in cat["faults"]:
+        check(isinstance(f.get("label"), str) and f["label"] and
+              isinstance(f.get("description"), str) and f["description"],
+              "%s carries a label and a description" % f["id"])
+    # the fake serves only named channels, and the label rides the
+    # instrument.hk_adc.N leaf (and no other leaf)
+    ctl = env.controller()
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        wait_for(lambda: ctl.state.get("instrument.hk_adc") is not None,
+                 what="the hk_adc leaves")
+        tree = ctl.state.get("instrument.hk_adc")
+        check(set(tree) == {"64"}, "the fake serves only ch 64: %r"
+              % sorted(tree))
+        a = tree["64"]
+        check(a["label"] == names[64] and a["truth"] == 100,
+              "the label rides the hk_adc leaf: %r" % a)
+        check("label" not in ctl.state.get("platform.obt"),
+              "no other leaf carries a label")
     finally:
         ctl.shutdown()
 
@@ -9373,6 +9439,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
          ("flash fault rows: the flash_damage kind (PL-11g)",
           t_flash_faults),
+         ("HK channel names + labels (PL-11h)", t_hk_names),
          ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
          ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
          ("flash watch leaves + debug.qmp hatch (PL-11d)", t_flash_leaves),

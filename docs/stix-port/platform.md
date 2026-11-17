@@ -154,7 +154,13 @@ The path prefix is `/api/v1`. Read endpoints:
 
 The state tree (D-PLo) holds one leaf per watched value, each
 `{truth, presented, reported, unit, index_space, t_sim, t_changed,
-status, fault_ids}`. `t_changed` is the bench time (`t_sim`) of the
+status, fault_ids}`. The `instrument.hk_adc.<ch>` leaves carry one
+extra optional key, `label` (PL-11h): the channel's name transcribed
+from the C comments over `stixctrl_hk_adc_table`
+(`hw/sparc/grlib_stixctrl.c`, e.g. `DPU_1V5_C` for ch 0), for the UI's
+forcing select and State table; snapshots copy only `truth` and
+`presented`, so the label never rides one. `t_changed` is the bench
+time (`t_sim`) of the
 leaf's last truth/presented change: set when a poll stores a new value,
 kept while the value holds (the State tab's Changed column). The
 namespaces and where each comes from:
@@ -400,6 +406,9 @@ logged as `force`. Each entry declares:
 
 - `id` (dotted) and `class` (`component|signal|link|memory|timing`) and
   the `target` (a state tree path);
+- `label` (a short title) and `description` (one sentence), both
+  optional (PL-11h) and validated as non-empty strings when present:
+  what the UI shows for the row; every shipped row carries them;
 - `mode` (`stuck_at|offset|drop|disconnect|wrong_value|…`) and `params`
   (types, ranges, units and the index space);
 - `persistence` (`transient|until_cleared|permanent|until_write`),
@@ -1227,7 +1236,9 @@ no CDN. It is only an API client:
   `/api/v1/cmd/<verb>`, with its `data-args` or the inputs of its row
   (`data-only` limits which); the faults panel is generated from
   `GET /faults`, the forcings from the state tree's `instrument.hk_adc.*`
-  leaves, the scenario list from `GET /scenarios`, and an "any verb"
+  leaves (their options carry the channel's name, `ch 8 — ATT_C`, from
+  the leaf's `label`), the scenario list from `GET /scenarios`, and an
+  "any verb"
   form and the buttons' tooltips from `GET /verbs` (a verb the server
   does not enable is greyed out and its tooltip is that verb's `why`;
   a panel whose verbs are all disabled says why in one shared note);
@@ -1290,7 +1301,10 @@ Supplies & HK rows, each with a Now inject. The Faults tab shows the
 catalogue as a table (fault, what it does, parameters, state, inject),
 grouped by category (`spw/timecode/obt/keepalive` = Link & time,
 `power/thermal/hk_prot` = Supplies & HK, `attenuator`, `memory`,
-anything else Other) with filter chips; the inject column has "now"
+anything else Other) with filter chips; the what-it-does cell shows the
+row's `label` as its title and its `description` under it (else the
+class/mode line), followed by the row's `preconditions` and
+`expected_detection` as small lists (PL-11h); the inject column has "now"
 and "at…" — an input of guest seconds, absolute (`120`) or relative
 (`+30`), sent as an `at_sim` trigger on the controller's sim time; the
 State column reads idle / armed at T / active since T (`since_sim`).
@@ -1312,7 +1326,9 @@ Filters "only differences" (presented ≠ truth) and "only faulted"
 (`fault_ids` non-empty or a status other than `ok`) sit beside the text filter. Clicking a
 numeric/bool/enum row adds `truth:<path>` to the Timeline's expanded
 panel (a new one when none is expanded) and switches to that tab; a
-just-added series may be listed as skipped until its first point.
+just-added series may be listed as skipped until its first point. The
+State tab's leaf cell carries the HK channel's name as its `title`
+(the `label` key, PL-11h).
 
 The server sends it behind the same Host filter, with
 `Content-Security-Policy: default-src 'none'; script-src <hash>;

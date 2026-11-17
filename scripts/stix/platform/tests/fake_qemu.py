@@ -257,10 +257,14 @@ class Fake:
                 "supplies": {"enables": 0, "powerstat": 0, "lines": {
                     n: {"enabled": False, "good": False}
                     for n in ("lv", "hv01", "hv17", "spw0", "spw1")}},
-                "hk_adc": {"5": {"truth": 100, "presented": 100,
-                                 "injected": False, "last": None}},
+                # the one served HK channel is a named one (PL-11h, R10):
+                # ch 64 (ASP_PHOTOA0_V), whose C-table nominal is 100
+                "hk_adc": {"64": {"truth": 100, "presented": 100,
+                                  "injected": False, "last": None}},
+                # line 1 watches ch 0 (stixctrl_hk_prot_ch), the device's
+                # mapping; the fake never samples, so this is inert data
                 "hk_prot": {"irqen": 0, "protstat": 0, "hotsample": 0,
-                            "lines": [{"line": 1, "ch": 5, "bit": 0,
+                            "lines": [{"line": 1, "ch": 0, "bit": 0,
                                        "threshold": 0, "prot_en": False}]},
                 "watchdog": {"running": False, "enabled": False,
                              "count": 0, "reload": 0},

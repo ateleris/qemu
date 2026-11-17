@@ -14,6 +14,8 @@ move on every sample), so a `state` record means a real change.
 
 import threading
 
+from .hknames import HK_NAMES
+
 # leaves that move on their own every sample: served, never logged as a
 # change
 VOLATILE = ("idpu.scet.coarse", "idpu.scet.fine", "idpu.watchdog.count",
@@ -69,9 +71,13 @@ def leaves_from_hw(ctrl, spw, t_sim):
             out["instrument.supplies.%s.good" % name] = \
                 leaf(ln["good"], t_sim=t_sim)
         for ch, c in ctrl["hk_adc"].items():
-            out["instrument.hk_adc.%s" % ch] = leaf(
-                c["truth"], c["presented"], unit="adc", index_space="ch",
-                t_sim=t_sim)
+            lf = leaf(c["truth"], c["presented"], unit="adc",
+                      index_space="ch", t_sim=t_sim)
+            # PL-11h: the C table's channel name, an additive key on
+            # these leaves only
+            if int(ch) in HK_NAMES:
+                lf["label"] = HK_NAMES[int(ch)]
+            out["instrument.hk_adc.%s" % ch] = lf
         p = ctrl["hk_prot"]
         for k in ("irqen", "protstat", "hotsample"):
             out["instrument.hk_prot." + k] = leaf(p[k], t_sim=t_sim)
