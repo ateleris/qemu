@@ -2997,6 +2997,130 @@ def t_det_burst(env):
         ctl.shutdown()
 
 
+def t_det_control(env):
+    """PL-11e: the scene/inject/replay verbs (option A names). Args are
+    validated before any QMP (400), only the given scene/config knobs
+    are qom-set (the fake's set log), scene.set moves the leaves, the
+    device's no-table refusals are the 409, and [qemu] det_replay_file
+    is an absolute -global that is absent while the key is empty."""
+    from . import verbs as verbs_mod
+    for v in ("det.scene.set", "det.inject", "det.replay.start",
+              "det.replay.stop", "det.replay.config"):
+        check(v in verbs_mod.VERBS, "%s in the registry" % v)
+    # the config key: absent from argv when empty, an absolute -global
+    # (made absolute like the ELF, against the controller's cwd)
+    c = config_mod.load(overrides={"qemu": {"binary": "/q/qemu-system-sparc",
+                                            "elf": "/e/asw.elf"}})
+    argv = qemu_mod.build_argv(c, "/r")
+    check(not any("det-replay-file" in a for a in argv),
+          "no replay -global when the key is empty: %r" % argv)
+    c = config_mod.load(overrides={"qemu": {
+        "binary": "/q/qemu-system-sparc", "elf": "/e/asw.elf",
+        "det_replay_file": "rel/X.dssevs"}})
+    g = [a for a in qemu_mod.build_argv(c, "/r")
+         if a.startswith("grlib-stixctrl.det-replay-file=")]
+    check(g == ["grlib-stixctrl.det-replay-file=%s"
+                % os.path.abspath("rel/X.dssevs")],
+          "the replay -global is absolute: %r" % g)
+    # a comma would split QEMU's option strings, as for the ELF
+    raises(config_mod.ConfigError, config_mod.load,
+           text='[qemu]\ndet_replay_file = "a,b.dssevs"\n')
+
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+
+        def sets():
+            return [list(x) for x in
+                    ctl.power.qmp.execute("x-fake-set-log")]
+
+        def leaf(p):
+            lf = ctl.state.get(p)
+            return None if lf is None else lf["truth"]
+
+        e = raises(VerbError, cmd, "det.scene.set", {"flare": True})
+        check(e.status == 409 and "off" in str(e), "off: %s" % e)
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        # arg validation before any QMP (nothing reaches the device):
+        # empty, the source enum, the cps bounds, a wrong type
+        n = len(sets())
+        for args in ({}, {"source": "quick"}, {"quiet_cps": 1000001},
+                     {"quiet_cps": -1}, {"flare": "yes"}):
+            e = raises(VerbError, cmd, "det.scene.set", args)
+            check(e.status == 400, "scene %r: %s" % (args, e))
+        for args in ({"fpga_det": 32, "pix": 0, "ebin": 0, "count": 1},
+                     {"fpga_det": 0, "pix": 12, "ebin": 0, "count": 1},
+                     {"fpga_det": 0, "pix": 0, "ebin": 32, "count": 1},
+                     {"fpga_det": 0, "pix": 0, "ebin": 0, "count": 0},
+                     {"fpga_det": 0, "pix": 0, "ebin": 0}):
+            e = raises(VerbError, cmd, "det.inject", args)
+            check(e.status == 400, "inject %r: %s" % (args, e))
+        for args in ({}, {"trigger": "now"},
+                     {"offset_ms": (1 << 32) * 100}):
+            e = raises(VerbError, cmd, "det.replay.config", args)
+            check(e.status == 400, "config %r: %s" % (args, e))
+        check(len(sets()) == n, "the refusals stayed client-side")
+        # only the given knobs are qom-set, and the leaves follow
+        n = len(sets())
+        r = cmd("det.scene.set", {"flare": True, "flare_cps": 50000})
+        check(r == {"flare": True, "flare_cps": 50000}, "%r" % r)
+        check(sets()[n:] == [["/machine/stixctrl", "det-flare", True],
+                             ["/machine/stixctrl", "det-flare-cps",
+                              50000]],
+              "only the given knobs: %r" % sets()[n:])
+        wait_for(lambda: leaf("instrument.detector.flare_cps") == 50000
+                 and leaf("instrument.detector.flare") is True,
+                 what="the scene leaves")
+        n = len(sets())
+        cmd("det.scene.set", {"source": "zero", "quiet_cps": 5})
+        check(sets()[n:] == [["/machine/stixctrl", "det-source", "zero"],
+                             ["/machine/stixctrl", "det-quiet-cps", 5]],
+              "the other two knobs: %r" % sets()[n:])
+        wait_for(lambda: leaf("instrument.detector.source") == "zero" and
+                 leaf("instrument.detector.quiet_cps") == 5,
+                 what="the source and quiet leaves")
+        # the device's own refusal: replay-dss without a table
+        e = raises(VerbError, cmd, "det.scene.set",
+                   {"source": "replay-dss"})
+        check(e.status == 409 and "needs a replay table" in str(e),
+              "replay-dss without a table: %s" % e)
+        # the deposit: one qom-set with the device's string
+        n = len(sets())
+        r = cmd("det.inject", {"fpga_det": 5, "pix": 3, "ebin": 7,
+                               "count": 123})
+        check(r == {"fpga_det": 5, "pix": 3, "ebin": 7, "count": 123},
+              "%r" % r)
+        check(sets()[n:] == [["/machine/stixctrl", "det-inject",
+                              "fpga_det=5,pix=3,ebin=7,count=123"]],
+              "the device's string: %r" % sets()[n:])
+        # the replay: a start is refused without a table, the config
+        # knobs are stored, the stop lands
+        e = raises(VerbError, cmd, "det.replay.start", {})
+        check(e.status == 409 and "no replay table" in str(e),
+              "start without a table: %s" % e)
+        n = len(sets())
+        r = cmd("det.replay.config",
+                {"trigger": "qmp", "offset_ms": 2500})
+        check(r == {"trigger": "qmp", "offset_ms": 2500}, "%r" % r)
+        check(sets()[n:] == [["/machine/stixctrl", "det-replay-trigger",
+                              "qmp"],
+                             ["/machine/stixctrl",
+                              "det-replay-offset-ms", 2500]],
+              "the config knobs: %r" % sets()[n:])
+        # the cap is exactly the device's: 2^32 ticks - 1 ms passes
+        cmd("det.replay.config", {"offset_ms": (1 << 32) * 100 - 1})
+        check(sets()[-1] == ["/machine/stixctrl", "det-replay-offset-ms",
+                             (1 << 32) * 100 - 1],
+              "the offset cap boundary: %r" % sets()[-1])
+        r = cmd("det.replay.stop", {})
+        check(r == {"started": False}, "%r" % r)
+        check(sets()[-1] == ["/machine/stixctrl", "det-replay-start",
+                             False], "the stop stored: %r" % sets()[-1])
+    finally:
+        ctl.shutdown()
+
+
 TAPE = {"api": 1, "name": "flare on Q1+Q3", "loop": False,
         "background": {"kind": "rate", "cps": 20},
         "steps": [{"kind": "rate", "for_s": 120,
@@ -8950,6 +9074,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("flash watch leaves + debug.qmp hatch (PL-11d)", t_flash_leaves),
          ("state: t_changed (D4)", t_state_t_changed),
          ("detector burst verb (FF)", t_det_burst),
+         ("detector control verbs (PL-11e)", t_det_control),
          ("detector tapes: files + schema (T3)", t_tapes_crud),
          ("detector tapes: play/stop verbs (T3)", t_tapes_play_stop),
          ("detector tapes: spec rules (S2 U3)", t_tapes_spec),

@@ -450,6 +450,55 @@ tr.cmp-first td { font-weight: 600; }
   </div>
 </section>
 
+<section class="narrow det-status-view">
+  <h2>Scene</h2>
+  <div class="ctl">
+    <span class="lbl">source</span>
+    <select name="source"
+            title="det-source: zero, synthetic, or the pre-scanned replay-dss table">
+      <option value="zero">zero</option>
+      <option value="synthetic">synthetic</option>
+      <option value="replay-dss">replay-dss</option>
+    </select>
+    <label class="muted"><input type="checkbox" name="flare"
+      data-type="bool" title="det-flare: the sky uses flare_cps and the
+      flare spectrum"> flare</label>
+    <span class="lbl">quiet cps</span>
+    <input type="number" name="quiet_cps" min="0" max="1000000" value="20"
+           data-type="int" title="quiet sky, counts/s per fpga_det">
+    <span class="lbl">flare cps</span>
+    <input type="number" name="flare_cps" min="0" max="1000000"
+           value="2000" data-type="int"
+           title="flare sky, counts/s per fpga_det">
+    <button data-verb="det.scene.set">apply</button>
+  </div>
+</section>
+
+<section class="narrow det-status-view">
+  <h2>DSS replay</h2>
+  <div class="ctl">
+    <button data-verb="det.replay.start" data-args="{}" class="danger">
+      start</button>
+    <button data-verb="det.replay.stop" data-args="{}">stop</button>
+    <span id="det-replay-read" class="chip">–</span>
+  </div>
+  <div class="ctl">
+    <span class="lbl">trigger</span>
+    <select name="trigger"
+            title="det-replay-trigger: nominal starts on the first SetEnable edge, qmp only on start">
+      <option value="nominal">nominal</option>
+      <option value="qmp">qmp</option>
+    </select>
+    <span class="lbl">offset</span>
+    <input type="number" name="offset_ms" min="0" value="0"
+           data-type="int" title="det-replay-offset-ms, into the file">
+    <button data-verb="det.replay.config">set</button>
+  </div>
+  <div class="desc">Needs a table (`[qemu] det_replay_file`) and
+    det-source = replay-dss; the progress rows are in the state table
+    below.</div>
+</section>
+
 <section class="full det-status-view">
   <h2>Detector state</h2>
   <div class="desc">instrument.detector.* and instrument.rotb.* from
@@ -2445,6 +2494,15 @@ function stimReadout() {
        (al.miss == null ? "" : " · preimage_miss " + al.miss));
   const adc = leafTruth("instrument.detector.adc.mode");
   text($("stim-adc-read"), adc == null ? "–" : (adc ? "on" : "off"));
+  /* PL-11e: the DSS replay panel's readout (the mockup's "idle ·
+     events 0 · dropped 0 · unsupported 0" line) */
+  const rep = { state: leafTruth("instrument.detector.replay.state"),
+                ev: leafTruth("instrument.detector.replay.events"),
+                drop: leafTruth("instrument.detector.replay.dropped"),
+                uns: leafTruth("instrument.detector.replay.unsupported") };
+  text($("det-replay-read"), rep.state == null ? "–" :
+       rep.state + " · events " + rep.ev + " · dropped " + rep.drop +
+       " · unsupported " + rep.uns);
 }
 
 /* ---- the vocabulary: tooltips, disabled verbs, the any-verb form ---- */

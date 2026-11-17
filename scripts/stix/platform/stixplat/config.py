@@ -36,6 +36,9 @@ DEFAULTS = {
         "icount_shift": 0,           # 0 = no icount (today's behaviour)
         "pace": "wall",              # "wall" | "fast" (-icount sleep=off)
         "memory": "64M",
+        # PL-11e (O2/D-PSg): the .dssevs replay table, startup-only
+        # (-global grlib-stixctrl.det-replay-file, absolute); "" = none
+        "det_replay_file": "",
         "extra_args": [],
         "traces": ["stixspw_timecode_emit", "stixspw_rx_deliver",
                    "stixspw_timecode_manual", "stixspw_timecode_once_drop",
@@ -228,7 +231,9 @@ def _check(cfg):
                           "[api] container = true" % cfg["api"]["bind"])
     for key, v in (("run_dir.path", cfg["run_dir"]["path"]),
                    ("qemu.elf", cfg["qemu"]["elf"]),
-                   ("qemu.binary", cfg["qemu"]["binary"])):
+                   ("qemu.binary", cfg["qemu"]["binary"]),
+                   ("qemu.det_replay_file",
+                    cfg["qemu"]["det_replay_file"])):
         if "," in v:
             raise ConfigError("%s %r has a comma, which would split "
                               "QEMU's option strings" % (key, v))

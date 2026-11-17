@@ -4,7 +4,9 @@ can refuse a scenario with a mistyped verb before it starts anything
 (review S4). The self-test checks it equals a live dispatcher's."""
 
 VERBS = frozenset({
-    "debug.qmp", "det.adc.set", "det.align.set", "det.rotb.burst",
+    "debug.qmp", "det.adc.set", "det.align.set", "det.inject",
+    "det.replay.config", "det.replay.start", "det.replay.stop",
+    "det.rotb.burst", "det.scene.set",
     "det.tape.delete", "det.tape.play", "det.tape.save", "det.tape.stop",
     "fault.clear", "fault.inject",
     "force.clear", "force.set", "log.mark", "param.read",

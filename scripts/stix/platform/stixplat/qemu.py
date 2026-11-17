@@ -56,14 +56,21 @@ def build_argv(cfg, run_dir, binary=None):
             % os.path.join(run_dir, "qmp.sock"),
             "-global", "grlib-stixflash.flash-file=%s"
             % os.path.join(run_dir, "flash.bin"),
-            "-global", "grlib-stixflash.inverted-storage=on",
-            "-global", spw + "tmtc-server=off",
-            "-global", spw + "udp-tm-host=127.0.0.1",
-            "-global", spw + "udp-tm-port=%d" % p["qemu_tm"],
-            "-global", spw + "udp-tc-port=%d" % p["qemu_tc"],
-            "-global", spw + "udp-spw-header=on",
-            "-global", spw + "timecode-source=%s" % q["timecode_source"],
-            "-global", spw + "obt-epoch=%d" % q["obt_epoch"]]
+            "-global", "grlib-stixflash.inverted-storage=on"]
+    argv += [
+        "-global", spw + "tmtc-server=off",
+        "-global", spw + "udp-tm-host=127.0.0.1",
+        "-global", spw + "udp-tm-port=%d" % p["qemu_tm"],
+        "-global", spw + "udp-tc-port=%d" % p["qemu_tc"],
+        "-global", spw + "udp-spw-header=on",
+        "-global", spw + "timecode-source=%s" % q["timecode_source"],
+        "-global", spw + "obt-epoch=%d" % q["obt_epoch"]]
+    # PL-11e (O2/D-PSg): the replay table, startup-only; absolute like
+    # the ELF (QEMU's cwd is the run dir). A bad file fails the device's
+    # realize, so power.on reports the exit
+    if q["det_replay_file"]:
+        argv += ["-global", "grlib-stixctrl.det-replay-file=%s"
+                 % os.path.abspath(q["det_replay_file"])]
     argv += reset_args(q["on_guest_reset"])
     # pacing (FF plan): -icount shift=N; fast skips the guest's idle
     # time (sleep=off is an icount option, so it needs shift > 0)

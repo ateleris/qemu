@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# PL-11e smoke gate: the detector scene verbs end to end on the
+# platform. The bench boots to SAFE (the detector tick does not run,
+# the scene knobs still take): det.scene.set keeps source=synthetic,
+# switches the flare on and raises its rate, and the await is the
+# hw-state echo in the instrument.detector.* leaves. One det.inject
+# deposit then pins the verb's acceptance on the real device (the
+# counts land in the accumulators at the next swaps, which needs the
+# FSM, so the movement itself stays a qtest/detector-smoke matter).
+{"api": 1, "name": "gate-det-scene",
+ "description": "The detector scene verbs on the platform (PL-11e). Boot to SAFE, det.scene.set (synthetic, flare on, 50000 cps per fpga_det) and await the scene leaves move, then one det.inject deposit accepted by the device.",
+ "duration_s": 60,
+ "setup": [{"do": "platform.power.on"}],
+ "steps": [
+  {"at": 0, "name": "boot", "do": "platform.power.boot",
+   "await_event": [{"eid": "14a3", "timeout_s": 50}]},
+  {"at": 2, "name": "raise the flare", "do": "det.scene.set",
+   "args": {"source": "synthetic", "flare": true, "flare_cps": 50000},
+   "await_state": [{"path": "instrument.detector.flare_cps", "eq": 50000,
+                    "timeout_s": 10},
+                   {"path": "instrument.detector.flare", "eq": true,
+                    "timeout_s": 10}]},
+  {"at": 6, "name": "one deposit", "do": "det.inject",
+   "args": {"fpga_det": 5, "pix": 3, "ebin": 7, "count": 123}}],
+ "teardown": [{"do": "platform.power.off"}]}

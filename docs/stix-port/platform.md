@@ -208,6 +208,11 @@ lists exactly these verbs and arguments.
 | `det.tape.delete` | `name` | delete a saved mix tape (404 unknown) |
 | `det.tape.play` | `name`, `loop` | load a saved tape into the model (`det-tape-load`) and start it on the guest-time tick (`det-tape-play`); `loop` overrides the tape's own; spectrum files are read and parsed first and passed as absolute paths (a bad or missing one is a 400 before any QMP); the answer is the parsed `det-tape-status` (`state`, `name`, `step`, `n_steps`, `label`, `step_left_ticks`, `loop`, `align`, `dropped`) plus `warnings` when a keV value is at or past K; 409 while STIX is off or the model refuses |
 | `det.tape.stop` | | stop the playing tape (`det-tape-play false`); the rates revert to the scene knobs; the answer is the parsed `det-tape-status` |
+| `det.scene.set` | `source`, `flare`, `quiet_cps`, `flare_cps` | the synthetic sky's scene knobs (`det-source`/`det-flare`/`det-quiet-cps`/`det-flare-cps` on `/machine/stixctrl`, PL-11e); at least one argument, and only the given ones are written; `source` zero \| synthetic \| replay-dss, the cps 0..1000000 counts/s per fpga_det; 409 with the device's text when it refuses (`replay-dss` needs a replay table, set at startup) |
+| `det.inject` | `fpga_det`, `pix`, `ebin`, `count` | one count deposit into the accumulator event sink (`det-inject`, write-only): one qom-set with the device's `fpga_det=F,pix=P,ebin=B,count=N` string; `fpga_det` is DSS 0..31, `pix` 0..11, `ebin` 0..31, `count` at least 1; the counts land in the finished QL bank's LACC at the next swap and in EACC at the next nominal swap |
+| `det.replay.start` | | start a loaded `.dssevs` replay now (`det-replay-start` true); the device refuses without a table or without `det-source=replay-dss` (409 with its text); a start applies at the next 100 ms tick |
+| `det.replay.stop` | | stop a running replay now (`det-replay-start` false, applied at once) |
+| `det.replay.config` | `trigger`, `offset_ms` | the replay's scene knobs (`det-replay-trigger` nominal \| qmp, `det-replay-offset-ms`); at least one argument, only the given ones are written; both survive a device reset, and the device rejects an offset past 2^32 ticks of replay time |
 | `fault.inject` | `id`, `params`, `trigger`, `seed` | a catalogue fault (`GET /faults`); logged as `fault` with its params and seed |
 | `fault.clear` | `id` | clear an active, reversible fault, or disarm an armed one |
 | `tc.platform.send` | `hex` | a raw platform TC space packet: source 14, services 9 and 20 only (403 otherwise); TC(9,129) gets 409 while a sync is pending |
@@ -298,6 +303,7 @@ over the gate scenarios). The keys most often set:
 | `qemu.obt_epoch`, `.obt_continuity` | `0x10000000 << 16`, `"aligned"` | the OBT start (CUC 48-bit) and the cold-cycle alignment |
 | `qemu.on_guest_reset` | `"warm"` | `warm` (in-process, BRAM kept) / `cold` / `halt` |
 | `qemu.icount_shift`, `.pace` | 0, `"wall"` | `-icount shift=N` (0 = no icount, today's behaviour); `pace = "fast"` adds `,sleep=off` and needs shift > 0 |
+| `qemu.det_replay_file` | `""` | the `.dssevs` DSS replay table (PL-11e): `-global grlib-stixctrl.det-replay-file=<absolute path>` when set (startup-only — the device scans it at realize; a bad file fails realize, so `power.on` reports the exit). The replay's runtime knobs ride `det.replay.config` instead |
 | `ports` | 8080, 21511, 21512, 21502 | api, qemu_tm, qemu_tc, gs_tc |
 | `gs.tm_dests`, `.bind` | `["127.0.0.1:21501"]`, `"127.0.0.1"` | the relay's TM destinations and the TC-proxy bind (loopback, or `container = true`) |
 | `gs.tc_during_link_down` | `"drop"` | or `"hold"` (at most `hold_max` = 32, the FSW queues 64) |

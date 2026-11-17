@@ -13,7 +13,10 @@ attenuator, edac, det and rotb sections, PL-11b/PL-11c, with the det
 section's tape/align/adc stimulus blocks), qom-set obt, the upset verbs
 on the EDAC (they move the hw-state's poisons and counters), the
 det-rotb-burst pair (the FF plan's burst), the det tape/align/adc QOM
-pairs (the stimulus plan T3/C2), the flash device at /machine/stixflash
+pairs (the stimulus plan T3/C2), the det scene/inject/replay knobs
+(PL-11e: the hw-state's det section echoes the stored scene; a
+replay-dss source or a replay start is refused with the device's
+no-table text), the flash device at /machine/stixflash
 (the five watch props, the damage-add/remove verbs and the
 x-fake-flash-op counter bumps, PL-11d), memsave (the fsw-params RAM
 snapshot: zeros into the asked file, in the cwd), and the test-only
@@ -45,13 +48,20 @@ ATTENUATOR = ("attenuator.sensor_ab.stuck_open",
               "attenuator.current.offset")
 SETTABLE = ("link-down", "timecodes", "timecode-once", "timecode-inject",
             "upset-inject", "upset-clear", "det-tape-load", "det-tape-play",
-            "det-align", "det-adc-mode") + ATTENUATOR + \
+            "det-align", "det-adc-mode",
+            # PL-11e: the scene, the one-shot deposit and the replay
+            # knobs on /machine/stixctrl
+            "det-source", "det-flare", "det-quiet-cps", "det-flare-cps",
+            "det-inject", "det-replay-start", "det-replay-trigger",
+            "det-replay-offset-ms") + ATTENUATOR + \
     tuple("adc-inject[%d]" % ch for ch in range(128))
 # read-back before the first set: the booleans are false, the offset 0
 ATT_DEFAULT = {"attenuator.current.offset": 0}
 # the EDAC device (the memory.* catalogue rows' target); its upset
 # verbs move the hw-state's edac section, like the device's
 EDAC = "/machine/stixctrl/edac"
+# the controller device (the det.* scene knobs are on its class)
+CTRL = "/machine/stixctrl"
 # the flash device (PL-11d): the five watch props, the damage verbs
 FLASH = "/machine/stixflash"
 
@@ -241,11 +251,19 @@ class Fake:
                 "scet": {"coarse": v // 1_000_000_000,
                          "fine": (v % 1_000_000_000) * 65536
                          // 1_000_000_000, "unsynced": True},
-                # the detector (stix_det.c, PL-11c): the scene defaults
-                # (stix_det_instance_init), the FSM off, no replay table
-                # loaded (idle), quarter power off
-                "det": {"quarter_on": [False] * 4, "source": "synthetic",
-                        "flare": False, "quiet_cps": 20, "flare_cps": 2000,
+                # the detector (stix_det.c, PL-11c): the scene as the
+                # det.* knobs left it (the device defaults otherwise),
+                # the FSM off, no replay table loaded (idle), quarter
+                # power off. PL-11e: the scene echoes the stored props
+                "det": {"quarter_on": [False] * 4,
+                        "source": self.props.get((CTRL, "det-source"),
+                                                 "synthetic"),
+                        "flare": self.props.get((CTRL, "det-flare"),
+                                                False),
+                        "quiet_cps": self.props.get(
+                            (CTRL, "det-quiet-cps"), 20),
+                        "flare_cps": self.props.get(
+                            (CTRL, "det-flare-cps"), 2000),
                         "ql_bank": 0, "fsm": {"enable": False},
                         "replay": {"state": "idle", "pos_ns": 0,
                                    "events": 0, "dropped": 0,
@@ -573,6 +591,20 @@ class Fake:
                     self.align["mode"] = "on" if a["value"] else "off"
                 elif prop == "det-adc-mode":
                     self.adc["mode"] = bool(a["value"])
+                elif prop == "det-source":
+                    # the device refuses replay-dss without a table
+                    # (stix_det.c:4078-4082); the fake never has one
+                    if a["value"] == "replay-dss":
+                        raise KeyError("det-source: replay-dss needs a "
+                                       "replay table (set det-replay-file "
+                                       "at startup)")
+                elif prop == "det-replay-start":
+                    # ditto for a start (stix_det.c:4446-4450, the
+                    # device's text); a stop (false) is stored
+                    if a["value"]:
+                        raise KeyError("det-replay-start: no replay "
+                                       "table (set det-replay-file at "
+                                       "startup)")
                 # a plain store; the self-test reads it back
                 self.props[(a["path"], prop)] = a["value"]
                 self.set_log.append((a["path"], prop, a["value"]))

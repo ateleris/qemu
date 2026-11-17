@@ -335,6 +335,53 @@ class Platform:
               doc="the ADC-faithful sky knob (det-adc-mode, default "
                   "off) + the parsed det-adc-status; when on, the "
                   "synthetic sky folds through the loaded FPGA ELUT")
+        d.add("det.scene.set", self.v_det_scene_set,
+              args={"source": {"type": "string",
+                               "enum": ["zero", "synthetic",
+                                        "replay-dss"]},
+                    "flare": {"type": "boolean"},
+                    "quiet_cps": {"type": "integer", "min": 0,
+                                  "max": 1000000},
+                    "flare_cps": {"type": "integer", "min": 0,
+                                  "max": 1000000}},
+              doc="the synthetic sky's scene knobs (det-source, "
+                  "det-flare, det-quiet-cps, det-flare-cps on "
+                  "/machine/stixctrl); at least one argument, and only "
+                  "the given ones are written; the device's refusal "
+                  "(replay-dss without a replay table) is the 409")
+        d.add("det.inject", self.v_det_inject,
+              args={"fpga_det": {"type": "integer", "required": True,
+                                 "min": 0, "max": 31},
+                    "pix": {"type": "integer", "required": True,
+                            "min": 0, "max": 11},
+                    "ebin": {"type": "integer", "required": True,
+                             "min": 0, "max": 31},
+                    "count": {"type": "integer", "required": True,
+                              "min": 1}},
+              doc="one count deposit into the accumulator event sink "
+                  "(det-inject, write-only): one qom-set with the "
+                  "device's fpga_det=F,pix=P,ebin=B,count=N string; "
+                  "fpga_det is DSS 0..31, pix 0..11, ebin 0..31, count "
+                  ">= 1; the counts land in the finished QL bank's LACC "
+                  "and in EACC at the next nominal swap")
+        d.add("det.replay.start", self.v_det_replay_start,
+              doc="start a loaded .dssevs replay now (det-replay-start "
+                  "true; the device refuses without a table or without "
+                  "det-source=replay-dss); the start applies at the "
+                  "next 100 ms tick")
+        d.add("det.replay.stop", self.v_det_replay_stop,
+              doc="stop a running replay now (det-replay-start false, "
+                  "applied at once)")
+        d.add("det.replay.config", self.v_det_replay_config,
+              args={"trigger": {"type": "string",
+                                "enum": ["nominal", "qmp"]},
+                    "offset_ms": {"type": "integer", "min": 0,
+                                  "max": 429496729599}},
+              doc="the replay's scene knobs (det-replay-trigger "
+                  "nominal|qmp, det-replay-offset-ms); at least one "
+                  "argument, only the given ones are written; both "
+                  "survive a device reset, the offset is capped at "
+                  "2^32 ticks of replay time")
         d.add("fault.inject", self.faults.inject,
               args={"id": {"type": "string", "required": True},
                     "params": {"type": "object"},
@@ -577,6 +624,67 @@ class Platform:
         return self._det_status("det-adc-status", {
             "mode": str, "kev_full": int, "base_source": str,
             "map_rows": int})
+
+    # -- PL-11e: the scene, the deposit and the replay knobs (all on
+    # /machine/stixctrl; validation before any QMP, the device's own
+    # refusals surface as the 409 from _qom_set)
+    def v_det_scene_set(self, source=None, flare=None, quiet_cps=None,
+                        flare_cps=None):
+        """The scene knobs of the synthetic sky (D-Df). One verb, only
+        the given knobs are qom-set (D-PSc's minimal sets, m12); the
+        leaves follow at the next poll."""
+        given = {"source": source, "flare": flare, "quiet_cps": quiet_cps,
+                 "flare_cps": flare_cps}
+        if all(v is None for v in given.values()):
+            raise VerbError(400, "det.scene.set: give at least one of "
+                            "source, flare, quiet_cps, flare_cps")
+        for prop, v in (("det-source", source), ("det-flare", flare),
+                        ("det-quiet-cps", quiet_cps),
+                        ("det-flare-cps", flare_cps)):
+            if v is not None:
+                self._qom_set(prop, v, STIXCTRL)
+        return {k: v for k, v in given.items() if v is not None}
+
+    def v_det_inject(self, fpga_det, pix, ebin, count):
+        """D-6: the one-shot deposit, write-only det-inject. The bounds
+        are the device's (stix_det.c:4237-4278: fpga_det < 32, pix < 12,
+        ebin < 32, count 0 adds no counts) and sit in the verb's arg
+        schema; the deposit lands at the next swaps."""
+        self._qom_set("det-inject",
+                      "fpga_det=%d,pix=%d,ebin=%d,count=%d"
+                      % (fpga_det, pix, ebin, count), STIXCTRL)
+        return {"fpga_det": fpga_det, "pix": pix, "ebin": ebin,
+                "count": count}
+
+    def v_det_replay_start(self):
+        """D-7: det-replay-start true. The device refuses a start
+        without a table or without det-source=replay-dss; a start is
+        tick-deferred, so the replay.state leaf follows at a poll."""
+        self._qom_set("det-replay-start", True, STIXCTRL)
+        return {"started": True}
+
+    def v_det_replay_stop(self):
+        """D-7: det-replay-start false; a stop applies at once."""
+        self._qom_set("det-replay-start", False, STIXCTRL)
+        return {"started": False}
+
+    def v_det_replay_config(self, trigger=None, offset_ms=None):
+        """The replay's two runtime knobs (O-N2a: they ride this verb,
+        only the file is a [qemu] key). The offset cap is the feeder's
+        (stix_det.c:4353-4358: past 2^32 100 ms ticks is rejected)."""
+        if trigger is None and offset_ms is None:
+            raise VerbError(400, "det.replay.config: give trigger or "
+                            "offset_ms")
+        if trigger is not None:
+            self._qom_set("det-replay-trigger", trigger, STIXCTRL)
+        if offset_ms is not None:
+            self._qom_set("det-replay-offset-ms", offset_ms, STIXCTRL)
+        out = {}
+        if trigger is not None:
+            out["trigger"] = trigger
+        if offset_ms is not None:
+            out["offset_ms"] = offset_ms
+        return out
 
     @staticmethod
     def _flash_name(name):
