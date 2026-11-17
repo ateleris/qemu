@@ -32,6 +32,7 @@ STIXSPW = "/machine/stixspw"
 STIXCTRL = "/machine/stixctrl"
 STIXATT = STIXCTRL + "/attenuator"      # PL-11f: the cmdsta forcing
 STIXEDAC = STIXCTRL + "/edac"           # PL-11f: the EDAC knobs
+STIXFLASH = "/machine/stixflash"        # PL-11g: the damage verbs
 
 
 def split_kv(line):
@@ -972,6 +973,26 @@ class Platform:
             self._q().qom_set(a["path"], a["property"],
                               a["clear"] if "clear" in a else prior)
 
+        def flash_damage(entry, p):
+            # PL-11g (D-PSe): the spec resolved against the params, JSON
+            # encoded as the device's damage-add takes it (one sidecar
+            # entry as a JSON object string, grlib_stixflash.c:
+            # 1507-1538). Write-only (no getter exists, :1767-1768): no
+            # prior read — the spec string is the undo anchor. The
+            # device's refusals (a duplicate at a warm reset, the
+            # reserved blocks) surface as the 409.
+            spec = json.dumps(
+                faults_mod.flash_build(entry["action"]["spec"], p))
+            self._qom_set("damage-add", spec, STIXFLASH)
+            return spec
+
+        def flash_damage_undo(entry, p, prior):
+            # the device's exact-spec removal (grlib_stixflash.c:
+            # 1585-1621): the same string, rebuilt from the entry
+            spec = json.dumps(
+                faults_mod.flash_build(entry["action"]["spec"], p))
+            self._qom_set("damage-remove", spec, STIXFLASH)
+
         def nothing(entry, p, prior=None):
             pass
 
@@ -981,7 +1002,8 @@ class Platform:
                 "obt_jump": (obt_jump, nothing),
                 "keepalive_off": (ka_off, ka_undo),
                 "adc": (adc, adc_undo),
-                "qom": (qom, qom_undo)}
+                "qom": (qom, qom_undo),
+                "flash_damage": (flash_damage, flash_damage_undo)}
 
     # -- read side ------------------------------------------------------------
     def status(self):

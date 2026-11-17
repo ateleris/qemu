@@ -2644,6 +2644,181 @@ def t_fault_reapply(env):
         ctl.shutdown()
 
 
+def t_flash_faults(env):
+    """PL-11g (D-PSe): the flash_damage action kind — the strict spec
+    validation (the qom kind still refused on the flash path), the three
+    catalogue rows injecting through damage-add into flash.damage.rows,
+    fault.clear removing the row, and the reapply tolerance: already
+    active on a warm reset, re-added on a cold one, any other device
+    error a reapply-error that never wedges the power-on."""
+    cat = faults_mod.load()
+    byid = {f["id"]: f for f in cat["faults"]}
+    for fid in ("flash.block.erase_fail", "flash.page.program_fail",
+                "flash.cell.stuck"):
+        check(byid[fid]["action"]["kind"] == "flash_damage" and
+              byid[fid]["action"]["path"] == "/machine/stixflash" and
+              byid[fid]["persistence"] == "until_cleared" and
+              byid[fid]["reversible"] and byid[fid]["class"] == "memory",
+              "%s is a flash_damage row: %r" % (fid, byid[fid]))
+    check(faults_mod.REAPPLY_KINDS == ("qom", "flash_damage"),
+          "flash_damage rejoins reapply")
+    check(not faults_mod.qom_path_ok("/machine/stixflash"),
+          "the qom kind still refuses the flash path")
+    base = byid["flash.cell.stuck"]
+    spec = base["action"]["spec"]
+
+    def broken(action=None, **kw):
+        f = dict(base, **kw)
+        if action is not None:
+            f["action"] = action
+        return {"api": 1, "faults": [f]}
+
+    def act(s):
+        return {"kind": "flash_damage", "path": "/machine/stixflash",
+                "spec": s}
+
+    stuck = {"kind": "stuck", "page": 5000,
+             "bit": {"byte": 3, "bit": 1}, "value": 1}
+    bad_rows = [
+        # the qom kind must not reach the flash device
+        dict(base, id="t.f", action={
+            "kind": "qom", "path": "/machine/stixflash",
+            "property": "damage-add", "value": "{}", "clear": 0}),
+        dict(base, id="t.f", action=act(dict(spec, kind="erase-fail"))),
+        dict(base, id="t.f", action=act({"kind": "program-fail",
+                                         "block": 100})),
+        dict(base, id="t.f", action=act({"kind": "stuck", "block": 100,
+                                         "value": 1,
+                                         "bit": {"byte": 3, "bit": 1}})),
+        dict(base, id="t.f", action=act({"kind": "stuck", "page": 100,
+                                         "value": 1})),
+        dict(base, id="t.f", action=act({"kind": "stuck", "page": 100,
+                                         "bit": {"byte": 3, "bit": 1}})),
+        dict(base, id="t.f", action=act(dict(stuck, kind="stuck0",
+                                             value=0))),
+        dict(base, id="t.f", action=act(dict(stuck, mcm=0))),
+        dict(base, id="t.f", action=act(dict(stuck, block=100,
+                                             page=100))),
+        dict(base, id="t.f", action=act({"kind": "erase-fail",
+                                         "block": 100,
+                                         "bit": {"byte": 3, "bit": 1}})),
+        dict(base, id="t.f", action=act({"kind": "stuck", "page": 100,
+                                         "bit": {"byte": 4224, "bit": 0},
+                                         "value": 1})),
+        dict(base, id="t.f", action=act({"kind": "stuck", "page": 100,
+                                         "bit": {"byte": 3, "bit": 8},
+                                         "value": 1})),
+        dict(base, id="t.f", action=act({"kind": "stuck", "page": 100,
+                                         "bit": {"byte": 3, "bit": 1},
+                                         "value": 2})),
+        dict(base, id="t.f",
+             action=dict(act(spec), path="/machine/stixctrl")),
+        dict(base, id="t.f", action=act(
+            {"kind": "stuck", "page": 100,
+             "bit": {"byte": {"param": "nosuch"}, "bit": 1},
+             "value": 1})),
+        dict(base, id="t.f", params=dict(base["params"],
+                                         page={"type": "string",
+                                               "default": "x"})),
+    ]
+    for bad in bad_rows:
+        raises(faults_mod.CatalogueError, faults_mod.validate,
+               {"api": 1, "faults": [bad]})
+    # positives: the stuck0 alias, a fixed-int spec, and the builder
+    faults_mod.validate(broken(id="t.f", action=act(
+        {"kind": "stuck0", "page": {"param": "page"},
+         "bit": {"byte": 3, "bit": 1}})))
+    faults_mod.validate(broken(id="t.f", action=act(stuck)))
+    check(faults_mod.flash_build(spec, {"page": 5000, "byte": 8,
+                                        "bit": 1, "value": 1}) ==
+          {"kind": "stuck", "page": 5000, "bit": "8.1", "value": 1},
+          "the built spec: %r" % faults_mod.flash_build(
+              spec, {"page": 5000, "byte": 8, "bit": 1, "value": 1}))
+    # against the fake
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        qmp = ctl.power.qmp
+
+        def rows():
+            lf = ctl.state.get("flash.damage.rows")
+            return lf["truth"] if lf else None
+
+        def recs(action):
+            return [(x.obj["path"], x.obj["data"])
+                    for x in ctl.log.since(0) if x.kind == "fault"
+                    and x.obj["data"].get("action") == action]
+        STUCK = {"src": "runtime", "kind": "stuck", "page": 5000,
+                 "bit": "8.1", "value": 1}
+        cmd("fault.inject", {"id": "flash.block.erase_fail",
+                             "params": {"block": 100}})
+        wait_for(lambda: rows() == [{"src": "runtime",
+                                     "kind": "erase-fail",
+                                     "block": 100}],
+                 what="the erase-fail row")
+        sets = qmp.execute("x-fake-set-log")
+        check(["/machine/stixflash", "damage-add",
+               '{"kind": "erase-fail", "block": 100}'] in sets,
+              "the damage-add set: %r" % sets[-3:])
+        cmd("fault.clear", {"id": "flash.block.erase_fail"})
+        wait_for(lambda: rows() == [], what="the cleared row")
+        sets = qmp.execute("x-fake-set-log")
+        check(["/machine/stixflash", "damage-remove",
+               '{"kind": "erase-fail", "block": 100}'] in sets,
+              "the damage-remove set: %r" % sets[-3:])
+        # a reserved-block inject fails at the device, nothing armed
+        e = raises(VerbError, cmd, "fault.inject",
+                   {"id": "flash.block.erase_fail",
+                    "params": {"block": 10}})
+        check(e.status == 409 and "reserved" in str(e),
+              "the reserved-block refusal: %s" % e)
+        check(ctl.status()["faults"] == {} and rows() == [],
+              "the refused inject armed nothing")
+        # the stuck cell: the row carries the bit as "byte.bit"
+        cmd("fault.inject", {"id": "flash.cell.stuck",
+                             "params": {"page": 5000, "byte": 8,
+                                        "bit": 1, "value": 1}})
+        wait_for(lambda: rows() == [STUCK], what="the stuck row")
+        # a warm reset keeps the runtime damage: the re-add is refused
+        # with the device's exact text and logs already-active
+        qmp.execute("x-fake-guest-reset", {})
+        wait_for(lambda: recs("already-active"),
+                 what="the already-active record")
+        check(not recs("reapply-error") and rows() == [STUCK],
+              "the warm reapply is not an error and the row survives")
+        # a cold cycle: a fresh process, the add just lands
+        cmd("platform.power.off", {})
+        cmd("platform.power.on", {})
+        wait_for(lambda: recs("reapply"), what="the cold reapply")
+        wait_for(lambda: rows() == [STUCK], what="the row is re-added cold")
+        cmd("platform.power.boot", {})
+        # any other device error at reapply: reapply-error, the
+        # power-on still completes
+        def boom(entry, p):
+            raise VerbError(409, "damage-add: GenericError: stixflash: "
+                            "damage-add: at most 65536 damage entries")
+        real = ctl.plat.faults.actions["flash_damage"]
+        ctl.plat.faults.actions["flash_damage"] = \
+            (boom, lambda *a: None)
+        cmd("platform.power.off", {})
+        cmd("platform.power.on", {})
+        wait_for(lambda: recs("reapply-error"),
+                 what="the reapply-error record")
+        wait_for(lambda: rows() == [], what="the failed add changed nothing")
+        # power.on ends frozen (spawned, held before cont); off would
+        # mean the reapply-error wedged it
+        check(ctl.power.state == "frozen",
+              "the power-on completed despite the reapply-error (state %s)"
+              % ctl.power.state)
+        check("at most 65536" in recs("reapply-error")[-1][1]["error"],
+              "the error text: %r" % (recs("reapply-error")[-1],))
+        ctl.plat.faults.actions["flash_damage"] = real
+    finally:
+        ctl.shutdown()
+
+
 def t_att_edac_leaves(env):
     """PL-11b (D-PSb): the stixctrl hw-state's attenuator and edac
     sections map to instrument.attenuator.* / instrument.memory.*
@@ -2866,16 +3041,18 @@ def t_flash_leaves(env):
         wait_for(lambda: ctl.state.get("flash.ops.read")["truth"] == 1 and
                  ctl.state.get("flash.ops.erase")["truth"] == 2,
                  what="the op counters")
-        # damage-add: the parsed record and the raw line
-        spec = '{"kind": "stuck", "page": 100, "bit": "3.1", "value": 1}'
+        # damage-add: the parsed record and the raw line (page 5000:
+        # containing block 78, outside the reserved ASW area the fake
+        # refuses since PL-11g)
+        spec = '{"kind": "stuck", "page": 5000, "bit": "3.1", "value": 1}'
         qmp.execute("qom-set", {"path": "/machine/stixflash",
                                 "property": "damage-add", "value": spec})
         wait_for(lambda: ctl.state.get("flash.damage.rows")["truth"] ==
-                 [{"src": "runtime", "kind": "stuck", "page": 100,
+                 [{"src": "runtime", "kind": "stuck", "page": 5000,
                    "bit": "3.1", "value": 1}],
                  what="the parsed damage row")
         check(ctl.state.get("flash.damage.raw")["truth"] ==
-              "src=runtime kind=stuck value=1 page=100 bit=3.1",
+              "src=runtime kind=stuck value=1 page=5000 bit=3.1",
               "the raw damage leaf: %r" % ctl.state.get("flash.damage.raw"))
         # a block-scope row joins it
         qmp.execute("qom-set", {"path": "/machine/stixflash",
@@ -9194,6 +9371,8 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("faults: since_sim (D1)", t_faults_since_sim),
          ("fault model: truth|presented, qom", t_fault_model),
          ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
+         ("flash fault rows: the flash_damage kind (PL-11g)",
+          t_flash_faults),
          ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
          ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
          ("flash watch leaves + debug.qmp hatch (PL-11d)", t_flash_leaves),

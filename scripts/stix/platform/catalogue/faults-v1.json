@@ -18,13 +18,8 @@
 # 2026-11-12-flash-damage-plan.md, D-X5), comment-only until the
 # platform track adopts the IDs: every real row is validated into an
 # injectable fault, so a reservation can only live here, as with the
-# attenuator IDs above.
-#   flash.block.erase_fail, flash.page.program_fail, flash.cell.stuck
-#     -- device faults: class memory, changes truth, persistence
-#     until_cleared, reversible; params block|page (+bit, value) in the
-#     FSW-linear index space; action qom with property damage-add and
-#     clear damage-remove on /machine/stixflash (needs the platform's
-#     qom-path pattern to reach that device first).
+# attenuator IDs above. The three injectable device rows are real since
+# PL-11g (below); the offline setup rows stay reserved here:
 #   flash.block.bad_factory, flash.file.corrupt, flash.file.wrong_address
 #     -- offline setup rows, no action: expressed as pre-boot scenario
 #     steps (the planned hooks.* verb flash.damage running
@@ -305,6 +300,60 @@
                 "value": "bram,0xE02000A8,0x1", "clear": 0},
      "preconditions": [
        "silent until the next boot: the WDT UNCHANGED_STORAGE record is read every boot (garbage sramTestResult or a spurious WDT_RESET_TRAP; [L], nothing formats it into TM yet), and the FSW clears the record after reading, so one boot only"],
+     "expected_detection": []},
+    # The flash-damage track's device rows (D-X5, PL-11g): the
+    # flash_damage action resolves the row's spec against the params
+    # and qom-sets it as one write-only "damage-add" JSON object string
+    # on /machine/stixflash; fault.clear runs the exact-spec
+    # "damage-remove" with the same string. block/page (+byte, bit,
+    # value) are the FSW-linear indices the device's damage-list
+    # getter prints (stixflash_dmg_entry linearises mcm/chip itself),
+    # so the flash.damage.rows record shows the params back. The
+    # damage hits at the flash op's completion; on the bench the
+    # evidence is the flash.damage row itself (no TM yet).
+    {"id": "flash.block.erase_fail", "class": "memory",
+     "changes": "truth",
+     "target": "flash.damage", "mode": "erase_fail",
+     "params": {"block": {"type": "integer", "min": 0, "max": 65535,
+                          "default": 100, "unit": "block",
+                          "index_space": "block"}},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "flash_damage", "path": "/machine/stixflash",
+                "spec": {"kind": "erase-fail",
+                         "block": {"param": "block"}}},
+     "preconditions": ["block >= 64: blocks below are the reserved ASW image area, refused without allow-reserved"],
+     "expected_detection": []},
+    {"id": "flash.page.program_fail", "class": "memory",
+     "changes": "truth",
+     "target": "flash.damage", "mode": "program_fail",
+     "params": {"page": {"type": "integer", "min": 0, "max": 4194303,
+                         "default": 5000, "unit": "page",
+                         "index_space": "page"}},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "flash_damage", "path": "/machine/stixflash",
+                "spec": {"kind": "program-fail",
+                         "page": {"param": "page"}}},
+     "preconditions": ["the containing block (page // 64) >= 64: the reserved ASW image area is refused"],
+     "expected_detection": []},
+    {"id": "flash.cell.stuck", "class": "memory",
+     "changes": "truth",
+     "target": "flash.damage", "mode": "stuck_at",
+     "params": {"page": {"type": "integer", "min": 0, "max": 4194303,
+                         "default": 5000, "unit": "page",
+                         "index_space": "page"},
+                "byte": {"type": "integer", "min": 0, "max": 4223,
+                         "default": 8, "unit": "byte"},
+                "bit": {"type": "integer", "min": 0, "max": 7,
+                        "default": 1, "unit": "bit"},
+                "value": {"type": "integer", "min": 0, "max": 1,
+                          "default": 1}},
+     "persistence": "until_cleared", "reversible": true,
+     "action": {"kind": "flash_damage", "path": "/machine/stixflash",
+                "spec": {"kind": "stuck", "page": {"param": "page"},
+                         "bit": {"byte": {"param": "byte"},
+                                 "bit": {"param": "bit"}},
+                         "value": {"param": "value"}}},
+     "preconditions": ["the containing block (page // 64) >= 64: the reserved ASW image area is refused"],
      "expected_detection": []}
   ]
 }

@@ -5,7 +5,9 @@ A named failure records the *intent*: an id from the JSON catalogue,
 its resolved params and seed, and its expected detection, as one
 `fault` record per inject and per clear. The action itself reuses the
 platform switches and the forcing hooks, or (`qom`) sets a property of
-a STIX device, for device-level faults such as the attenuator's.
+a STIX device, for device-level faults such as the attenuator's, or
+(`flash_damage`, PL-11g) drives the flash device's write-only
+damage-add/damage-remove with the row's spec.
 
 What a fault changes (the attenuator plan's amendment to D-PLo, PL-4
 review SF8): a fault that models a physical failure may change *truth*
@@ -46,18 +48,34 @@ CLASSES = ("component", "signal", "link", "memory", "timing")
 PERSISTENCE = ("transient", "until_cleared", "permanent", "until_write")
 LASTING = ("until_cleared", "until_write")
 ACTIONS = ("link_down", "timecodes_off", "timecode_inject", "obt_jump",
-           "keepalive_off", "adc", "qom")
+           "keepalive_off", "adc", "qom", "flash_damage")
 # the kinds reapply covers (D-PSa): device state the power cycle can
 # lose. The controller-side kinds (link, timecodes, keepalive) and adc
-# keep their own paths; flash_damage joins in PL-11g, whose reapply
-# logs the device's "the spec is already active" (grlib_stixflash.c:
-# 1562) as "already active", not an error
-REAPPLY_KINDS = ("qom",)
+# keep their own paths. flash_damage (PL-11g): a warm reset keeps the
+# runtime damage, so the re-add is refused with FLASH_ALREADY_ACTIVE
+# and the row logs as already-active, not a reapply-error
+REAPPLY_KINDS = ("qom", "flash_damage")
 CHANGES = ("truth", "presented")
 # the qom action reaches the STIX devices only (stixctrl and its
 # sub-models such as the attenuator, and stixspw)
 QOM_PATH = re.compile(r"^/machine/(stixctrl[A-Za-z0-9_-]*"
                       r"(/[A-Za-z0-9_-]+)*|stixspw)$")
+# the flash_damage action (PL-11g, D-PSe): the device's spec grammar is
+# stixflash_dmg_entry (grlib_stixflash.c:1094-1298) — the linear block/
+# page form only (the fake refuses mcm/chip too); the geometry is the
+# device's (grlib_stixflash.c:33-43). Blocks < 64 are the reserved ASW
+# image area (grlib_stixflash.c:145) and the controller never sets
+# allow-reserved. The qom kind above still refuses the flash path.
+FLASH_PATH = "/machine/stixflash"
+FLASH_KEYS = ("kind", "block", "page", "bit", "value")
+FLASH_KINDS = ("erase-fail", "program-fail", "stuck", "stuck0")
+FLASH_PAGE_SIZE = 4224          # 4096 data + 128 header bytes
+FLASH_PAGES_PER_BLOCK = 64
+FLASH_BLOCKS = 65536            # 2 mcms * 8 devices * 4096 blocks
+FLASH_PAGES = FLASH_BLOCKS * FLASH_PAGES_PER_BLOCK
+# the device's exact duplicate-spec refusal (grlib_stixflash.c:1562):
+# reapply matches on it (the owner decision, D-PSa)
+FLASH_ALREADY_ACTIVE = "stixflash: damage-add: the spec is already active"
 # the qom value rides verbatim: an integer for the forcing-style
 # properties, a string for the EDAC upset verbs (upset-inject, M-6a of
 # the memory-upset plan)
@@ -132,6 +150,10 @@ def validate(cat):
                   "%s: qom needs a param of the entry or a value" % fid)
             _need(isinstance(act.get("clear", 0), int), "%s: qom clear "
                   "is not an integer" % fid)
+        if act["kind"] == "flash_damage":
+            _need(act.get("path") == FLASH_PATH, "%s: flash_damage path "
+                  "%r is not %r" % (fid, act.get("path"), FLASH_PATH))
+            flash_spec_ok(fid, act.get("spec"), f["params"])
         if act["kind"] == "adc":
             ch = act.get("ch")
             _need(isinstance(ch, int) and 0 <= ch < HK_CHANNELS,
@@ -146,6 +168,89 @@ def validate(cat):
 
 def qom_path_ok(path):
     return isinstance(path, str) and QOM_PATH.match(path) is not None
+
+
+def _flash_leaf(fid, name, leaf, params, bounds):
+    """One spec leaf: a fixed int within @bounds, or {"param": name} of
+    an existing param (its integer typing is the params rule above)."""
+    if isinstance(leaf, dict):
+        _need(set(leaf) == {"param"} and isinstance(leaf["param"], str) and
+              leaf["param"] in params, "%s: spec %s must reference an "
+              "existing param as {\"param\": name}, got %r"
+              % (fid, name, leaf))
+        return
+    _need(isinstance(leaf, int) and not isinstance(leaf, bool) and
+          bounds[0] <= leaf <= bounds[1], "%s: spec %s is not an integer "
+          "in %d..%d (or a param reference), got %r"
+          % (fid, name, bounds[0], bounds[1], leaf))
+
+
+def flash_spec_ok(fid, spec, params):
+    """The strict shape check of a flash_damage spec (D-PSe, R2): the
+    device's keys and kind enum, exactly one of block/page (the scope),
+    erase-fail block-only, program-fail page-only, stuck with value
+    (0/1; the stuck0 alias fixes it and takes none), a page-scope stuck
+    with a {byte, bit} bit and a block-scope one without, and the fixed
+    values within the device's geometry."""
+    _need(isinstance(spec, dict), "%s: flash_damage spec is not an "
+          "object" % fid)
+    extra = sorted(set(spec) - set(FLASH_KEYS))
+    _need(not extra, "%s: flash_damage spec has unknown keys %r"
+          % (fid, extra))
+    _need(spec.get("kind") in FLASH_KINDS, "%s: flash_damage kind %r is "
+          "not one of %s" % (fid, spec.get("kind"), "|".join(FLASH_KINDS)))
+    kind = spec["kind"]
+    has_block, has_page = "block" in spec, "page" in spec
+    _need(has_block != has_page, "%s: flash_damage needs exactly one of "
+          "'block' and 'page' (the scope)" % fid)
+    if kind == "erase-fail":
+        _need(has_block, "%s: erase-fail is a block kind" % fid)
+    elif kind == "program-fail":
+        _need(has_page, "%s: program-fail is a page kind" % fid)
+    else:                           # stuck / stuck0
+        if kind == "stuck":
+            _need("value" in spec, "%s: stuck needs 'value'" % fid)
+            _flash_leaf(fid, "value", spec["value"], params, (0, 1))
+        else:
+            _need("value" not in spec, "%s: 'value' with the 'stuck0' "
+                  "alias; use kind \"stuck\" with \"value\": 0" % fid)
+        if has_page:
+            bit = spec.get("bit")
+            _need(isinstance(bit, dict) and set(bit) == {"byte", "bit"},
+                  "%s: page-scope stuck needs 'bit' as "
+                  "{\"byte\": ..., \"bit\": ...}" % fid)
+            _flash_leaf(fid, "bit.byte", bit["byte"], params,
+                        (0, FLASH_PAGE_SIZE - 1))
+            _flash_leaf(fid, "bit.bit", bit["bit"], params, (0, 7))
+        else:
+            _need("bit" not in spec,
+                  "%s: block-scope stuck takes no 'bit'" % fid)
+    if kind in ("erase-fail", "program-fail"):
+        _need("bit" not in spec and "value" not in spec,
+              "%s: 'bit' and 'value' are stuck-only" % fid)
+    if has_block:
+        _flash_leaf(fid, "block", spec["block"], params,
+                    (0, FLASH_BLOCKS - 1))
+    else:
+        _flash_leaf(fid, "page", spec["page"], params,
+                    (0, FLASH_PAGES - 1))
+
+
+def flash_build(spec, params):
+    """A validated spec resolved against the fault's params (D-PSe):
+    {"param": name} leaves become the values and the bit composes to
+    the device's "byte.bit" string — the JSON object damage-add takes
+    (grlib_stixflash.c:1507-1538)."""
+    def val(v):
+        return params[v["param"]] if isinstance(v, dict) else v
+    out = dict(spec)
+    if "bit" in out:
+        out["bit"] = "%d.%d" % (val(spec["bit"]["byte"]),
+                                val(spec["bit"]["bit"]))
+    for k in ("block", "page", "value"):
+        if k in out:
+            out[k] = val(out[k])
+    return out
 
 
 def load(path=None):
@@ -309,6 +414,17 @@ class Faults:
                 apply_fn, _ = self.actions[entry["action"]["kind"]]
                 apply_fn(entry, st["params"])
             except Exception as e:
+                # PL-11g (the owner decision, D-PSa): a warm reset keeps
+                # the flash device's runtime damage, so the re-add is
+                # refused with its exact duplicate text — the row is
+                # fine, log it as already-active, not an error
+                if entry["action"]["kind"] == "flash_damage" and \
+                        FLASH_ALREADY_ACTIVE in str(e):
+                    self.log.emit("ctl", "fault", "fault." + fid,
+                                  {"action": "already-active", "why": why,
+                                   "params": st["params"],
+                                   "seed": st["seed"]})
+                    continue
                 self.log.emit("ctl", "fault", "fault." + fid,
                               {"action": "reapply-error", "why": why,
                                "params": st["params"], "seed": st["seed"],

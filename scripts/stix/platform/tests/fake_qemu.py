@@ -17,8 +17,9 @@ pairs (the stimulus plan T3/C2), the det scene/inject/replay knobs
 (PL-11e: the hw-state's det section echoes the stored scene; a
 replay-dss source or a replay start is refused with the device's
 no-table text), the flash device at /machine/stixflash
-(the five watch props, the damage-add/remove verbs and the
-x-fake-flash-op counter bumps, PL-11d), the PL-11f knobs (the
+(the five watch props, the damage-add/remove verbs with the device's
+duplicate and reserved-block refusals, and the x-fake-flash-op counter
+bumps, PL-11d), the PL-11f knobs (the
 attenuator's force.cmdsta-set/-clear move the hw-state's presented
 cmdsta, upset-clear and random-count move the poisons, edac-enable and
 random-seed are stored like the device's), memsave (the fsw-params RAM
@@ -507,8 +508,14 @@ class Fake:
     def flash_add(self, value):
         """damage-add (grlib_stixflash.c:1547-1575): one runtime entry;
         a spec that is already active is rejected with the device's
-        exact text (PL-11g's reapply tolerance matches on it)."""
+        exact text (PL-11g's reapply tolerance matches on it), and so
+        is the reserved ASW image area (:1245-1257 — the controller
+        never sets allow-reserved)."""
         rec = self.flash_spec(value)
+        blk = rec["block"] if "block" in rec else rec["page"] // 64
+        if blk < 64:
+            raise KeyError("stixflash: damage-add: block %d is in the "
+                           "reserved ASW image area (blocks < 64)" % blk)
         if rec in self.flash_damage:
             raise KeyError("stixflash: damage-add: the spec is already "
                            "active")

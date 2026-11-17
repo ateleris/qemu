@@ -6,7 +6,7 @@
 # root /tmp/stix-plat/run-smoke; in slot k the slot's band and
 # /tmp/stix-plat/run-smoke-s<k>. Checks:
 #   1. run mode over the gate scenarios (gate-spw-link x3, gate-keepalive,
-#      gate-timesync x3, gate-fault-reapply x3, gate-det-tape,
+#      gate-timesync x3, gate-fault-reapply x4, gate-det-tape,
 #      gate-det-scene) exits 0 and every run's report says pass
 #   2. gate-negative alone exits 1, with exactly one failed check: the
 #      await_event 142d of the step before the clear

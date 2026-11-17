@@ -385,8 +385,9 @@ The gate scenarios: `gate-spw-link` (nominal, fault_no_recovery,
 fault_with_recovery), `gate-keepalive` (the NOMINAL-entry re-arm, R1),
 `gate-timesync` (aligned, mismatch), `gate-fault-reapply` (nominal,
 fault_reapply: the attenuator offset fault survives a cold cycle only
-through the re-apply), the optional `gate-timecode-loss`, and
-`gate-negative`, which must fail with exactly one unmatched await
+through the re-apply; edac_cmdsta; flash_stuck: a stuck-cell damage row
+survives a cold cycle and clears), the optional `gate-timecode-loss`,
+and `gate-negative`, which must fail with exactly one unmatched await
 (`tests/run-smoke.sh` checks both).
 
 ## The fault catalogue
@@ -427,14 +428,19 @@ list is controller-side and survives a power cycle; the device does not
 device itself keeps, e.g. the attenuator's faults but not adc-inject).
 So at every cold power-on (before `cont`, the link-down precedent) and
 warm guest reset, every active LASTING fault of the device-state kinds
-(`qom` today; the flash rows when they land) is re-applied: one
-`fault` record per row with `action: "reapply"` and the cycle's reason.
-The stored `prior` stays the one captured at the first apply, so
-`fault.clear` still writes the pre-fault value, not the faulted one.
-One-shots (`transient`/`permanent` — the `memory.*` rows) are never
-re-applied; the controller-side kinds (link, timecodes, keepalive) and
-`adc` keep their own re-apply paths. A re-apply that fails at the
-device is a `reapply-error` record and never fails the power-on.
+(`qom` and `flash_damage`) is re-applied: one `fault` record per row
+with `action: "reapply"` and the cycle's reason. The stored `prior`
+stays the one captured at the first apply, so `fault.clear` still
+writes the pre-fault value, not the faulted one. One-shots
+(`transient`/`permanent` — the `memory.*` rows) are never re-applied;
+the controller-side kinds (link, timecodes, keepalive) and `adc` keep
+their own re-apply paths. A re-apply that fails at the device is a
+`reapply-error` record and never fails the power-on. The `flash_damage`
+rows tolerate the device's exact duplicate refusal (the flash device
+keeps its runtime damage across a warm reset, so the re-add is refused
+with `stixflash: damage-add: the spec is already active`): that one is
+logged as `already-active`, not an error; on a cold cycle the fresh
+process's list is empty and the add just lands.
 Deliberately outside the re-apply rule (PL-11f): the cmdsta forcing
 (`att.cmdsta.*`) — the device clears it on reset by design — and the
 EDAC's Edacon (`mem.edac.enable`) — the FSW's TC(236) write or a reset
@@ -444,11 +450,33 @@ The v1 entries (all on existing model hooks): `spw.link.disconnect`,
 `timecode.missing`, `timecode.wrong_value`, `obt.jump`,
 `keepalive.missing`, `power.dpu_1v5.undervoltage`,
 `thermal.psu.overtemp` and `hk_prot.det_c.overcurrent`. The
-attenuator's fault IDs are reserved in the catalogue's comments. The
-memory-upset track's `memory.*` entries (M-6a of
+attenuator's nine A-3 rows ride the qom action on
+`/machine/stixctrl/attenuator` (the A-later IDs stay comment-reserved).
+The memory-upset track's `memory.*` entries (M-6a of
 `2026-11-12-memory-upset-plan.md`) ride the qom action on
 `/machine/stixctrl/edac` with string values (one-shot events; the
 device's own `upset-clear` is the undo).
+
+The flash-damage track's three injectable rows (D-X5, PL-11g):
+`flash.block.erase_fail`, `flash.page.program_fail` and
+`flash.cell.stuck` ride the `flash_damage` action on
+`/machine/stixflash`. The row's `spec` is the device's sidecar-entry
+grammar (kind `erase-fail|program-fail|stuck`, exactly one of
+`block`/`page` as the scope, stuck with `value` 0/1 and, page-scope
+only, a `bit` as `{"byte": …, "bit": …}`; leaves are fixed integers or
+`{"param": name}` references into the row's params). Apply resolves the
+spec against the params — the bit composes to the device's
+`"byte.bit"` — and qom-sets it as one write-only `damage-add` JSON
+object string (no getter exists, so there is no prior read);
+`fault.clear` runs the exact-spec `damage-remove` with the same
+string. The params are the FSW-linear block/page indices the device's
+`damage-list` getter prints, so the `flash.damage.rows` record shows
+them back; the damage takes effect at the next flash op's completion,
+and blocks < 64 (the reserved ASW image area) are refused — the
+controller never sets `allow-reserved`. The offline rows
+(`flash.block.bad_factory`, `flash.file.corrupt`,
+`flash.file.wrong_address`) stay comment-reserved: pre-boot tool work,
+never injectable faults.
 
 ## Timing
 
