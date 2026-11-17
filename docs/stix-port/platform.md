@@ -169,6 +169,7 @@ namespaces and where each comes from:
 | `instrument.attenuator.*` | the hw-state's `attenuator` section (PL-11b): `truth.{position, position_ppm, sensor_ab, sensor_bc, motor1_driving, motor2_driving, att_c, moves, last_end, last_end_ns}`, `presented.{sensor_ab, sensor_bc, cmdsta, att_c}`, `fsw_accesses`, `faults_active` |
 | `instrument.memory.*` | the hw-state's `edac` section (PL-11b): per-memory `injected`/`corrected`/`detected` counters for `cache`, `sdram` and `rotbuf`, and `poisons` (the armed upsets as one leaf; a change record per arm and per clear). `instrument.memory.bram` maps no leaf: the bram has no EDAC counters and its upsets arm no poison |
 | `instrument.rotb.{count, full, enable, rd, wr, capacity}` | the hw-state's `rotb` section (PL-11c): the ROTB ring's FIFO state — the block count, the full flag, the rotbConfig ENABLE bit, the read/write block indices, and the rotb-blocks capacity. `count`/`rd`/`wr` are volatile (they move while the detector fills the ring) |
+| `flash.ops.{read, prog, erase, abort}`, `flash.damage.rows`, `flash.damage.raw` | the flash device's read-only QOM props at `/machine/stixflash` (PL-11d): the four op counters and the active damage specs. `damage.rows` is parsed from the device's damage-list rows (`{src, kind, block or page, bit "byte.bit" and value when present}`), `damage.raw` is the raw string. They move only on a flash op or a damage add/remove (no volatile entries), and the whole `flash.*` subtree drops at power off |
 
 Every state change is `POST /api/v1/cmd/<verb>` with a JSON object of
 arguments, `Content-Type: application/json` and `X-Stix-Platform: 1`.
@@ -225,7 +226,7 @@ lists exactly these verbs and arguments.
 | `run.open` | `name`, `port` | serve a finished run bundle read-only (the `--view-run` pair) on 127.0.0.1 in-process; one slot (409 while one is open); the answer is `{url, port}`, `port` 1024..65535 or a free one |
 | `run.close` | `port` | close the open run viewer (409 when none, or when `port` is not the open one) |
 | `run.compare` | `a`, `b` | compare two finished run bundles by run id: the decisions aligned at the first common (kind, key) pair plus the derived rows; the answer is `{summary, rows, artifact}` and the artifact pair is (re)written under `<retention.run_root>/compares/` — both run dirs stay read-only; 404 unknown id, 409 a bundle still open |
-| `debug.qmp` | `command`, `arguments` | one raw `qom-get` or `qom-set` on `/machine/stixspw` or `/machine/stixctrl`, or `query-status`; refused (403) unless `[debug] raw_qmp = true`, and in run mode also `[debug] allow_in_run = true`; every call is a `debug` record and sets the sticky `status.debug_used` taint (dev and gate use only) |
+| `debug.qmp` | `command`, `arguments` | one raw `qom-get` or `qom-set` on `/machine/stixspw`, `/machine/stixctrl`, `/machine/stixctrl/attenuator`, `/machine/stixctrl/edac` or `/machine/stixflash` (exact paths only — no children, no patterns), or `query-status`; refused (403) unless `[debug] raw_qmp = true`, and in run mode also `[debug] allow_in_run = true`; every call is a `debug` record and sets the sticky `status.debug_used` taint (dev and gate use only) |
 <!-- verbs:end -->
 
 ### Versioning and stability (D-PLn)

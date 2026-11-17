@@ -13,13 +13,16 @@ attenuator, edac, det and rotb sections, PL-11b/PL-11c, with the det
 section's tape/align/adc stimulus blocks), qom-set obt, the upset verbs
 on the EDAC (they move the hw-state's poisons and counters), the
 det-rotb-burst pair (the FF plan's burst), the det tape/align/adc QOM
-pairs (the stimulus plan T3/C2), memsave (the fsw-params RAM snapshot:
-zeros into the asked file, in the cwd), and the test-only
+pairs (the stimulus plan T3/C2), the flash device at /machine/stixflash
+(the five watch props, the damage-add/remove verbs and the
+x-fake-flash-op counter bumps, PL-11d), memsave (the fsw-params RAM
+snapshot: zeros into the asked file, in the cwd), and the test-only
 x-fake-guest-reset, x-fake-tape-state, x-fake-align-state and
 x-fake-adc-state, which behave per -no-reboot / -action like QEMU.
 `noquit` ignores quit (the controller must escalate to SIGTERM);
 `noqmp` accepts the QMP connection and never answers; `badstate`
-serves a hw-state without its keys.
+serves a hw-state without its keys; `noflash` refuses every flash
+qom-get (the poller's flash-error tolerance).
 """
 
 import json
@@ -49,6 +52,8 @@ ATT_DEFAULT = {"attenuator.current.offset": 0}
 # the EDAC device (the memory.* catalogue rows' target); its upset
 # verbs move the hw-state's edac section, like the device's
 EDAC = "/machine/stixctrl/edac"
+# the flash device (PL-11d): the five watch props, the damage verbs
+FLASH = "/machine/stixflash"
 
 
 def greeting():
@@ -129,6 +134,13 @@ class Fake:
         self.edac_counters = {m: {"injected": 0, "corrected": 0,
                                   "detected": 0}
                               for m in ("sdram", "cache", "rotbuf")}
+        # the flash device (PL-11d): the op counters move only through
+        # x-fake-flash-op (D-F9); the damage list holds the parsed
+        # runtime specs (damage-add/damage-remove) and survives a guest
+        # reset like the device's runtime state
+        self.flash_ops = {"ops-read": 0, "ops-prog": 0, "ops-erase": 0,
+                          "ops-abort": 0}
+        self.flash_damage = []
         for i, a in enumerate(args):
             nxt = args[i + 1] if i + 1 < len(args) else ""
             if a == "-qmp" and nxt.startswith("unix:"):
@@ -344,6 +356,106 @@ class Fake:
             raise KeyError("no upset %d armed (%d)" % (i, len(self.poisons)))
         del self.poisons[i]
 
+    def flash_spec(self, value):
+        """One damage spec string into a canonical record — the device's
+        grammar (stixflash_dmg_entry, grlib_stixflash.c:1094-1298) as
+        far as the fake needs it: the linear block/page form only."""
+        try:
+            e = json.loads(value)
+        except ValueError:
+            raise KeyError("stixflash: not JSON: %s" % value)
+        if not isinstance(e, dict):
+            raise KeyError("stixflash: the spec is not a JSON object")
+        if set(e) - {"kind", "block", "page", "bit", "value"}:
+            raise KeyError("stixflash: unknown key in the damage spec")
+        kind = e.get("kind")
+        if kind == "stuck0":        # the device's alias for value 0
+            if "value" in e:
+                raise KeyError("stixflash: 'value' with the 'stuck0' "
+                               "alias; use kind \"stuck\"")
+            kind, e = "stuck", dict(e, value=0)
+        if kind not in ("erase-fail", "program-fail", "stuck"):
+            raise KeyError("stixflash: bad kind %r" % kind)
+        if kind == "stuck":
+            if e.get("value") not in (0, 1):
+                raise KeyError("stixflash: stuck needs a value 0 or 1")
+        elif "value" in e:
+            raise KeyError("stixflash: 'value' is only valid with kind "
+                           "\"stuck\"")
+        has_block = "block" in e
+        has_page = "page" in e
+        if has_block == has_page:   # exactly one of them
+            raise KeyError("stixflash: needs a 'block' or a 'page'")
+        if kind == "erase-fail" and has_page:
+            raise KeyError("stixflash: erase-fail is a block kind")
+        if kind == "program-fail" and has_block:
+            raise KeyError("stixflash: program-fail is a page kind")
+        rec = {"kind": kind}
+        if has_block:
+            rec["block"] = e["block"]
+        else:
+            rec["page"] = e["page"]
+        if kind == "stuck":
+            if has_page:
+                try:
+                    byte, bit = str(e["bit"]).split(".")
+                    byte, bit = int(byte), int(bit)
+                except (KeyError, ValueError, AttributeError):
+                    raise KeyError("stixflash: stuck needs a bit as "
+                                   "'byte.bit'")
+                if not (0 <= byte < 4096 and 0 <= bit < 8):
+                    raise KeyError("stixflash: bit out of range")
+                rec["byte"], rec["bit"] = byte, bit
+            elif "bit" in e:
+                raise KeyError("stixflash: block-scope stuck takes no "
+                               "'bit'")
+            rec["value"] = e["value"]
+        return rec
+
+    def flash_add(self, value):
+        """damage-add (grlib_stixflash.c:1547-1575): one runtime entry;
+        a spec that is already active is rejected with the device's
+        exact text (PL-11g's reapply tolerance matches on it)."""
+        rec = self.flash_spec(value)
+        if rec in self.flash_damage:
+            raise KeyError("stixflash: damage-add: the spec is already "
+                           "active")
+        self.flash_damage.append(rec)
+
+    def flash_remove(self, value):
+        """damage-remove (grlib_stixflash.c:1585-1621): "all" or the
+        exact spec; a spec that names nothing errors and changes
+        nothing."""
+        if value == "all":
+            self.flash_damage = []
+            return
+        rec = self.flash_spec(value)
+        if rec not in self.flash_damage:
+            raise KeyError("stixflash: damage-remove: no such runtime "
+                           "damage entry")
+        self.flash_damage.remove(rec)
+
+    def flash_list(self):
+        """The damage-list string in the device's line format
+        (stixflash_damage_list_get, grlib_stixflash.c:1429-1478); the
+        fake has no sidecar rows, so src is always runtime."""
+        rows = []
+        for d in self.flash_damage:
+            if d["kind"] == "erase-fail":
+                rows.append("src=runtime kind=erase-fail block=%d"
+                            % d["block"])
+            elif d["kind"] == "program-fail":
+                rows.append("src=runtime kind=program-fail page=%d"
+                            % d["page"])
+            elif "page" in d:
+                rows.append("src=runtime kind=stuck value=%d page=%d "
+                            "bit=%d.%d" % (d["value"], d["page"],
+                                           d["byte"], d["bit"]))
+            else:
+                rows.append("src=runtime kind=stuck value=%d block=%d"
+                            % (d["value"], d["block"]))
+        return "\n".join(rows)
+
     def command(self, msg):
         ex = msg.get("execute")
         a = msg.get("arguments", {})
@@ -371,6 +483,8 @@ class Fake:
             raise SystemExit(0)
         if ex == "qom-get":
             prop = a.get("property")
+            if self.variant == "noflash" and a["path"] == FLASH:
+                raise KeyError("Property '%s' not found" % prop)
             if prop == "vclock-ns":
                 return self.vclock()
             if prop == "obt":
@@ -386,6 +500,10 @@ class Fake:
                 return self.align_status()
             if prop == "det-adc-status":
                 return self.adc_status()
+            if a["path"] == FLASH and prop in self.flash_ops:
+                return self.flash_ops[prop]
+            if a["path"] == FLASH and prop == "damage-list":
+                return self.flash_list()
             if (a["path"], prop) in self.props:
                 return self.props[(a["path"], prop)]
             if prop in ATTENUATOR:
@@ -408,6 +526,16 @@ class Fake:
                     "requested=%d,appended=%d,stop=done,rotb_count=%d" \
                     % (n, n, self.rotb_blocks)
                 self.set_log.append((a["path"], prop, n))
+                return {}
+            if a["path"] == FLASH and prop in ("damage-add",
+                                               "damage-remove"):
+                # the flash device's runtime injection verbs (X-2,
+                # write-only: no getter, so qom-get of them fails)
+                if prop == "damage-add":
+                    self.flash_add(a["value"])
+                else:
+                    self.flash_remove(a["value"])
+                self.set_log.append((a["path"], prop, a["value"]))
                 return {}
             if prop in SETTABLE:
                 if a["path"] == EDAC and prop == "upset-inject":
@@ -487,12 +615,22 @@ class Fake:
         if ex == "x-fake-guest-reset":
             threading.Timer(0.05, self.guest_reset).start()
             return {}
+        if ex == "x-fake-flash-op":
+            # the flash op counters move only here (the real device's
+            # move in its MMIO handler, D-F9)
+            op = a.get("op")
+            if op not in ("read", "prog", "erase", "abort"):
+                raise KeyError("x-fake-flash-op needs op "
+                               "read|prog|erase|abort")
+            self.flash_ops["ops-" + op] += 1
+            return {}
         raise KeyError("The command %s has not been found" % ex)
 
     def guest_reset(self):
         # this fake keeps all props across the reset; the real device
         # drops link-down/adc-inject (stix_att.c:504-512 keeps only the
-        # attenuator's faults), and the controller re-applies those
+        # attenuator's faults), and the controller re-applies those.
+        # The flash damage is runtime state and survives too
         if self.no_reboot:
             self.event("SHUTDOWN", {"guest": True, "reason": "guest-reset"})
             os._exit(0)

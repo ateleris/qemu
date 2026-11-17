@@ -27,7 +27,11 @@ from .state import StateTree
 
 TRACE_NAME_RE = re.compile(r"^(?:\d+@\d+\.\d+:)?(\w+) ")
 DEBUG_QMP = ("qom-get", "qom-set", "query-status")
-DEBUG_PATHS = ("/machine/stixspw", "/machine/stixctrl")
+# D-PSd: the five fixed paths debug.qmp may touch (exact match, no
+# children)
+DEBUG_PATHS = ("/machine/stixspw", "/machine/stixctrl",
+               "/machine/stixctrl/attenuator", "/machine/stixctrl/edac",
+               "/machine/stixflash")
 
 
 class Controller:
@@ -60,6 +64,7 @@ class Controller:
         self.poller = None
         self.last_state_poll = 0.0
         self.last_poll_error = None
+        self._poll_errored = False   # an error was seen in this poll
         self.debug_used = False
         self.snap_lock = threading.Lock()
         self.last_sparse = time.monotonic()
@@ -339,12 +344,14 @@ class Controller:
 
     # -- polling (D-PLr, D-PLo) --
     def poll_state(self, snapshot=True):
-        """Sample both hw-states; never raises (S3): a failure is one
-        poller.error record (repeats of the same error are not logged)."""
+        """Sample both hw-states and the flash device's watch props;
+        never raises (S3): a failure is one poller.error record
+        (repeats of the same error are not logged)."""
         q = self.power.qmp
         if q is None or not self.power.qmp_alive():
             return
         self.last_state_poll = time.monotonic()
+        self._poll_errored = False
         try:
             ctrl = json.loads(q.qom_get(qemu_mod.STIXCTRL, "hw-state"))
             spw = json.loads(q.qom_get(qemu_mod.STIXSPW, "hw-state"))
@@ -362,22 +369,45 @@ class Controller:
         except Exception as e:
             return self._poll_error("state", e)
         self._emit_changes(changes)
+        # PL-11d (R4): the flash watch props in their own block, after
+        # the hw-state update: one bad get is a "flash" poller.error and
+        # never skips or undoes the hw-state leaves above
+        flash = {}
+        flash_err = None
+        for prop in ("ops-read", "ops-prog", "ops-erase", "ops-abort",
+                     "damage-list"):
+            try:
+                flash[prop] = q.qom_get(qemu_mod.STIXFLASH, prop)
+            except (QmpError, ValueError, KeyError) as e:
+                flash_err = flash_err or e
+        if flash_err is not None:
+            # only the first one per poll: five different messages
+            # would defeat the repeat check and log every poll
+            self._poll_error("flash", flash_err)
+        if flash:
+            try:
+                self._emit_changes(self.state.update_flash(flash, sim))
+            except Exception as e:
+                self._poll_error("flash", e)
         self.plat._platform_state()
         if snapshot:
             self._maybe_snapshot(sim)
         self._poll_ok()
 
     def _poll_error(self, where, e):
+        self._poll_errored = True   # no poller.recovered in this poll
         msg = "%s: %s: %s" % (where, type(e).__name__, e)
         if msg != self.last_poll_error:
             self.last_poll_error = msg
             self.log.emit("ctl", "log", "poller.error", {"error": msg})
 
     def _poll_ok(self):
-        if self.last_poll_error is not None:
+        # recovered only when the last error did not recur this poll
+        if self.last_poll_error is not None and not self._poll_errored:
             self.log.emit("ctl", "log", "poller.recovered",
                           {"after": self.last_poll_error})
             self.last_poll_error = None
+        self._poll_errored = False
 
     def _maybe_snapshot(self, sim):
         """A periodic snapshot every snapshot_s of bench time, so the log

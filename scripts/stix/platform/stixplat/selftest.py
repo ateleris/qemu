@@ -101,7 +101,7 @@ class Env:
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="stixplat-selftest-")
         self.bins = {}
-        for v in ("new", "old", "noquit", "noqmp", "badstate"):
+        for v in ("new", "old", "noquit", "noqmp", "badstate", "noflash"):
             p = os.path.join(self.tmp, "qemu-%s" % v)
             with open(p, "w") as f:
                 f.write('#!/bin/sh\nexec "%s" "%s" --variant %s "$@"\n'
@@ -666,8 +666,21 @@ def t_power(env):
         check(ctl.status()["debug_used"] is True, "the taint flag")
         e = raises(VerbError, ctl.command, "debug.qmp", {"command": "quit"})
         check(e.status == 400, "debug.qmp allowlist")
-        for path in ("/machine", "/machine/stixflash", "/objects/x",
-                     "/machine/stixspw/../stixflash"):
+        # D-PSd as corrected by R9: the five fixed paths are accepted
+        # (exact match), everything else 403
+        for path, prop in (("/machine/stixspw", "vclock-ns"),
+                           ("/machine/stixctrl", "vclock-ns"),
+                           ("/machine/stixctrl/attenuator",
+                            "attenuator.sensor_ab.stuck_open"),
+                           ("/machine/stixctrl/edac", "hw-state"),
+                           ("/machine/stixflash", "ops-read")):
+            r = ctl.command("debug.qmp", {"command": "qom-get",
+                                          "arguments": {"path": path,
+                                                        "property": prop}})
+            check("return" in r, "debug.qmp accepts %s" % path)
+        for path in ("/machine", "/objects/x",
+                     "/machine/stixspw/../stixflash",
+                     "/machine/stixspw/sub", "/machine/stixflash/x"):
             e = raises(VerbError, ctl.command, "debug.qmp", {
                 "command": "qom-get", "arguments": {
                     "path": path, "property": "x"}})
@@ -2790,6 +2803,132 @@ def t_det_rotb_leaves(env):
         check(len(changes()) == seen,
               "no change record for the stable reads (and the volatile "
               "ones flood none): %r" % changes()[seen:])
+    finally:
+        ctl.shutdown()
+
+
+def t_flash_leaves(env):
+    """PL-11d (D-PSb): the flash device's watch props map to flash.*
+    leaves; the op counters move on x-fake-flash-op, damage-add/remove
+    shows in flash.damage and flash.damage.raw, clear_hw drops the
+    subtree, and a bad flash get is a poller.error that leaves the
+    instrument leaves updating."""
+    # the damage-list parser: an unparsable line is skipped, a good one
+    # parses into the record shape
+    check(state_mod.parse_damage("") == [] and
+          state_mod.parse_damage("src=runtime kind=weird block=3") == [] and
+          state_mod.parse_damage("src=runtime kind=stuck value=1 page=100 "
+                                 "bit=x.y") == [] and
+          state_mod.parse_damage("garbage") == [] and
+          state_mod.parse_damage("src=runtime kind=stuck value=1 page=100 "
+                                 "bit=3.1") == [{"src": "runtime",
+                                                 "kind": "stuck",
+                                                 "page": 100,
+                                                 "bit": "3.1",
+                                                 "value": 1}] and
+          state_mod.parse_damage("src=runtime kind=erase-fail block=200")
+          == [{"src": "runtime", "kind": "erase-fail", "block": 200}] and
+          state_mod.parse_damage("src=map kind=program-fail page=9")
+          == [{"src": "map", "kind": "program-fail", "page": 9}],
+          "parse_damage skips unparsable lines")
+    ctl = env.controller()
+    try:
+        cmd = ctl.command
+        cmd("platform.power.on", {})
+        cmd("platform.power.boot", {})
+        wait_for(lambda: ctl.state.get("flash") is not None,
+                 what="the flash leaves")
+        for k in ("read", "prog", "erase", "abort"):
+            lf = ctl.state.get("flash.ops." + k)
+            check(lf is not None and lf["truth"] == 0,
+                  "flash.ops.%s at zero: %r" % (k, lf))
+        ops = ctl.state.get("flash.ops.read")
+        check(set(ops) == {"truth", "presented", "reported", "unit",
+                           "index_space", "t_sim", "t_changed", "status",
+                           "fault_ids"},
+              "the leaf dict shape: %r" % sorted(ops))
+        check(ctl.state.get("flash.damage.rows")["truth"] == [] and
+              ctl.state.get("flash.damage.raw")["truth"] == "",
+              "no damage at boot")
+
+        def changes():
+            return [x for x in ctl.log.since(0) if x.kind == "state" and
+                    x.obj["path"].startswith("flash.")]
+        seen = len(changes())
+        time.sleep(0.3)                # several state polls, all stable
+        check(len(changes()) == seen,
+              "no change record for the stable reads: %r" % changes()[seen:])
+        # the counters move only through the test command
+        qmp = ctl.power.qmp
+        qmp.execute("x-fake-flash-op", {"op": "read"})
+        qmp.execute("x-fake-flash-op", {"op": "erase"})
+        qmp.execute("x-fake-flash-op", {"op": "erase"})
+        wait_for(lambda: ctl.state.get("flash.ops.read")["truth"] == 1 and
+                 ctl.state.get("flash.ops.erase")["truth"] == 2,
+                 what="the op counters")
+        # damage-add: the parsed record and the raw line
+        spec = '{"kind": "stuck", "page": 100, "bit": "3.1", "value": 1}'
+        qmp.execute("qom-set", {"path": "/machine/stixflash",
+                                "property": "damage-add", "value": spec})
+        wait_for(lambda: ctl.state.get("flash.damage.rows")["truth"] ==
+                 [{"src": "runtime", "kind": "stuck", "page": 100,
+                   "bit": "3.1", "value": 1}],
+                 what="the parsed damage row")
+        check(ctl.state.get("flash.damage.raw")["truth"] ==
+              "src=runtime kind=stuck value=1 page=100 bit=3.1",
+              "the raw damage leaf: %r" % ctl.state.get("flash.damage.raw"))
+        # a block-scope row joins it
+        qmp.execute("qom-set", {"path": "/machine/stixflash",
+                                "property": "damage-add",
+                                "value": '{"kind": "erase-fail", '
+                                         '"block": 200}'})
+        wait_for(lambda: len(ctl.state.get("flash.damage.rows")["truth"]) == 2,
+                 what="the second damage row")
+        # a duplicate add is refused with the device's exact text
+        e = raises(QmpError, qmp.execute, "qom-set",
+                   {"path": "/machine/stixflash", "property": "damage-add",
+                    "value": spec})
+        check("the spec is already active" in str(e), "duplicate: %s" % e)
+        e = raises(QmpError, qmp.execute, "qom-set",
+                   {"path": "/machine/stixflash",
+                    "property": "damage-remove",
+                    "value": '{"kind": "erase-fail", "block": 201}'})
+        check("no such runtime damage entry" in str(e), "absent: %s" % e)
+        # a fake guest reset keeps the runtime damage
+        qmp.execute("x-fake-guest-reset", {})
+        time.sleep(0.3)
+        check(len(ctl.state.get("flash.damage.rows")["truth"]) == 2,
+              "the damage survives a guest reset")
+        # the remove drops the row again
+        qmp.execute("qom-set", {"path": "/machine/stixflash",
+                                "property": "damage-remove",
+                                "value": spec})
+        wait_for(lambda: ctl.state.get("flash.damage.raw")["truth"] ==
+                 "src=runtime kind=erase-fail block=200", what="the remove")
+        cmd("platform.power.off", {})
+        wait_for(lambda: ctl.state.get("flash") is None,
+                 what="clear_hw drops flash.*")
+    finally:
+        ctl.shutdown()
+    # a flash get error: one poller.error (deduped), the poll and the
+    # instrument leaves live on
+    ctl = env.controller(qemu={"binary": env.bins["noflash"]})
+    try:
+        ctl.command("platform.power.on", {})
+        ctl.command("platform.power.boot", {})
+        wait_for(lambda: any(r.obj["path"] == "poller.error" and
+                             str(r.obj["data"].get("error", "")).
+                             startswith("flash:")
+                             for r in ctl.log.since(0)),
+                 what="the flash poller.error")
+        wait_for(lambda: ctl.state.get("platform.obt") is not None,
+                 what="the instrument leaves still update")
+        time.sleep(0.4)
+        n = sum(r.obj["path"] == "poller.error" for r in ctl.log.since(0))
+        time.sleep(0.4)
+        n2 = sum(r.obj["path"] == "poller.error" for r in ctl.log.since(0))
+        check(n2 == n, "the flash error is deduped (%d -> %d)" % (n, n2))
+        check(ctl.poller.is_alive(), "the poller died on a flash error")
     finally:
         ctl.shutdown()
 
@@ -8808,6 +8947,7 @@ CASES = [("config", t_config), ("argv golden", t_argv),
          ("fault re-apply across a power cycle (PL-11a)", t_fault_reapply),
          ("attenuator + EDAC state leaves (PL-11b)", t_att_edac_leaves),
          ("detector + ROTB state leaves (PL-11c)", t_det_rotb_leaves),
+         ("flash watch leaves + debug.qmp hatch (PL-11d)", t_flash_leaves),
          ("state: t_changed (D4)", t_state_t_changed),
          ("detector burst verb (FF)", t_det_burst),
          ("detector tapes: files + schema (T3)", t_tapes_crud),

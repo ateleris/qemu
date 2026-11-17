@@ -158,6 +158,65 @@ def leaves_from_hw(ctrl, spw, t_sim):
     return out
 
 
+# PL-11d: the flash device's watch props (poll_state gets them one by
+# one, so any of them may be missing after a bad get)
+FLASH_OPS = ("read", "prog", "erase", "abort")
+
+
+def parse_damage(raw):
+    """The device's damage-list rows (the renderer
+    grlib_stixflash.c:1429-1478) into records {src, kind, block or
+    page, bit ("byte.bit", only when present), value (only when
+    present)}. An unparsable line is skipped (the raw leaf keeps it),
+    silently: a bad line must not log on every poll."""
+    rows = []
+    for line in raw.split("\n"):
+        if not line:
+            continue
+        try:
+            tok = {}
+            for t in line.split(" "):
+                k, v = t.split("=", 1)
+                tok[k] = v
+            rec = {"src": tok["src"], "kind": tok["kind"]}
+            if tok["kind"] == "erase-fail":
+                rec["block"] = int(tok["block"])
+            elif tok["kind"] == "program-fail":
+                rec["page"] = int(tok["page"])
+            elif tok["kind"] == "stuck":
+                rec["value"] = int(tok["value"])
+                if "page" in tok:
+                    byte, bit = tok["bit"].split(".")
+                    int(byte), int(bit)     # both parts are integers
+                    rec["page"] = int(tok["page"])
+                    rec["bit"] = tok["bit"]
+                else:
+                    rec["block"] = int(tok["block"])
+            else:
+                raise ValueError(tok["kind"])
+            rows.append(rec)
+        except (KeyError, ValueError, AttributeError):
+            pass
+    return rows
+
+
+def flash_leaves(flash, t_sim):
+    """The flash watch leaves (PL-11d) from the poll's qom-gets: the
+    four op counters, the damage rows parsed from the device's
+    damage-list string, and the raw string. They move only on a flash
+    op or a damage add/remove, so none is VOLATILE."""
+    out = {}
+    for k in FLASH_OPS:
+        v = flash.get("ops-" + k)
+        if v is not None:
+            out["flash.ops." + k] = leaf(v, t_sim=t_sim)
+    raw = flash.get("damage-list")
+    if raw is not None:
+        out["flash.damage.rows"] = leaf(parse_damage(raw), t_sim=t_sim)
+        out["flash.damage.raw"] = leaf(raw, t_sim=t_sim)
+    return out
+
+
 class StateTree:
     def __init__(self):
         self.lock = threading.Lock()
@@ -174,11 +233,17 @@ class StateTree:
         leaves whose truth or presented changed."""
         return self._update(leaves_from_hw(ctrl, spw, t_sim), replace=False)
 
+    def update_flash(self, flash, t_sim):
+        """The flash device's poll (PL-11d): whatever the flash qom-gets
+        brought this poll (a bad get just leaves its leaf alone).
+        Returns {path: (old, new)} like update_hw."""
+        return self._update(flash_leaves(flash, t_sim), replace=False)
+
     def clear_hw(self):
-        """Power off: the IDPU and instrument subtrees are gone."""
+        """Power off: the IDPU, instrument and flash subtrees are gone."""
         with self.lock:
             for p in [p for p in self.leaves
-                      if p.startswith(("idpu.", "instrument.")) or
+                      if p.startswith(("idpu.", "instrument.", "flash.")) or
                       p.startswith("platform.timecode.") or
                       p in ("platform.obt", "platform.obt_kind")]:
                 del self.leaves[p]

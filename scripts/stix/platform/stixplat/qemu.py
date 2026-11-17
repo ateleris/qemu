@@ -15,6 +15,7 @@ import time
 
 STIXSPW = "/machine/stixspw"
 STIXCTRL = "/machine/stixctrl"
+STIXFLASH = "/machine/stixflash"
 GUARD_MSG = "QEMU predates 21f898484f; it would write a 16.5 GB flash"
 
 
